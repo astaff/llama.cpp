@@ -341,10 +341,85 @@ static VkDeviceSize ggml_vk_get_max_buffer_range(const ggml_backend_vk_context *
 void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
     // Use waitForFences while most of the graph executes. Hopefully the CPU can sleep
     // during this wait.
+    bool gen_had_almost_ready = false;
     if (ctx->almost_ready_fence_pending) {
         VK_CHECK(ctx->device->device.waitForFences({ ctx->almost_ready_fence }, true, UINT64_MAX), "almost_ready_fence", ctx->device);
         ctx->device->device.resetFences({ ctx->almost_ready_fence });
         ctx->almost_ready_fence_pending = false;
+        gen_had_almost_ready = true;
+    }
+    const int64_t gen_t_ar = ggml_time_us();
+
+    // gen: GGML_VK_FENCE_WAIT selects how the last part of the graph is waited for:
+    //   spin (default)  getFenceStatus + 1000 YIELDs per poll
+    //   block           waitForFences (the thread sleeps)
+    //   wfe             poll, then WFE (aarch64): the core is clock-gated until an event or the arch timer's event
+    //                   stream (~100 us) wakes it; it stays "busy" for the scheduler, so its frequency stays up
+    //   nap             poll, then nanosleep 50 us
+    static const int gen_wait_mode = [] {
+        const char * m = getenv("GGML_VK_FENCE_WAIT");
+        if (m == nullptr || strcmp(m, "spin") == 0) return 0;
+        if (strcmp(m, "block") == 0) return 1;
+        if (strcmp(m, "wfe") == 0) return 2;
+        if (strcmp(m, "nap") == 0) return 3;
+        if (strcmp(m, "hybrid") == 0) return 4;
+        return 0;
+    }();
+    // hybrid: sleep in waitForFences until GGML_VK_FENCE_MARGIN_US (default 300) before the expected end of the graph
+    // (moving average of the time from the almost-ready fence to the final fence), then spin
+    if (gen_wait_mode == 4 && gen_had_almost_ready) {
+        static const int64_t margin_us = getenv("GGML_VK_FENCE_MARGIN_US") ? atoll(getenv("GGML_VK_FENCE_MARGIN_US")) : 300;
+        static thread_local double ema_tail_us = 0.0;
+        const int64_t sleep_us = (int64_t) ema_tail_us - margin_us;
+        if (sleep_us > 50) {
+            const vk::Result r = ctx->device->device.waitForFences({ ctx->fence }, true, (uint64_t) sleep_us * 1000);
+            if (r != vk::Result::eSuccess && r != vk::Result::eTimeout) {
+                throw vk::SystemError(vk::make_error_code(r), "ggml_vulkan: waitForFences (hybrid)");
+            }
+        }
+        for (;;) {
+            const vk::Result r = ctx->device->device.getFenceStatus(ctx->fence);
+            if (r == vk::Result::eSuccess) {
+                break;
+            }
+            if (r != vk::Result::eNotReady) {
+                throw vk::SystemError(vk::make_error_code(r), "ggml_vulkan: getFenceStatus");
+            }
+            YIELD();
+        }
+        const double tail = (double) (ggml_time_us() - gen_t_ar);
+        ema_tail_us = ema_tail_us == 0.0 ? tail : 0.8 * ema_tail_us + 0.2 * tail;
+        ctx->device->device.resetFences({ ctx->fence });
+        return;
+    }
+    const bool gen_block_wait = gen_wait_mode == 1;
+    if (gen_wait_mode == 2 || gen_wait_mode == 3) {
+        for (;;) {
+            const vk::Result r = ctx->device->device.getFenceStatus(ctx->fence);
+            if (r == vk::Result::eSuccess) {
+                break;
+            }
+            if (r != vk::Result::eNotReady) {
+                throw vk::SystemError(vk::make_error_code(r), "ggml_vulkan: getFenceStatus");
+            }
+            if (gen_wait_mode == 2) {
+#if defined(__aarch64__)
+                __asm__ __volatile__("wfe" ::: "memory");
+#else
+                YIELD();
+#endif
+            } else {
+                struct timespec ts = { 0, 50000 };
+                nanosleep(&ts, nullptr);
+            }
+        }
+        ctx->device->device.resetFences({ ctx->fence });
+        return;
+    }
+    if (gen_block_wait) {
+        VK_CHECK(ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX), "fence (blocking)", ctx->device);
+        ctx->device->device.resetFences({ ctx->fence });
+        return;
     }
 
     // Spin (w/pause) waiting for the graph to finish executing.
@@ -1158,6 +1233,7 @@ void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subctx) {
 
     if (ctx) {
         ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
+        ctx->stat_syncs++;
     }
 
     subctx->s->buffer->buf.pipelineBarrier(
@@ -14435,7 +14511,14 @@ static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
     VK_LOG_DEBUG("ggml_backend_vk_synchronize()");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
+    static const bool gen_stats = getenv("GGML_VK_GRAPH_STATS") != nullptr && atoi(getenv("GGML_VK_GRAPH_STATS")) != 0;
+    const int64_t gen_t_start = gen_stats ? ggml_time_us() : 0;
+
     ggml_vk_synchronize(ctx);
+
+    if (gen_stats) {
+        fprintf(stderr, "ggml_vk_sync_stats: wait_us=%lld\n", (long long) (ggml_time_us() - gen_t_start));
+    }
 
     ggml_vk_graph_cleanup(ctx);
 }
@@ -15201,6 +15284,66 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->do_add_rms_partials = false;
     ctx->do_add_rms_partials_offset_calculation = false;
 
+    // gen instrumentation (env-gated, off by default):
+    //   GGML_VK_GRAPH_STATS=1        one line per graph: nodes, dispatches, syncs, submits, CPU recording time
+    //   GGML_VK_FLOPS_PER_SUBMIT=N   override the flops-based submit threshold (0 disables it)
+    //   GGML_VK_DUP_OPS=A,B|ALL      record matching non-in-place nodes twice (timing ablation; results unchanged)
+    struct gen_env_t {
+        bool stats = false;
+        int64_t flops_per_submit = -1;
+        bool dup_all = false;
+        std::vector<std::string> dup;
+        gen_env_t() {
+            const char * s = getenv("GGML_VK_GRAPH_STATS");
+            stats = s != nullptr && atoi(s) != 0;
+            const char * f = getenv("GGML_VK_FLOPS_PER_SUBMIT");
+            flops_per_submit = f != nullptr ? std::stoll(f) : -1;
+            const char * d = getenv("GGML_VK_DUP_OPS");
+            if (d != nullptr) {
+                std::string list(d);
+                size_t pos = 0;
+                while (pos <= list.size()) {
+                    size_t comma = list.find(',', pos);
+                    if (comma == std::string::npos) {
+                        comma = list.size();
+                    }
+                    std::string item = list.substr(pos, comma - pos);
+                    if (item == "ALL") {
+                        dup_all = true;
+                    } else if (!item.empty()) {
+                        dup.push_back(item);
+                    }
+                    pos = comma + 1;
+                }
+            }
+        }
+    };
+    static const gen_env_t gen_env;
+    const int64_t gen_t_start = gen_env.stats ? ggml_time_us() : 0;
+    ctx->stat_dispatches = 0;
+    ctx->stat_syncs = 0;
+    uint32_t gen_dups = 0;
+    auto const gen_dup_match = [&](const ggml_tensor * n) -> bool {
+        if (n->op == GGML_OP_ADD || n->op == GGML_OP_NONE || ggml_vk_is_empty(const_cast<ggml_tensor *>(n))) {
+            return false;  // ADD may carry rms partials state; views record nothing
+        }
+        for (uint32_t s = 0; s < GGML_MAX_SRC; ++s) {
+            if (n->src[s] && n->src[s]->buffer && n->buffer && ggml_vk_tensors_overlap(n->src[s], n, false)) {
+                return false;  // in-place: a second run would not be idempotent
+            }
+        }
+        if (gen_env.dup_all) {
+            return true;
+        }
+        const char * name = ggml_op_desc(n);
+        for (const std::string & d : gen_env.dup) {
+            if (d == name) {
+                return true;
+            }
+        }
+        return false;
+    };
+
     int last_node = cgraph->n_nodes - 1;
 
     // If the last op in the cgraph isn't backend GPU, the command buffer doesn't get closed properly
@@ -15280,6 +15423,32 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     // small graphs gain nothing from splitting, each submit costs CPU time
     uint64_t flops_per_submit = ctx->last_total_flops < 1'000'000'000ULL ? 0 :
         std::clamp(ctx->last_total_flops / 40u, std::min<uint64_t>(100'000'000ULL, flops_cap), flops_cap);
+    if (gen_env.flops_per_submit >= 0) {
+        flops_per_submit = (uint64_t) gen_env.flops_per_submit;
+    }
+
+    // gen: submit policy (GGML_VK_SUBMIT_MODE):
+    //   default  upstream: every max_nodes_per_submit nodes and on the flops threshold
+    //   one      a single submit per graph (no flops/node/almost-ready submits)
+    //   geo      first submit after GGML_VK_SUBMIT_FIRST nodes (default 32), each later batch
+    //            GGML_VK_SUBMIT_GROWTH times larger (default 4); no flops-based submits
+    static const int gen_submit_mode = [] {
+        const char * m = getenv("GGML_VK_SUBMIT_MODE");
+        if (m == nullptr || strcmp(m, "default") == 0) return 0;
+        if (strcmp(m, "one") == 0) return 1;
+        if (strcmp(m, "geo") == 0) return 2;
+        GGML_ABORT("GGML_VK_SUBMIT_MODE must be default, one or geo");
+    }();
+    static const uint32_t gen_submit_first  = getenv("GGML_VK_SUBMIT_FIRST")  ? (uint32_t) std::max(1, atoi(getenv("GGML_VK_SUBMIT_FIRST")))  : 32u;
+    static const uint32_t gen_submit_growth = getenv("GGML_VK_SUBMIT_GROWTH") ? (uint32_t) std::max(1, atoi(getenv("GGML_VK_SUBMIT_GROWTH"))) : 4u;
+    uint32_t gen_max_nodes = ctx->device->max_nodes_per_submit;
+    if (gen_submit_mode == 1) {
+        flops_per_submit = 0;
+        gen_max_nodes = UINT32_MAX;
+    } else if (gen_submit_mode == 2) {
+        flops_per_submit = 0;
+        gen_max_nodes = gen_submit_first;
+    }
 
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
@@ -15307,6 +15476,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         batch_flops = 0;
         if (submit_count < 3) {
             flops_per_submit *= 2;
+        }
+        if (gen_submit_mode == 2) {
+            gen_max_nodes = gen_max_nodes > UINT32_MAX / gen_submit_growth ? UINT32_MAX : gen_max_nodes * gen_submit_growth;
         }
         submit_count++;
     };
@@ -15592,12 +15764,18 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
 
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
-        bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
-        bool submit = (submitted_nodes >= ctx->device->max_nodes_per_submit) ||
+        bool almost_ready = gen_submit_mode != 1 && (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
+        bool submit = (submitted_nodes >= gen_max_nodes) ||
                       (flops_per_submit != 0 && batch_flops >= flops_per_submit) ||
                       (i + ctx->num_additional_fused_ops >= last_node) ||
                       (almost_ready && !ctx->almost_ready_fence_pending);
 
+        if ((gen_env.dup_all || !gen_env.dup.empty()) && gen_dup_match(cgraph->nodes[i]) &&
+            !(cgraph->nodes[i]->op == GGML_OP_RMS_NORM && ctx->do_add_rms_partials)) {
+            if (ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, false, false, false)) {
+                gen_dups++;
+            }
+        }
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
 
         if (vk_perf_logger_enabled && enqueued) {
@@ -15644,6 +15822,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
 
     ctx->last_total_flops = total_flops;
+
+    if (gen_env.stats) {
+        fprintf(stderr, "ggml_vk_graph_stats: nodes=%d dispatches=%llu syncs=%llu submits=%u dups=%u flops_per_submit=%llu cpu_record_us=%lld\n",
+                      cgraph->n_nodes, (unsigned long long) ctx->stat_dispatches, (unsigned long long) ctx->stat_syncs,
+                      submit_count, gen_dups, (unsigned long long) flops_per_submit, (long long) (ggml_time_us() - gen_t_start));
+    }
 
     if (vk_perf_logger_enabled) {
         // End the command buffer and submit/wait

@@ -1306,6 +1306,9 @@ struct ggml_backend_vk_context {
     bool do_add_rms_partials;
 
     uint64_t last_total_flops {UINT64_MAX};
+    // gen instrumentation (GGML_VK_GRAPH_STATS): per-graph counters
+    uint64_t stat_dispatches {};
+    uint64_t stat_syncs {};
 
     // Cache most recent tensor that was converted into prealloc_y, and what pipeline it used to convert.
     vk_pipeline_struct * prealloc_y_last_pipeline_used {};
