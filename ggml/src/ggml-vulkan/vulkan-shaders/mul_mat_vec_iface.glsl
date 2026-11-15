@@ -4,6 +4,8 @@
 #define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+// gen: MUL_MAT_ID with all tokens in one dispatch: workgroup y = expert slot + nei0 * token
+#define MAT_VEC_FUSION_FLAGS_GEN_TOKY 0x40
 
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
 #if defined(A_TYPEV4)
