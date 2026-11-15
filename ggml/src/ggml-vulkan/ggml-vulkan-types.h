@@ -1337,6 +1337,7 @@ struct ggml_backend_vk_context {
     // gen: paired dense MUL_MAT sharing src1 (GGML_GEN_FUSE=pairmm)
     const ggml_tensor * gen_pair_mm1 {};
     const ggml_tensor * gen_pair_dst1 {};
+    uint32_t gen_n1_partials_offset {};
     uint64_t stat_syncs {};
 
     // Cache most recent tensor that was converted into prealloc_y, and what pipeline it used to convert.

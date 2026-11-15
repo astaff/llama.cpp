@@ -25,12 +25,11 @@ layout (binding = 5) readonly buffer E {float data_e[];};
 
 void main() {
     const uint ncols     = p.ne00;
-    const uint nrows     = gl_NumWorkGroups.x;
-    const uint nchannels = gl_NumWorkGroups.y;
-
-    const uint row       = 0;
-    const uint channel   = gl_WorkGroupID.y;
-    const uint samp      = gl_WorkGroupID.z;
+    // gen: one workgroup row (y) per tensor row (rows > 1 only in GGML_VK_BATCH_INVARIANT mode); a row's partials are
+    // num_partials consecutive values after the previous rows'
+    const uint row       = gl_WorkGroupID.y;
+    const uint channel   = 0;
+    const uint samp      = 0;
     // The work is split across multiple workgroups in the x dimension. Each invocation
     // processes one element
     const uint tid       = gl_GlobalInvocationID.x;
@@ -41,13 +40,13 @@ void main() {
 
     uint32_t a_offset = samp*stride_sample + channel*stride_channel + row*stride_row + get_aoffset();
     uint32_t b_offset = src1_idx(0, row, channel, samp) + get_boffset();
-    uint32_t d_offset = ((samp*nchannels + channel)*nrows + row)*ncols + get_doffset();
+    uint32_t d_offset = row*ncols + get_doffset();
 
     FLOAT_TYPE sum = FLOAT_TYPE(0.0f); // partial sum for thread in warp
 
     uint32_t num_partials = p.param3;
     for (uint32_t i = gl_SubgroupInvocationID; i < num_partials; i += gl_SubgroupSize) {
-        sum += partial_sums[i];
+        sum += partial_sums[row * num_partials + i];
     }
     sum = subgroupAdd(sum);
 
