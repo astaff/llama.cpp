@@ -41,6 +41,10 @@ layout(binding = 3) readonly  buffer GBuf     { FLOAT_TYPE data_g[];     };
 layout(binding = 4) readonly  buffer BetaBuf  { FLOAT_TYPE data_beta[];  };
 layout(binding = 5) readonly  buffer StateBuf { FLOAT_TYPE data_state[]; };
 layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
+#if STATE_OUT
+// gen: the final state goes straight to its destination (the recurrent cache row), not into dst
+layout(binding = 7)           buffer StateOutBuf { FLOAT_TYPE data_state_out[]; };
+#endif
 
 #if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
 shared FLOAT_TYPE temp[SUBGROUP_SIZE];
@@ -183,7 +187,11 @@ void main() {
 
     if (K == 1u) {
         [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+#if STATE_OUT
+            data_state_out[state_out_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
+#else
             data_dst[s_off + state_out_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
+#endif
         }
     }
 }

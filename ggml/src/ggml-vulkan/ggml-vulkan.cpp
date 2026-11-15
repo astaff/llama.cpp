@@ -4239,17 +4239,24 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const bool use_clustered_reduce = device->subgroup_arithmetic && device->subgroup_clustered && need_partial_subgroup_reduce;
             const bool use_subgroup_reduce = device->subgroup_arithmetic && !need_partial_subgroup_reduce;
             const bool use_subgroup_ops = use_clustered_reduce || use_subgroup_reduce;
-            size_t gdn_len;
+            size_t gdn_len, gdn_sout_len;
             const void * gdn_data;
+            const void * gdn_sout_data;
             if (use_clustered_reduce) {
                 gdn_len = gated_delta_net_f32_len;
                 gdn_data = (const void *)gated_delta_net_f32_data;
+                gdn_sout_len = gated_delta_net_f32_sout_len;
+                gdn_sout_data = (const void *)gated_delta_net_f32_sout_data;
             } else if (use_subgroup_reduce) {
                 gdn_len = gated_delta_net_f32_nocluster_len;
                 gdn_data = (const void *)gated_delta_net_f32_nocluster_data;
+                gdn_sout_len = gated_delta_net_f32_nocluster_sout_len;
+                gdn_sout_data = (const void *)gated_delta_net_f32_nocluster_sout_data;
             } else {
                 gdn_len = gated_delta_net_f32_shmem_len;
                 gdn_data = (const void *)gated_delta_net_f32_shmem_data;
+                gdn_sout_len = gated_delta_net_f32_shmem_sout_len;
+                gdn_sout_data = (const void *)gated_delta_net_f32_shmem_sout_data;
             }
 
             const uint32_t cols_per_wg = gdn_subgroup_size / lanes_per_column;
@@ -4258,6 +4265,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             for (uint32_t kda = 0; kda < 2; kda++) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
                     gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
+                    wg_denoms, {S_V, kda, gdn_subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, gdn_subgroup_size);
+                const std::string sout_name = std::string(gdn_names[si][kda]) + "_sout";
+                ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_sout[si][kda],
+                    sout_name.c_str(), gdn_sout_len, gdn_sout_data, "main", 8, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, gdn_subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, gdn_subgroup_size);
             }
         }
@@ -10166,6 +10177,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                 case 128: si = 3; break;
                 default: return nullptr;
             }
+            if (ctx->gen_gdn_state_out != nullptr) {
+                return ctx->device->pipeline_gated_delta_net_sout[si][kda];
+            }
             return ctx->device->pipeline_gated_delta_net[si][kda];
         }
         return nullptr;
@@ -11304,6 +11318,16 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
         scale,
         K
     };
+
+    if (ctx->gen_gdn_state_out != nullptr) {
+        // gen: the final state is written straight into the CPY destination (see GGML_GEN_GDN_INPLACE)
+        GGML_ASSERT(K == 1);
+        vk_subbuffer state_out_buf = ggml_vk_tensor_subbuffer(ctx, ctx->gen_gdn_state_out);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, state_out_buf},
+            pc, { H, n_seqs, S_v });
+        return;
+    }
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
@@ -15264,6 +15288,69 @@ static int32_t find_first_set(uint32_t x) {
     return ret;
 }
 
+// gen (GGML_GEN_GDN_INPLACE): find the CPY that stores GATED_DELTA_NET node i's final state (K == 1) and
+// nothing else reads, so the GDN dispatch can write the state straight to the CPY destination.
+static int gen_find_gdn_state_cpy(const ggml_cgraph * g, int i, int last_node) {
+    const ggml_tensor * gdn = g->nodes[i];
+    if (ggml_get_op_params_i32(gdn, 0) != 1 || gdn->type != GGML_TYPE_F32 || !gdn->buffer) {
+        return -1;
+    }
+    const ggml_tensor * v = gdn->src[2];
+    const size_t S_v = v->ne[0], H = v->ne[1], n_tokens = v->ne[2], n_seqs = v->ne[3];
+    const size_t s_off_bytes = S_v * H * n_tokens * n_seqs * sizeof(float);
+    const size_t state_bytes = S_v * S_v * H * n_seqs * sizeof(float);
+    int cpy = -1;
+    for (int j = i + 1; j < std::min(last_node, i + 32); j++) {
+        const ggml_tensor * n = g->nodes[j];
+        if (n->op == GGML_OP_CPY && n->src[0]->view_src == gdn && n->src[0]->view_offs == s_off_bytes &&
+            n->src[0]->type == GGML_TYPE_F32 && n->type == GGML_TYPE_F32 &&
+            ggml_nbytes(n->src[0]) == state_bytes && ggml_nbytes(n) == state_bytes &&
+            ggml_is_contiguous(n->src[0]) && ggml_is_contiguous(n) && n->buffer) {
+            cpy = j;
+            break;
+        }
+    }
+    if (cpy < 0) {
+        return -1;
+    }
+    // nothing else may read the state part of the GDN result
+    for (int k = 0; k < g->n_nodes; k++) {
+        const ggml_tensor * n = g->nodes[k];
+        if (k == cpy || ggml_op_is_empty(n->op)) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            const ggml_tensor * src = n->src[s];
+            if (src == nullptr) {
+                continue;
+            }
+            if (src == gdn && k != i) {
+                return -1;
+            }
+            if (src->view_src == gdn && src->view_offs + ggml_nbytes(src) > s_off_bytes) {
+                return -1;
+            }
+        }
+    }
+    // the destination must not overlap q, k, v, g, beta; it may be exactly the state input (in place) or disjoint
+    const ggml_tensor * dst = g->nodes[cpy];
+    for (int s = 0; s < 5; s++) {
+        if (gdn->src[s] && gdn->src[s]->buffer && ggml_vk_tensors_overlap(gdn->src[s], dst, false)) {
+            return -1;
+        }
+    }
+    const ggml_tensor * st = gdn->src[5];
+    if (st->buffer && ggml_vk_tensors_overlap(st, dst, false)) {
+        const bool same = st->buffer == dst->buffer &&
+                          vk_tensor_offset(st) + st->view_offs == vk_tensor_offset(dst) + dst->view_offs &&
+                          ggml_nbytes(st) == ggml_nbytes(dst) && ggml_is_contiguous(st);
+        if (!same) {
+            return -1;
+        }
+    }
+    return cpy;
+}
+
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
@@ -15483,7 +15570,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         submit_count++;
     };
 
+    static const bool gen_gdn_inplace = getenv("GGML_GEN_GDN_INPLACE") != nullptr && atoi(getenv("GGML_GEN_GDN_INPLACE")) != 0;
+    std::vector<char> gen_skip;
+    if (gen_gdn_inplace) {
+        gen_skip.assign(cgraph->n_nodes, 0);
+    }
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
+        if (!gen_skip.empty() && gen_skip[i]) {
+            continue;  // gen: a state CPY already done by its GATED_DELTA_NET
+        }
         if (first_node_in_batch) {
             submit_node_idx = i;
         }
@@ -15770,13 +15866,40 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                       (i + ctx->num_additional_fused_ops >= last_node) ||
                       (almost_ready && !ctx->almost_ready_fence_pending);
 
-        if ((gen_env.dup_all || !gen_env.dup.empty()) && gen_dup_match(cgraph->nodes[i]) &&
+        int gen_state_cpy = -1;
+        if (gen_gdn_inplace && cgraph->nodes[i]->op == GGML_OP_GATED_DELTA_NET && ctx->num_additional_fused_ops == 0) {
+            gen_state_cpy = gen_find_gdn_state_cpy(cgraph, i, last_node);
+        }
+        if (gen_state_cpy >= 0) {
+            const ggml_tensor * cpy = cgraph->nodes[gen_state_cpy];
+            bool need_sync = false;
+            for (const ggml_tensor * o : ctx->unsynced_nodes_read) {
+                need_sync = need_sync || (o->buffer == cpy->buffer && ggml_vk_tensors_overlap(o, cpy, false));
+            }
+            for (const ggml_tensor * o : ctx->unsynced_nodes_written) {
+                need_sync = need_sync || (o->buffer == cpy->buffer && ggml_vk_tensors_overlap(o, cpy, false));
+            }
+            if (need_sync) {
+                vk_context sync_ctx = ggml_vk_get_compute_ctx(ctx);
+                ctx->unsynced_nodes_written.clear();
+                ctx->unsynced_nodes_read.clear();
+                ggml_vk_sync_buffers(ctx, sync_ctx);
+            }
+            ctx->gen_gdn_state_out = cpy;
+            gen_skip[gen_state_cpy] = 1;
+        }
+
+        if (gen_state_cpy < 0 && (gen_env.dup_all || !gen_env.dup.empty()) && gen_dup_match(cgraph->nodes[i]) &&
             !(cgraph->nodes[i]->op == GGML_OP_RMS_NORM && ctx->do_add_rms_partials)) {
             if (ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, false, false, false)) {
                 gen_dups++;
             }
         }
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
+        if (gen_state_cpy >= 0) {
+            ctx->gen_gdn_state_out = nullptr;
+            ctx->unsynced_nodes_written.push_back(cgraph->nodes[gen_state_cpy]);
+        }
 
         if (vk_perf_logger_enabled && enqueued) {
             compute_ctx = ggml_vk_get_compute_ctx(ctx);
