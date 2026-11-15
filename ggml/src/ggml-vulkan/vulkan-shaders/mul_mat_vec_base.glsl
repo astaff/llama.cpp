@@ -97,6 +97,31 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 layout (constant_id = 0) const uint BLOCK_SIZE = 32;
 layout (constant_id = 1) const uint NUM_ROWS = 1;
 layout (constant_id = 2) const uint NUM_COLS = 1;
+// gen: 1 only in the GLU-fused twin pipelines, so the epilogue costs nothing in the others
+layout (constant_id = 3) const uint GEN_GLU = 0;
+
+#ifndef MUL_MAT_ID
+FLOAT_TYPE gen_apply_mm_epilogue(FLOAT_TYPE val, const uint j, const uint first_row, const uint n) {
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SIGMOID) != 0) {
+        precise float gen_x = float(D_TYPE(val));
+        precise float gen_y = 1.0f / (1.0f + exp(-gen_x));
+        return FLOAT_TYPE(gen_y);
+    }
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SOFTPLUS_GATE) != 0) {
+        precise float gen_x = float(D_TYPE(val)) + float(data_fuse0[first_row + n]);
+        precise float gen_sp = (gen_x > 20.0f) ? gen_x : log(1.0f + exp(gen_x));
+        precise float gen_y = gen_sp * float(data_fuse1[first_row + n]);
+        return FLOAT_TYPE(gen_y);
+    }
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_ROW_SCALE0) != 0) {
+        precise float gen_x = float(D_TYPE(val));
+        precise float gen_g = float(data_fuse0[j]);
+        precise float gen_y = gen_x * gen_g;
+        return FLOAT_TYPE(gen_y);
+    }
+    return val;
+}
+#endif
 
 #ifdef USE_SUBGROUP_ADD_NO_SHMEM
 void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offset, const in uint32_t first_row, const in uint32_t num_rows, const in uint32_t tid) {
@@ -131,7 +156,17 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
+                if (GEN_GLU != 0 && (p.fusion_flags & (MAT_VEC_FUSION_FLAGS_SIGMOID | MAT_VEC_FUSION_FLAGS_SOFTPLUS_GATE | MAT_VEC_FUSION_FLAGS_ROW_SCALE0)) != 0) {
+                    temp[j][n] = gen_apply_mm_epilogue(temp[j][n], j, first_row, n);
+                }
 #endif
+                if (GEN_GLU != 0 && (p.fusion_flags & (MAT_VEC_FUSION_FLAGS_GLU_A | MAT_VEC_FUSION_FLAGS_GLU_B)) != 0) {
+                    // gen: same expression as swiglu.comp op(a, b) = a / (1 + exp(-a)) * b
+                    const float glu_o = float(data_fuse0[j*p.batch_stride_d + d_offset + first_row + n]);
+                    const float glu_r = float(temp[j][n]);
+                    temp[j][n] = FLOAT_TYPE((p.fusion_flags & MAT_VEC_FUSION_FLAGS_GLU_A) != 0 ?
+                        glu_r / (1.0f + exp(-glu_r)) * glu_o : glu_o / (1.0f + exp(-glu_o)) * glu_r);
+                }
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
             }
         }
@@ -189,7 +224,17 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
+                if (GEN_GLU != 0 && (p.fusion_flags & (MAT_VEC_FUSION_FLAGS_SIGMOID | MAT_VEC_FUSION_FLAGS_SOFTPLUS_GATE | MAT_VEC_FUSION_FLAGS_ROW_SCALE0)) != 0) {
+                    temp[j][n] = gen_apply_mm_epilogue(temp[j][n], j, first_row, n);
+                }
 #endif
+                if (GEN_GLU != 0 && (p.fusion_flags & (MAT_VEC_FUSION_FLAGS_GLU_A | MAT_VEC_FUSION_FLAGS_GLU_B)) != 0) {
+                    // gen: same expression as swiglu.comp op(a, b) = a / (1 + exp(-a)) * b
+                    const float glu_o = float(data_fuse0[j*p.batch_stride_d + d_offset + first_row + n]);
+                    const float glu_r = float(temp[j][n]);
+                    temp[j][n] = FLOAT_TYPE((p.fusion_flags & MAT_VEC_FUSION_FLAGS_GLU_A) != 0 ?
+                        glu_r / (1.0f + exp(-glu_r)) * glu_o : glu_o / (1.0f + exp(-glu_o)) * glu_r);
+                }
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
             }
         }
@@ -237,7 +282,17 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
                     tmpsh[j][n][0] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
+                if (GEN_GLU != 0 && (p.fusion_flags & (MAT_VEC_FUSION_FLAGS_SIGMOID | MAT_VEC_FUSION_FLAGS_SOFTPLUS_GATE | MAT_VEC_FUSION_FLAGS_ROW_SCALE0)) != 0) {
+                    tmpsh[j][n][0] = gen_apply_mm_epilogue(tmpsh[j][n][0], j, first_row, n);
+                }
 #endif
+                if (GEN_GLU != 0 && (p.fusion_flags & (MAT_VEC_FUSION_FLAGS_GLU_A | MAT_VEC_FUSION_FLAGS_GLU_B)) != 0) {
+                    // gen: same expression as swiglu.comp op(a, b) = a / (1 + exp(-a)) * b
+                    const float glu_o = float(data_fuse0[j*p.batch_stride_d + d_offset + first_row + n]);
+                    const float glu_r = float(tmpsh[j][n][0]);
+                    tmpsh[j][n][0] = FLOAT_TYPE((p.fusion_flags & MAT_VEC_FUSION_FLAGS_GLU_A) != 0 ?
+                        glu_r / (1.0f + exp(-glu_r)) * glu_o : glu_o / (1.0f + exp(-glu_o)) * glu_r);
+                }
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(tmpsh[j][n][0]);
             }
         }

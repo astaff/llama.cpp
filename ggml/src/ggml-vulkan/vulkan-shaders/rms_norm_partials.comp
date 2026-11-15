@@ -23,8 +23,6 @@ layout (binding = 4) readonly buffer C {float data_c[];};
 layout (binding = 5) readonly buffer E {float data_e[];};
 #endif
 
-shared FLOAT_TYPE sumsh[BLOCK_SIZE];
-
 void main() {
     const uint ncols     = p.ne00;
     const uint nrows     = gl_NumWorkGroups.x;
