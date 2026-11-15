@@ -1,5 +1,7 @@
 #include "llama-model-loader.h"
 
+#include <mutex>
+
 #include "ggml-alloc.h"
 #include "ggml.h"
 #include "gguf.h"
@@ -1208,6 +1210,19 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
     return true;
 }
 
+static std::mutex             g_gen_bf16_mutex;
+static std::set<std::string>  g_gen_bf16_names;
+
+bool llama_gen_bf16_converted(const char * name) {
+    std::lock_guard<std::mutex> lock(g_gen_bf16_mutex);
+    return g_gen_bf16_names.count(name) != 0;
+}
+
+int64_t llama_gen_bf16_cast_above() {
+    static const int64_t v = getenv("GGML_GEN_BF16_CAST_ABOVE") ? atoll(getenv("GGML_GEN_BF16_CAST_ABOVE")) : 8;
+    return v;
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
@@ -1455,6 +1470,47 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     GGML_ASSERT(ggml_nbytes(&t_meta) == ggml_nbytes(cur));
 
+    // gen: GGML_GEN_BF16_EXACT=1 stores the F32 router / shared-expert gate / ssm_alpha / ssm_beta weights as
+    // BF16 when every value is exactly representable (low 16 bits zero), checked here per tensor from the file.
+    // The values are unchanged, so the matrix-vector product gives the same result with half the bytes.
+    bool gen_to_bf16 = false;
+    {
+        static const bool gen_bf16_exact = getenv("GGML_GEN_BF16_EXACT") != nullptr && atoi(getenv("GGML_GEN_BF16_EXACT")) != 0;
+        const std::string name = tn.str();
+        auto ends_with = [&](const char * suf) {
+            const size_t n = strlen(suf);
+            return name.size() >= n && name.compare(name.size() - n, n, suf) == 0;
+        };
+        if (gen_bf16_exact && !use_mmap && !is_lazy && !(flags & TENSOR_DUPLICATED) && t_meta.type == GGML_TYPE_F32 &&
+            t_meta.ne[0] % 2 == 0 &&
+            (ends_with(".ffn_gate_inp.weight") || ends_with(".ffn_gate_inp_shexp.weight") ||
+             ends_with(".ssm_alpha.weight") || ends_with(".ssm_beta.weight") ||
+             ends_with(".ssm_beta_alpha.weight") || ends_with(".ssm_ba.weight"))) {
+            const auto & w = require_weight(name.c_str());
+            std::vector<uint32_t> vals(ggml_nelements(&t_meta));
+            files.at(w.idx)->seek(w.offs, SEEK_SET);
+            files.at(w.idx)->read_raw(vals.data(), ggml_nbytes(&t_meta));
+            bool exact = true;
+            for (uint32_t v : vals) {
+                if (v & 0xffffu) {
+                    exact = false;
+                    break;
+                }
+            }
+            if (exact) {
+                t_meta.type = GGML_TYPE_BF16;
+                t_meta.nb[0] = ggml_type_size(GGML_TYPE_BF16);
+                t_meta.nb[1] = ggml_row_size(GGML_TYPE_BF16, t_meta.ne[0]);
+                for (int dim = 2; dim < GGML_MAX_DIMS; dim++) {
+                    t_meta.nb[dim] = t_meta.ne[dim-1]*t_meta.nb[dim-1];
+                }
+                gen_to_bf16 = true;
+            } else {
+                LLAMA_LOG_WARN("%s: %s is not bf16-exact, kept as F32\n", __func__, name.c_str());
+            }
+        }
+    }
+
     ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
     if (buft == nullptr) {
         return nullptr;
@@ -1474,6 +1530,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
     ggml_set_name(tensor, ggml_get_name(&t_meta));
+
+    if (gen_to_bf16) {
+        gen_bf16_tensors.insert(ggml_get_name(tensor));
+        std::lock_guard<std::mutex> lock(g_gen_bf16_mutex);
+        g_gen_bf16_names.insert(ggml_get_name(tensor));
+    }
 
     if (duplicated) {
         size_data += ggml_nbytes(&t_meta);
@@ -1658,6 +1720,10 @@ bool llama_model_loader::load_all_data(
     }
     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
 
+    if (!gen_bf16_tensors.empty()) {
+        fprintf(stderr, "gen: %zu bf16-exact F32 weight tensors stored as BF16 (GGML_GEN_BF16_EXACT)\n", gen_bf16_tensors.size());
+    }
+
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
 
     // 4 staging buffers for async uploads, each sized 1MB seems to be a good default for single NVMe drives.
@@ -1792,6 +1858,26 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        if (!gen_bf16_tensors.empty() && gen_bf16_tensors.count(ggml_get_name(cur))) {
+            // gen: the file holds F32; convert (exactly, see create_tensor) and upload as BF16
+            const auto & file = files.at(weight->idx);
+            const int64_t n = ggml_nelements(cur);
+            std::vector<uint32_t> f32(n);
+            std::vector<uint16_t> bf16(n);
+            file->seek(weight->offs, SEEK_SET);
+            file->read_raw(f32.data(), n * sizeof(uint32_t));
+            for (int64_t i = 0; i < n; i++) {
+                GGML_ASSERT((f32[i] & 0xffffu) == 0);
+                bf16[i] = (uint16_t) (f32[i] >> 16);
+            }
+            if (upload_backend) {
+                ggml_backend_synchronize(upload_backend);
+            }
+            ggml_backend_tensor_set(cur, bf16.data(), 0, n_size);
+            size_done += n * sizeof(uint32_t);
+            continue;
+        }
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 

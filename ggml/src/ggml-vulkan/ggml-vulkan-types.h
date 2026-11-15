@@ -1017,6 +1017,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_lightning_indexer_f32[GGML_TYPE_COUNT];
     // [size_idx][kda][replay] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2][2];
+    vk_pipeline pipeline_gated_delta_net_sout[4][2]; // gen: final state to a separate binding
     vk_pipeline pipeline_gated_delta_net_cm[2];
     vk_pipeline pipeline_gated_delta_net_cm_v32[2];
     vk_pipeline pipeline_gated_delta_net_cm_v128[2];
@@ -1327,6 +1328,8 @@ struct ggml_backend_vk_context {
     uint64_t last_total_flops {UINT64_MAX};
     // gen instrumentation (GGML_VK_GRAPH_STATS): per-graph counters
     uint64_t stat_dispatches {};
+    // gen: GATED_DELTA_NET writes its final state into this CPY node's destination (and the CPY is skipped)
+    const ggml_tensor * gen_gdn_state_out {};
     uint64_t stat_syncs {};
 
     // Cache most recent tensor that was converted into prealloc_y, and what pipeline it used to convert.
