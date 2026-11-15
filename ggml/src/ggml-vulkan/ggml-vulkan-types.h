@@ -271,6 +271,8 @@ struct vk_pipeline_struct {
     // linked list of pipelines for multiple compilation variants.
     // currently only used to compile a 64-bit indexing variant.
     vk_pipeline next;
+    // gen: twin of a mat-vec pipeline compiled with the SWIGLU epilogue (spec constant 3), see GGML_GEN_FUSE=glu
+    vk_pipeline gen_glu;
 };
 
 typedef std::weak_ptr<vk_pipeline_struct> vk_pipeline_ref;
@@ -672,6 +674,8 @@ enum rms_norm_mode {
     RMS_NORM_MUL_ROPE,
     RMS_NORM_MUL_ROPE_VIEW_SET_ROWS,
     RMS_NORM_VIEW_SET_ROWS,
+    RMS_NORM_SCALE, // gen
+    RMS_NORM_MUL_SILU_GATE, // gen
     RMS_NORM_COUNT,
 };
 
@@ -926,8 +930,10 @@ struct vk_device_struct {
     vk_pipeline pipeline_group_norm_f32;
     // [src/dst 0=fp32,1=bf16][mul]
     std::array<vk_pipeline, 3> pipeline_rms_norm[2][2];
+    std::array<vk_pipeline, 3> pipeline_rms_norm_scale_f32; // gen
     // [src/dst 0=fp32,1=bf16][residual 0=fp32,1=bf16][post mul]
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_add[2][2][2];
+    std::array<vk_pipeline, 3> pipeline_rms_norm_mul_silu_f32; // gen
     vk_pipeline pipeline_rms_norm_mul_add_partials_f32;
     vk_pipeline pipeline_rms_norm_mul_add_mul_partials_f32;
     vk_pipeline pipeline_rms_norm_set_rows_f32_f32;
@@ -1164,7 +1170,12 @@ typedef std::vector<vk_submission> vk_sequence;
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+#define MAT_VEC_FUSION_FLAGS_GLU_A 0x10 // gen
+#define MAT_VEC_FUSION_FLAGS_GLU_B 0x20 // gen
 #define MAT_VEC_FUSION_FLAGS_GEN_TOKY 0x40 // gen: MUL_MAT_ID, all tokens in one dispatch (y = slot + nei0 * token)
+#define MAT_VEC_FUSION_FLAGS_SIGMOID 0x80 // gen
+#define MAT_VEC_FUSION_FLAGS_SOFTPLUS_GATE 0x100 // gen
+#define MAT_VEC_FUSION_FLAGS_ROW_SCALE0 0x200 // gen
 
 struct vk_staging_memcpy {
     vk_staging_memcpy(void * _dst, const void * _src, size_t _n) : dst(_dst), src(_src), n(_n) {}
@@ -1330,6 +1341,13 @@ struct ggml_backend_vk_context {
     uint64_t stat_dispatches {};
     // gen: GATED_DELTA_NET writes its final state into this CPY node's destination (and the CPY is skipped)
     const ggml_tensor * gen_gdn_state_out {};
+    // gen: RMS_NORM_SCALE writes into this SCALE node (found a few nodes later, which is then skipped)
+    const ggml_tensor * gen_rms_scale_dst {};
+    // gen: dense MUL_MAT forward-elision epilogue target and auxiliary inputs (GGML_GEN_FUSE=mmgate,shexp)
+    const ggml_tensor * gen_mm_dst {};
+    const ggml_tensor * gen_mm_f0 {};
+    const ggml_tensor * gen_mm_f1 {};
+    uint32_t gen_mm_flags {};
     uint64_t stat_syncs {};
 
     // Cache most recent tensor that was converted into prealloc_y, and what pipeline it used to convert.
