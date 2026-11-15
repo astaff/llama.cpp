@@ -5,7 +5,11 @@
 #include "mul_mat_vec_base.glsl"
 #include "dequant_funcs.glsl"
 
+#if defined(USE_SUBGROUP_ADD_NO_SHMEM) && !defined(NEEDS_INIT_IQ_SHMEM)
+layout(local_size_x_id = 0, local_size_y_id = 4, local_size_z = 1) in;
+#else
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+#endif
 
 #if !defined(DATA_A_F32) && !defined(DATA_A_F16) && !defined(DATA_A_BF16)
 #define K_PER_ITER 8
@@ -77,6 +81,7 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
             vec4 v = dequantize4(ib, iqs, a_offset);
             vec4 v2 = dequantize4(ib, iqs+(4/QUANT_R), a_offset);
 
+#if defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1)
             const vec2 dm = get_dm(ib, a_offset);
             if (dm.y != 0) { // quant has min component
                 v = v * dm.x + dm.y;
@@ -89,6 +94,14 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
 
             if (dm.y == 0)
                 rowtmp *= dm.x;
+#elif defined(DATA_A_NVFP4)
+            FLOAT_TYPE rowtmp = dot(bv0, v);
+            rowtmp += dot(bv1, v2);
+#else
+            FLOAT_TYPE rowtmp = dot(bv0, v);
+            rowtmp += dot(bv1, v2);
+            rowtmp *= get_dm(ib, a_offset).x;
+#endif
 
             temp[j][n] += rowtmp;
 #else
@@ -115,33 +128,142 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
 }
 
 #if defined(DATA_A_F32) || defined(DATA_A_F16) || defined(DATA_A_BF16)
-void iter_aligned_nonquant(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint tid, const uint i)
+vec4 dequantize4_2aligned_a2(uint ib, uint a_offset) {
+#if defined(DATA_A_F32)
+    const vec2 a = data_a2_packed64[(a_offset + ib)/2];
+    const vec2 b = data_a2_packed64[(a_offset + ib)/2 + 1];
+    return vec4(a, b);
+#elif defined(DATA_A_F16)
+    const vec2 a = data_a2_packed32[(a_offset + ib)/2];
+    const vec2 b = data_a2_packed32[(a_offset + ib)/2 + 1];
+    return vec4(a, b);
+#else
+    const uint a = data_a2_packed32[(a_offset + ib)/2];
+    const uint b = data_a2_packed32[(a_offset + ib)/2 + 1];
+    return vec4(uintBitsToFloat((a & 0x0000ffff) << 16),
+                uintBitsToFloat( a & 0xffff0000),
+                uintBitsToFloat((b & 0x0000ffff) << 16),
+                uintBitsToFloat( b & 0xffff0000));
+#endif
+}
+
+void iter_aligned_nonquant_a(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_TYPE temp2[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint tid, const uint i)
 {
-    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-        const uint col = i*BLOCK_SIZE + K_PER_ITER*tid;
-        const uint iqs = 0; // quant index
-        const uint iybs = col; // y block start index
+    const uint col = i*BLOCK_SIZE + K_PER_ITER*tid;
+    uint ibi = first_row*p.ncols;
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        const uint ib = (ibi + col)/QUANT_K;
+        ibi += p.ncols;
+        const vec4 v = dequantize4_2aligned(ib, 0, a_offset);
+        vec4 u = vec4(0.0);
+        if (GEN_GLU == 3) {
+            u = dequantize4_2aligned_a2(ib, a_offset);
+        }
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const vec4 b = data_b_v4[(j*p.batch_stride_b + b_offset + col) / 4];
+            temp[j][n] += dot(v, b);
+            if (GEN_GLU == 3) {
+                temp2[j][n] += dot(u, b);
+            }
+        }
+    }
+}
 
-        const vec4 b = data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4];
-
-        uint ibi = first_row*p.ncols;
-        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-            const uint ib = (ibi + col)/QUANT_K; // block index
-            ibi += p.ncols;
-
-            const vec4 v = dequantize4_2aligned(ib, iqs, a_offset);
-
-            // matrix multiplication
+void iter_aligned_nonquant_a2(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint tid, const uint i)
+{
+    const uint col = i*BLOCK_SIZE + K_PER_ITER*tid;
+    uint ibi = first_row*p.ncols;
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        const uint ib = (ibi + col)/QUANT_K;
+        ibi += p.ncols;
+        const vec4 v = dequantize4_2aligned_a2(ib, a_offset);
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const vec4 b = data_b_v4[(j*p.batch_stride_b + b_offset + col) / 4];
             temp[j][n] += dot(v, b);
         }
     }
 }
 #endif
 
+#if defined(DATA_A_Q8_0)
+void iter_aligned_q8_0_a(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_TYPE temp2[NUM_COLS][NUM_ROWS], const uint row_base, const uint num_rows, const uint tid, const uint iter_idx)
+{
+    const uint b_col4 = iter_idx * (2 * BLOCK_SIZE) + 2 * tid;
+    const uint iqs_h = 4 * (tid & 3);
+    const uint ib_col = iter_idx * (BLOCK_SIZE >> 2) + (tid >> 2);
+    const uint blocks_per_row = p.ncols >> 5;
+
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        const uint ib = a_offset + (row_base + n) * blocks_per_row + ib_col;
+        const vec4 v  = vec4(unpack8(pack32(i16vec2(data_a_packed16[ib].qs[iqs_h    ], data_a_packed16[ib].qs[iqs_h + 1]))));
+        const vec4 v2 = vec4(unpack8(pack32(i16vec2(data_a_packed16[ib].qs[iqs_h + 2], data_a_packed16[ib].qs[iqs_h + 3]))));
+        const FLOAT_TYPE da = float(data_a_packed16[ib].d);
+        vec4 u = vec4(0.0), u2 = vec4(0.0);
+        FLOAT_TYPE da2 = FLOAT_TYPE(0);
+        if (GEN_GLU == 3) {
+            u   = vec4(unpack8(pack32(i16vec2(data_a2_packed16[ib].qs[iqs_h    ], data_a2_packed16[ib].qs[iqs_h + 1]))));
+            u2  = vec4(unpack8(pack32(i16vec2(data_a2_packed16[ib].qs[iqs_h + 2], data_a2_packed16[ib].qs[iqs_h + 3]))));
+            da2 = float(data_a2_packed16[ib].d);
+        }
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const uint b4 = (j * p.batch_stride_b + b_offset) >> 2;
+            const vec4 bv0 = vec4(data_b_v4[b4 + b_col4]);
+            const vec4 bv1 = vec4(data_b_v4[b4 + b_col4 + 1]);
+            FLOAT_TYPE rowtmp = dot(bv0, v);
+            rowtmp += dot(bv1, v2);
+            rowtmp *= da;
+            temp[j][n] += rowtmp;
+            if (GEN_GLU == 3) {
+                FLOAT_TYPE rowtmp2 = dot(bv0, u);
+                rowtmp2 += dot(bv1, u2);
+                rowtmp2 *= da2;
+                temp2[j][n] += rowtmp2;
+            }
+        }
+    }
+}
+
+void iter_aligned_q8_0_a2(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint row_base, const uint num_rows, const uint tid, const uint iter_idx)
+{
+    const uint b_col4 = iter_idx * (2 * BLOCK_SIZE) + 2 * tid;
+    const uint iqs_h = 4 * (tid & 3);
+    const uint ib_col = iter_idx * (BLOCK_SIZE >> 2) + (tid >> 2);
+    const uint blocks_per_row = p.ncols >> 5;
+
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        const uint ib = a_offset + (row_base + n) * blocks_per_row + ib_col;
+        const vec4 v  = vec4(unpack8(pack32(i16vec2(data_a2_packed16[ib].qs[iqs_h    ], data_a2_packed16[ib].qs[iqs_h + 1]))));
+        const vec4 v2 = vec4(unpack8(pack32(i16vec2(data_a2_packed16[ib].qs[iqs_h + 2], data_a2_packed16[ib].qs[iqs_h + 3]))));
+        const FLOAT_TYPE da = float(data_a2_packed16[ib].d);
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const uint b4 = (j * p.batch_stride_b + b_offset) >> 2;
+            const vec4 bv0 = vec4(data_b_v4[b4 + b_col4]);
+            const vec4 bv1 = vec4(data_b_v4[b4 + b_col4 + 1]);
+            FLOAT_TYPE rowtmp = dot(bv0, v);
+            rowtmp += dot(bv1, v2);
+            rowtmp *= da;
+            temp[j][n] += rowtmp;
+        }
+    }
+}
+#endif
+
 void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+#if defined(USE_SUBGROUP_ADD_NO_SHMEM) && !defined(NEEDS_INIT_IQ_SHMEM)
+    const uint tid = gl_SubgroupInvocationID;
+#else
     const uint tid = gl_LocalInvocationID.x;
+#endif
 
     get_offsets(a_offset, b_offset, d_offset);
+#ifndef MUL_MAT_ID
+    const bool use_a2   = (GEN_GLU == 2) && (first_row >= p.pair_m0);
+    const uint row_base = use_a2 ? (first_row - p.pair_m0) : first_row;
+#else
+    const bool use_a2   = false;
+    const uint row_base = first_row;
+#endif
+
     const bool is_aligned_nonquant =
         p.batch_stride_b % 4 == 0 && p.ncols % 4 == 0 &&
         a_offset % 4 == 0 && b_offset % 4 == 0 &&
@@ -150,12 +272,50 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     y_offset = QUANT_R == 1 ? 1 : QUANT_K/2;
 
     FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+    FLOAT_TYPE temp2[NUM_COLS][NUM_ROWS];
 
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
         [[unroll]] for (uint i = 0; i < NUM_ROWS; ++i) {
             temp[j][i] = FLOAT_TYPE(0);
+            if (GEN_GLU == 3) {
+                temp2[j][i] = FLOAT_TYPE(0);
+            }
         }
     }
+
+#if defined(DATA_A_Q8_0)
+    if ((p.ncols & 31) == 0 && (p.batch_stride_b & 3) == 0 && (b_offset & 3) == 0 && (BLOCK_SIZE & 3) == 0) {
+        const uint full_iters = p.ncols / (8 * BLOCK_SIZE);
+        const bool has_tail = (full_iters * (8 * BLOCK_SIZE) + 8 * tid < p.ncols);
+        if (GEN_GLU == 2 && use_a2) {
+            for (uint it = 0; it < full_iters; ++it) {
+                iter_aligned_q8_0_a2(temp, row_base, num_rows, tid, it);
+            }
+            if (has_tail) {
+                iter_aligned_q8_0_a2(temp, row_base, num_rows, tid, full_iters);
+            }
+        } else {
+            for (uint it = 0; it < full_iters; ++it) {
+                iter_aligned_q8_0_a(temp, temp2, row_base, num_rows, tid, it);
+            }
+            if (has_tail) {
+                iter_aligned_q8_0_a(temp, temp2, row_base, num_rows, tid, full_iters);
+            }
+        }
+        if (GEN_GLU == 3) {
+            reduce_pair_glu(temp, temp2, d_offset, first_row, num_rows, tid);
+        }
+#ifndef MUL_MAT_ID
+        else if (GEN_GLU == 2 && use_a2) {
+            reduce_result_d2(temp, row_base, num_rows, tid);
+        }
+#endif
+        else {
+            reduce_result(temp, d_offset, first_row, num_rows, tid);
+        }
+        return;
+    }
+#endif
 
     uint num_iters = p.ncols / (K_PER_ITER * BLOCK_SIZE);
     if (num_iters * K_PER_ITER * BLOCK_SIZE + K_PER_ITER*tid < p.ncols) {
@@ -175,11 +335,19 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
         unrolled_iters -= unroll_count;
     }
     if (is_aligned_nonquant) {
-        while (i < unrolled_iters) {
-            // Manually partially unroll the loop
-            [[unroll]] for (uint k = 0; k < unroll_count; ++k) {
-                iter_aligned_nonquant(temp, first_row, num_rows, tid, i*K_PER_ITER);
-                i++;
+        if (GEN_GLU == 2 && use_a2) {
+            while (i < unrolled_iters) {
+                [[unroll]] for (uint k = 0; k < unroll_count; ++k) {
+                    iter_aligned_nonquant_a2(temp, row_base, num_rows, tid, i*K_PER_ITER);
+                    i++;
+                }
+            }
+        } else {
+            while (i < unrolled_iters) {
+                [[unroll]] for (uint k = 0; k < unroll_count; ++k) {
+                    iter_aligned_nonquant_a(temp, temp2, row_base, num_rows, tid, i*K_PER_ITER);
+                    i++;
+                }
             }
         }
     } else {
@@ -187,7 +355,7 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     while (i < unrolled_iters) {
         // Manually partially unroll the loop
         [[unroll]] for (uint k = 0; k < unroll_count; ++k) {
-            iter(temp, first_row, num_rows, tid, i*K_PER_ITER, false);
+            iter(temp, row_base, num_rows, tid, i*K_PER_ITER, false);
             i++;
         }
     }
@@ -206,11 +374,19 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     }
 
     if (is_aligned_nonquant) {
-        while (i < unrolled_iters && is_aligned_nonquant) {
-            // Manually partially unroll the loop
-            [[unroll]] for (uint k = 0; k < unroll_count; ++k) {
-                iter_aligned_nonquant(temp, first_row, num_rows, tid, i*K_PER_ITER);
-                i++;
+        if (GEN_GLU == 2 && use_a2) {
+            while (i < unrolled_iters && is_aligned_nonquant) {
+                [[unroll]] for (uint k = 0; k < unroll_count; ++k) {
+                    iter_aligned_nonquant_a2(temp, row_base, num_rows, tid, i*K_PER_ITER);
+                    i++;
+                }
+            }
+        } else {
+            while (i < unrolled_iters && is_aligned_nonquant) {
+                [[unroll]] for (uint k = 0; k < unroll_count; ++k) {
+                    iter_aligned_nonquant_a(temp, temp2, row_base, num_rows, tid, i*K_PER_ITER);
+                    i++;
+                }
             }
         }
     } else {
@@ -218,7 +394,7 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     while (i < unrolled_iters) {
         // Manually partially unroll the loop
         [[unroll]] for (uint k = 0; k < unroll_count; ++k) {
-            iter(temp, first_row, num_rows, tid, i*K_PER_ITER, false);
+            iter(temp, row_base, num_rows, tid, i*K_PER_ITER, false);
             i++;
         }
     }
@@ -228,25 +404,46 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
 
 #if K_PER_ITER == 4
     if (is_aligned_nonquant) {
-        while (i < num_iters) {
-            iter_aligned_nonquant(temp, first_row, num_rows, tid, i*K_PER_ITER);
-            i++;
+        if (GEN_GLU == 2 && use_a2) {
+            while (i < num_iters) {
+                iter_aligned_nonquant_a2(temp, row_base, num_rows, tid, i*K_PER_ITER);
+                i++;
+            }
+        } else {
+            while (i < num_iters) {
+                iter_aligned_nonquant_a(temp, temp2, row_base, num_rows, tid, i*K_PER_ITER);
+                i++;
+            }
         }
     } else {
 #endif
     while (i < num_iters) {
-        iter(temp, first_row, num_rows, tid, i*K_PER_ITER, true);
+        iter(temp, row_base, num_rows, tid, i*K_PER_ITER, true);
         i++;
     }
 #if K_PER_ITER == 4
     }
 #endif
 
-    reduce_result(temp, d_offset, first_row, num_rows, tid);
+    if (GEN_GLU == 3) {
+        reduce_pair_glu(temp, temp2, d_offset, first_row, num_rows, tid);
+    }
+#ifndef MUL_MAT_ID
+    else if (GEN_GLU == 2 && use_a2) {
+        reduce_result_d2(temp, row_base, num_rows, tid);
+    }
+#endif
+    else {
+        reduce_result(temp, d_offset, first_row, num_rows, tid);
+    }
 }
 
 void main() {
+#if defined(USE_SUBGROUP_ADD_NO_SHMEM) && !defined(NEEDS_INIT_IQ_SHMEM)
+    const uint first_row = NUM_ROWS * (NUM_SUBGROUPS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z) + gl_SubgroupID);
+#else
     const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+#endif
 
 #ifdef NEEDS_INIT_IQ_SHMEM
     init_iq_shmem(gl_WorkGroupSize);
