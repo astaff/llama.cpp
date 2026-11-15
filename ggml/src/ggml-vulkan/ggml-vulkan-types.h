@@ -713,6 +713,8 @@ struct vk_device_struct {
     vk::Device device;
     uint32_t vendor_id;
     vk::DriverId driver_id;
+    bool borealis_medium_tiles = false;
+    bool borealis_roll_bk = false;
     vk_device_architecture architecture;
     std::unique_ptr<vk_queue> compute_queue;
     std::unique_ptr<vk_queue> transfer_queue;
@@ -1142,6 +1144,7 @@ typedef std::vector<vk_submission> vk_sequence;
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+#define MAT_VEC_FUSION_FLAGS_GEN_TOKY 0x40 // gen: MUL_MAT_ID, all tokens in one dispatch (y = slot + nei0 * token)
 
 struct vk_staging_memcpy {
     vk_staging_memcpy(void * _dst, const void * _src, size_t _n) : dst(_dst), src(_src), n(_n) {}

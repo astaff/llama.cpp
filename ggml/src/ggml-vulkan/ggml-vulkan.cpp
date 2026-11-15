@@ -672,10 +672,11 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
 
 #if VK_HEADER_VERSION >= 287
     // Roll the mul_mm BK loop on Asahi Linux. Skip bf16 and the mul_mmq pipelines.
-    if (device->driver_id == vk::DriverId::eMesaHoneykrisp &&
+    if ((device->driver_id == vk::DriverId::eMesaHoneykrisp || device->borealis_roll_bk) &&
         pipeline->name.rfind("matmul", 0) == 0 &&
         pipeline->name.find("bf16") == std::string::npos &&
-        pipeline->name.find("q8_1") == std::string::npos) {
+        pipeline->name.find("q8_1") == std::string::npos &&
+        (!device->coopmat_support || (getenv("GGML_VK_CM1_ROLL_BK") && atoi(getenv("GGML_VK_CM1_ROLL_BK")) != 0))) {
         const uint32_t * src   = spirv.empty() ? reinterpret_cast<const uint32_t *>(spv_data) : spirv.data();
         size_t           src_n = spirv.empty() ? spv_size / sizeof(uint32_t) : spirv.size();
         std::vector<uint32_t> rolled;
@@ -1724,6 +1725,19 @@ static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vec
     return supported;
 }
 
+static bool ggml_vk_is_apple_agx_coopmat(const vk_device& device) {
+    if (!device->coopmat_support || device->coopmat_m != 8 || device->coopmat_n != 8 || device->coopmat_k != 8) {
+        return false;
+    }
+#if VK_HEADER_VERSION >= 287
+    if (device->driver_id == vk::DriverId::eMesaHoneykrisp) {
+        return true;
+    }
+#endif
+    return device->borealis_medium_tiles || device->borealis_roll_bk ||
+           (device->vendor_id == 0x10005 && device->properties.deviceID == 0x6041);
+}
+
 static bool ggml_vk_matmul_int_shmem_support(const vk_device& device, const std::vector<uint32_t>& warptile, bool mul_mat_id, ggml_type src0_type) {
 
     // FLOAT_TYPE in the shader is float16_t with fp16 support, otherwise float.
@@ -1975,7 +1989,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                             l_mmq_wg_denoms, m_mmq_wg_denoms, s_mmq_wg_denoms,
                             l_mmq_wg_denoms_k, m_mmq_wg_denoms_k, s_mmq_wg_denoms_k,
                             l_mmq_cm1_wg_denoms_k, m_mmq_cm1_wg_denoms_k, s_mmq_cm1_wg_denoms_k,
-                            l_mmqid_wg_denoms, m_mmqid_wg_denoms, s_mmqid_wg_denoms;
+                            l_mmqid_wg_denoms, m_mmqid_wg_denoms, s_mmqid_wg_denoms, gen_s_mmqid_denoms;
 
     uint32_t l_align, m_align, s_align;
 
@@ -2129,6 +2143,53 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 l_mmq_wg_denoms = { 128, 256, 1 };
                 l_align         = 32;  //set as BK
             }
+        }
+
+        if (ggml_vk_is_apple_agx_coopmat(device)) {
+            // AGX G17P 8x8x8 simdgroup_matrix (f32matmad8x8): keep <=16 8x8 accumulators (64 half-regs) per subgroup
+            // to avoid spilling on the 192-half-reg file, and use BN=16 for small MoE expert tiles.
+            s_warptile       = {  64,  32, 32, 16, 32, 16, 2, tm_s, tn_s, tk_s, 32 };
+            m_warptile       = { 128,  64, 64, 16, 32, 32, 2, tm_m, tn_m, tk_m, 32 };
+            l_warptile       = { 256, 128, 64, 16, 32, 32, 2, tm_l, tn_l, tk_l, 32 };
+            s_warptile_mmq   = {  64,  32, 32, 32, 32, 16, 2, tm_s, tn_s, tk_s, 32 };
+            m_warptile_mmq   = { 128,  64, 64, 32, 32, 32, 2, tm_m, tn_m, tk_m, 32 };
+            l_warptile_mmq   = { 256, 128, 64, 32, 32, 32, 2, tm_l, tn_l, tk_l, 32 };
+            s_warptile_id    = s_warptile;
+            m_warptile_id    = m_warptile;
+            l_warptile_id    = l_warptile;
+            s_warptile_mmqid = { 128,  64, 16, 32, 32,  8, 2, tm_s, tn_s, tk_s, 32 };
+            m_warptile_mmqid = m_warptile_mmq;
+            l_warptile_mmqid = l_warptile_mmq;
+            l_mmq_wg_denoms  = l_wg_denoms = { 128, 64, 1 };
+            m_mmq_wg_denoms  = m_wg_denoms = {  64, 64, 1 };
+            s_mmq_wg_denoms  = s_wg_denoms = {  32, 32, 1 };
+            l_mmqid_wg_denoms = { 128, 64, 1 };
+            m_mmqid_wg_denoms = {  64, 64, 1 };
+            s_mmqid_wg_denoms = {  64, 16, 1 };
+        }
+        auto gen_parse_warptile = [](const char * env_name, std::vector<uint32_t>& wt, std::array<uint32_t, 3>& denoms) {
+            if (const char * gs = getenv(env_name)) {
+                std::vector<uint32_t> v;
+                for (const char * c = gs; *c; ) { char * end = nullptr; v.push_back((uint32_t) strtoul(c, &end, 10)); c = end; if (*c == ',') c++; else if (*c) break; }
+                GGML_ASSERT(v.size() == 11 && "warptile override needs 11 values");
+                wt = v;
+                denoms = { v[1], v[2], 1 };
+            }
+        };
+        gen_parse_warptile("GGML_VK_MMQ_S", s_warptile_mmq, s_mmq_wg_denoms);
+        gen_parse_warptile("GGML_VK_MMQ_L", l_warptile_mmq, l_mmq_wg_denoms);
+
+        // gen: GGML_VK_MMQID_S="BLOCK,BM,BN,BK,WM,WN,WMITER,TM,TN,TK,WARP" replaces the small quantized MUL_MAT_ID tile
+        // (and enables it on Borealis, which otherwise runs only the medium 64x64 tile): an expert with ~8 rows in a
+        // 64-column tile computes 56 empty columns. Each output's sum over K is unchanged.
+        if (const char * gs = getenv("GGML_VK_MMQID_S")) {
+            std::vector<uint32_t> v;
+            for (const char * c = gs; *c; ) { char * end = nullptr; v.push_back((uint32_t) strtoul(c, &end, 10)); c = end; if (*c == ',') c++; else if (*c) break; }
+            GGML_ASSERT(v.size() == 11 && "GGML_VK_MMQID_S needs 11 values");
+            s_warptile_mmqid = v;
+            gen_s_mmqid_denoms = { v[1], v[2], 1 };
+        } else {
+            gen_s_mmqid_denoms = { s_warptile_mmqid[1], s_warptile_mmqid[2], 1 };
         }
 
         const bool use_cm1_int = device->coopmat_int_support &&
@@ -2584,7 +2645,17 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     };
 
     std::vector<vk_tile_config> tc_mm = {{s_warptile, s_wg_denoms, s_align}, {m_warptile, m_wg_denoms, m_align}, {l_warptile, l_wg_denoms, l_align}};
-    std::vector<vk_tile_config> tc_mmq = {{s_warptile_mmq, s_mmq_wg_denoms, s_align}, {m_warptile_mmq, m_mmq_wg_denoms, m_align}, {l_warptile_mmq, l_mmq_wg_denoms, l_align}};
+    // gen: GGML_VK_MMQ_M="BLOCK,BM,BN,BK,WM,WN,WMITER,TM,TN,TK,WARP" replaces the medium quantized matmul tile (the only
+    // one Borealis runs), for a register/shared-memory tile sweep on the M4 Max
+    std::array<uint32_t, 3> gen_m_mmq_denoms = m_mmq_wg_denoms;
+    if (const char * gs = getenv("GGML_VK_MMQ_M")) {
+        std::vector<uint32_t> v;
+        for (const char * c = gs; *c; ) { char * end = nullptr; v.push_back((uint32_t) strtoul(c, &end, 10)); c = end; if (*c == ',') c++; else if (*c) break; }
+        GGML_ASSERT(v.size() == 11 && "GGML_VK_MMQ_M needs 11 values");
+        m_warptile_mmq = v;
+        gen_m_mmq_denoms = { v[1], v[2], 1 };
+    }
+    std::vector<vk_tile_config> tc_mmq = {{s_warptile_mmq, s_mmq_wg_denoms, s_align}, {m_warptile_mmq, gen_m_mmq_denoms, m_align}, {l_warptile_mmq, l_mmq_wg_denoms, l_align}};
 
 #if defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
     if (device->coopmat2) {
@@ -2710,7 +2781,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const bool cm1_pin = device->vendor_id == VK_VENDOR_ID_INTEL;
 
         // Intel coopmat1 uses a dedicated large-tile config for quant matmul_id.
-        std::vector<vk_tile_config> tc_mmq_id = tc_mmq;
+        const uint32_t s_mmqid_align = std::max(s_align, s_warptile_mmqid[1]);
+        std::vector<vk_tile_config> tc_id = {{s_warptile_id, s_wg_denoms, s_align}, {m_warptile_id, m_wg_denoms, m_align}, {l_warptile_id, l_wg_denoms, l_align}};
+        std::vector<vk_tile_config> tc_mmq_id = {
+            {s_warptile_mmqid, gen_s_mmqid_denoms, s_mmqid_align},
+            {m_warptile_mmqid, m_mmq_wg_denoms, m_align},
+            {l_warptile_mmqid, l_mmq_wg_denoms, l_align},
+        };
         if (cm1_pin) {
             tc_mmq_id[2] = { { 512, 128, 128, 32, 32, 32, 2, device->coopmat_m, device->coopmat_n, device->coopmat_k, 32 }, { 128, 128, 1 }, 32 };
         }
@@ -2826,18 +2903,18 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
         GGML_ASSERT(device->subgroup_ballot);
 
-        cm1_create({GGML_TYPE_F32, GGML_TYPE_F32, true, false}, tc_mm, "matmul_id_subgroup_f32_f32", matmul_id_subgroup_f32_f32_cm1_len, matmul_id_subgroup_f32_f32_cm1_data, sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
+        cm1_create({GGML_TYPE_F32, GGML_TYPE_F32, true, false}, tc_id, "matmul_id_subgroup_f32_f32", matmul_id_subgroup_f32_f32_cm1_len, matmul_id_subgroup_f32_f32_cm1_data, sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
         if (device->coopmat_acc_f16_support) {
-            cm1_create({GGML_TYPE_F16, GGML_TYPE_F16, true, true},  tc_mm, "matmul_id_subgroup_f16_f16acc",     matmul_id_subgroup_f16_f16acc_cm1_len,     matmul_id_subgroup_f16_f16acc_cm1_data,     sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
-            cm1_create({GGML_TYPE_F16, GGML_TYPE_F32, true, true},  tc_mm, "matmul_id_subgroup_f16_f32_f16acc", matmul_id_subgroup_f16_f32_f16acc_cm1_len, matmul_id_subgroup_f16_f32_f16acc_cm1_data, sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
+            cm1_create({GGML_TYPE_F16, GGML_TYPE_F16, true, true},  tc_id, "matmul_id_subgroup_f16_f16acc",     matmul_id_subgroup_f16_f16acc_cm1_len,     matmul_id_subgroup_f16_f16acc_cm1_data,     sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
+            cm1_create({GGML_TYPE_F16, GGML_TYPE_F32, true, true},  tc_id, "matmul_id_subgroup_f16_f32_f16acc", matmul_id_subgroup_f16_f32_f16acc_cm1_len, matmul_id_subgroup_f16_f32_f16acc_cm1_data, sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
         }
         if (device->coopmat_acc_f32_support) {
-            cm1_create({GGML_TYPE_F16, GGML_TYPE_F16, true, false}, tc_mm, "matmul_id_subgroup_f16",     matmul_id_subgroup_f16_cm1_len,     matmul_id_subgroup_f16_cm1_data,     sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
-            cm1_create({GGML_TYPE_F16, GGML_TYPE_F32, true, false}, tc_mm, "matmul_id_subgroup_f16_f32", matmul_id_subgroup_f16_f32_cm1_len, matmul_id_subgroup_f16_f32_cm1_data, sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
+            cm1_create({GGML_TYPE_F16, GGML_TYPE_F16, true, false}, tc_id, "matmul_id_subgroup_f16",     matmul_id_subgroup_f16_cm1_len,     matmul_id_subgroup_f16_cm1_data,     sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
+            cm1_create({GGML_TYPE_F16, GGML_TYPE_F32, true, false}, tc_id, "matmul_id_subgroup_f16_f32", matmul_id_subgroup_f16_f32_cm1_len, matmul_id_subgroup_f16_f32_cm1_data, sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
         }
 #if defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
         if (device->coopmat_bf16_support) {
-            cm1_create({GGML_TYPE_BF16, GGML_TYPE_BF16, true, false}, tc_mm, "matmul_id_subgroup_bf16", matmul_id_subgroup_bf16_cm1_len, matmul_id_subgroup_bf16_cm1_data, sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
+            cm1_create({GGML_TYPE_BF16, GGML_TYPE_BF16, true, false}, tc_id, "matmul_id_subgroup_bf16", matmul_id_subgroup_bf16_cm1_len, matmul_id_subgroup_bf16_cm1_data, sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
         }
 #endif
         for (const auto type : non_lut_quant_types) {
@@ -2930,7 +3007,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #endif
 
         std::vector<vk_tile_config> tc_id = {{s_warptile_id, s_wg_denoms, s_align}, {m_warptile_id, m_wg_denoms, m_align}, {l_warptile_id, l_wg_denoms, l_align}};
-        std::vector<vk_tile_config> tc_mmqid = {{s_warptile_mmqid, s_mmq_wg_denoms, s_align}, {m_warptile_mmqid, m_mmq_wg_denoms, m_align}, {l_warptile_mmqid, l_mmq_wg_denoms, l_align}};
+        std::vector<vk_tile_config> tc_mmqid = {{s_warptile_mmqid, gen_s_mmqid_denoms, s_align}, {m_warptile_mmqid, m_mmq_wg_denoms, m_align}, {l_warptile_mmqid, l_mmq_wg_denoms, l_align}};
 
         if (device->fp16) {
             // FP16 subgroup path - with dot2 runtime selection
@@ -3197,7 +3274,17 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             if (m <= 64 || n <= 64) return 1;
             return last;
         };
-        device->matmul_id_tile_selector = device->matmul_tile_selector;
+        device->matmul_id_tile_selector = [](uint32_t m, uint32_t n, uint32_t /*k*/, uint32_t /*shader_core_count*/,
+                                             const std::vector<vk_matmul_pipeline_pair>& configs) -> uint32_t {
+            if (configs.size() <= 1) return 0;
+            const uint32_t bn0 = configs[0].unaligned->wg_denoms[1];
+            const uint32_t bn1 = configs[1].unaligned->wg_denoms[1];
+            const uint32_t cross0 = std::min(2 * bn0, std::max(bn0, bn1 / 2));
+            if (m <= 32 || n <= cross0) return 0;
+            if (configs.size() == 2) return 1;
+            if (m <= 64 || n <= bn1) return 1;
+            return (uint32_t)configs.size() - 1;
+        };
     }
 
     // mul mat vec
@@ -4423,7 +4510,8 @@ vk_device ggml_vk_get_device(size_t idx) {
 
         const char* GGML_VK_DISABLE_GRAPH_OPTIMIZE = getenv("GGML_VK_DISABLE_GRAPH_OPTIMIZE");
         device->disable_graph_optimize = GGML_VK_DISABLE_GRAPH_OPTIMIZE != nullptr;
-        device->disable_narrow_mul_mat = getenv("GGML_VK_DISABLE_NARROW_MUL_MAT") != nullptr;
+        const char* GGML_VK_DISABLE_NARROW_MUL_MAT = getenv("GGML_VK_DISABLE_NARROW_MUL_MAT");
+        device->disable_narrow_mul_mat = GGML_VK_DISABLE_NARROW_MUL_MAT != nullptr && strcmp(GGML_VK_DISABLE_NARROW_MUL_MAT, "0") != 0;
 
         bool fp16_storage = false;
         bool fp16_compute = false;
@@ -4580,6 +4668,27 @@ vk_device ggml_vk_get_device(size_t idx) {
         device->properties = props2.properties;
         device->vendor_id = device->properties.vendorID;
         device->driver_id = driver_props.driverID;
+
+#if VK_HEADER_VERSION >= 287
+        // Private M4 Max experiment: Borealis currently reports Mesa's vendor ID
+        // and a driver ID not named by the installed Vulkan headers. Match its
+        // advertised name and this device instead of guessing a new enum value.
+        if (device->vendor_id == 0x10005 && device->properties.deviceID == 0x6041 &&
+            strcmp(driver_props.driverName.data(), "Borealis") == 0) {
+            const char * mode = getenv("GGML_VK_BOREALIS_TUNING");
+            if (mode == nullptr) {
+                mode = "all";
+            }
+            if (strcmp(mode, "off") != 0 && strcmp(mode, "tiles") != 0 &&
+                strcmp(mode, "roll") != 0 && strcmp(mode, "all") != 0) {
+                throw std::invalid_argument("GGML_VK_BOREALIS_TUNING must be off, tiles, roll, or all");
+            }
+            device->borealis_medium_tiles = strcmp(mode, "tiles") == 0 || strcmp(mode, "all") == 0;
+            device->borealis_roll_bk = strcmp(mode, "roll") == 0 || strcmp(mode, "all") == 0;
+            GGML_LOG_INFO("ggml_vulkan: Borealis M4 tuning=%s (medium_tiles=%d, roll_bk=%d)\n",
+                          mode, device->borealis_medium_tiles, device->borealis_roll_bk);
+        }
+#endif
 
         device->external_memory_host = device->external_memory_host && ggml_vk_external_memory_host_usable(device->driver_id);
 
@@ -5264,15 +5373,15 @@ vk_device ggml_vk_get_device(size_t idx) {
             }
 
 #if VK_HEADER_VERSION >= 287
-            // Honeykrisp driver for Asahi Linux doesn't report VK_VENDOR_ID_APPLE.
-            // Check for Honeykrisp driver and force same configuration as the VK_VENDOR_ID_APPLE case.
-            if (device->driver_id == vk::DriverId::eMesaHoneykrisp) {
+            // Mesa's Apple drivers do not report VK_VENDOR_ID_APPLE. Reuse the
+            // Apple tile configuration for Honeykrisp and opted-in Borealis.
+            if (device->driver_id == vk::DriverId::eMesaHoneykrisp || device->borealis_medium_tiles) {
                 device->mul_mat_l[i] = false;
                 device->mul_mat_m[i] = true;
                 device->mul_mat_s[i] = false;
                 device->mul_mat_id_l[i] = false;
                 device->mul_mat_id_m[i] = true;
-                device->mul_mat_id_s[i] = false;
+                device->mul_mat_id_s[i] = getenv("GGML_VK_MMQID_S") != nullptr;  // gen
             }
 #endif
 
@@ -5282,6 +5391,29 @@ vk_device ggml_vk_get_device(size_t idx) {
             device->mul_mat_id_l_int[i] = device->mul_mat_id_l[i];
             device->mul_mat_id_m_int[i] = device->mul_mat_id_m[i];
             device->mul_mat_id_s_int[i] = device->mul_mat_id_s[i];
+            if (ggml_vk_is_apple_agx_coopmat(device)) {
+                const char * cm1_t = getenv("GGML_VK_CM1_TILES");
+                const char * cm1_id_t = getenv("GGML_VK_CM1_ID_TILES");
+                if (!cm1_t || !*cm1_t) cm1_t = "sml";
+                if (!cm1_id_t || !*cm1_id_t) cm1_id_t = "sm";
+                device->mul_mat_s[i] = strchr(cm1_t, 's') != nullptr;
+                device->mul_mat_m[i] = strchr(cm1_t, 'm') != nullptr;
+                device->mul_mat_l[i] = strchr(cm1_t, 'l') != nullptr;
+                device->mul_mat_id_s[i] = strchr(cm1_id_t, 's') != nullptr;
+                device->mul_mat_id_m[i] = strchr(cm1_id_t, 'm') != nullptr;
+                device->mul_mat_id_l[i] = strchr(cm1_id_t, 'l') != nullptr;
+            }
+        }
+
+        // Upstream narrow-N CM1 tiles ({BM, 16/32, 32, WM=16, WN=16}) and shader_core_count==0 split_k=8
+        // target AMD/Intel 16x16 coopmat1; keep Apple AGX's tuned 8x8x8 s/m/l tiles and split_k=1 unless overridden.
+        if (GGML_VK_DISABLE_NARROW_MUL_MAT == nullptr &&
+            (ggml_vk_is_apple_agx_coopmat(device) || device->borealis_medium_tiles
+#if VK_HEADER_VERSION >= 287
+             || device->driver_id == vk::DriverId::eMesaHoneykrisp
+#endif
+            )) {
+            device->disable_narrow_mul_mat = true;
         }
 
 
@@ -7950,9 +8082,11 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 #endif
     const bool can_quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 &&
                                 ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0 && ggml_vk_src1_prec_allows_q8(dst);
-    // Intel coopmat1 matrix cores prefer f16 activations for quantized weights
+    // Intel and Apple AGX coopmat1 matrix cores prefer f16 activations for quantized weights (nei1 > 32 on AGX avoids cpy_f32_f16 on short prompts)
+    static const int gen_mmid_f16_b = getenv("GGML_VK_MMID_F16_B") ? atoi(getenv("GGML_VK_MMID_F16_B")) : -1;
     const bool prefer_f16_b = ctx->device->coopmat_support && !ctx->device->coopmat2 &&
-                              ctx->device->vendor_id == VK_VENDOR_ID_INTEL &&
+                              (gen_mmid_f16_b > 0 || (gen_mmid_f16_b < 0 &&
+                               (ctx->device->vendor_id == VK_VENDOR_ID_INTEL || (ggml_vk_is_apple_agx_coopmat(ctx->device) && nei1 > 32)))) &&
                               ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32;
 
     const ggml_type y_kernel_type = ggml_vk_mul_mat_b_type(ctx, src0->type, src1, f16_type,
@@ -7981,10 +8115,22 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                                   y_decode_vector_staging || y_needs_k_padding);
     const bool qy_needs_dequant = y_needs_reformat;
 
-    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, nei1, true));
+    // gen: GGML_VK_MMID_SELECT=pairs sizes the tile by the rows an expert gets on average (tokens x used / experts),
+    // not by the token count: each nonempty expert gets its own tiles, so a 128-column tile for an expert with 8 rows
+    // computes 120 empty columns. Each output's sum over K is the same for every tile size.
+    static const int gen_mmid_sel_mode = []() {
+        const char * s = getenv("GGML_VK_MMID_SELECT");
+        if (!s || !*s) return -1;
+        if (!strcmp(s, "pairs")) return 1;
+        if (!strcmp(s, "tokens")) return 0;
+        return -1;
+    }();
+    const bool gen_mmid_pairs = gen_mmid_sel_mode >= 0 ? (gen_mmid_sel_mode > 0) : ggml_vk_is_apple_agx_coopmat(ctx->device);
+    const uint32_t n_sel = gen_mmid_pairs ? (uint32_t) std::max<uint64_t>(1, CEIL_DIV(nei0 * nei1, n_as)) : (uint32_t) nei1;
+    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, n_sel, true));
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && nei1 > 8;
 
-    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, nei1, aligned, true);
+    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, n_sel, aligned, true);
 
     const uint32_t bn = pipeline->wg_denoms[1];
     const uint64_t max_tiles = ggml_vk_mul_mat_id_max_tiles(n_as, nei0 * nei1, bn);
@@ -8439,6 +8585,20 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         fusion_flags |= MAT_VEC_FUSION_FLAGS_SCALE1;
     }
 
+    // gen: GGML_VK_MMVID_ONE=1 issues all tokens as one dispatch (workgroup y = expert slot + nei0 * token) instead of
+    // one dispatch per token; every workgroup computes exactly what it computed before
+    static const bool gen_mmvid_one = getenv("GGML_VK_MMVID_ONE") && atoi(getenv("GGML_VK_MMVID_ONE")) != 0;
+    if (gen_mmvid_one && nei1 > 1 && groups_z == 1 && nei0 * nei1 <= ctx->device->properties.limits.maxComputeWorkGroupCount[1]) {
+        const vk_mat_vec_id_push_constants pc = {
+            (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
+            stride_batch_x, stride_batch_y, (uint32_t)(ne20 * ne21),
+            fusion_flags | MAT_VEC_FUSION_FLAGS_GEN_TOKY,
+            (uint32_t)nei0, (uint32_t)ne11, 0, nbi1
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
+            { d_X, d_Y, d_D, d_F0, d_F1, d_ids, },
+            pc, { groups_x, (uint32_t)(nei0 * nei1), groups_z });
+    } else
     // Loop over the batch dimension
     for (uint32_t expert_i1 = 0; expert_i1 < nei1; ++expert_i1) {
         const vk_mat_vec_id_push_constants pc = {
@@ -8470,7 +8630,10 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
 static bool ggml_vk_use_mul_mat_vec_id(const ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * ids = dst->src[2];
-    return ids->ne[1] <= 8 && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
+    // gen: GGML_VK_MMVID_MAX raises the token count up to which MUL_MAT_ID runs as mat-vec per token (default 8;
+    // Metal uses its mat-vec-id kernel below 32 tokens)
+    static const int64_t gen_mmvid_max = getenv("GGML_VK_MMVID_MAX") ? std::max(1, atoi(getenv("GGML_VK_MMVID_MAX"))) : 8;
+    return ids->ne[1] <= gen_mmvid_max && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
 }
 
 bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int node_idx) {
