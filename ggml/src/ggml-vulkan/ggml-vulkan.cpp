@@ -1283,6 +1283,13 @@ void ggml_vk_wait_events(vk_context& ctx, std::vector<vk::Event>&& events) {
     );
 }
 
+// gen: GGML_VK_BATCH_INVARIANT=1 makes small batches (speculative verification) compute each token exactly as n=1:
+// the KV split of flash attention is sized as for one token, and the n=1-only ADD+RMS_NORM partials fusion is off.
+static bool gen_batch_invariant() {
+    static const bool v = getenv("GGML_VK_BATCH_INVARIANT") != nullptr && atoi(getenv("GGML_VK_BATCH_INVARIANT")) != 0;
+    return v;
+}
+
 static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
 
     vk_fa_tuning_params result{};
@@ -5900,7 +5907,8 @@ vk_device ggml_vk_get_device(size_t idx) {
         device->disable_descriptor_reuse = getenv("GGML_VK_DISABLE_DESCRIPTOR_REUSE") != nullptr;
 
         device->add_rms_fusion = device->subgroup_arithmetic &&
-                                 device->vendor_id != VK_VENDOR_ID_INTEL;
+                                 device->vendor_id != VK_VENDOR_ID_INTEL &&
+                                 getenv("GGML_VK_DISABLE_ADD_RMS") == nullptr;
         device->partials_binding_alignment =
             std::max(4u, (uint32_t)device->properties.limits.minStorageBufferOffsetAlignment);
 
@@ -6489,8 +6497,9 @@ void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->prealloc_size_x = 0;
     ctx->prealloc_size_y = 0;
     ctx->prealloc_size_split_k = 0;
-    // Fixed size of 1KB, for deterministic behavior
-    ctx->prealloc_size_add_rms_partials = 1024;
+    // Fixed size of 1KB, for deterministic behavior (gen: 1 MiB in batch-invariant mode, where the 1 KB budget is
+    // still applied per row so the same pairs fuse as at n=1)
+    ctx->prealloc_size_add_rms_partials = gen_batch_invariant() ? (1u << 20) : 1024;
 
     ctx->fence = ctx->device->device.createFence({});
     ctx->almost_ready_fence = ctx->device->device.createFence({});
@@ -9772,10 +9781,14 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         // Match the shader's per-split block count so no split is empty.
         const uint32_t per_blocks = CEIL_DIV(total_blocks, split_k);
         split_k = CEIL_DIV(total_blocks, per_blocks);
-    } else if (gqa_ratio > 1 && workgroups_x <= Br) {
-        split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
+    } else if (gqa_ratio > 1 && (workgroups_x <= Br || (gen_batch_invariant() && workgroups_x <= 8))) {
+        // gen: in batch-invariant mode also above Br query tokens (gqa ratio 2 has Br 2), so k <= 8 keeps n=1's split
+        // gen: GGML_VK_BATCH_INVARIANT=1 sizes the KV split as for one query token, so a token's attention sums in the
+        // same order whether it is evaluated alone or in a small verification batch
+        const uint32_t wx_split = gen_batch_invariant() ? 1u : workgroups_x;
+        split_k = shader_core_count * 2 / (wx_split * workgroups_y * workgroups_z);
     } else if (gqa_ratio <= 1) {
-        uint32_t total_wgs_no_split = Tr * workgroups_y * workgroups_z;
+        uint32_t total_wgs_no_split = (gen_batch_invariant() && N <= 8 ? 1u : Tr) * workgroups_y * workgroups_z;
         if (total_wgs_no_split < shader_core_count * 2) {
             split_k = shader_core_count * 2 / total_wgs_no_split;
         }
@@ -10977,8 +10990,8 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         break;
     case GGML_OP_RMS_NORM:
         if (ctx->do_add_rms_partials) {
-            // Run one element per thread, 128 threads per workgroup
-            elements = { (uint32_t)CEIL_DIV(ne00, 128), 1, 1 };
+            // Run one element per thread, 128 threads per workgroup (gen: one row of workgroups per row)
+            elements = { (uint32_t)CEIL_DIV(ne00, 128), (uint32_t)ne01, 1 };
         } else {
             elements = { (uint32_t)ne01, (uint32_t)ne02, (uint32_t)ne03 };
             elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
@@ -11588,6 +11601,40 @@ void ggml_vk_unary_mul(ggml_backend_vk_context * ctx, vk_context& subctx, const 
         (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], (uint32_t)src0->ne[2],(uint32_t)src0->ne[3], (uint32_t)src0->nb[0] / src0_type_size, (uint32_t)src0->nb[1] / src0_type_size, (uint32_t)src0->nb[2] / src0_type_size, (uint32_t)src0->nb[3] / src0_type_size,
         (uint32_t)src1->ne[0], (uint32_t)src1->ne[1], (uint32_t)src1->ne[2],(uint32_t)src1->ne[3], (uint32_t)src1->nb[0] / src1_type_size, (uint32_t)src1->nb[1] / src1_type_size, (uint32_t)src1->nb[2] / src1_type_size, (uint32_t)src1->nb[3] / src1_type_size,
         (uint32_t) mul->ne[0], (uint32_t) mul->ne[1], (uint32_t) mul->ne[2],(uint32_t) mul->ne[3], (uint32_t) mul->nb[0] /  dst_type_size, (uint32_t) mul->nb[1] /  dst_type_size, (uint32_t) mul->nb[2] /  dst_type_size, (uint32_t) mul->nb[3] /  dst_type_size,
+        0,
+        0.0f, 0.0f, 0,
+    }, pipeline);
+}
+
+static void ggml_vk_cont_unary_mul(ggml_backend_vk_context * ctx, vk_context & subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * cont  = cgraph->nodes[node_idx];
+    const ggml_tensor * unary = cgraph->nodes[node_idx + ctx->num_additional_fused_ops - 1];
+    ggml_tensor *       mul   = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+
+    const ggml_tensor * src0 = cont->src[0];
+    const ggml_tensor * src1 = (mul->src[0] == unary) ? mul->src[1] : mul->src[0];
+
+    const bool f16 = src0->type == GGML_TYPE_F16;
+    const int  oi  = ggml_vk_unary_mul_op_index(ggml_get_unary_op(unary));
+    if (oi < 0) {
+        GGML_ABORT("fatal error");
+    }
+    vk_pipeline pipeline = ctx->device->pipeline_unary_mul[oi][f16][1][0];
+
+    const uint32_t ts = ggml_type_size(src0->type);
+    const uint32_t d0 = (uint32_t) src0->ne[0];
+    const uint32_t d1 = (uint32_t) src0->ne[1];
+    const uint32_t d2 = (uint32_t) src0->ne[2];
+    const uint32_t d3 = (uint32_t) src0->ne[3];
+    const uint32_t s1 = d0;
+    const uint32_t s2 = d0 * d1;
+    const uint32_t s3 = d0 * d1 * d2;
+
+    ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, mul, GGML_OP_UNARY, {
+        (uint32_t) ggml_nelements(mul),
+        d0, d1, d2, d3, (uint32_t) (src0->nb[0] / ts), (uint32_t) (src0->nb[1] / ts), (uint32_t) (src0->nb[2] / ts), (uint32_t) (src0->nb[3] / ts),
+        d0, d1, d2, d3, 1u, s1, s2, s3,
+        d0, d1, d2, d3, 1u, s1, s2, s3,
         0,
         0.0f, 0.0f, 0,
     }, pipeline);
@@ -12389,6 +12436,13 @@ uint32_t ggml_vk_rms_partials_size(ggml_backend_vk_context * ctx, const ggml_ten
     return num_bytes;
 }
 
+// gen (GGML_VK_BATCH_INVARIANT=1): the partials of a multi-row ADD+RMS_NORM, one row's partials after another; the
+// per-row values are exactly those of the same row evaluated alone
+static uint32_t gen_rms_partials_size_rows(ggml_backend_vk_context * ctx, const ggml_tensor *node) {
+    const uint32_t num_partials = ggml_vk_rms_num_partials(ctx, node) * (uint32_t) ggml_nrows(node);
+    return ROUNDUP_POW2(num_partials * sizeof(uint32_t), ctx->device->partials_binding_alignment);
+}
+
 static vk_op_rope_push_constants ggml_vk_make_rope_constants(const ggml_tensor *dst, const ggml_tensor *src0, const bool has_ff, bool backprop, const uint32_t set_rows_stride) {
     const int n_dims        = ((const int32_t *) dst->op_params)[1];
     const int mode          = ((const int32_t *) dst->op_params)[2];
@@ -12438,7 +12492,8 @@ static vk_op_rope_push_constants ggml_vk_make_rope_constants(const ggml_tensor *
 
 static void ggml_vk_rms_norm_finish(ggml_backend_vk_context * ctx, const ggml_tensor * src0) {
     if (ctx->do_add_rms_partials_offset_calculation) {
-        ctx->prealloc_size_add_rms_partials_offset += ggml_vk_rms_partials_size(ctx, src0);
+        ctx->prealloc_size_add_rms_partials_offset += gen_batch_invariant() ? gen_rms_partials_size_rows(ctx, src0) : ggml_vk_rms_partials_size(ctx, src0);
+        ctx->gen_n1_partials_offset += ggml_vk_rms_partials_size(ctx, src0);
         ctx->do_add_rms_partials = false;
         ctx->do_add_rms_partials_offset_calculation = false;
     }
@@ -12535,7 +12590,7 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
                     ggml_vk_subbuffer(ctx, ctx->prealloc_add_rms_partials, ctx->prealloc_size_add_rms_partials_offset),
                     ggml_vk_tensor_subbuffer(ctx, residual),
                     ggml_vk_tensor_subbuffer(ctx, post_scale),
-                }, pc, { (uint32_t)CEIL_DIV(src0->ne[0], 128), 1, 1 });
+                }, pc, { (uint32_t)CEIL_DIV(src0->ne[0], 128), (uint32_t)src0->ne[1], 1 });
         } else {
             ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
                 {
@@ -13929,11 +13984,20 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
             cgraph->nodes[next_node_idx]->src[0] == cgraph->nodes[next_node_idx - 1] &&
             cgraph->nodes[next_node_idx]->type == GGML_TYPE_F32 &&
             node->type == GGML_TYPE_F32 &&
-            ggml_nrows(cgraph->nodes[next_node_idx]) == 1 &&
+            (ggml_nrows(cgraph->nodes[next_node_idx]) == 1 ||
+             (gen_batch_invariant() && ggml_nrows(cgraph->nodes[next_node_idx]) <= 64 &&
+              ggml_is_contiguous(cgraph->nodes[node_idx]) && ggml_is_contiguous(cgraph->nodes[next_node_idx]) &&
+              cgraph->nodes[node_idx]->ne[0] % ctx->device->pipeline_add_rms[0][0][0]->wg_denoms[0] == 0)) &&
             ctx->device->add_rms_fusion && !ctx->device->disable_fusion) {
             uint32_t size = ggml_vk_rms_partials_size(ctx, cgraph->nodes[node_idx]);
             ctx->do_add_rms_partials_offset_calculation = true;
-            if (ctx->prealloc_size_add_rms_partials_offset + size <= ctx->prealloc_size_add_rms_partials) {
+            // gen: in batch-invariant mode the same ADD+RMS pairs fuse as for one row (budget counted per row, as at
+            // n=1), the real buffer holds every row's partials
+            const bool fits = gen_batch_invariant() ?
+                ctx->gen_n1_partials_offset + size <= 1024 &&
+                    ctx->prealloc_size_add_rms_partials_offset + gen_rms_partials_size_rows(ctx, cgraph->nodes[node_idx]) <= ctx->prealloc_size_add_rms_partials :
+                ctx->prealloc_size_add_rms_partials_offset + size <= ctx->prealloc_size_add_rms_partials;
+            if (fits) {
                 ctx->do_add_rms_partials = true;
                 ggml_vk_count_fusion(ctx->device, "ADD_RMS_NORM_PARTIALS");
             }
@@ -14177,8 +14241,15 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         ggml_vk_roll(ctx, compute_ctx, src0, node);
 
         break;
-    case GGML_OP_CPY:
     case GGML_OP_CONT:
+        if (ctx->num_additional_fused_ops >= 2 &&
+            cgraph->nodes[node_idx + ctx->num_additional_fused_ops]->op == GGML_OP_MUL) {
+            ggml_vk_cont_unary_mul(ctx, compute_ctx, cgraph, node_idx);
+            break;
+        }
+        ggml_vk_cpy(ctx, compute_ctx, src0, node);
+        break;
+    case GGML_OP_CPY:
     case GGML_OP_DUP:
         ggml_vk_cpy(ctx, compute_ctx, src0, node);
 
@@ -15369,8 +15440,12 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
     auto const &mm_add_ok = [&](const ggml_tensor *mul, const ggml_tensor *add) {
         const ggml_tensor *bias = add->src[0] == mul ? add->src[1] : add->src[0];
 
-        // mat-vec only
-        if (ggml_nrows(mul) != 1) {
+        // mat-vec only (gen: in batch-invariant mode also small batches on the multi-column mat-vec path, so a token's
+        // graph has the same fusions whether it is evaluated alone or in a verification batch)
+        if (ggml_nrows(mul) != 1 &&
+            !(gen_batch_invariant() && mul->ne[2] == 1 && mul->ne[3] == 1 &&
+              mul->ne[1] <= (int64_t) ggml_vk_mul_mat_vec_max_cols(ctx->device) &&
+              mul->src[1] && mul->src[1]->ne[2] * mul->src[1]->ne[3] == 1)) {
             return false;
         }
         // shaders assume the types match
@@ -16487,6 +16562,70 @@ static int gen_can_fuse_rms_mul_silu(const ggml_backend_vk_context * ctx, const 
     return ggml_can_fuse_subgraph_ext(cgraph, idxs, 4, ops, outs, 1) ? 3 : 0;
 }
 
+// gen (GGML_GEN_FUSE=s8): CONT(gate_view), [empty view(s)], UNARY, MUL(other, unary) -> single strided unary_mul dispatch
+static int gen_can_fuse_cont_unary_mul(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int i) {
+    GGML_UNUSED(ctx);
+    if (!gen_fuse_enabled("s8") || i + 2 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * cont = cgraph->nodes[i];
+    if (cont->op != GGML_OP_CONT) {
+        return 0;
+    }
+    const ggml_tensor * gate_view = cont->src[0];
+    if (!gate_view || (gate_view->type != GGML_TYPE_F32 && gate_view->type != GGML_TYPE_F16) ||
+        cont->type != gate_view->type || !ggml_is_contiguous_1(gate_view) || !gate_view->buffer) {
+        return 0;
+    }
+    const size_t ts = ggml_type_size(gate_view->type);
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        if (gate_view->nb[d] % ts != 0) {
+            return 0;
+        }
+    }
+    int u_off = 1;
+    while (u_off <= 2 && i + u_off + 1 < cgraph->n_nodes && ggml_op_is_empty(cgraph->nodes[i + u_off]->op) &&
+           cgraph->nodes[i + u_off]->op != GGML_OP_NONE) {
+        u_off++;
+    }
+    if (i + u_off + 1 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * unary = cgraph->nodes[i + u_off];
+    const ggml_tensor * mul   = cgraph->nodes[i + u_off + 1];
+    if (unary->op != GGML_OP_UNARY || mul->op != GGML_OP_MUL) {
+        return 0;
+    }
+    if (ggml_vk_unary_mul_op_index(ggml_get_unary_op(unary)) < 0) {
+        return 0;
+    }
+    const bool unary_reads_cont = unary->src[0] == cont ||
+        ((unary->src[0]->op == GGML_OP_RESHAPE || unary->src[0]->op == GGML_OP_VIEW) &&
+         unary->src[0]->view_src == cont && unary->src[0]->view_offs == 0 &&
+         ggml_is_contiguous(unary->src[0]) && ggml_nelements(unary->src[0]) == ggml_nelements(cont));
+    if (!unary_reads_cont || (mul->src[0] != unary && mul->src[1] != unary)) {
+        return 0;
+    }
+    const ggml_tensor * other = (mul->src[0] == unary) ? mul->src[1] : mul->src[0];
+    if (!other || !other->buffer || !mul->buffer ||
+        unary->type != gate_view->type || other->type != gate_view->type || mul->type != gate_view->type ||
+        !ggml_is_contiguous(cont) || !ggml_is_contiguous(other) || !ggml_is_contiguous(mul) ||
+        ggml_nelements(cont) != ggml_nelements(gate_view) ||
+        ggml_nelements(other) != ggml_nelements(gate_view) ||
+        ggml_nelements(mul) != ggml_nelements(gate_view)) {
+        return 0;
+    }
+    int idxs[5];
+    ggml_op ops[5];
+    const int n_nodes = u_off + 2;
+    for (int k = 0; k < n_nodes; ++k) {
+        idxs[k] = i + k;
+        ops[k]  = cgraph->nodes[i + k]->op;
+    }
+    const int outs[1] = { i + n_nodes - 1 };
+    return ggml_can_fuse_subgraph_ext(cgraph, idxs, n_nodes, ops, outs, 1) ? (n_nodes - 1) : 0;
+}
+
 // gen (GGML_GEN_FUSE=l2): the SCALE (bias 0) that is the only consumer of RMS_NORM node i, a few nodes later.
 // The RMS_NORM is deferred and runs fused at the SCALE's position (its own output is never written).
 static int gen_find_rms_norm_scale(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int i, int last_node) {
@@ -16619,6 +16758,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ggml_vk_debug_label queue_dbg(ctx->device->compute_queue->handle.get(), "ggml_backend_vk_graph_compute");
 
     ctx->prealloc_size_add_rms_partials_offset = 0;
+    ctx->gen_n1_partials_offset = 0;
     ctx->do_add_rms_partials = false;
     ctx->do_add_rms_partials_offset_calculation = false;
 
@@ -16974,7 +17114,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // they are overwritten, and one workgroup per row. So close enough.
                 op_srcs_fused_elementwise[0] = true;
                 op_srcs_fused_elementwise[1] = true;
-            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL })) {
+            } else if ((gen_deferred_mm.empty() || gen_deferred_mm[i + 1] < 0) &&
+                       ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL })) {
                 ctx->num_additional_fused_ops = 1;
                 switch (ggml_get_unary_op(cgraph->nodes[i])) {
                     case GGML_UNARY_OP_GELU:     fusion_string = "GELU_MUL";     break;
@@ -16984,6 +17125,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 }
                 op_srcs_fused_elementwise[0] = true;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (int n_cum_ops = gen_can_fuse_cont_unary_mul(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = n_cum_ops;
+                fusion_string = "GEN_CONT_UNARY_MUL";
+                op_srcs_fused_elementwise[0] = false;
+                for (int k = 1; k <= n_cum_ops; ++k) {
+                    op_srcs_fused_elementwise[k] = true;
+                }
             } else if (ggml_vk_can_fuse_ssm_conv(ctx, cgraph, i, 2)) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "SSM_CONV_BIAS_SILU";
@@ -17101,7 +17249,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // the destination and the src is not an intermediate node that's being
                 // elided, then disable fusion.
                 for (int k = 0; k <= ctx->num_additional_fused_ops; ++k) {
-                    if (ctx->fused_rms_norm_mode == RMS_NORM_MUL_SILU_GATE && ggml_op_is_empty(cgraph->nodes[i + k]->op)) {
+                    if ((ctx->fused_rms_norm_mode == RMS_NORM_MUL_SILU_GATE ||
+                         (cgraph->nodes[i]->op == GGML_OP_CONT &&
+                          cgraph->nodes[i + ctx->num_additional_fused_ops]->op == GGML_OP_MUL)) &&
+                        ggml_op_is_empty(cgraph->nodes[i + k]->op)) {
                         continue;
                     }
                     for (uint32_t s = 0; s < GGML_MAX_SRC; ++s) {
@@ -17260,6 +17411,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                     ctx->unsynced_nodes_read.clear();
                     ggml_vk_sync_buffers(ctx, sync_ctx);
                 }
+                ctx->fused_ops_write_mask = 0;
                 ctx->gen_mm_dst = mm_ep.dst;
                 ctx->gen_mm_f0 = mm_ep.f0;
                 ctx->gen_mm_f1 = mm_ep.f1;
@@ -17525,6 +17677,22 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             }
         };
 
+        auto const &is_gate_up_glu = [&](int s) -> bool {
+            if (!gen_fuse_enabled("gateup") || s < 0 || s + 2 >= graph->n_nodes) {
+                return false;
+            }
+            if (used[s] || used[s + 1] || used[s + 2]) {
+                return false;
+            }
+            ggml_tensor * a = graph->nodes[s];
+            ggml_tensor * b = graph->nodes[s + 1];
+            ggml_tensor * g = graph->nodes[s + 2];
+            return (a->op == GGML_OP_MUL_MAT || a->op == GGML_OP_MUL_MAT_ID) &&
+                   b->op == a->op && a->src[1] == b->src[1] &&
+                   g->op == GGML_OP_GLU &&
+                   ((g->src[0] == a && g->src[1] == b) || (g->src[0] == b && g->src[1] == a));
+        };
+
         auto const &keep_topk_moe_pattern = [&](const std::initializer_list<ggml_op> &pattern) -> bool {
             if (!match_pattern(pattern, first_unused)) {
                 return false;
@@ -17532,13 +17700,55 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
 
             int last_node = first_unused + (int) pattern.size() - 1;
             // Some TOPK_MOE variants fuse a trailing scale.
-            if (last_node + 1 < graph->n_nodes && graph->nodes[last_node + 1]->op == GGML_OP_SCALE) {
+            const bool has_trailing_scale = last_node + 1 < graph->n_nodes && graph->nodes[last_node + 1]->op == GGML_OP_SCALE;
+            if (has_trailing_scale) {
                 last_node++;
             }
 
+            ggml_tensor * topk_src0 = graph->nodes[first_unused]->src[0];
             add_pattern_alloc_deps(pattern, last_node);
 
-            return keep_pattern(pattern);
+            keep_pattern(pattern);
+
+            // gen (s8): overlap 1-workgroup TOPK_MOE with ready shared-expert gate+up+glu
+            if (gen_fuse_enabled("s8") && !has_trailing_scale) {
+                for (int k = first_unused; k + 2 < std::min(first_unused + 32, graph->n_nodes); ++k) {
+                    if (!is_gate_up_glu(k) || graph->nodes[k]->op != GGML_OP_MUL_MAT) {
+                        continue;
+                    }
+                    ggml_tensor * g0  = graph->nodes[k];
+                    ggml_tensor * g1  = graph->nodes[k + 1];
+                    ggml_tensor * glu = graph->nodes[k + 2];
+                    if (g0->src[0]->op != GGML_OP_NONE || g1->src[0]->op != GGML_OP_NONE ||
+                        !(g0->src[1]->op == GGML_OP_NONE || used_node_set.find(g0->src[1]) != used_node_set.end())) {
+                        continue;
+                    }
+                    bool dep_ok = true;
+                    for (int c = first_unused; c < k; ++c) {
+                        if (!used[c] && (is_src_of(g0, graph->nodes[c]) || is_src_of(g1, graph->nodes[c]) || is_src_of(glu, graph->nodes[c]))) {
+                            dep_ok = false;
+                            break;
+                        }
+                    }
+                    if (dep_ok) {
+                        if (params && params->add_alloc_dep && topk_src0) {
+                            params->add_alloc_dep(params->user_data, topk_src0, g0);
+                            params->add_alloc_dep(params->user_data, topk_src0, g1);
+                            params->add_alloc_dep(params->user_data, topk_src0, glu);
+                        }
+                        for (int t = 0; t < 3; ++t) {
+                            new_order.push_back(graph->nodes[k + t]);
+                            used_node_set.insert(graph->nodes[k + t]);
+                            used[k + t] = true;
+                        }
+                        while (first_unused < graph->n_nodes && used[first_unused]) {
+                            first_unused++;
+                        }
+                        break;
+                    }
+                }
+            }
+            return true;
         };
 
         if (keep_topk_moe_pattern(topk_moe_early_softmax_norm)) {
@@ -17583,21 +17793,6 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             keep_pattern(hc_post_gate_pattern);
             continue;
         }
-        auto const &is_gate_up_glu = [&](int s) -> bool {
-            if (!gen_fuse_enabled("gateup") || s < 0 || s + 2 >= graph->n_nodes) {
-                return false;
-            }
-            if (used[s] || used[s + 1] || used[s + 2]) {
-                return false;
-            }
-            ggml_tensor * a = graph->nodes[s];
-            ggml_tensor * b = graph->nodes[s + 1];
-            ggml_tensor * g = graph->nodes[s + 2];
-            return (a->op == GGML_OP_MUL_MAT || a->op == GGML_OP_MUL_MAT_ID) &&
-                   b->op == a->op && a->src[1] == b->src[1] &&
-                   g->op == GGML_OP_GLU &&
-                   ((g->src[0] == a && g->src[1] == b) || (g->src[0] == b && g->src[1] == a));
-        };
         auto const &mm_softplus_gate_len = [&](int s) -> int {
             if (!gen_fuse_enabled("mmgate") || s < 0 || s + 3 >= graph->n_nodes || used[s]) {
                 return 0;
@@ -17677,8 +17872,172 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             }
             return false;
         };
+        auto const &match_rms_mul_silu = [&](int s, int out_idxs[5]) -> int {
+            if (!gen_fuse_enabled("s8") || !gen_fuse_enabled("gate") || s < 0 || s + 3 >= graph->n_nodes || used[s] || used[s + 1]) {
+                return 0;
+            }
+            ggml_tensor * rms = graph->nodes[s];
+            ggml_tensor * mul = graph->nodes[s + 1];
+            if (rms->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || (mul->src[0] != rms && mul->src[1] != rms)) {
+                return 0;
+            }
+            int p = s + 2;
+            while (p < graph->n_nodes && p <= s + 5 && (used[p] || graph->nodes[p]->op == GGML_OP_MUL_MAT)) {
+                p++;
+            }
+            if (p + 1 >= graph->n_nodes) {
+                return 0;
+            }
+            int n = 0;
+            out_idxs[n++] = s;
+            out_idxs[n++] = s + 1;
+            ggml_tensor * maybe_view = nullptr;
+            if ((graph->nodes[p]->op == GGML_OP_RESHAPE || graph->nodes[p]->op == GGML_OP_VIEW) && !used[p] && p + 2 < graph->n_nodes) {
+                maybe_view = graph->nodes[p];
+                out_idxs[n++] = p;
+                p++;
+            }
+            if (p + 1 >= graph->n_nodes || used[p] || used[p + 1]) {
+                return 0;
+            }
+            ggml_tensor * silu = graph->nodes[p];
+            ggml_tensor * out  = graph->nodes[p + 1];
+            if (silu->op != GGML_OP_UNARY || ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU || out->op != GGML_OP_MUL) {
+                return 0;
+            }
+            if (maybe_view && silu->src[0] != maybe_view) {
+                return 0;
+            }
+            if (!((out->src[0] == mul && out->src[1] == silu) || (out->src[0] == silu && out->src[1] == mul))) {
+                return 0;
+            }
+            out_idxs[n++] = p;
+            out_idxs[n++] = p + 1;
+            return n;
+        };
+        auto const &cont_unary_mul_len = [&](int s) -> int {
+            if (!gen_fuse_enabled("s8") || s < 0 || s + 2 >= graph->n_nodes || used[s]) {
+                return 0;
+            }
+            ggml_tensor * cont = graph->nodes[s];
+            if (cont->op != GGML_OP_CONT || !cont->src[0]) {
+                return 0;
+            }
+            int u_off = 1;
+            while (u_off <= 2 && s + u_off + 1 < graph->n_nodes && is_empty(graph->nodes[s + u_off]) &&
+                   graph->nodes[s + u_off]->op != GGML_OP_NONE && !used[s + u_off]) {
+                u_off++;
+            }
+            if (s + u_off + 1 >= graph->n_nodes || used[s + u_off] || used[s + u_off + 1]) {
+                return 0;
+            }
+            ggml_tensor * unary = graph->nodes[s + u_off];
+            ggml_tensor * mul   = graph->nodes[s + u_off + 1];
+            if (unary->op != GGML_OP_UNARY || mul->op != GGML_OP_MUL ||
+                ggml_vk_unary_mul_op_index(ggml_get_unary_op(unary)) < 0) {
+                return 0;
+            }
+            const bool unary_reads_cont = unary->src[0] == cont ||
+                ((unary->src[0]->op == GGML_OP_RESHAPE || unary->src[0]->op == GGML_OP_VIEW) && unary->src[0]->view_src == cont);
+            if (!unary_reads_cont || (mul->src[0] != unary && mul->src[1] != unary)) {
+                return 0;
+            }
+            return u_off + 2;
+        };
+        auto const &in_s8_protected_group = [&](int idx) -> bool {
+            int r_idxs[5];
+            for (int o = 0; o <= 6; ++o) {
+                int nr = match_rms_mul_silu(idx - o, r_idxs);
+                for (int k = 0; k < nr; ++k) {
+                    if (r_idxs[k] == idx) {
+                        return true;
+                    }
+                }
+            }
+            for (int o = 0; o < 5; ++o) {
+                if (cont_unary_mul_len(idx - o) > o) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        auto const &idxs_srcs_ready = [&](const int * idxs, int len) -> bool {
+            for (int t = 0; t < len; ++t) {
+                ggml_tensor * n = graph->nodes[idxs[t]];
+                for (uint32_t k = 0; k < GGML_MAX_SRC; ++k) {
+                    ggml_tensor * src = n->src[k];
+                    if (!src || src->op == GGML_OP_NONE || used_node_set.find(src) != used_node_set.end()) {
+                        continue;
+                    }
+                    bool in_group = false;
+                    for (int p = 0; p < t; ++p) {
+                        if (graph->nodes[idxs[p]] == src) {
+                            in_group = true;
+                            break;
+                        }
+                    }
+                    if (!in_group) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        };
+        auto const &group_srcs_ready = [&](int s, int len) -> bool {
+            int seq[8];
+            for (int t = 0; t < len; ++t) {
+                seq[t] = s + t;
+            }
+            return idxs_srcs_ready(seq, len);
+        };
         if (is_gate_up_glu(first_unused)) {
             keep_pattern({ graph->nodes[first_unused]->op, graph->nodes[first_unused + 1]->op, GGML_OP_GLU });
+            continue;
+        }
+        {
+            int rms_idxs[5];
+            int rms_len = match_rms_mul_silu(first_unused, rms_idxs);
+            if (rms_len > 0 && idxs_srcs_ready(rms_idxs, rms_len)) {
+                if (rms_len == 5) {
+                    // Emit z_2d view before RMS_NORM so [RMS_NORM, MUL, UNARY, MUL] has no external-source view inside subgraph
+                    new_order.push_back(graph->nodes[rms_idxs[2]]);
+                    used_node_set.insert(graph->nodes[rms_idxs[2]]);
+                    used[rms_idxs[2]] = true;
+                }
+                for (int t = 0; t < rms_len; ++t) {
+                    if (rms_len == 5 && t == 2) {
+                        continue;
+                    }
+                    new_order.push_back(graph->nodes[rms_idxs[t]]);
+                    used_node_set.insert(graph->nodes[rms_idxs[t]]);
+                    used[rms_idxs[t]] = true;
+                }
+                while (first_unused < graph->n_nodes && used[first_unused]) {
+                    first_unused++;
+                }
+                continue;
+            }
+        }
+        if (int cum_len = cont_unary_mul_len(first_unused); cum_len > 0 && group_srcs_ready(first_unused, cum_len)) {
+            ggml_tensor * cont_node = graph->nodes[first_unused];
+            for (int t = 1; t < cum_len - 2; ++t) {
+                ggml_tensor * ev = graph->nodes[first_unused + t];
+                if (ev->view_src != cont_node) {
+                    new_order.push_back(ev);
+                    used_node_set.insert(ev);
+                    used[first_unused + t] = true;
+                }
+            }
+            for (int t = 0; t < cum_len; ++t) {
+                if (!used[first_unused + t]) {
+                    new_order.push_back(graph->nodes[first_unused + t]);
+                    used_node_set.insert(graph->nodes[first_unused + t]);
+                    used[first_unused + t] = true;
+                }
+            }
+            while (first_unused < graph->n_nodes && used[first_unused]) {
+                first_unused++;
+            }
             continue;
         }
         if (int sp_len = mm_softplus_gate_len(first_unused)) {
@@ -17699,6 +18058,24 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 used[first_unused + t] = true;
             }
             while (first_unused < graph->n_nodes && used[first_unused]) {
+                first_unused++;
+            }
+            continue;
+        }
+
+        if (gen_fuse_enabled("s8") && is_empty(graph->nodes[first_unused]) && !in_s8_protected_group(first_unused) &&
+            group_srcs_ready(first_unused, 1)) {
+            while (first_unused < graph->n_nodes) {
+                if (used[first_unused]) {
+                    first_unused++;
+                    continue;
+                }
+                if (!is_empty(graph->nodes[first_unused]) || in_s8_protected_group(first_unused) || !group_srcs_ready(first_unused, 1)) {
+                    break;
+                }
+                new_order.push_back(graph->nodes[first_unused]);
+                used_node_set.insert(graph->nodes[first_unused]);
+                used[first_unused] = true;
                 first_unused++;
             }
             continue;
@@ -17776,9 +18153,58 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 if (!cands.empty() && !is_qkv_head) {
                     current_set.push_back(cands[0]);
                     paired = true;
+                    if (gen_fuse_enabled("s8")) {
+                        for (int k = first_unused + 1; k < std::min(first_unused + 48, graph->n_nodes); ++k) {
+                            if (used[k] || std::find(current_set.begin(), current_set.end(), k) != current_set.end()) {
+                                continue;
+                            }
+                            int ep_len = mm_softplus_gate_len(k);
+                            if (!ep_len) {
+                                ep_len = mm_sigmoid_len(k);
+                            }
+                            if (ep_len > 0 && graph->nodes[k]->src[0]->op == GGML_OP_NONE && graph->nodes[k]->src[1] == mm0->src[1]) {
+                                for (int t = 0; t < ep_len; ++t) {
+                                    current_set.push_back(k + t);
+                                }
+                                k += ep_len - 1;
+                            }
+                        }
+                    }
                 } else if (is_qkv_head) {
                     // Emit Q standalone now so K becomes first_unused next and pairs with V
                     paired = true;
+                } else if (gen_fuse_enabled("s8")) {
+                    // Mixed-quant GDN layer (wqkv and z differ in quant type): still group z + ssm_alpha + ssm_beta with wqkv
+                    bool has_gdn_ep = false;
+                    for (int k = first_unused + 1; k < std::min(first_unused + 48, graph->n_nodes); ++k) {
+                        if (!used[k] && (mm_softplus_gate_len(k) > 0 || mm_sigmoid_len(k) > 0) &&
+                            graph->nodes[k]->src[0]->op == GGML_OP_NONE && graph->nodes[k]->src[1] == mm0->src[1]) {
+                            has_gdn_ep = true;
+                            break;
+                        }
+                    }
+                    if (has_gdn_ep) {
+                        for (int k = first_unused + 1; k < std::min(first_unused + 48, graph->n_nodes); ++k) {
+                            if (used[k]) {
+                                continue;
+                            }
+                            int ep_len = mm_softplus_gate_len(k);
+                            if (!ep_len) {
+                                ep_len = mm_sigmoid_len(k);
+                            }
+                            if (ep_len > 0 && graph->nodes[k]->src[0]->op == GGML_OP_NONE && graph->nodes[k]->src[1] == mm0->src[1]) {
+                                for (int t = 0; t < ep_len; ++t) {
+                                    current_set.push_back(k + t);
+                                }
+                                k += ep_len - 1;
+                                paired = true;
+                            } else if (graph->nodes[k]->op == GGML_OP_MUL_MAT && graph->nodes[k]->src[0]->op == GGML_OP_NONE &&
+                                       graph->nodes[k]->src[1] == mm0->src[1] && !mm_has_own_fusion(k)) {
+                                current_set.push_back(k);
+                                paired = true;
+                            }
+                        }
+                    }
                 }
             }
             if (paired) {
@@ -17801,15 +18227,57 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         // This first pass only grabs "real" (non-view nodes). Second pass grabs view nodes.
         // The goal is to not interleave real and view nodes in a way that breaks fusion.
         const int NUM_TO_CHECK = 20;
-        for (int j = first_unused+1; j < std::min(first_unused + NUM_TO_CHECK, graph->n_nodes); ++j) {
+        const auto pass1_limit = [&]() {
+            int lim = first_unused + NUM_TO_CHECK;
+            if (gen_fuse_enabled("s8") && !current_set.empty() && graph->nodes[first_unused]->op == GGML_OP_ADD) {
+                lim = std::max(lim, current_set.back() + NUM_TO_CHECK);
+            }
+            return std::min(lim, graph->n_nodes);
+        };
+        for (int j = first_unused+1; j < pass1_limit(); ++j) {
             if (used[j]) {
                 continue;
             }
             if (is_empty(graph->nodes[j])) {
                 continue;
             }
-            if (is_gate_up_glu(j - 1) || is_gate_up_glu(j - 2) || in_mm_epilogue_group(j)) {
+            if (is_gate_up_glu(j - 1) || is_gate_up_glu(j - 2) || in_mm_epilogue_group(j) || in_s8_protected_group(j)) {
                 continue;
+            }
+            const bool is_zero_scale = graph->nodes[j]->op == GGML_OP_SCALE &&
+                                       ggml_get_op_params_f32(graph->nodes[j], 0) == 0.0f;
+            if (gen_fuse_enabled("s8") &&
+                ((graph->nodes[first_unused]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_GET_ROWS) ||
+                 (graph->nodes[first_unused]->op != GGML_OP_ADD && is_zero_scale))) {
+                continue;
+            }
+            if (gen_fuse_enabled("s8") && gen_fuse_enabled("pairmm") &&
+                graph->nodes[first_unused]->op != GGML_OP_MUL_MAT &&
+                graph->nodes[j]->op == GGML_OP_MUL_MAT && graph->nodes[j]->src[0]->op == GGML_OP_NONE &&
+                (graph->nodes[j]->ne[0] & 7) == 0 && gen_supports_pair_type(graph->nodes[j]->src[0]->type)) {
+                continue;
+            }
+            if (gen_fuse_enabled("s8") && graph->nodes[current_set.back()]->op == GGML_OP_ADD && graph->nodes[j]->op != GGML_OP_ADD) {
+                ggml_tensor * last_add = graph->nodes[current_set.back()];
+                bool more_add_ahead = false;
+                for (int a = j + 1; a < pass1_limit(); ++a) {
+                    if (used[a] || graph->nodes[a]->op != GGML_OP_ADD) {
+                        continue;
+                    }
+                    ggml_tensor * na = graph->nodes[a];
+                    if (na->src[0] != last_add && na->src[1] != last_add) {
+                        continue;
+                    }
+                    ggml_tensor * other = (na->src[0] == last_add) ? na->src[1] : na->src[0];
+                    if (other && (other->op == GGML_OP_NONE || used_node_set.find(other) != used_node_set.end() ||
+                                  (other->view_src && (other->view_src->op == GGML_OP_NONE || used_node_set.find(other->view_src) != used_node_set.end())))) {
+                        more_add_ahead = true;
+                        break;
+                    }
+                }
+                if (more_add_ahead) {
+                    continue;
+                }
             }
             if (is_gate_up_glu(j)) {
                 bool pair_ok = true;
@@ -17856,9 +18324,29 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 continue;
             }
             bool ok = true;
+            std::vector<int> pending_empty_deps;
+            const bool allow_empty_chain = gen_fuse_enabled("s8") &&
+                graph->nodes[current_set.back()]->op == GGML_OP_ADD &&
+                (is_zero_scale || graph->nodes[j]->op == GGML_OP_GET_ROWS);
             for (int c = first_unused; c < j; ++c) {
                 if (!used[c] &&
-                    is_src_of(graph->nodes[j], graph->nodes[c]) &&
+                    is_src_of(graph->nodes[j], graph->nodes[c])) {
+                    if (allow_empty_chain && is_empty(graph->nodes[c]) && !in_s8_protected_group(c)) {
+                        bool emp_ok = true;
+                        for (int e = first_unused; e < c; ++e) {
+                            if (!used[e] && !is_empty(graph->nodes[e]) &&
+                                std::find(current_set.begin(), current_set.end(), e) == current_set.end() &&
+                                is_src_of(graph->nodes[c], graph->nodes[e])) {
+                                emp_ok = false;
+                                break;
+                            }
+                        }
+                        if (emp_ok) {
+                            pending_empty_deps.push_back(c);
+                            continue;
+                        }
+                    }
+                    if (
                     !(c == current_set.back() && graph->nodes[c]->op == GGML_OP_RMS_NORM && graph->nodes[j]->op == GGML_OP_MUL && empty_or_scheduled_between(c+1, j)) &&
                     // gen: keep mat-vec + SWIGLU adjacent for the GGML_GEN_FUSE=glu / gateup fusion
                     !((gen_fuse_enabled("glu") || gen_fuse_enabled("gateup")) && graph->nodes[j]->op == GGML_OP_GLU &&
@@ -17869,14 +18357,21 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_ADD) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_ADD_ID) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_MUL) &&
-                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_ADD) &&
+                    !((j == c+1 || (gen_fuse_enabled("s8") && empty_or_scheduled_between(c+1, j))) && c == current_set.back() && graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_ADD) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_ADD) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_UNARY)) {
-                    ok = false;
-                    break;
+                        ok = false;
+                        break;
+                    }
                 }
             }
             if (ok) {
+                for (int ec : pending_empty_deps) {
+                    if (!used[ec] && std::find(current_set.begin(), current_set.end(), ec) == current_set.end()) {
+                        current_set.push_back(ec);
+                        used[ec] = true;
+                    }
+                }
                 current_set.push_back(j);
 
                 int rope_idx = j;
@@ -17950,6 +18445,80 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                         }
                     }
                 }
+                // gen (s8): overlap ffn_moe_down + ffn_moe_weighted with ready ffn_shexp + ffn_shexp_gated so all 9 ADDs fuse
+                if (gen_fuse_enabled("s8") && gen_fuse_enabled("shexp") &&
+                    current_set.size() >= 2 && graph->nodes[current_set.back()]->op == GGML_OP_MUL) {
+                    const int prev_idx = current_set[current_set.size() - 2];
+                    const int mmid_idx = graph->nodes[prev_idx]->op == GGML_OP_MUL_MAT_ID ? prev_idx :
+                        (current_set.size() >= 3 && graph->nodes[prev_idx]->op == GGML_OP_ADD_ID &&
+                         graph->nodes[current_set[current_set.size() - 3]]->op == GGML_OP_MUL_MAT_ID ? current_set[current_set.size() - 3] : -1);
+                    if (mmid_idx >= 0) {
+                        ggml_tensor * mmid_node = graph->nodes[mmid_idx];
+                        ggml_tensor * mmid_mul  = graph->nodes[current_set.back()];
+                        const int scan_hi = std::min(current_set.back() + 28, graph->n_nodes);
+                        for (int k = current_set.back() + 1; k < scan_hi; ++k) {
+                            if (used[k] || graph->nodes[k]->op != GGML_OP_MUL_MAT) {
+                                continue;
+                            }
+                            ggml_tensor * mm = graph->nodes[k];
+                            if (mm->src[0]->op != GGML_OP_NONE || !mm->src[1] ||
+                                !(mm->src[1]->op == GGML_OP_NONE || used_node_set.find(mm->src[1]) != used_node_set.end())) {
+                                continue;
+                            }
+                            int found_mul = -1;
+                            for (int m = k + 1; m < std::min(k + 6, graph->n_nodes); ++m) {
+                                if (used[m] || !empty_or_scheduled_between(k + 1, m)) {
+                                    continue;
+                                }
+                                ggml_tensor * mul = graph->nodes[m];
+                                if (mul->op != GGML_OP_MUL || (mul->src[0] != mm && mul->src[1] != mm)) {
+                                    continue;
+                                }
+                                ggml_tensor * gate = (mul->src[0] == mm) ? mul->src[1] : mul->src[0];
+                                if (gate && gate->ne[0] == 1 && gate->ne[1] == mm->ne[1] &&
+                                    (gate->op == GGML_OP_NONE || used_node_set.find(gate) != used_node_set.end())) {
+                                    found_mul = m;
+                                }
+                                break;
+                            }
+                            if (found_mul < 0) {
+                                continue;
+                            }
+                            bool dep_ok = true;
+                            for (int c = first_unused; c < found_mul; ++c) {
+                                if (!used[c] && c != k && std::find(current_set.begin(), current_set.end(), c) == current_set.end() &&
+                                    (is_src_of(mm, graph->nodes[c]) || is_src_of(graph->nodes[found_mul], graph->nodes[c]))) {
+                                    dep_ok = false;
+                                    break;
+                                }
+                            }
+                            if (dep_ok) {
+                                if (params && params->add_alloc_dep) {
+                                    ggml_tensor * shexp_outs[2] = { mm, graph->nodes[found_mul] };
+                                    for (ggml_tensor * out_t : shexp_outs) {
+                                        if (mmid_node->src[1]) {
+                                            params->add_alloc_dep(params->user_data, mmid_node->src[1], out_t);
+                                        }
+                                        if (mmid_node->src[2]) {
+                                            params->add_alloc_dep(params->user_data, mmid_node->src[2], out_t);
+                                        }
+                                        if (mmid_mul->src[0]) {
+                                            params->add_alloc_dep(params->user_data, mmid_mul->src[0], out_t);
+                                        }
+                                        if (mmid_mul->src[1]) {
+                                            params->add_alloc_dep(params->user_data, mmid_mul->src[1], out_t);
+                                        }
+                                    }
+                                }
+                                current_set.push_back(k);
+                                used[k] = true;
+                                current_set.push_back(found_mul);
+                                used[found_mul] = true;
+                                break;
+                            }
+                        }
+                    }
+                }
                 // Look for MUL_MAT + ADD + ADD
                 if (j > 0 &&
                     graph->nodes[j]->op == GGML_OP_ADD &&
@@ -18008,7 +18577,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 if (used[j]) {
                     continue;
                 }
-                if (!is_empty(graph->nodes[j])) {
+                if (!is_empty(graph->nodes[j]) || in_s8_protected_group(j)) {
                     continue;
                 }
                 bool ok = true;
@@ -18077,6 +18646,115 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                         params->add_alloc_dep(params->user_data, n0->src[1], last_out);
                     }
                     params->add_alloc_dep(params->user_data, n0, last_out);
+                }
+            }
+        }
+        if (gen_fuse_enabled("mmgate")) {
+            for (int i = 0; i < graph->n_nodes; ++i) {
+                ggml_tensor * mm = graph->nodes[i];
+                if (mm->op != GGML_OP_MUL_MAT || !mm->src[1]) {
+                    continue;
+                }
+                auto same_mm = [&](const ggml_tensor * t) {
+                    return t == mm || ((t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW) && t->view_src == mm);
+                };
+                for (int j = i + 1; j < std::min(i + 32, graph->n_nodes); ++j) {
+                    ggml_tensor * n = graph->nodes[j];
+                    if (n->op == GGML_OP_UNARY && ggml_get_unary_op(n) == GGML_UNARY_OP_SIGMOID && same_mm(n->src[0])) {
+                        params->add_alloc_dep(params->user_data, mm->src[1], n);
+                        break;
+                    }
+                    if (n->op == GGML_OP_ADD && j + 2 < graph->n_nodes && (same_mm(n->src[0]) || same_mm(n->src[1]))) {
+                        ggml_tensor * sp  = graph->nodes[j + 1];
+                        ggml_tensor * mul = graph->nodes[j + 2];
+                        if (sp->op == GGML_OP_UNARY && ggml_get_unary_op(sp) == GGML_UNARY_OP_SOFTPLUS && sp->src[0] == n &&
+                            mul->op == GGML_OP_MUL && (mul->src[0] == sp || mul->src[1] == sp)) {
+                            params->add_alloc_dep(params->user_data, mm->src[1], mul);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        if (gen_fuse_enabled("shexp")) {
+            for (int i = 0; i < graph->n_nodes; ++i) {
+                ggml_tensor * mm = graph->nodes[i];
+                if (mm->op != GGML_OP_MUL_MAT || !mm->src[1]) {
+                    continue;
+                }
+                for (int j = i + 1; j < std::min(i + 16, graph->n_nodes); ++j) {
+                    ggml_tensor * mul = graph->nodes[j];
+                    if (mul->op == GGML_OP_MUL && (mul->src[0] == mm || mul->src[1] == mm)) {
+                        ggml_tensor * gate = (mul->src[0] == mm) ? mul->src[1] : mul->src[0];
+                        if (gate && gate->ne[0] == 1 && gate->ne[1] == mm->ne[1]) {
+                            params->add_alloc_dep(params->user_data, mm->src[1], mul);
+                            params->add_alloc_dep(params->user_data, gate, mul);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        if (gen_fuse_enabled("s8")) {
+            auto base_tensor = [](ggml_tensor * t) -> ggml_tensor * {
+                while (t && t->view_src) {
+                    t = t->view_src;
+                }
+                return t;
+            };
+            for (int i = 0; i < graph->n_nodes; ++i) {
+                ggml_tensor * n0 = graph->nodes[i];
+                if (n0->op == GGML_OP_RMS_NORM && i + 3 < graph->n_nodes && graph->nodes[i + 1]->op == GGML_OP_MUL) {
+                    int silu_off = 2;
+                    if ((graph->nodes[i + 2]->op == GGML_OP_RESHAPE || graph->nodes[i + 2]->op == GGML_OP_VIEW) && i + 4 < graph->n_nodes) {
+                        silu_off = 3;
+                    }
+                    ggml_tensor * silu = graph->nodes[i + silu_off];
+                    ggml_tensor * out  = graph->nodes[i + silu_off + 1];
+                    if (silu->op == GGML_OP_UNARY && ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU &&
+                        out->op == GGML_OP_MUL && (out->src[0] == silu || out->src[1] == silu)) {
+                        if (ggml_tensor * b0 = base_tensor(n0->src[0])) {
+                            params->add_alloc_dep(params->user_data, b0, out);
+                        }
+                        if (ggml_tensor * bz = base_tensor(silu->src[0])) {
+                            params->add_alloc_dep(params->user_data, bz, out);
+                        }
+                    }
+                }
+                if (n0->op == GGML_OP_CONT && n0->src[0] && i + 2 < graph->n_nodes) {
+                    int u_off = 1;
+                    while (u_off <= 2 && i + u_off + 1 < graph->n_nodes && is_empty(graph->nodes[i + u_off]) &&
+                           graph->nodes[i + u_off]->op != GGML_OP_NONE) {
+                        u_off++;
+                    }
+                    if (i + u_off + 1 < graph->n_nodes) {
+                        ggml_tensor * unary = graph->nodes[i + u_off];
+                        ggml_tensor * mul   = graph->nodes[i + u_off + 1];
+                        if (unary->op == GGML_OP_UNARY && mul->op == GGML_OP_MUL &&
+                            (mul->src[0] == unary || mul->src[1] == unary)) {
+                            if (ggml_tensor * bg = base_tensor(n0->src[0])) {
+                                params->add_alloc_dep(params->user_data, bg, mul);
+                            }
+                        }
+                    }
+                }
+                if (n0->op == GGML_OP_ADD) {
+                    int end = i;
+                    while (end + 1 < graph->n_nodes && graph->nodes[end + 1]->op == GGML_OP_ADD && end - i + 1 < MAX_FUSED_ADDS) {
+                        end++;
+                    }
+                    if (end - i + 1 >= 3) {
+                        ggml_tensor * last_add = graph->nodes[end];
+                        for (int a = i; a <= end; ++a) {
+                            for (int s = 0; s < 2; ++s) {
+                                ggml_tensor * src = graph->nodes[a]->src[s];
+                                if (src && src->view_src) {
+                                    params->add_alloc_dep(params->user_data, src->view_src, last_add);
+                                }
+                            }
+                        }
+                        i = end;
+                    }
                 }
             }
         }
