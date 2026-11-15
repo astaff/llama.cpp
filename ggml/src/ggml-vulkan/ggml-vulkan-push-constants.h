@@ -59,6 +59,9 @@ struct vk_mat_vec_push_constants {
     uint32_t ne12;
     uint32_t broadcast2;
     uint32_t broadcast3;
+    uint32_t pair_m0;
+    uint32_t stride_d2;
+    uint32_t batch_stride_d2;
 };
 
 struct vk_mat_vec_p021_push_constants {

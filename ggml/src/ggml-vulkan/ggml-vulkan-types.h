@@ -271,8 +271,10 @@ struct vk_pipeline_struct {
     // linked list of pipelines for multiple compilation variants.
     // currently only used to compile a 64-bit indexing variant.
     vk_pipeline next;
-    // gen: twin of a mat-vec pipeline compiled with the SWIGLU epilogue (spec constant 3), see GGML_GEN_FUSE=glu
+    // gen: mat-vec twins compiled lazily with spec constant 3 = 1 (single-op epilogue), 2 (PAIR_MM), 3 (PAIR_GLU)
     vk_pipeline gen_glu;
+    vk_pipeline gen_pair_mm;
+    vk_pipeline gen_pair_glu;
 };
 
 typedef std::weak_ptr<vk_pipeline_struct> vk_pipeline_ref;
@@ -1176,6 +1178,9 @@ typedef std::vector<vk_submission> vk_sequence;
 #define MAT_VEC_FUSION_FLAGS_SIGMOID 0x80 // gen
 #define MAT_VEC_FUSION_FLAGS_SOFTPLUS_GATE 0x100 // gen
 #define MAT_VEC_FUSION_FLAGS_ROW_SCALE0 0x200 // gen
+#define MAT_VEC_FUSION_FLAGS_PAIR_GLU 0x400 // gen: gate+up+swiglu in one mat-vec/mat-vec-id dispatch
+#define MAT_VEC_FUSION_FLAGS_PAIR_MM 0x800 // gen: two mat-vecs sharing src1 in one dispatch
+#define MAT_VEC_FUSION_FLAGS_PAIR_MM_SIGMOID1 0x1000 // gen: sigmoid epilogue on second mat-vec output
 
 struct vk_staging_memcpy {
     vk_staging_memcpy(void * _dst, const void * _src, size_t _n) : dst(_dst), src(_src), n(_n) {}
@@ -1348,6 +1353,9 @@ struct ggml_backend_vk_context {
     const ggml_tensor * gen_mm_f0 {};
     const ggml_tensor * gen_mm_f1 {};
     uint32_t gen_mm_flags {};
+    // gen: paired dense MUL_MAT sharing src1 (GGML_GEN_FUSE=pairmm)
+    const ggml_tensor * gen_pair_mm1 {};
+    const ggml_tensor * gen_pair_dst1 {};
     uint64_t stat_syncs {};
 
     // Cache most recent tensor that was converted into prealloc_y, and what pipeline it used to convert.
