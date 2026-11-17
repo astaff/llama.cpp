@@ -217,7 +217,7 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
 #define VK_LOG_DEBUG(msg) ((void) 0)
 #endif // GGML_VULKAN_DEBUG
 
-#define MAX_PARAMETER_COUNT 13
+#define MAX_PARAMETER_COUNT 14
 
 #define MAX_FUSED_ADDS 9
 
@@ -839,8 +839,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols_limit];
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols_limit];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
-    vk_pipeline pipeline_mul_mv_mma[GGML_TYPE_COUNT][3][6];
-    vk_pipeline pipeline_mul_mv_mma_id[GGML_TYPE_COUNT][3][3];
+    vk_pipeline pipeline_mul_mv_mma[GGML_TYPE_COUNT][3][6][2];
+    vk_pipeline pipeline_mul_mv_mma_f32_f16[3][6][2];
+    vk_pipeline pipeline_mul_mv_mma_id[GGML_TYPE_COUNT][7][5][2];
 
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols_limit];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
@@ -868,7 +869,7 @@ struct vk_device_struct {
     // indexed by num_additional_fused_ops == num_adds - 1
     vk_pipeline pipeline_multi_add[MAX_FUSED_ADDS];
     vk_pipeline pipeline_multi_add_rms[MAX_FUSED_ADDS];
-    vk_pipeline pipeline_multi_add_rms_mul[MAX_FUSED_ADDS][2][2];
+    vk_pipeline pipeline_multi_add_rms_mul[MAX_FUSED_ADDS][3][2];
 
     vk_pipeline pipeline_add_id_f32;
 
@@ -897,12 +898,12 @@ struct vk_device_struct {
     vk_pipeline pipeline_set_rows_i64[2][GGML_TYPE_COUNT];
     vk_pipeline pipeline_norm_f32;
     vk_pipeline pipeline_group_norm_f32;
-    std::array<vk_pipeline, 3> pipeline_rms_norm_f32;
-    std::array<vk_pipeline, 3> pipeline_rms_norm_mul_f32;
-    std::array<vk_pipeline, 3> pipeline_rms_norm_scale_f32; // gen
-    std::array<vk_pipeline, 3> pipeline_rms_norm_mul_add_f32;
-    std::array<vk_pipeline, 3> pipeline_rms_norm_mul_silu_f32; // gen
-    std::array<vk_pipeline, 3> pipeline_rms_norm_mul_add_mul_f32;
+    std::array<vk_pipeline, 4> pipeline_rms_norm_f32;
+    std::array<vk_pipeline, 4> pipeline_rms_norm_mul_f32;
+    std::array<vk_pipeline, 4> pipeline_rms_norm_scale_f32; // gen
+    std::array<vk_pipeline, 4> pipeline_rms_norm_mul_add_f32;
+    std::array<vk_pipeline, 4> pipeline_rms_norm_mul_silu_f32; // gen
+    std::array<vk_pipeline, 4> pipeline_rms_norm_mul_add_mul_f32;
     vk_pipeline pipeline_rms_norm_mul_add_partials_f32;
     vk_pipeline pipeline_rms_norm_mul_add_mul_partials_f32;
     vk_pipeline pipeline_rms_norm_set_rows_f32_f32;
@@ -1182,6 +1183,9 @@ typedef std::vector<vk_submission> vk_sequence;
 #define MAT_VEC_FUSION_FLAGS_SCALE0_TOK 0x2000 // s10: MUL_MAT_ID SCALE0 indexed per (slot, token)
 #define MAT_VEC_FUSION_FLAGS_SCALE1_TOK 0x4000 // s10: MUL_MAT_ID SCALE1 indexed per (slot, token)
 #define MAT_VEC_FUSION_FLAGS_COL_SPLIT 0x8000 // s10: multi-column batch_n split across y workgroups
+#define MAT_VEC_FUSION_FLAGS_B_F16 0x10000 // s14: FP16 B buffer bound to mul_mv_mma{_id}
+#define MAT_VEC_FUSION_FLAGS_D_F16_AUX1 0x20000 // s14: mul_mv_mma_id _pairglu writes FP16 D to AUX1 (prealloc_y)
+#define MAT_VEC_FUSION_FLAGS_SKIP_F32_D 0x40000 // s14: mul_mv_mma_id _pairglu skips dead FP32 D store
 
 struct vk_staging_memcpy {
     vk_staging_memcpy(void * _dst, const void * _src, size_t _n) : dst(_dst), src(_src), n(_n) {}
@@ -1321,7 +1325,7 @@ class vk_perf_logger {
     uint32_t print_count {};
 };
 
-static constexpr uint32_t VK_PREALLOC_RING = 4;
+static constexpr uint32_t VK_PREALLOC_RING = 8;
 static constexpr size_t   VK_REPLAY_CACHE_MAX = 8;
 
 struct vk_graph_replay_entry {
@@ -1427,6 +1431,9 @@ struct ggml_backend_vk_context {
     vk_pipeline_struct * prealloc_y_last_pipeline_ring[VK_PREALLOC_RING] {};
     const ggml_tensor *  prealloc_y_last_tensor_ring[VK_PREALLOC_RING] {};
     bool                 prealloc_y_last_k_padded_ring[VK_PREALLOC_RING] {};
+    int                  prealloc_y_keep_slot {-1};
+    bool                 gen_pair_glu_sole_mmid_next {};
+    bool                 gen_rms_silu_sole_mm_next {};
 
     uint32_t prealloc_split_k_ring_idx {};
     size_t   prealloc_split_k_ring_stride {};

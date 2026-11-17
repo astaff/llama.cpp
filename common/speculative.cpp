@@ -64,7 +64,11 @@ static void spec_retune(
     sparams.temp     = cur.temp;
     // must be explicit, the default reseeds at random; mixed so it differs from the target's
     sparams.seed     = cur.seed == LLAMA_DEFAULT_SEED ? cur.seed : cur.seed ^ 0x85ebca6bu;
-    sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K, COMMON_SAMPLER_TYPE_TEMPERATURE };
+    if (cur.temp <= 0.0f && !getenv("GGML_VK_DISABLE_GREEDY_FAST")) {
+        sparams.samplers = { COMMON_SAMPLER_TYPE_TEMPERATURE };
+    } else {
+        sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K, COMMON_SAMPLER_TYPE_TEMPERATURE };
+    }
 
     smpls[seq_id].reset(common_sampler_init(model, sparams));
 }

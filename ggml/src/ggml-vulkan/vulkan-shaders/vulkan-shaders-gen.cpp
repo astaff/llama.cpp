@@ -810,6 +810,7 @@ void process_shaders() {
 #endif
 
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    string_to_spv("mul_mv_mma_f32_f16", "mul_mv_mma.comp", {{"FLOAT16", "1"}, {"DATA_A_F32_F16", "1"}}, true, true, false, false);
     for (const std::string & mma_t : {"f32", "f16", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "q4_k", "q5_k", "q6_k", "iq4_xs", "iq4_nl"}) {
         const std::string mma_def = "DATA_A_" + to_uppercase(mma_t);
         string_to_spv("mul_mv_mma_" + mma_t,    "mul_mv_mma.comp", {{"FLOAT16", "1"}, {mma_def, "1"}}, true, true, false, false);
