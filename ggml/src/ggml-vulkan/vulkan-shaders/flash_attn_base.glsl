@@ -30,6 +30,7 @@ const bool Q_IN_REGS       = (Flags & 32) != 0;
 // coopmat1: subgroups own Q rows, O in coopmat accumulators. K/V staged in LDS, or loaded from global memory with FLIP_DIRECT.
 const bool FLIP            = (Flags & 64) != 0;
 const bool FLIP_DIRECT     = (Flags & 128) != 0;
+const bool USE_LPT_GQA_SWIZZLE = (Flags & 256) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -103,7 +104,7 @@ layout (binding = 7) readonly buffer SP {int32_t data_sparse[];};
 
 #include "fa_types.glsl"
 
-#if defined(BFLOAT16)
+#if defined(BFLOAT16) || defined(COOPMAT_8X8)
 #define O_TYPE float
 #define O_TYPEV4 vec4
 #else
@@ -221,6 +222,22 @@ void init_indices()
     // that prevents the compiler from folding the "&" through the select
     // and breaking the alignment detection.
     m_stride = (p.gqa_ratio > 1) ? (p.gqa_ratio >> 16) : KV;
+
+    if (USE_LPT_GQA_SWIZZLE) {
+        if (!USE_SPARSE) {
+            if (p.k_num == 1u && p.gqa_ratio == 1u && p.nek2 == p.nev2 && rk2 > 1u && p.neq2 == p.nek2 * rk2) {
+                const uint32_t wg_lin = gl_WorkGroupID.y * Tr + gl_WorkGroupID.x;
+                const uint32_t h_sub  = wg_lin % rk2;
+                const uint32_t tmp    = wg_lin / rk2;
+                const uint32_t i_rev  = tmp % Tr;
+                const uint32_t ik_lin = tmp / Tr;
+                i   = (Tr - 1u) - i_rev;
+                iq2 = ik_lin * rk2 + h_sub;
+                ik2 = ik_lin;
+                iv2 = ik_lin;
+            }
+        }
+    }
 
     // Sparse: the tile shares one mask row (gqa heads, or Br==1). split_k
     // partitions the n_kv_max blocks.
