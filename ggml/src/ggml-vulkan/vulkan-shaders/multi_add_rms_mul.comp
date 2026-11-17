@@ -1,6 +1,8 @@
 #version 450
 
 #extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
@@ -8,23 +10,37 @@
 layout(constant_id = 0) const uint NUM_SRCS = 2;
 layout(constant_id = 1) const uint RMS_TREE_MODE = 0;
 layout(constant_id = 2) const uint DO_MUL = 1;
+layout(constant_id = 3) const uint BLOCK_SIZE = 512;
 
-const uint BLOCK_SIZE = 512;
-layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x_id = 3, local_size_y = 1, local_size_z = 1) in;
 
-layout(binding = 0)  readonly  buffer A0     { float data_a0[]; };
-layout(binding = 1)  readonly  buffer A1     { float data_a1[]; };
-layout(binding = 2)  readonly  buffer A2     { float data_a2[]; };
-layout(binding = 3)  readonly  buffer A3     { float data_a3[]; };
-layout(binding = 4)  readonly  buffer A4     { float data_a4[]; };
-layout(binding = 5)  readonly  buffer A5     { float data_a5[]; };
-layout(binding = 6)  readonly  buffer A6     { float data_a6[]; };
-layout(binding = 7)  readonly  buffer A7     { float data_a7[]; };
-layout(binding = 8)  readonly  buffer A8     { float data_a8[]; };
-layout(binding = 9)  readonly  buffer A9     { float data_a9[]; };
-layout(binding = 10) writeonly buffer AddDst { float add_dst[]; };
-layout(binding = 11) readonly  buffer Weight { float data_w[];  };
-layout(binding = 12) writeonly buffer RmsDst { float rms_dst[]; };
+layout(binding = 0)  readonly  buffer A0     { float data_a0[];    };
+layout(binding = 0)  readonly  buffer A0V4   { vec4  data_a0_v4[]; };
+layout(binding = 1)  readonly  buffer A1     { float data_a1[];    };
+layout(binding = 1)  readonly  buffer A1V4   { vec4  data_a1_v4[]; };
+layout(binding = 2)  readonly  buffer A2     { float data_a2[];    };
+layout(binding = 2)  readonly  buffer A2V4   { vec4  data_a2_v4[]; };
+layout(binding = 3)  readonly  buffer A3     { float data_a3[];    };
+layout(binding = 3)  readonly  buffer A3V4   { vec4  data_a3_v4[]; };
+layout(binding = 4)  readonly  buffer A4     { float data_a4[];    };
+layout(binding = 4)  readonly  buffer A4V4   { vec4  data_a4_v4[]; };
+layout(binding = 5)  readonly  buffer A5     { float data_a5[];    };
+layout(binding = 5)  readonly  buffer A5V4   { vec4  data_a5_v4[]; };
+layout(binding = 6)  readonly  buffer A6     { float data_a6[];    };
+layout(binding = 6)  readonly  buffer A6V4   { vec4  data_a6_v4[]; };
+layout(binding = 7)  readonly  buffer A7     { float data_a7[];    };
+layout(binding = 7)  readonly  buffer A7V4   { vec4  data_a7_v4[]; };
+layout(binding = 8)  readonly  buffer A8     { float data_a8[];    };
+layout(binding = 8)  readonly  buffer A8V4   { vec4  data_a8_v4[]; };
+layout(binding = 9)  readonly  buffer A9     { float data_a9[];    };
+layout(binding = 9)  readonly  buffer A9V4   { vec4  data_a9_v4[]; };
+layout(binding = 10) writeonly buffer AddDst   { float add_dst[];    };
+layout(binding = 10) writeonly buffer AddDstV4 { vec4  add_dst_v4[]; };
+layout(binding = 11) readonly  buffer Weight   { float data_w[];     };
+layout(binding = 11) readonly  buffer WeightV4 { vec4  data_w_v4[];  };
+layout(binding = 12) writeonly buffer RmsDst      { float   rms_dst[];        };
+layout(binding = 12) writeonly buffer RmsDstV4    { vec4    rms_dst_v4[];     };
+layout(binding = 13) writeonly buffer RmsDstF16V4 { f16vec4 rms_dst_f16_v4[]; };
 
 layout(push_constant) uniform PushConstants {
     uint ne0;
@@ -34,7 +50,21 @@ layout(push_constant) uniform PushConstants {
     uint nb1[10];
 } p;
 
-shared float sumsh[BLOCK_SIZE];
+const uint SUMSH_SIZE = (RMS_TREE_MODE == 2u) ? 16u : 512u;
+shared float sumsh[SUMSH_SIZE];
+
+vec4 load_sum_v4(const uint row, const uint v4_col) {
+    vec4 s = data_a0_v4[row * (p.nb1[0] >> 2u) + v4_col] + data_a1_v4[row * (p.nb1[1] >> 2u) + v4_col];
+    if (NUM_SRCS > 2) s += data_a2_v4[row * (p.nb1[2] >> 2u) + v4_col];
+    if (NUM_SRCS > 3) s += data_a3_v4[row * (p.nb1[3] >> 2u) + v4_col];
+    if (NUM_SRCS > 4) s += data_a4_v4[row * (p.nb1[4] >> 2u) + v4_col];
+    if (NUM_SRCS > 5) s += data_a5_v4[row * (p.nb1[5] >> 2u) + v4_col];
+    if (NUM_SRCS > 6) s += data_a6_v4[row * (p.nb1[6] >> 2u) + v4_col];
+    if (NUM_SRCS > 7) s += data_a7_v4[row * (p.nb1[7] >> 2u) + v4_col];
+    if (NUM_SRCS > 8) s += data_a8_v4[row * (p.nb1[8] >> 2u) + v4_col];
+    if (NUM_SRCS > 9) s += data_a9_v4[row * (p.nb1[9] >> 2u) + v4_col];
+    return s;
+}
 
 float load_sum(const uint row, const uint col) {
     precise float s;
@@ -64,6 +94,92 @@ void main() {
 
     const uint tid = gl_LocalInvocationID.x;
     const uint row_off = row * p.ne0;
+
+    if (RMS_TREE_MODE == 2u) {
+        const uint ne0_v4 = p.ne0 >> 2u;
+        const uint row_v4 = row_off >> 2u;
+        vec4 vals_v4[8];
+        float sum = 0.0f;
+
+        const bool do_add = (p.write_add_dst & 1u) != 0u;
+        const bool do_f16 = (p.write_add_dst & 2u) != 0u;
+
+        if (ne0_v4 <= 4u * BLOCK_SIZE) {
+            [[unroll]] for (uint idx = 0u; idx < 4u; ++idx) {
+                const uint v4_col = tid + idx * BLOCK_SIZE;
+                vec4 xv = vec4(0.0f);
+                if (v4_col < ne0_v4) {
+                    xv = load_sum_v4(row, v4_col);
+                    if (do_add) {
+                        add_dst_v4[row_v4 + v4_col] = xv;
+                    }
+                }
+                vals_v4[idx] = xv;
+                sum += dot(xv, xv);
+            }
+        } else {
+            [[unroll]] for (uint idx = 0u; idx < 8u; ++idx) {
+                const uint v4_col = tid + idx * BLOCK_SIZE;
+                vec4 xv = vec4(0.0f);
+                if (v4_col < ne0_v4) {
+                    xv = load_sum_v4(row, v4_col);
+                    if (do_add) {
+                        add_dst_v4[row_v4 + v4_col] = xv;
+                    }
+                }
+                vals_v4[idx] = xv;
+                sum += dot(xv, xv);
+            }
+        }
+
+        sum = subgroupAdd(sum);
+        if (subgroupElect()) {
+            sumsh[gl_SubgroupID] = sum;
+        }
+        barrier();
+
+        float total_sq = 0.0f;
+        if (gl_NumSubgroups <= 4u) {
+            [[unroll]] for (uint i = 0u; i < gl_NumSubgroups; ++i) {
+                total_sq += sumsh[i];
+            }
+        } else {
+            for (uint i = gl_SubgroupInvocationID; i < gl_NumSubgroups; i += gl_SubgroupSize) {
+                total_sq += sumsh[i];
+            }
+            total_sq = subgroupAdd(total_sq);
+        }
+
+        const float scale = inversesqrt(total_sq / float(p.ne0) + p.eps);
+        if (ne0_v4 <= 4u * BLOCK_SIZE) {
+            [[unroll]] for (uint idx = 0u; idx < 4u; ++idx) {
+                const uint v4_col = tid + idx * BLOCK_SIZE;
+                if (v4_col < ne0_v4) {
+                    const vec4 out_v4 = (DO_MUL != 0u)
+                        ? (scale * vals_v4[idx] * data_w_v4[v4_col])
+                        : (scale * vals_v4[idx]);
+                    rms_dst_v4[row_v4 + v4_col] = out_v4;
+                    if (do_f16) {
+                        rms_dst_f16_v4[row_v4 + v4_col] = f16vec4(out_v4);
+                    }
+                }
+            }
+        } else {
+            [[unroll]] for (uint idx = 0u; idx < 8u; ++idx) {
+                const uint v4_col = tid + idx * BLOCK_SIZE;
+                if (v4_col < ne0_v4) {
+                    const vec4 out_v4 = (DO_MUL != 0u)
+                        ? (scale * vals_v4[idx] * data_w_v4[v4_col])
+                        : (scale * vals_v4[idx]);
+                    rms_dst_v4[row_v4 + v4_col] = out_v4;
+                    if (do_f16) {
+                        rms_dst_f16_v4[row_v4 + v4_col] = f16vec4(out_v4);
+                    }
+                }
+            }
+        }
+        return;
+    }
 
     if (RMS_TREE_MODE == 0) {
         float vals[8];

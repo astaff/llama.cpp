@@ -9,52 +9,63 @@
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
-layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
+layout (binding = 0) readonly buffer A   { A_TYPE data_a[];    };
+layout (binding = 0) readonly buffer AV4 { vec4   data_a_v4[]; };
+layout (binding = 1) writeonly buffer D  { D_TYPE data_d[];    };
 
-layout (constant_id = 0) const uint BLOCK_SIZE = 32;
+layout (constant_id = 0) const uint BLOCK_SIZE = 512;
 
-shared FLOAT_TYPE tmpmax[BLOCK_SIZE];
-shared uint tmp[BLOCK_SIZE];
+shared FLOAT_TYPE tmpmax[512];
+shared uint tmp[512];
+
+void update_best(inout FLOAT_TYPE amax, inout uint acol, FLOAT_TYPE val, uint idx) {
+    if (val > amax || (val == amax && idx < acol)) {
+        amax = val;
+        acol = idx;
+    }
+}
 
 void main() {
     const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
-    const uint col = gl_LocalInvocationID.x;
+    const uint tid = gl_LocalInvocationID.x;
 
     if (row >= p.KY) {
         return;
     }
 
-    A_TYPE amax = -FLT_MAX;
-    uint acol = col;
+    FLOAT_TYPE amax = FLOAT_TYPE(uintBitsToFloat(0xFF800000u));
+    uint acol = 0xFFFFFFFFu;
+    const uint row_base = row * p.KX;
 
-    if (col < p.KX) {
-        amax = data_a[row*p.KX + col];
-    }
-
-    for (uint i = col + BLOCK_SIZE; i < p.KX; i += BLOCK_SIZE) {
-        A_TYPE val = data_a[row*p.KX + i];
-        if (val > amax) {
-            amax = val;
-            acol = i;
+    if ((p.KX & 3u) == 0u) {
+        const uint kx4 = p.KX >> 2u;
+        const uint base4 = row_base >> 2u;
+        for (uint v4_i = tid; v4_i < kx4; v4_i += BLOCK_SIZE) {
+            const vec4 v = data_a_v4[base4 + v4_i];
+            const uint c0 = v4_i << 2u;
+            update_best(amax, acol, FLOAT_TYPE(v.x), c0 + 0u);
+            update_best(amax, acol, FLOAT_TYPE(v.y), c0 + 1u);
+            update_best(amax, acol, FLOAT_TYPE(v.z), c0 + 2u);
+            update_best(amax, acol, FLOAT_TYPE(v.w), c0 + 3u);
+        }
+    } else {
+        for (uint i = tid; i < p.KX; i += BLOCK_SIZE) {
+            update_best(amax, acol, FLOAT_TYPE(data_a[row_base + i]), i);
         }
     }
 
-    tmp[col] = acol;
-    tmpmax[col] = amax;
-
+    tmp[tid]    = acol;
+    tmpmax[tid] = amax;
     barrier();
-    [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
-        if (col < s && col + s < p.KX) {
-            if (tmpmax[col] < tmpmax[col + s]) {
-                tmpmax[col] = tmpmax[col + s];
-                tmp[col] = tmp[col + s];
-            }
+
+    [[unroll]] for (uint s = BLOCK_SIZE >> 1u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            update_best(tmpmax[tid], tmp[tid], tmpmax[tid + s], tmp[tid + s]);
         }
         barrier();
     }
 
-    if (col == 0) {
+    if (tid == 0u) {
         data_d[row] = D_TYPE(tmp[0]);
     }
 }

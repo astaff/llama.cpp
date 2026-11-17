@@ -91,7 +91,6 @@ void zero_skipped_rows() {
 void main() {
     const uint num_elements = p.ne00 * p.ne01;
     const uint tid = gl_LocalInvocationID.x;
-    const uint tile_shift = findLSB(p.row_tile_size);
     uint total_tiles = 0;
     uint local_skipped = 0;
     if (tid == 0) {
@@ -127,7 +126,7 @@ void main() {
             for (uint e = gl_SubgroupInvocationID; e < n_experts_padded; e += gl_SubgroupSize) {
                 const bool in_range = e < n_experts;
                 const uint count = in_range ? vals[e] : 0;
-                const uint n_tiles = (count + p.row_tile_size - 1) >> tile_shift;
+                const uint n_tiles = (count + p.row_tile_size - 1) / p.row_tile_size;
                 const uint tile_begin = base + subgroupExclusiveAdd(n_tiles);
                 if (in_range) {
                     offsets[e] = tile_begin * p.row_tile_size;
@@ -144,7 +143,7 @@ void main() {
         if (tid == 0) {
             for (uint e = 0; e < n_experts; ++e) {
                 const uint count = vals[e];
-                const uint n_tiles = (count + p.row_tile_size - 1) >> tile_shift;
+                const uint n_tiles = (count + p.row_tile_size - 1) / p.row_tile_size;
                 offsets[e] = total_tiles * p.row_tile_size;
                 cursors[e] = 0;
                 write_tiles(expert_base + e, count, total_tiles, n_tiles);

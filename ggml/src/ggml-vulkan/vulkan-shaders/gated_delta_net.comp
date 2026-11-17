@@ -19,6 +19,7 @@ layout(constant_id = 4) const bool PACKED_ROWS = false;
 layout(constant_id = 5) const uint REPLAY = 0;
 layout(constant_id = 6) const uint COLS_PER_SUB = 1;
 layout(constant_id = 7) const uint SUBGROUPS_PER_WG = 1;
+layout(constant_id = 8) const uint CONTIG_VEC4 = 0;
 
 const uint COLS_PER_SUB_STEP = SUBGROUP_SIZE / LANES_PER_COLUMN;
 const uint COLS_PER_WG = COLS_PER_SUB_STEP * SUBGROUPS_PER_WG;
@@ -53,13 +54,18 @@ layout(push_constant) uniform Parameters {
     uint sout_nb2;
 };
 
-layout(binding = 0) readonly  restrict buffer QBuf     { FLOAT_TYPE data_q[];     };
-layout(binding = 1) readonly  restrict buffer KBuf     { FLOAT_TYPE data_k[];     };
-layout(binding = 2) readonly  restrict buffer VBuf     { FLOAT_TYPE data_v[];     };
+layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
+layout(binding = 0) readonly  buffer QBufV4   { vec4       data_q_v4[];  };
+layout(binding = 1) readonly  buffer KBuf     { FLOAT_TYPE data_k[];     };
+layout(binding = 1) readonly  buffer KBufV4   { vec4       data_k_v4[];  };
+layout(binding = 2) readonly  buffer VBuf     { FLOAT_TYPE data_v[];     };
+layout(binding = 2) readonly  buffer VBufV4   { vec4       data_v_v4[];  };
 layout(binding = 3) readonly  restrict buffer GBuf     { FLOAT_TYPE data_g[];     };
 layout(binding = 4) readonly  restrict buffer BetaBuf  { FLOAT_TYPE data_beta[];  };
-layout(binding = 5) readonly           buffer StateBuf { FLOAT_TYPE data_state[]; };
-layout(binding = 6) writeonly restrict buffer DstBuf   { FLOAT_TYPE data_dst[];   };
+layout(binding = 5) readonly  buffer StateBuf   { FLOAT_TYPE data_state[];    };
+layout(binding = 5) readonly  buffer StateBufV4 { vec4       data_state_v4[]; };
+layout(binding = 6) writeonly buffer DstBuf     { FLOAT_TYPE data_dst[];      };
+layout(binding = 6) writeonly buffer DstBufV4   { vec4       data_dst_v4[];   };
 // replay: pending tokens to run before the new ones (see ggml_gated_delta_net_ext)
 layout(binding = 7)  readonly buffer PKBuf    { FLOAT_TYPE data_pk[];    };
 layout(binding = 8)  readonly buffer PVBuf    { FLOAT_TYPE data_pv[];    };
@@ -67,7 +73,8 @@ layout(binding = 9)  readonly buffer PGBBuf   { FLOAT_TYPE data_pgb[];   };
 layout(binding = 10) readonly buffer NRepBuf  { int        data_n_rep[]; };
 #if STATE_OUT
 // gen: the final state goes straight to its destination (the recurrent cache row), not into dst
-layout(binding = 11)          buffer StateOutBuf { FLOAT_TYPE data_state_out[]; };
+layout(binding = 11)          buffer StateOutBuf   { FLOAT_TYPE data_state_out[];    };
+layout(binding = 11)          buffer StateOutBufV4 { vec4       data_state_out_v4[]; };
 #endif
 
 #if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
@@ -137,6 +144,180 @@ void main() {
     const uint state_size_per_snap = state_size * H * n_seqs;
     const bool zero_state          = (K & 0x80000000u) != 0u;
     const uint eff_K               = K & 0x7FFFFFFFu;
+
+#if USE_SUBGROUP_ADD
+    if (CONTIG_VEC4 != 0u && KDA == 0u && ROWS_PER_LANE == 4u && LANES_PER_COLUMN == 32u && (COLS_PER_SUB == 4u || COLS_PER_SUB == 2u)) {
+        const bool qk_v4_ok = ((sq1 & 3u) == 0u) && ((sq2 & 3u) == 0u) && ((sq3 & 3u) == 0u);
+        const bool v_v4_ok  = (COLS_PER_SUB == 4u) && (COLS_PER_WG == 1u) && ((sv1 & 3u) == 0u) && ((sv2 & 3u) == 0u) && ((sv3 & 3u) == 0u) && ((col_base & 3u) == 0u);
+        const bool st_v4_ok = ((sout_nb2 & 3u) == 0u) && ((s_off & 3u) == 0u);
+        vec4 s0 = vec4(0.0f), s1 = vec4(0.0f), s2 = vec4(0.0f), s3 = vec4(0.0f);
+        if (!zero_state) {
+            s0 = data_state_v4[((state_in_base + (col_base + 0u * COLS_PER_WG) * S_V) >> 2u) + lane];
+            s1 = data_state_v4[((state_in_base + (col_base + 1u * COLS_PER_WG) * S_V) >> 2u) + lane];
+            if (COLS_PER_SUB == 4u) {
+                s2 = data_state_v4[((state_in_base + (col_base + 2u * COLS_PER_WG) * S_V) >> 2u) + lane];
+                s3 = data_state_v4[((state_in_base + (col_base + 3u * COLS_PER_WG) * S_V) >> 2u) + lane];
+            }
+        }
+
+        uint attn_off = (seq_id * n_tokens * H + head_id) * S_V;
+        uint q_off    = iq3 * sq3 + iq1 * sq1;
+        uint v_off    = seq_id * sv3 + head_id * sv1;
+        uint gb_off   = seq_id * sb3 + head_id * sb1;
+        for (uint t = 0u; t < n_tokens; ++t) {
+            const float beta_val = data_beta[gb_off];
+            const float g_val    = exp(data_g[gb_off]);
+
+            const vec4 k_vec = qk_v4_ok
+                ? data_k_v4[(q_off >> 2u) + lane]
+                : vec4(data_k[q_off + 4u * lane + 0u], data_k[q_off + 4u * lane + 1u], data_k[q_off + 4u * lane + 2u], data_k[q_off + 4u * lane + 3u]);
+            const vec4 q_vec = qk_v4_ok
+                ? data_q_v4[(q_off >> 2u) + lane]
+                : vec4(data_q[q_off + 4u * lane + 0u], data_q[q_off + 4u * lane + 1u], data_q[q_off + 4u * lane + 2u], data_q[q_off + 4u * lane + 3u]);
+
+            if (COLS_PER_SUB == 4u) {
+                vec4 attn_cols;
+                if (CONTIG_VEC4 >= 2u) {
+                    const vec4 kv_sh = vec4(
+                        dot(s0, k_vec),
+                        dot(s1, k_vec),
+                        dot(s2, k_vec),
+                        dot(s3, k_vec)
+                    ) * g_val;
+                    const vec4 sq_sh = vec4(
+                        dot(s0, q_vec),
+                        dot(s1, q_vec),
+                        dot(s2, q_vec),
+                        dot(s3, q_vec)
+                    );
+                    const float kq_sh   = dot(k_vec, q_vec);
+                    const vec4  kv_cols = subgroupAdd(kv_sh);
+                    const vec4  sq_cols = subgroupAdd(sq_sh);
+                    const float kq_dot  = subgroupAdd(kq_sh);
+                    const vec4  v_cols  = v_v4_ok
+                        ? data_v_v4[(v_off + col_base) >> 2u]
+                        : vec4(data_v[v_off + col_base], data_v[v_off + col_base + COLS_PER_WG], data_v[v_off + col_base + 2u * COLS_PER_WG], data_v[v_off + col_base + 3u * COLS_PER_WG]);
+                    const vec4 delta = (v_cols - kv_cols) * beta_val;
+                    attn_cols = fma(vec4(g_val), sq_cols, delta * kq_dot) * scale;
+                    s0 = fma(vec4(g_val), s0, k_vec * delta.x);
+                    s1 = fma(vec4(g_val), s1, k_vec * delta.y);
+                    s2 = fma(vec4(g_val), s2, k_vec * delta.z);
+                    s3 = fma(vec4(g_val), s3, k_vec * delta.w);
+                } else {
+                    vec4 kv_sh = vec4(
+                        dot(s0, k_vec),
+                        dot(s1, k_vec),
+                        dot(s2, k_vec),
+                        dot(s3, k_vec)
+                    ) * g_val;
+                    const vec4 kv_cols = subgroupAdd(kv_sh);
+                    const vec4 v_cols  = v_v4_ok
+                        ? data_v_v4[(v_off + col_base) >> 2u]
+                        : vec4(data_v[v_off + col_base], data_v[v_off + col_base + COLS_PER_WG], data_v[v_off + col_base + 2u * COLS_PER_WG], data_v[v_off + col_base + 3u * COLS_PER_WG]);
+                    const vec4 delta = (v_cols - kv_cols) * beta_val;
+                    s0 = fma(vec4(g_val), s0, k_vec * delta.x);
+                    s1 = fma(vec4(g_val), s1, k_vec * delta.y);
+                    s2 = fma(vec4(g_val), s2, k_vec * delta.z);
+                    s3 = fma(vec4(g_val), s3, k_vec * delta.w);
+
+                    attn_cols = subgroupAdd(vec4(
+                        dot(s0, q_vec),
+                        dot(s1, q_vec),
+                        dot(s2, q_vec),
+                        dot(s3, q_vec)
+                    )) * scale;
+                }
+                if (COLS_PER_WG == 1u && ((col_base & 3u) == 0u)) {
+                    if (lane == 0u) {
+                        data_dst_v4[(attn_off + col_base) >> 2u] = attn_cols;
+                    }
+                } else if (lane < 4u) {
+                    data_dst[attn_off + col_base + lane * COLS_PER_WG] = attn_cols[lane];
+                }
+            } else {
+                vec2 attn_cols;
+                if (CONTIG_VEC4 >= 2u) {
+                    const vec2  kv_sh   = vec2(dot(s0, k_vec), dot(s1, k_vec)) * g_val;
+                    const vec2  sq_sh   = vec2(dot(s0, q_vec), dot(s1, q_vec));
+                    const float kq_sh   = dot(k_vec, q_vec);
+                    const vec2  kv_cols = subgroupAdd(kv_sh);
+                    const vec2  sq_cols = subgroupAdd(sq_sh);
+                    const float kq_dot  = subgroupAdd(kq_sh);
+                    const vec2  v_cols  = vec2(data_v[v_off + col_base], data_v[v_off + col_base + COLS_PER_WG]);
+                    const vec2  delta   = (v_cols - kv_cols) * beta_val;
+                    attn_cols = fma(vec2(g_val), sq_cols, delta * kq_dot) * scale;
+                    s0 = fma(vec4(g_val), s0, k_vec * delta.x);
+                    s1 = fma(vec4(g_val), s1, k_vec * delta.y);
+                } else {
+                    vec2 kv_sh = vec2(dot(s0, k_vec), dot(s1, k_vec)) * g_val;
+                    const vec2 kv_cols = subgroupAdd(kv_sh);
+                    const vec2 v_cols  = vec2(data_v[v_off + col_base], data_v[v_off + col_base + COLS_PER_WG]);
+                    const vec2 delta   = (v_cols - kv_cols) * beta_val;
+                    s0 = fma(vec4(g_val), s0, k_vec * delta.x);
+                    s1 = fma(vec4(g_val), s1, k_vec * delta.y);
+
+                    attn_cols = subgroupAdd(vec2(dot(s0, q_vec), dot(s1, q_vec))) * scale;
+                }
+                if (lane < 2u) {
+                    data_dst[attn_off + col_base + lane * COLS_PER_WG] = attn_cols[lane];
+                }
+            }
+
+            attn_off += S_V * H;
+            q_off    += sq2;
+            v_off    += sv2;
+            gb_off   += sb2;
+
+            if (eff_K > 1u) {
+                const int target_slot = int(n_tokens) - 1 - int(t);
+                if (target_slot >= 0 && target_slot < int(eff_K)) {
+                    for (uint c = 0u; c < COLS_PER_SUB; ++c) {
+                        const vec4 sv = (c == 0u) ? s0 : ((c == 1u) ? s1 : ((c == 2u) ? s2 : s3));
+                        const uint col = col_base + c * COLS_PER_WG;
+#if STATE_OUT
+                        const uint slot_base = uint(target_slot) * sout_nb2 + state_out_base;
+                        if (st_v4_ok) {
+                            data_state_out_v4[((slot_base + col * S_V) >> 2u) + lane] = sv;
+                        } else {
+                            const uint b = slot_base + col * S_V + 4u * lane;
+                            data_state_out[b + 0u] = sv.x; data_state_out[b + 1u] = sv.y;
+                            data_state_out[b + 2u] = sv.z; data_state_out[b + 3u] = sv.w;
+                        }
+#else
+                        const uint slot_base = s_off + uint(target_slot) * state_size_per_snap + state_out_base;
+                        if (st_v4_ok) {
+                            data_dst_v4[((slot_base + col * S_V) >> 2u) + lane] = sv;
+                        } else {
+                            const uint b = slot_base + col * S_V + 4u * lane;
+                            data_dst[b + 0u] = sv.x; data_dst[b + 1u] = sv.y;
+                            data_dst[b + 2u] = sv.z; data_dst[b + 3u] = sv.w;
+                        }
+#endif
+                    }
+                }
+            }
+        }
+
+        if (eff_K == 1u) {
+            for (uint c = 0u; c < COLS_PER_SUB; ++c) {
+                const vec4 sv = (c == 0u) ? s0 : ((c == 1u) ? s1 : ((c == 2u) ? s2 : s3));
+                const uint col = col_base + c * COLS_PER_WG;
+#if STATE_OUT
+                data_state_out_v4[((state_out_base + col * S_V) >> 2u) + lane] = sv;
+#else
+                if (st_v4_ok) {
+                    data_dst_v4[((s_off + state_out_base + col * S_V) >> 2u) + lane] = sv;
+                } else {
+                    const uint b = s_off + state_out_base + col * S_V + 4u * lane;
+                    data_dst[b + 0u] = sv.x; data_dst[b + 1u] = sv.y;
+                    data_dst[b + 2u] = sv.z; data_dst[b + 3u] = sv.w;
+                }
+#endif
+            }
+        }
+        return;
+    }
+#endif
 
     FLOAT_TYPE s_shard[COLS_PER_SUB * ROWS_PER_LANE];
     if (zero_state) {

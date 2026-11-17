@@ -596,11 +596,16 @@ void main() {
 
 #ifdef COOPMAT
     bool use_sw_pipe = false;
+#if (defined(DATA_A_F32) || defined(DATA_A_F16)) && LOAD_VEC_A == 4
+    const uint MAX_STAGE_A = 4u;
+#else
+    const uint MAX_STAGE_A = 2u;
+#endif
     if (AGX_DIRECT_STORE != 1u) {
         if (ALIGNED != 0) {
             if (mm_can_stage_a()) {
                 if (LOAD_VEC_B == 8 || LOAD_VEC_B == 4) {
-                    if (BM <= 2u * loadstride_a && BN <= 2u * loadstride_b) {
+                    if (BM <= MAX_STAGE_A * loadstride_a && BN <= 2u * loadstride_b) {
                         use_sw_pipe = true;
                     }
                 }
@@ -614,6 +619,10 @@ void main() {
         for (uint block = start_k; block < end_k; block += BK) {
             FLOAT_TYPEV2 reg_a0[8];
             FLOAT_TYPEV2 reg_a1[8];
+#if (defined(DATA_A_F32) || defined(DATA_A_F16)) && LOAD_VEC_A == 4
+            FLOAT_TYPEV2 reg_a2[8];
+            FLOAT_TYPEV2 reg_a3[8];
+#endif
             FLOAT_TYPEV2 reg_b0[4];
             FLOAT_TYPEV2 reg_b1[4];
 #ifdef MUL_MAT_ID
@@ -651,6 +660,36 @@ void main() {
                     stage_a_to_reg(pos_a, loadr_a, c_sh1, c_sh1, ir * BM_EFF + c_sh1, block, end_k, reg_a1);
                 }
             }
+#if (defined(DATA_A_F32) || defined(DATA_A_F16)) && LOAD_VEC_A == 4
+            if (2u * loadstride_a < BM && loadc_a + 2u * loadstride_a < BM) {
+                const uint c_sh2 = loadc_a + 2u * loadstride_a;
+#ifdef MM_FUSED
+                if (MM_FUSE_MODE == 2u && c_sh2 >= BM_EFF) {
+                    const uint c_mem2 = c_sh2 - BM_EFF;
+                    stage_u_to_reg(pos_a, loadr_a, c_sh2, c_mem2, ir * BM_EFF + c_mem2, block, end_k, reg_a2);
+                } else if (pair_use_u) {
+                    stage_u_to_reg(pos_a, loadr_a, c_sh2, c_sh2, ir * BM_EFF + c_sh2, block, end_k, reg_a2);
+                } else
+#endif
+                {
+                    stage_a_to_reg(pos_a, loadr_a, c_sh2, c_sh2, ir * BM_EFF + c_sh2, block, end_k, reg_a2);
+                }
+            }
+            if (3u * loadstride_a < BM && loadc_a + 3u * loadstride_a < BM) {
+                const uint c_sh3 = loadc_a + 3u * loadstride_a;
+#ifdef MM_FUSED
+                if (MM_FUSE_MODE == 2u && c_sh3 >= BM_EFF) {
+                    const uint c_mem3 = c_sh3 - BM_EFF;
+                    stage_u_to_reg(pos_a, loadr_a, c_sh3, c_mem3, ir * BM_EFF + c_mem3, block, end_k, reg_a3);
+                } else if (pair_use_u) {
+                    stage_u_to_reg(pos_a, loadr_a, c_sh3, c_sh3, ir * BM_EFF + c_sh3, block, end_k, reg_a3);
+                } else
+#endif
+                {
+                    stage_a_to_reg(pos_a, loadr_a, c_sh3, c_sh3, ir * BM_EFF + c_sh3, block, end_k, reg_a3);
+                }
+            }
+#endif
 
 #ifdef MUL_MAT_ID
             if (loadc_b < active_cols_b) {
@@ -679,6 +718,14 @@ void main() {
             if (loadstride_a < BM && loadc_a + loadstride_a < BM) {
                 commit_stage_a(loadc_a + loadstride_a, loadr_a, reg_a1);
             }
+#if (defined(DATA_A_F32) || defined(DATA_A_F16)) && LOAD_VEC_A == 4
+            if (2u * loadstride_a < BM && loadc_a + 2u * loadstride_a < BM) {
+                commit_stage_a(loadc_a + 2u * loadstride_a, loadr_a, reg_a2);
+            }
+            if (3u * loadstride_a < BM && loadc_a + 3u * loadstride_a < BM) {
+                commit_stage_a(loadc_a + 3u * loadstride_a, loadr_a, reg_a3);
+            }
+#endif
 #ifdef MUL_MAT_ID
             if (loadc_b < active_cols_b) {
                 commit_stage_b(loadc_b, loadr_b, reg_b0);

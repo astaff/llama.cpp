@@ -27,22 +27,30 @@
 
 layout(local_size_x = 32, local_size_y_id = 0, local_size_z = 1) in;
 
-layout(constant_id = 0) const uint WG_SG     = 1; // total subgroups per workgroup = NSG * MSG
+layout(constant_id = 0) const uint WG_SG     = 1; // total subgroups per workgroup = NSG * MSG * CSG
 layout(constant_id = 1) const uint NT        = 2; // 8*NT M-rows per subgroup
-layout(constant_id = 2) const uint RT        = 1; // 8*RT N-cols per workgroup (1, 2, 4)
-layout(constant_id = 3) const uint NSG       = 1; // K-split subgroups (MSG = WG_SG / NSG)
+layout(constant_id = 2) const uint RT        = 1; // 8*RT N-cols per subgroup (1, 2, 4)
+layout(constant_id = 3) const uint NSG       = 1; // K-split subgroups
 // 0 = plain, 1 = single-op epilogue, 2 = PAIR_MM (dense only), 3 = PAIR_GLU, 4 = fast epilogue
 layout(constant_id = 4) const uint FUSE_MODE = 0;
 layout(constant_id = 5) const uint USE_SH_B  = 1;
 layout(constant_id = 6) const uint K_PAIRS   = 1;
+layout(constant_id = 7) const uint CSG       = 1; // column-split subgroups (MUL_MAT_ID cooperative dequant)
+layout(constant_id = 8) const uint B_IS_F16  = 0; // compile-time FP16 B buffer specialization
 
-const uint MSG        = WG_SG / NSG;
+const uint MSG        = WG_SG / (NSG * CSG);
 const uint WG_THREADS = 32u * WG_SG;
+const uint BN_COLS    = 8u * RT * CSG;
 
 #if defined(DATA_A_F32)
 #define MMA_FTYPE float
 #define MMA_FVEC4 vec4
 #define MMA_FVEC2 vec2
+#define MMA_ELEM_SHIFT 0u
+#elif defined(DATA_A_F32_F16)
+#define MMA_FTYPE float16_t
+#define MMA_FVEC4 f16vec4
+#define MMA_FVEC2 f16vec2
 #define MMA_ELEM_SHIFT 0u
 #elif defined(DATA_A_F16)
 #define MMA_FTYPE float16_t
@@ -73,7 +81,7 @@ const uint WG_THREADS = 32u * WG_SG;
 #endif
 
 // Per-type SSBO bindings (only the active type's descriptors are declared)
-#if defined(DATA_A_F32)
+#if defined(DATA_A_F32) || defined(DATA_A_F32_F16)
 layout(binding = 0)          readonly buffer BUF_A_F32   { float data[]; } a_f32;
 layout(binding = 0)          readonly buffer BUF_A_F32V4 { vec4  data[]; } a_f32v4;
 layout(binding = MMA_BIND_U) readonly buffer BUF_U_F32   { float data[]; } u_f32;
@@ -124,9 +132,12 @@ layout(binding = MMA_BIND_U) readonly buffer BUF_U_IQ4_NL { block_iq4_nl_packed1
 #endif
 
 // B bindings (binding = 1)
-layout(binding = 1) readonly buffer BUF_B_F32   { float data_b[];    };
-layout(binding = 1) readonly buffer BUF_B_F32V2 { vec2  data_b_v2[]; };
-layout(binding = 1) readonly buffer BUF_B_F32V4 { vec4  data_b_v4[]; };
+layout(binding = 1) readonly buffer BUF_B_F32   { float     data_b[];       };
+layout(binding = 1) readonly buffer BUF_B_F32V2 { vec2      data_b_v2[];    };
+layout(binding = 1) readonly buffer BUF_B_F32V4 { vec4      data_b_v4[];    };
+layout(binding = 1) readonly buffer BUF_B_F16   { float16_t data_b_f16[];   };
+layout(binding = 1) readonly buffer BUF_B_F16V2 { f16vec2   data_b_f16v2[]; };
+layout(binding = 1) readonly buffer BUF_B_F16V4 { f16vec4   data_b_f16v4[]; };
 
 // D binding (binding = 2)
 layout(binding = 2) writeonly buffer BUF_D_F32  { float data_d[]; };
@@ -134,6 +145,7 @@ layout(binding = 2) writeonly buffer BUF_D_F32  { float data_d[]; };
 #ifdef MUL_MAT_ID
 layout(binding = 3) readonly buffer BUF_IDS     { int   data_ids[];     };
 layout(binding = 4) readonly buffer BUF_ROW_MAP { uint  data_row_map[]; };
+layout(binding = MMA_BIND_AUX1) writeonly buffer BUF_D_F16 { float16_t data_d_f16[]; };
 #else
 layout(binding = 5) writeonly buffer BUF_D2_F32 { float data_d2[];    };
 layout(binding = 6) readonly  buffer BUF_F2_F32 { float data_aux2[];  };
@@ -156,6 +168,9 @@ layout(binding = MMA_BIND_AUX1) readonly buffer BUF_AUX1 { float data_aux1[]; };
 #define MAT_VEC_FUSION_FLAGS_PAIR_MM_SIGMOID1 0x1000u
 #define MAT_VEC_FUSION_FLAGS_SCALE0_TOK       0x2000u
 #define MAT_VEC_FUSION_FLAGS_SCALE1_TOK       0x4000u
+#define MAT_VEC_FUSION_FLAGS_B_F16            0x10000u
+#define MAT_VEC_FUSION_FLAGS_D_F16_AUX1       0x20000u
+#define MAT_VEC_FUSION_FLAGS_SKIP_F32_D       0x40000u
 
 layout(push_constant) uniform parameter {
 #ifdef MUL_MAT_ID
@@ -197,18 +212,36 @@ layout(push_constant) uniform parameter {
 #endif
 } p;
 
+#ifndef MUL_MAT_ID
 const uint RED_SLOTS = (NSG > 1u) ? (NSG * MSG * RT * NT * 64u * ((FUSE_MODE == 3u) ? 2u : 1u)) : 1u;
 shared float red_shmem[RED_SLOTS];
+#endif
 
 // Cooperative B staging tile when MSG > 1 && USE_SH_B != 0
-const uint SH_B_COLS = (MSG > 1u && USE_SH_B != 0u) ? (8u * RT)         : 1u;
-const uint SH_B_K4   = (MSG > 1u && USE_SH_B != 0u) ? (16u * K_PAIRS)   : 1u;
+const bool COOP_SH_B = (MSG > 1u) && (USE_SH_B != 0u);
+const uint SH_B_COLS = COOP_SH_B ? BN_COLS         : 1u;
+const uint SH_B_K4   = COOP_SH_B ? (16u * K_PAIRS) : 1u;
 shared MMA_FVEC4 sh_b[SH_B_COLS][SH_B_K4];
 
 #ifdef MUL_MAT_ID
-shared uint sh_b_base[8u * RT];
-shared uint sh_r_ids[8u * RT];
-shared float sh_col_scale[(FUSE_MODE == 4u) ? (8u * RT) : 1u];
+const bool USE_SH_IDS = (SH_B_COLS * SH_B_K4 * 8u) < 16384u;
+shared uint  sh_b_base[USE_SH_IDS ? BN_COLS : 1u];
+shared uint  sh_r_ids[USE_SH_IDS ? BN_COLS : 1u];
+shared float sh_col_scale[(USE_SH_IDS && FUSE_MODE == 4u) ? BN_COLS : 1u];
+
+uint mma_id_col_packed(uint row_begin, uint tile_ne1, uint col_i) {
+    if (USE_SH_IDS) {
+        return sh_r_ids[min(col_i, BN_COLS - 1u)];
+    }
+    return data_row_map[p.row_ids_offset + row_begin + min(col_i, tile_ne1 - 1u)];
+}
+uint mma_id_col_b_base(uint row_begin, uint tile_ne1, uint col_i) {
+    if (USE_SH_IDS) {
+        return sh_b_base[min(col_i, BN_COLS - 1u)];
+    }
+    const uint packed = mma_id_col_packed(row_begin, tile_ne1, col_i);
+    return (packed >> 16u) * p.batch_stride_b + ((packed & 0xFFFFu) % p.ne11) * p.stride_b;
+}
 #endif
 
 uint mma_lane_fm(uint l) { return ((l >> 1u) & 3u) | ((l >> 2u) & 4u); }
@@ -237,41 +270,53 @@ float iq4nl_lut(uint idx) {
 }
 #endif
 
-vec4 load_b_vec4_aligned_or_scalar(uint elem_idx, bool v4_ok) {
-    if (v4_ok) {
-        return data_b_v4[elem_idx >> 2u];
+MMA_FVEC4 load_b_mvec4(uint elem_idx, bool v4_ok, bool b_is_f16) {
+    if (b_is_f16) {
+        if (v4_ok) {
+            return MMA_FVEC4(data_b_f16v4[elem_idx >> 2u]);
+        }
+        return MMA_FVEC4(data_b_f16[elem_idx + 0u], data_b_f16[elem_idx + 1u], data_b_f16[elem_idx + 2u], data_b_f16[elem_idx + 3u]);
     }
-    return vec4(data_b[elem_idx + 0u], data_b[elem_idx + 1u], data_b[elem_idx + 2u], data_b[elem_idx + 3u]);
+    if (v4_ok) {
+        return MMA_FVEC4(data_b_v4[elem_idx >> 2u]);
+    }
+    return MMA_FVEC4(data_b[elem_idx + 0u], data_b[elem_idx + 1u], data_b[elem_idx + 2u], data_b[elem_idx + 3u]);
 }
 
-vec2 load_b_vec2_aligned_or_scalar(uint elem_idx, bool v2_ok) {
-    if (v2_ok) {
-        return data_b_v2[elem_idx >> 1u];
+MMA_FVEC2 load_b_mvec2(uint elem_idx, bool v2_ok, bool b_is_f16) {
+    if (b_is_f16) {
+        if (v2_ok) {
+            return MMA_FVEC2(data_b_f16v2[elem_idx >> 1u]);
+        }
+        return MMA_FVEC2(data_b_f16[elem_idx + 0u], data_b_f16[elem_idx + 1u]);
     }
-    return vec2(data_b[elem_idx + 0u], data_b[elem_idx + 1u]);
+    if (v2_ok) {
+        return MMA_FVEC2(data_b_v2[elem_idx >> 1u]);
+    }
+    return MMA_FVEC2(data_b[elem_idx + 0u], data_b[elem_idx + 1u]);
 }
 
 // Unified single-body dequant16 (prevents duplicate temporary live ranges in PAIR_GLU / PAIR_MM!)
 void dequant16(bool use_u, uint row_unit_base, uint ci, out MMA_FVEC4 w0, out MMA_FVEC4 w1, out MMA_FVEC4 w2, out MMA_FVEC4 w3) {
-#if defined(DATA_A_F32)
+#if defined(DATA_A_F32) || defined(DATA_A_F32_F16)
     const uint base = row_unit_base + (ci << 4u);
     if ((base & 3u) == 0u) {
         const uint v4 = base >> 2u;
         if (use_u) {
-            w0 = u_f32v4.data[v4 + 0u]; w1 = u_f32v4.data[v4 + 1u]; w2 = u_f32v4.data[v4 + 2u]; w3 = u_f32v4.data[v4 + 3u];
+            w0 = MMA_FVEC4(u_f32v4.data[v4 + 0u]); w1 = MMA_FVEC4(u_f32v4.data[v4 + 1u]); w2 = MMA_FVEC4(u_f32v4.data[v4 + 2u]); w3 = MMA_FVEC4(u_f32v4.data[v4 + 3u]);
         } else {
-            w0 = a_f32v4.data[v4 + 0u]; w1 = a_f32v4.data[v4 + 1u]; w2 = a_f32v4.data[v4 + 2u]; w3 = a_f32v4.data[v4 + 3u];
+            w0 = MMA_FVEC4(a_f32v4.data[v4 + 0u]); w1 = MMA_FVEC4(a_f32v4.data[v4 + 1u]); w2 = MMA_FVEC4(a_f32v4.data[v4 + 2u]); w3 = MMA_FVEC4(a_f32v4.data[v4 + 3u]);
         }
     } else if (use_u) {
-        w0 = vec4(u_f32.data[base+0u],  u_f32.data[base+1u],  u_f32.data[base+2u],  u_f32.data[base+3u]);
-        w1 = vec4(u_f32.data[base+4u],  u_f32.data[base+5u],  u_f32.data[base+6u],  u_f32.data[base+7u]);
-        w2 = vec4(u_f32.data[base+8u],  u_f32.data[base+9u],  u_f32.data[base+10u], u_f32.data[base+11u]);
-        w3 = vec4(u_f32.data[base+12u], u_f32.data[base+13u], u_f32.data[base+14u], u_f32.data[base+15u]);
+        w0 = MMA_FVEC4(u_f32.data[base+0u],  u_f32.data[base+1u],  u_f32.data[base+2u],  u_f32.data[base+3u]);
+        w1 = MMA_FVEC4(u_f32.data[base+4u],  u_f32.data[base+5u],  u_f32.data[base+6u],  u_f32.data[base+7u]);
+        w2 = MMA_FVEC4(u_f32.data[base+8u],  u_f32.data[base+9u],  u_f32.data[base+10u], u_f32.data[base+11u]);
+        w3 = MMA_FVEC4(u_f32.data[base+12u], u_f32.data[base+13u], u_f32.data[base+14u], u_f32.data[base+15u]);
     } else {
-        w0 = vec4(a_f32.data[base+0u],  a_f32.data[base+1u],  a_f32.data[base+2u],  a_f32.data[base+3u]);
-        w1 = vec4(a_f32.data[base+4u],  a_f32.data[base+5u],  a_f32.data[base+6u],  a_f32.data[base+7u]);
-        w2 = vec4(a_f32.data[base+8u],  a_f32.data[base+9u],  a_f32.data[base+10u], a_f32.data[base+11u]);
-        w3 = vec4(a_f32.data[base+12u], a_f32.data[base+13u], a_f32.data[base+14u], a_f32.data[base+15u]);
+        w0 = MMA_FVEC4(a_f32.data[base+0u],  a_f32.data[base+1u],  a_f32.data[base+2u],  a_f32.data[base+3u]);
+        w1 = MMA_FVEC4(a_f32.data[base+4u],  a_f32.data[base+5u],  a_f32.data[base+6u],  a_f32.data[base+7u]);
+        w2 = MMA_FVEC4(a_f32.data[base+8u],  a_f32.data[base+9u],  a_f32.data[base+10u], a_f32.data[base+11u]);
+        w3 = MMA_FVEC4(a_f32.data[base+12u], a_f32.data[base+13u], a_f32.data[base+14u], a_f32.data[base+15u]);
     }
 #elif defined(DATA_A_F16)
     const uint base = row_unit_base + (ci << 4u);
@@ -652,13 +697,15 @@ float mma_apply_dense_epilogue(float val, uint d_row, uint d_col, uint d_idx, bo
 #endif
 
 void main() {
-    const uint lane  = gl_LocalInvocationID.x;
-    const uint sgitg = gl_LocalInvocationID.y;
-    const uint tid   = sgitg * 32u + lane;
-    const uint sg_k  = sgitg % NSG;
-    const uint sg_m  = sgitg / NSG;
-    const uint fm    = mma_lane_fm(lane);
-    const uint fn    = mma_lane_fn(lane);
+    const uint lane     = gl_LocalInvocationID.x;
+    const uint sgitg    = gl_LocalInvocationID.y;
+    const uint tid      = sgitg * 32u + lane;
+    const uint sg_k     = (CSG > 1u) ? 0u : (sgitg % NSG);
+    const uint sg_c     = (CSG > 1u) ? (sgitg % CSG) : 0u;
+    const uint sg_m     = (CSG > 1u) ? (sgitg / CSG) : (sgitg / NSG);
+    const uint sg_c_off = sg_c * (8u * RT);
+    const uint fm       = mma_lane_fm(lane);
+    const uint fn       = mma_lane_fn(lane);
 
     const uint wg_m0 = gl_WorkGroupID.x * (8u * NT * MSG);
     const uint sg_m0 = wg_m0 + sg_m * (8u * NT);
@@ -671,27 +718,28 @@ void main() {
         return;
     }
     const uint expert_idx = data_row_map[1u + 2u * tile_idx];
-    const uint row_begin  = tile_idx * (8u * RT);
+    const uint row_begin  = tile_idx * BN_COLS;
     const uint tile_ne1   = data_row_map[2u + 2u * tile_idx];
     if (tile_ne1 == 0u || wg_m0 >= p.M) {
         return;
     }
     const uint n_valid = tile_ne1;
     const uint a_batch_base = expert_idx * (p.batch_stride_a >> MMA_ELEM_SHIFT);
-
-    if (tid < 8u * RT) {
-        const uint c = min(tid, tile_ne1 - 1u);
-        const uint packed = data_row_map[p.row_ids_offset + row_begin + c];
-        const uint slot = packed & 0xFFFFu;
-        const uint tok  = packed >> 16u;
-        sh_r_ids[tid]  = packed;
-        sh_b_base[tid] = tok * p.batch_stride_b + (slot % p.ne11) * p.stride_b;
-        if (FUSE_MODE == 4u) {
-            const uint s0_idx = slot + (((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0_TOK) != 0u) ? (tok * p.nei0) : 0u);
-            sh_col_scale[tid] = data_aux0[s0_idx];
+    if (USE_SH_IDS) {
+        for (uint c_it = tid; c_it < BN_COLS; c_it += WG_THREADS) {
+            const uint c = min(c_it, tile_ne1 - 1u);
+            const uint packed = data_row_map[p.row_ids_offset + row_begin + c];
+            const uint slot = packed & 0xFFFFu;
+            const uint tok  = packed >> 16u;
+            sh_r_ids[c_it]  = packed;
+            sh_b_base[c_it] = tok * p.batch_stride_b + (slot % p.ne11) * p.stride_b;
+            if (FUSE_MODE == 4u) {
+                const uint s0_idx = slot + (((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0_TOK) != 0u) ? (tok * p.nei0) : 0u);
+                sh_col_scale[c_it] = data_aux0[s0_idx];
+            }
         }
+        barrier();
     }
-    barrier();
 #else
     if (wg_m0 >= p.M) {
         return;
@@ -743,10 +791,15 @@ void main() {
         }
     }
 
-    // Cooperative B-tile path when MSG > 1 && USE_SH_B != 0 (NSG == 1, K % 64 == 0)
+    const bool b_is_f16 = (B_IS_F16 != 0u);
+
+    // Cooperative B-tile path when MSG > 1 && USE_SH_B != 0 (NSG == 1, CSG == 1, K % 64 == 0)
     if (MSG > 1u && USE_SH_B != 0u) {
         const bool v4_ok = ((p.stride_b & 3u) == 0u) && ((p.batch_stride_b & 3u) == 0u);
         const uint k4_lane_base = 4u * (fm >> 1u) + 2u * (fm & 1u);
+
+#define MMA_SG_FENCE() controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease)
+#define MMA_NO_FENCE() do {} while (false)
 
 #define MMA_ACCUM_SHB_1D(ACC_VEC, SUB_OFF, W0, W1, W2, W3)                                   \
     do {                                                                                     \
@@ -775,6 +828,7 @@ void main() {
 #define MMA_ACCUM_SHB(MC_ARR, SUB_OFF, W0, W1, W2, W3)                                       \
     do {                                                                                     \
         [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {                                       \
+            if (use_sg_fence) { MMA_SG_FENCE(); }                                            \
             if (rt == 0u || (8u * rt < n_valid)) {                                           \
                 const uint c0 = 8u * rt + fn + 0u;                                           \
                 const uint c1 = 8u * rt + fn + 1u;                                           \
@@ -795,9 +849,6 @@ void main() {
             }                                                                                \
         }                                                                                    \
     } while (false)
-
-#define MMA_SG_FENCE() controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease)
-#define MMA_NO_FENCE() do {} while (false)
 
 #if defined(DATA_A_Q4_K)
 #define MMA_ACCUM_KPAIRS_GEN(LOOP_ATTR, FENCE_MACRO, TARGET_MACRO, TARGET_ARR, USE_U, ROW_BASE)                          \
@@ -977,6 +1028,21 @@ void main() {
     MMA_ACCUM_KPAIRS_GEN([[unroll]], MMA_NO_FENCE, MMA_ACCUM_SHB_1D, ACC_VEC, USE_U, ROW_BASE)
 #define MMA_ACCUM_KPAIRS_FENCED(MC_ARR, USE_U, ROW_BASE) \
     MMA_ACCUM_KPAIRS_GEN([[unroll]], MMA_SG_FENCE, MMA_ACCUM_SHB, MC_ARR, USE_U, ROW_BASE)
+#define MMA_ACCUM_PRELOADED_MB(MC_ARR, SUB_OFF, W0, W1, W2, W3)                              \
+    do {                                                                                     \
+        const uint _kp_i = (SUB_OFF) >> 4u;                                                  \
+        [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {                                       \
+            if (rt == 0u || (8u * rt < n_valid)) {                                           \
+                [[unroll]] for (uint s = 0u; s < 4u; ++s) {                                  \
+                    coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> ma0, ma1;      \
+                    ma0[0] = (W0)[s]; ma0[1] = (W2)[s];                                      \
+                    ma1[0] = (W1)[s]; ma1[1] = (W3)[s];                                      \
+                    MC_ARR[rt][t] = coopMatMulAdd(ma0, mb0_all[_kp_i][rt][s], MC_ARR[rt][t]); \
+                    MC_ARR[rt][t] = coopMatMulAdd(ma1, mb1_all[_kp_i][rt][s], MC_ARR[rt][t]); \
+                }                                                                            \
+            }                                                                                \
+        }                                                                                    \
+    } while (false)
 
         const uint K4_PER_COL = 16u * K_PAIRS;
         const uint K_CHUNK    = 64u * K_PAIRS;
@@ -984,9 +1050,11 @@ void main() {
         const uint B_ELEMS    = K4_PER_COL * 8u * RT;
         const uint B_LOADS    = (B_ELEMS + WG_THREADS - 1u) / WG_THREADS;
 
-        const bool stage_tmp_b = (USE_SH_B == 1u) ? true : ((USE_SH_B == 5u) ? true : (USE_SH_B == 8u));
-        const bool use_sg_fence = (USE_SH_B == 5u) ? true : (USE_SH_B == 6u);
-        const bool load_mb_once = (USE_SH_B == 7u) ? true : (USE_SH_B == 8u);
+        const bool stage_tmp_b    = (USE_SH_B == 1u) ? true : ((USE_SH_B == 5u) ? true : (USE_SH_B == 8u));
+        const bool use_sg_fence   = (USE_SH_B == 5u) ? true : (USE_SH_B == 6u);
+        const bool load_mb_once   = (USE_SH_B == 7u) ? true : ((USE_SH_B == 8u) ? true : (USE_SH_B == 9u));
+        const bool fence_mb_once  = (USE_SH_B != 9u);
+        const bool preload_mb_all = (USE_SH_B == 10u) ? true : (USE_SH_B == 11u);
 
         for (uint g = 0u; g < nch; ++g) {
             if (stage_tmp_b) {
@@ -1002,11 +1070,11 @@ void main() {
                         const uint k4 = idx % K4_PER_COL;
                         if (idx < B_ELEMS && col_in_tile < n_valid) {
 #ifdef MUL_MAT_ID
-                            const uint b_base = sh_b_base[col_in_tile];
+                            const uint b_base = mma_id_col_b_base(row_begin, tile_ne1, col_in_tile);
 #else
                             const uint b_base = b_batch_base + (wg_n0 + col_in_tile) * p.stride_b;
 #endif
-                            tmp_b[li] = MMA_FVEC4(load_b_vec4_aligned_or_scalar(b_base + g * K_CHUNK + (k4 << 2u), v4_ok));
+                            tmp_b[li] = load_b_mvec4(b_base + g * K_CHUNK + (k4 << 2u), v4_ok, b_is_f16);
                         }
                     }
                 }
@@ -1039,11 +1107,11 @@ void main() {
                             MMA_FVEC4 bv = MMA_FVEC4(0.0f);
                             if (col_in_tile < n_valid) {
 #ifdef MUL_MAT_ID
-                                const uint b_base = sh_b_base[col_in_tile];
+                                const uint b_base = mma_id_col_b_base(row_begin, tile_ne1, col_in_tile);
 #else
                                 const uint b_base = b_batch_base + (wg_n0 + col_in_tile) * p.stride_b;
 #endif
-                                bv = MMA_FVEC4(load_b_vec4_aligned_or_scalar(b_base + g * K_CHUNK + (k4 << 2u), v4_ok));
+                                bv = load_b_mvec4(b_base + g * K_CHUNK + (k4 << 2u), v4_ok, b_is_f16);
                             }
                             sh_b[col_in_tile][k4] = bv;
                         }
@@ -1054,7 +1122,7 @@ void main() {
 
             if (load_mb_once) {
                 [[unroll]] for (uint s_kp = 0u; s_kp < K_PAIRS; ++s_kp) {
-                    MMA_SG_FENCE();
+                    if (fence_mb_once) { MMA_SG_FENCE(); }
                     const uint sub_off = (s_kp << 4u) + k4_lane_base;
                     coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> mb0[RT][4];
                     coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> mb1[RT][4];
@@ -1074,10 +1142,10 @@ void main() {
                     }
                     const uint ci_kp = ((g * K_PAIRS + s_kp) << 2u) + (fn >> 1u);
                     [[unroll]] for (uint t = 0u; t < NT; ++t) {
-                        MMA_SG_FENCE();
+                        if (fence_mb_once) { MMA_SG_FENCE(); }
                         MMA_FVEC4 w0, w1, w2, w3;
                         dequant16(FUSE_MODE == 2u && tile_second[t], a_row_base[t], ci_kp, w0, w1, w2, w3);
-                        MMA_SG_FENCE();
+                        if (fence_mb_once) { MMA_SG_FENCE(); }
                         [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {
                             if (rt == 0u || (8u * rt < n_valid)) {
                                 [[unroll]] for (uint s = 0u; s < 4u; ++s) {
@@ -1090,10 +1158,10 @@ void main() {
                             }
                         }
                         if (FUSE_MODE == 3u) {
-                            MMA_SG_FENCE();
+                            if (fence_mb_once) { MMA_SG_FENCE(); }
                             MMA_FVEC4 uw0, uw1, uw2, uw3;
                             dequant16(true, a_row_base[t], ci_kp, uw0, uw1, uw2, uw3);
-                            MMA_SG_FENCE();
+                            if (fence_mb_once) { MMA_SG_FENCE(); }
                             [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {
                                 if (rt == 0u || (8u * rt < n_valid)) {
                                     [[unroll]] for (uint s = 0u; s < 4u; ++s) {
@@ -1108,21 +1176,39 @@ void main() {
                         }
                     }
                 }
-            } else if (K_PAIRS == 1u) {
-                const uint ci = (g << 2u) + (fn >> 1u);
-                [[unroll]] for (uint t = 0u; t < NT; ++t) {
-                    if (use_sg_fence) { MMA_SG_FENCE(); }
-                    MMA_FVEC4 w0, w1, w2, w3;
-                    dequant16(FUSE_MODE == 2u && tile_second[t], a_row_base[t], ci, w0, w1, w2, w3);
-                    if (use_sg_fence) { MMA_SG_FENCE(); }
-                    MMA_ACCUM_SHB(mc, 0u, w0, w1, w2, w3);
-
-                    if (FUSE_MODE == 3u) {
-                        if (use_sg_fence) { MMA_SG_FENCE(); }
-                        MMA_FVEC4 uw0, uw1, uw2, uw3;
-                        dequant16(true, a_row_base[t], ci, uw0, uw1, uw2, uw3);
-                        if (use_sg_fence) { MMA_SG_FENCE(); }
-                        MMA_ACCUM_SHB(mc_u, 0u, uw0, uw1, uw2, uw3);
+            } else if (preload_mb_all) {
+                coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> mb0_all[K_PAIRS][RT][4];
+                coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> mb1_all[K_PAIRS][RT][4];
+                [[unroll]] for (uint s_kp = 0u; s_kp < K_PAIRS; ++s_kp) {
+                    const uint sub_off = (s_kp << 4u) + k4_lane_base;
+                    [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {
+                        if (rt == 0u || (8u * rt < n_valid)) {
+                            const uint c0 = 8u * rt + fn + 0u;
+                            const uint c1 = 8u * rt + fn + 1u;
+                            const MMA_FVEC4 ba0 = sh_b[c0][sub_off + 0u];
+                            const MMA_FVEC4 ba1 = sh_b[c0][sub_off + 1u];
+                            const MMA_FVEC4 bb0 = sh_b[c1][sub_off + 0u];
+                            const MMA_FVEC4 bb1 = sh_b[c1][sub_off + 1u];
+                            [[unroll]] for (uint s = 0u; s < 4u; ++s) {
+                                mb0_all[s_kp][rt][s][0] = ba0[s]; mb0_all[s_kp][rt][s][1] = bb0[s];
+                                mb1_all[s_kp][rt][s][0] = ba1[s]; mb1_all[s_kp][rt][s][1] = bb1[s];
+                            }
+                        }
+                    }
+                }
+                if (USE_SH_B == 11u) {
+                    [[unroll]] for (uint t = 0u; t < NT; ++t) {
+                        MMA_ACCUM_KPAIRS_GEN([[unroll]], MMA_SG_FENCE, MMA_ACCUM_PRELOADED_MB, mc, (FUSE_MODE == 2u && tile_second[t]), a_row_base[t]);
+                        if (FUSE_MODE == 3u) {
+                            MMA_ACCUM_KPAIRS_GEN([[unroll]], MMA_SG_FENCE, MMA_ACCUM_PRELOADED_MB, mc_u, true, a_row_base[t]);
+                        }
+                    }
+                } else {
+                    [[unroll]] for (uint t = 0u; t < NT; ++t) {
+                        MMA_ACCUM_KPAIRS_GEN([[unroll]], MMA_NO_FENCE, MMA_ACCUM_PRELOADED_MB, mc, (FUSE_MODE == 2u && tile_second[t]), a_row_base[t]);
+                        if (FUSE_MODE == 3u) {
+                            MMA_ACCUM_KPAIRS_GEN([[unroll]], MMA_NO_FENCE, MMA_ACCUM_PRELOADED_MB, mc_u, true, a_row_base[t]);
+                        }
                     }
                 }
             } else if (USE_SH_B == 4u) {
@@ -1163,6 +1249,7 @@ void main() {
                 }
             }
         }
+#undef MMA_ACCUM_PRELOADED_MB
 #undef MMA_ACCUM_KPAIRS_FENCED
 #undef MMA_ACCUM_KPAIRS_UNROLLED
 #undef MMA_ACCUM_KPAIRS
@@ -1185,13 +1272,13 @@ void main() {
                 if (rt == 0u || (8u * rt < n_valid)) {
                     [[unroll]] for (uint e = 0u; e < 2u; ++e) {
 #ifdef MUL_MAT_ID
-                        const uint b_base = sh_b_base[min(8u * rt + fn + e, n_valid - 1u)];
+                        const uint b_base = mma_id_col_b_base(row_begin, tile_ne1, min(8u * rt + fn + e, n_valid - 1u));
 #else
                         const uint b_base = b_batch_base + (wg_n0 + min(8u * rt + fn + e, n_valid - 1u)) * p.stride_b;
 #endif
                         const uint base = b_base + (ib << 5u) + b_lane_off;
-                        b0[rt][e] = MMA_FVEC2(load_b_vec2_aligned_or_scalar(base,      v2_ok));
-                        b1[rt][e] = MMA_FVEC2(load_b_vec2_aligned_or_scalar(base + 4u, v2_ok));
+                        b0[rt][e] = load_b_mvec2(base,      v2_ok, b_is_f16);
+                        b1[rt][e] = load_b_mvec2(base + 4u, v2_ok, b_is_f16);
                     }
                 }
             }
@@ -1259,13 +1346,13 @@ void main() {
                 if (rt == 0u || (8u * rt < n_valid)) {
                     [[unroll]] for (uint e = 0u; e < 2u; ++e) {
 #ifdef MUL_MAT_ID
-                        const uint b_base = sh_b_base[min(8u * rt + fn + e, n_valid - 1u)];
+                        const uint b_base = mma_id_col_b_base(row_begin, tile_ne1, min(8u * rt + fn + e, n_valid - 1u));
 #else
                         const uint b_base = b_batch_base + (wg_n0 + min(8u * rt + fn + e, n_valid - 1u)) * p.stride_b;
 #endif
                         const uint base = b_base + (ib << 5u) + b_lane_off;
-                        b0[rt][e] = MMA_FVEC2(load_b_vec2_aligned_or_scalar(base,       v2_ok));
-                        b1[rt][e] = MMA_FVEC2(load_b_vec2_aligned_or_scalar(base + 16u, v2_ok));
+                        b0[rt][e] = load_b_mvec2(base,       v2_ok, b_is_f16);
+                        b1[rt][e] = load_b_mvec2(base + 16u, v2_ok, b_is_f16);
                     }
                 }
             }
@@ -1327,21 +1414,32 @@ void main() {
         const uint b_lane_off = 16u * (fm >> 1u) + 8u * (fm & 1u);
         const uint nch = p.K >> 6u;
 
+        uint base0_rt[RT], base1_rt[RT];
+        [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {
+            if (rt == 0u || (8u * rt < n_valid)) {
+#ifdef MUL_MAT_ID
+                base0_rt[rt] = mma_id_col_b_base(row_begin, tile_ne1, min(8u * rt + fn + 0u, n_valid - 1u)) + b_lane_off;
+                base1_rt[rt] = mma_id_col_b_base(row_begin, tile_ne1, min(8u * rt + fn + 1u, n_valid - 1u)) + b_lane_off;
+#else
+                base0_rt[rt] = b_batch_base + (wg_n0 + min(8u * rt + fn + 0u, n_valid - 1u)) * p.stride_b + b_lane_off;
+                base1_rt[rt] = b_batch_base + (wg_n0 + min(8u * rt + fn + 1u, n_valid - 1u)) * p.stride_b + b_lane_off;
+#endif
+            } else {
+                base0_rt[rt] = 0u;
+                base1_rt[rt] = 0u;
+            }
+        }
+
         for (uint g = sg_k; g < nch; g += NSG) {
             MMA_FVEC4 ba0[RT], ba1[RT], bb0[RT], bb1[RT];
             [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {
                 if (rt == 0u || (8u * rt < n_valid)) {
-#ifdef MUL_MAT_ID
-                    const uint base0 = sh_b_base[min(8u * rt + fn + 0u, n_valid - 1u)] + (g << 6u) + b_lane_off;
-                    const uint base1 = sh_b_base[min(8u * rt + fn + 1u, n_valid - 1u)] + (g << 6u) + b_lane_off;
-#else
-                    const uint base0 = b_batch_base + (wg_n0 + min(8u * rt + fn + 0u, n_valid - 1u)) * p.stride_b + (g << 6u) + b_lane_off;
-                    const uint base1 = b_batch_base + (wg_n0 + min(8u * rt + fn + 1u, n_valid - 1u)) * p.stride_b + (g << 6u) + b_lane_off;
-#endif
-                    ba0[rt] = MMA_FVEC4(load_b_vec4_aligned_or_scalar(base0,      v4_ok));
-                    ba1[rt] = MMA_FVEC4(load_b_vec4_aligned_or_scalar(base0 + 4u, v4_ok));
-                    bb0[rt] = MMA_FVEC4(load_b_vec4_aligned_or_scalar(base1,      v4_ok));
-                    bb1[rt] = MMA_FVEC4(load_b_vec4_aligned_or_scalar(base1 + 4u, v4_ok));
+                    const uint base0 = base0_rt[rt] + (g << 6u);
+                    const uint base1 = base1_rt[rt] + (g << 6u);
+                    ba0[rt] = load_b_mvec4(base0,      v4_ok, b_is_f16);
+                    ba1[rt] = load_b_mvec4(base0 + 4u, v4_ok, b_is_f16);
+                    bb0[rt] = load_b_mvec4(base1,      v4_ok, b_is_f16);
+                    bb1[rt] = load_b_mvec4(base1 + 4u, v4_ok, b_is_f16);
                 }
             }
 
@@ -1391,15 +1489,23 @@ void main() {
     // Store path: when NSG == 1, write directly from registers with ZERO reduction shmem and ZERO barriers!
     if (NSG == 1u) {
         [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {
-            if (rt == 0u || (8u * rt < n_valid)) {
+            if ((CSG == 1u && rt == 0u) || (sg_c_off + 8u * rt < n_valid)) {
                 [[unroll]] for (uint e = 0u; e < 2u; ++e) {
 #ifdef MUL_MAT_ID
-                    const uint col_in_tile = 8u * rt + fn + e;
+                    const uint col_in_tile = sg_c_off + 8u * rt + fn + e;
                     if (col_in_tile < tile_ne1) {
-                        const uint packed = sh_r_ids[col_in_tile];
+                        const uint packed = mma_id_col_packed(row_begin, tile_ne1, col_in_tile);
                         const u16vec2 rid = u16vec2(packed & 0xFFFFu, packed >> 16u);
                         const uint d_col_base = uint(rid.y) * p.batch_stride_d + uint(rid.x) * p.stride_d;
-                        const float col_scale = (FUSE_MODE == 4u) ? sh_col_scale[col_in_tile] : 1.0f;
+                        float col_scale = 1.0f;
+                        if (FUSE_MODE == 4u) {
+                            if (USE_SH_IDS) {
+                                col_scale = sh_col_scale[col_in_tile];
+                            } else {
+                                const uint s0_idx = uint(rid.x) + (((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0_TOK) != 0u) ? (uint(rid.y) * p.nei0) : 0u);
+                                col_scale = data_aux0[s0_idx];
+                            }
+                        }
                         [[unroll]] for (uint t = 0u; t < NT; ++t) {
                             const uint r0 = sg_m0 + 8u * t + fm;
                             if (r0 < p.M) {
@@ -1408,12 +1514,20 @@ void main() {
                                 if (FUSE_MODE == 3u) {
                                     const float u = mc_u[rt][t][e];
                                     val = (val / (1.0f + exp(-val))) * u;
-                                } else if (FUSE_MODE == 4u) {
-                                    val *= col_scale;
-                                } else if (FUSE_MODE == 1u) {
-                                    val = mma_apply_id_epilogue(val, expert_idx, rid, r0, d_idx);
+                                    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_D_F16_AUX1) != 0u) {
+                                        data_d_f16[d_idx] = float16_t(val);
+                                    }
+                                    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SKIP_F32_D) == 0u) {
+                                        data_d[d_idx] = val;
+                                    }
+                                } else {
+                                    if (FUSE_MODE == 4u) {
+                                        val *= col_scale;
+                                    } else if (FUSE_MODE == 1u) {
+                                        val = mma_apply_id_epilogue(val, expert_idx, rid, r0, d_idx);
+                                    }
+                                    data_d[d_idx] = val;
                                 }
-                                data_d[d_idx] = val;
                             }
                         }
                     }
@@ -1459,7 +1573,8 @@ void main() {
         return;
     }
 
-    // NSG > 1 (MSG == 1) reduction through shared memory
+#ifndef MUL_MAT_ID
+    // NSG > 1 (MSG == 1) reduction through shared memory (dense only)
     const uint stride_sg = RT * NT * 64u;
     [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {
         [[unroll]] for (uint t = 0u; t < NT; ++t) {
@@ -1496,26 +1611,6 @@ void main() {
         const uint l_fm = mma_lane_fm(l);
         const uint l_fn = mma_lane_fn(l);
 
-#ifdef MUL_MAT_ID
-        const uint col_in_tile = 8u * rt + l_fn + e;
-        if (col_in_tile < tile_ne1) {
-            const uint packed = sh_r_ids[col_in_tile];
-            const u16vec2 rid = u16vec2(packed & 0xFFFFu, packed >> 16u);
-            const uint r0 = sg_m0 + 8u * t + l_fm;
-            if (r0 < p.M) {
-                const uint d_idx = uint(rid.y) * p.batch_stride_d + uint(rid.x) * p.stride_d + r0;
-                float val = sum;
-                if (FUSE_MODE == 3u) {
-                    val = (val / (1.0f + exp(-val))) * sum_u;
-                } else if (FUSE_MODE == 4u) {
-                    val *= sh_col_scale[col_in_tile];
-                } else if (FUSE_MODE == 1u) {
-                    val = mma_apply_id_epilogue(val, expert_idx, rid, r0, d_idx);
-                }
-                data_d[d_idx] = val;
-            }
-        }
-#else
         const uint col = wg_n0 + 8u * rt + l_fn + e;
         if (col < p.N) {
             const uint tile_r = sg_m0 + 8u * t;
@@ -1548,6 +1643,6 @@ void main() {
                 }
             }
         }
-#endif
     }
+#endif
 }

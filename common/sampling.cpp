@@ -353,6 +353,37 @@ struct common_sampler * common_sampler_init(
 
         bool use_adaptive_p = false; // see below
 
+        const bool greedy = params.n_probs == 0 && !params.samplers.empty() &&
+            ((params.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE && params.temp <= 0.0f && params.dynatemp_range == 0.0f) ||
+             (params.samplers.back() == COMMON_SAMPLER_TYPE_TOP_K && params.top_k == 1));
+
+        bool pure_argmax_chain = greedy && !grmr && !rbudget && !getenv("GGML_VK_DISABLE_GREEDY_FAST");
+        if (pure_argmax_chain) {
+            for (const auto & cnstr : params.samplers) {
+                switch (cnstr) {
+                    case COMMON_SAMPLER_TYPE_TOP_K:
+                        break;
+                    case COMMON_SAMPLER_TYPE_TOP_P:
+                    case COMMON_SAMPLER_TYPE_MIN_P:
+                        if (params.min_keep < 1) { pure_argmax_chain = false; }
+                        break;
+                    case COMMON_SAMPLER_TYPE_TYPICAL_P:
+                        if (params.typ_p < 1.0f) { pure_argmax_chain = false; }
+                        break;
+                    case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                        if (params.top_n_sigma > 0.0f) { pure_argmax_chain = false; }
+                        break;
+                    case COMMON_SAMPLER_TYPE_TEMPERATURE:
+                        if (params.temp > 0.0f || params.dynatemp_range != 0.0f) { pure_argmax_chain = false; }
+                        break;
+                    default:
+                        pure_argmax_chain = false;
+                        break;
+                }
+            }
+        }
+
+        if (!pure_argmax_chain) {
         for (const auto & cnstr : params.samplers) {
             switch (cnstr) {
                 case COMMON_SAMPLER_TYPE_DRY:
@@ -403,14 +434,12 @@ struct common_sampler * common_sampler_init(
                     GGML_ASSERT(false && "unknown sampler type");
             }
         }
+        }
         if (use_adaptive_p) {
             // only if user explicitly included adaptive-p sampler
             samplers.push_back(llama_sampler_init_adaptive_p(params.adaptive_target, params.adaptive_decay, params.seed));
         } else {
             // Keep distribution sampling when callers request probabilities.
-            const bool greedy = params.n_probs == 0 && !params.samplers.empty() &&
-                ((params.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE && params.temp == 0.0f && params.dynatemp_range == 0.0f) ||
-                 (params.samplers.back() == COMMON_SAMPLER_TYPE_TOP_K && params.top_k == 1));
             samplers.push_back(greedy ? llama_sampler_init_greedy() : llama_sampler_init_dist(params.seed));
         }
     } else if (params.mirostat == 1) {
