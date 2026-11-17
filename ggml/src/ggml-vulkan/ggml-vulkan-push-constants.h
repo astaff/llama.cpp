@@ -15,6 +15,20 @@ struct vk_mat_mat_push_constants {
     uint32_t padded_N;
 };
 
+struct vk_mat_mat_fused_push_constants {
+    uint32_t M; uint32_t N; uint32_t K;
+    uint32_t stride_a; uint32_t stride_b; uint32_t stride_d;
+    uint32_t batch_stride_a; uint32_t batch_stride_b; uint32_t batch_stride_d;
+    uint32_t base_work_group_z; uint32_t num_batches;
+    uint32_t k_split;
+    uint32_t ne02; uint32_t ne12; uint32_t broadcast2; uint32_t broadcast3;
+    uint32_t padded_N;
+    uint32_t fusion_flags;
+    uint32_t pair_m0;
+    uint32_t stride_d2;
+    uint32_t batch_stride_d2;
+};
+
 struct vk_mat_vec_push_constants {
     uint32_t ncols;
     uint32_t stride_a;
@@ -25,6 +39,27 @@ struct vk_mat_vec_push_constants {
     uint32_t batch_stride_d;
     uint32_t fusion_flags;
     uint32_t base_work_group_y;
+    uint32_t ne02;
+    uint32_t ne12;
+    uint32_t broadcast2;
+    uint32_t broadcast3;
+    uint32_t pair_m0;
+    uint32_t stride_d2;
+    uint32_t batch_stride_d2;
+};
+
+struct vk_mat_mv_mma_push_constants {
+    uint32_t M;
+    uint32_t N;
+    uint32_t K;
+    uint32_t stride_a;
+    uint32_t stride_b;
+    uint32_t stride_d;
+    uint32_t batch_stride_a;
+    uint32_t batch_stride_b;
+    uint32_t batch_stride_d;
+    uint32_t fusion_flags;
+    uint32_t base_work_group_z;
     uint32_t ne02;
     uint32_t ne12;
     uint32_t broadcast2;
@@ -67,6 +102,16 @@ struct vk_mat_mat_id_push_constants {
     uint32_t nei0; uint32_t nei1; uint32_t nbi1; uint32_t ne11;
     uint32_t n_experts;
     uint32_t row_ids_offset;
+};
+
+struct vk_mat_mat_id_fused_push_constants {
+    uint32_t M; uint32_t N; uint32_t K;
+    uint32_t stride_a; uint32_t stride_b; uint32_t stride_d;
+    uint32_t batch_stride_a; uint32_t batch_stride_b; uint32_t batch_stride_d;
+    uint32_t nei0; uint32_t nei1; uint32_t nbi1; uint32_t ne11;
+    uint32_t n_experts;
+    uint32_t row_ids_offset;
+    uint32_t fusion_flags;
 };
 
 struct vk_mat_vec_id_push_constants {

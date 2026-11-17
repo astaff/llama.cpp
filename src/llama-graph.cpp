@@ -511,7 +511,7 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
 }
 
 int llm_graph_input_rs::gen_compute_identity(const llama_memory_recurrent_context * mctx, int64_t n_seqs, uint32_t n_rs_seq) {
-    static const bool enabled = getenv("GGML_GEN_GDN_INPLACE") != nullptr && atoi(getenv("GGML_GEN_GDN_INPLACE")) != 0;
+    static const bool enabled = getenv("GGML_GEN_GDN_INPLACE") ? (atoi(getenv("GGML_GEN_GDN_INPLACE")) != 0) : true;
     if (!enabled) {
         return -1;
     }
