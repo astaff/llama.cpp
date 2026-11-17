@@ -14,8 +14,9 @@ FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
 void calc_superblock(const uint a_offset, const uint b_offset, const uint ib32, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
     const uint y_idx = i * QUANT_K + 32 * ib32;
 
-    uint ibi = a_offset + first_row * num_blocks_per_row + i;
-    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        const uint rn = (n == 0 || n < num_rows) ? n : 0;
+        const uint ibi = a_offset + (first_row + rn) * num_blocks_per_row + i;
         const float d = float(data_a[ibi].d);
         const uint sl = (data_a[ibi].scales_l[ib32/2] >> (4 * (ib32 & 1))) & 0xF;
         const uint sh = (data_a[ibi].scales_h >> (2 * ib32)) & 3;
@@ -50,8 +51,6 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint ib32, 
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
             temp[j][n] = fma(dscale, sum[j], temp[j][n]);
         }
-
-        ibi += num_blocks_per_row;
     }
 }
 
@@ -74,7 +73,7 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
         }
     }
 
-    [[unroll]] for (uint i = ix; i < num_blocks_per_row; i += blocks_per_wg)
+    for (uint i = ix; i < num_blocks_per_row; i += blocks_per_wg)
         calc_superblock(a_offset, b_offset, itid, i, num_blocks_per_row, first_row, num_rows);
 
     reduce_result(temp, d_offset, first_row, num_rows, tid);
@@ -85,13 +84,8 @@ void main() {
 
     init_iq_shmem(gl_WorkGroupSize);
 
-    // do NUM_ROWS at a time, unless there aren't enough remaining rows
-    if (first_row + NUM_ROWS <= p.stride_d) {
-        compute_outputs(first_row, NUM_ROWS);
-    } else {
-        if (first_row >= p.stride_d) {
-            return;
-        }
-        compute_outputs(first_row, p.stride_d - first_row);
+    if (first_row >= p.stride_d) {
+        return;
     }
+    compute_outputs(first_row, min(NUM_ROWS, p.stride_d - first_row));
 }
