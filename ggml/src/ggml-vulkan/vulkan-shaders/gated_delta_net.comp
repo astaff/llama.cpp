@@ -17,6 +17,7 @@ layout(constant_id = 2) const uint SUBGROUP_SIZE = 32;
 layout(constant_id = 3) const uint LANES_PER_COLUMN = 32;
 layout(constant_id = 4) const bool PACKED_ROWS = false;
 layout(constant_id = 5) const uint REPLAY = 0;
+layout(constant_id = 6) const uint COLS_PER_SUB = 1;
 
 const uint COLS_PER_WG = SUBGROUP_SIZE / LANES_PER_COLUMN;
 const uint ROWS_PER_LANE = S_V / LANES_PER_COLUMN;
@@ -47,6 +48,7 @@ layout(push_constant) uniform Parameters {
     uint spk1, spk2, spk3;
     uint spv1, spv2, spv3;
     uint spg1, spg2, spg3;
+    uint sout_nb2;
 };
 
 layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
@@ -120,7 +122,7 @@ void main() {
     const uint head_id = gl_WorkGroupID.x;
     const uint seq_id = gl_WorkGroupID.y;
     const uint lane = gl_SubgroupInvocationID % LANES_PER_COLUMN;
-    const uint col = gl_WorkGroupID.z * COLS_PER_WG + (gl_SubgroupInvocationID / LANES_PER_COLUMN);
+    const uint col_base = (gl_WorkGroupID.z * COLS_PER_SUB) * COLS_PER_WG + (gl_SubgroupInvocationID / LANES_PER_COLUMN);
 
     const uint iq1 = head_id % neq1;
     const uint iq3 = seq_id / rq3;
@@ -132,9 +134,12 @@ void main() {
     const uint state_out_base      = (seq_id * H + head_id) * state_size;
     const uint state_size_per_snap = state_size * H * n_seqs;
 
-    FLOAT_TYPE s_shard[ROWS_PER_LANE];
-    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-        s_shard[r] = FLOAT_TYPE(data_state[state_in_base + col * S_V + row_index(r, lane)]);
+    FLOAT_TYPE s_shard[COLS_PER_SUB * ROWS_PER_LANE];
+    [[unroll]] for (uint c = 0; c < COLS_PER_SUB; c++) {
+        const uint col = col_base + c * COLS_PER_WG;
+        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+            s_shard[c * ROWS_PER_LANE + r] = FLOAT_TYPE(data_state[state_in_base + col * S_V + row_index(r, lane)]);
+        }
     }
 
     if (REPLAY != 0) {
@@ -163,25 +168,32 @@ void main() {
                 }
             }
 
-            const FLOAT_TYPE v_val = FLOAT_TYPE(data_pv[v_off + col]);
+            [[unroll]] for (uint c = 0; c < COLS_PER_SUB; c++) {
+                const uint col = col_base + c * COLS_PER_WG;
+                const uint sb = c * ROWS_PER_LANE;
+                const FLOAT_TYPE v_val = FLOAT_TYPE(data_pv[v_off + col]);
 
-            // same update as below, without the attention output
-            FLOAT_TYPE kv_shard = 0.0;
-            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-                kv_shard += g_exp[r] * s_shard[r] * k_reg[r];
-            }
-            FLOAT_TYPE kv_col = reduce_partial(kv_shard);
+                // same update as below, without the attention output
+                FLOAT_TYPE kv_shard = 0.0;
+                [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                    kv_shard += g_exp[r] * s_shard[sb + r] * k_reg[r];
+                }
+                FLOAT_TYPE kv_col = reduce_partial(kv_shard);
 
-            FLOAT_TYPE delta_col = (v_val - kv_col) * beta_val;
+                FLOAT_TYPE delta_col = (v_val - kv_col) * beta_val;
 
-            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-                s_shard[r] = g_exp[r] * s_shard[r] + k_reg[r] * delta_col;
+                [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                    s_shard[sb + r] = g_exp[r] * s_shard[sb + r] + k_reg[r] * delta_col;
+                }
             }
         }
 
         if (keep != 0) {
-            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-                data_dst[s_off + state_out_base + col * S_V + row_index(r, lane)] = s_shard[r];
+            [[unroll]] for (uint c = 0; c < COLS_PER_SUB; c++) {
+                const uint col = col_base + c * COLS_PER_WG;
+                [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                    data_dst[s_off + state_out_base + col * S_V + row_index(r, lane)] = s_shard[c * ROWS_PER_LANE + r];
+                }
             }
         }
     }
@@ -199,46 +211,85 @@ void main() {
         const FLOAT_TYPE beta_val = FLOAT_TYPE(data_beta[gb_off]);
 
         FLOAT_TYPE k_reg[ROWS_PER_LANE];
-        FLOAT_TYPE q_reg[ROWS_PER_LANE];
         [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
             const uint i = row_index(r, lane);
             k_reg[r] = FLOAT_TYPE(data_k[k_off + i]);
-            q_reg[r] = FLOAT_TYPE(data_q[q_off + i]);
         }
 
-        FLOAT_TYPE g_exp[ROWS_PER_LANE];
         if (KDA == 0) {
             const FLOAT_TYPE g_val = exp(FLOAT_TYPE(data_g[gb_off]));
-            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-                g_exp[r] = g_val;
+            [[unroll]] for (uint c = 0; c < COLS_PER_SUB; c++) {
+                const uint col = col_base + c * COLS_PER_WG;
+                const uint sb = c * ROWS_PER_LANE;
+                const FLOAT_TYPE v_val = FLOAT_TYPE(data_v[v_off + col]);
+
+                FLOAT_TYPE kv_shard = 0.0;
+                [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                    kv_shard += g_val * s_shard[sb + r] * k_reg[r];
+                }
+                FLOAT_TYPE kv_col = reduce_partial(kv_shard);
+                FLOAT_TYPE delta_col = (v_val - kv_col) * beta_val;
+
+                [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                    s_shard[sb + r] = g_val * s_shard[sb + r] + k_reg[r] * delta_col;
+                }
             }
         } else {
+            FLOAT_TYPE g_exp[ROWS_PER_LANE];
             const uint g_base = gb_off * S_V;
             [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
                 const uint i = row_index(r, lane);
                 g_exp[r] = exp(FLOAT_TYPE(data_g[g_base + i]));
             }
+            [[unroll]] for (uint c = 0; c < COLS_PER_SUB; c++) {
+                const uint col = col_base + c * COLS_PER_WG;
+                const uint sb = c * ROWS_PER_LANE;
+                const FLOAT_TYPE v_val = FLOAT_TYPE(data_v[v_off + col]);
+
+                FLOAT_TYPE kv_shard = 0.0;
+                [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                    kv_shard += g_exp[r] * s_shard[sb + r] * k_reg[r];
+                }
+                FLOAT_TYPE kv_col = reduce_partial(kv_shard);
+                FLOAT_TYPE delta_col = (v_val - kv_col) * beta_val;
+
+                [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                    s_shard[sb + r] = g_exp[r] * s_shard[sb + r] + k_reg[r] * delta_col;
+                }
+            }
         }
 
-        const FLOAT_TYPE v_val = FLOAT_TYPE(data_v[v_off + col]);
+        if (COLS_PER_SUB == 1u) {
+            FLOAT_TYPE attn_partial = 0.0;
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                const uint i = row_index(r, lane);
+                attn_partial += s_shard[r] * FLOAT_TYPE(data_q[q_off + i]);
+            }
+            FLOAT_TYPE attn_col = reduce_partial(attn_partial);
 
-        FLOAT_TYPE kv_shard = 0.0;
-        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-            kv_shard += g_exp[r] * s_shard[r] * k_reg[r];
-        }
-        FLOAT_TYPE kv_col = reduce_partial(kv_shard);
+            if (lane == 0) {
+                data_dst[attn_off + col_base] = attn_col * scale;
+            }
+        } else {
+            FLOAT_TYPE q_reg[ROWS_PER_LANE];
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                const uint i = row_index(r, lane);
+                q_reg[r] = FLOAT_TYPE(data_q[q_off + i]);
+            }
 
-        FLOAT_TYPE delta_col = (v_val - kv_col) * beta_val;
+            [[unroll]] for (uint c = 0; c < COLS_PER_SUB; c++) {
+                const uint col = col_base + c * COLS_PER_WG;
+                const uint sb = c * ROWS_PER_LANE;
+                FLOAT_TYPE attn_partial = 0.0;
+                [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                    attn_partial += s_shard[sb + r] * q_reg[r];
+                }
+                FLOAT_TYPE attn_col = reduce_partial(attn_partial);
 
-        FLOAT_TYPE attn_partial = 0.0;
-        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-            s_shard[r] = g_exp[r] * s_shard[r] + k_reg[r] * delta_col;
-            attn_partial += s_shard[r] * q_reg[r];
-        }
-        FLOAT_TYPE attn_col = reduce_partial(attn_partial);
-
-        if (lane == 0) {
-            data_dst[attn_off + col] = attn_col * scale;
+                if (lane == 0) {
+                    data_dst[attn_off + col] = attn_col * scale;
+                }
+            }
         }
 
         attn_off += S_V * H;
@@ -246,22 +297,38 @@ void main() {
         if (K > 1u) {
             const int target_slot = int(n_tokens) - 1 - int(t);
             if (target_slot >= 0 && target_slot < int(K)) {
-                const uint slot_base = s_off + uint(target_slot) * state_size_per_snap + state_out_base;
-                [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-                    data_dst[slot_base + col * S_V + row_index(r, lane)] = s_shard[r];
+#if STATE_OUT
+                const uint slot_base = uint(target_slot) * sout_nb2 + state_out_base;
+                [[unroll]] for (uint c = 0; c < COLS_PER_SUB; c++) {
+                    const uint col = col_base + c * COLS_PER_WG;
+                    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                        data_state_out[slot_base + col * S_V + row_index(r, lane)] = s_shard[c * ROWS_PER_LANE + r];
+                    }
                 }
+#else
+                const uint slot_base = s_off + uint(target_slot) * state_size_per_snap + state_out_base;
+                [[unroll]] for (uint c = 0; c < COLS_PER_SUB; c++) {
+                    const uint col = col_base + c * COLS_PER_WG;
+                    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                        data_dst[slot_base + col * S_V + row_index(r, lane)] = s_shard[c * ROWS_PER_LANE + r];
+                    }
+                }
+#endif
             }
         }
     }
 
     // replay with keep: the state output is the state after the replay
     if (K == 1u && !(REPLAY != 0 && keep != 0)) {
-        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+        [[unroll]] for (uint c = 0; c < COLS_PER_SUB; c++) {
+            const uint col = col_base + c * COLS_PER_WG;
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
 #if STATE_OUT
-            data_state_out[state_out_base + col * S_V + row_index(r, lane)] = s_shard[r];
+                data_state_out[state_out_base + col * S_V + row_index(r, lane)] = s_shard[c * ROWS_PER_LANE + r];
 #else
-            data_dst[s_off + state_out_base + col * S_V + row_index(r, lane)] = s_shard[r];
+                data_dst[s_off + state_out_base + col * S_V + row_index(r, lane)] = s_shard[c * ROWS_PER_LANE + r];
 #endif
+            }
         }
     }
 }

@@ -232,9 +232,9 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
 #define VK_LOG_DEBUG(msg) ((void) 0)
 #endif // GGML_VULKAN_DEBUG
 
-#define MAX_PARAMETER_COUNT 12
+#define MAX_PARAMETER_COUNT 13
 
-#define MAX_FUSED_ADDS (MAX_PARAMETER_COUNT - 3)
+#define MAX_FUSED_ADDS 9
 
 #define GGML_VK_GDN_CM_V 64u
 #define GGML_VK_GDN_CM2_V 32u
@@ -897,6 +897,7 @@ struct vk_device_struct {
     // indexed by num_additional_fused_ops == num_adds - 1
     vk_pipeline pipeline_multi_add[MAX_FUSED_ADDS];
     vk_pipeline pipeline_multi_add_rms[MAX_FUSED_ADDS];
+    vk_pipeline pipeline_multi_add_rms_mul[MAX_FUSED_ADDS][2][2];
 
     vk_pipeline pipeline_add_id_f32;
 
@@ -905,6 +906,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_upscale_nearest_f32, pipeline_upscale_bilinear_f32, pipeline_upscale_bicubic_f32, pipeline_upscale_bilinear_antialias_f32;
     // [src/dst 0=fp32,1=fp16,2=bf16]
     vk_pipeline pipeline_scale[3];
+    vk_pipeline pipeline_scale_zero_f32;
     vk_pipeline pipeline_log[3];
     vk_pipeline pipeline_tri[3];
     vk_pipeline pipeline_diag[3];
@@ -1035,6 +1037,12 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
+    vk_pipeline pipeline_ssm_conv_1t_f32;
+    vk_pipeline pipeline_ssm_conv_silu_1t_f32;
+    vk_pipeline pipeline_ssm_conv_sout_f32;
+    vk_pipeline pipeline_ssm_conv_silu_sout_f32;
+    vk_pipeline pipeline_ssm_conv_concat_cpy_f32;
+    vk_pipeline pipeline_ssm_conv_concat_cpy_silu_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -1181,6 +1189,9 @@ typedef std::vector<vk_submission> vk_sequence;
 #define MAT_VEC_FUSION_FLAGS_PAIR_GLU 0x400 // gen: gate+up+swiglu in one mat-vec/mat-vec-id dispatch
 #define MAT_VEC_FUSION_FLAGS_PAIR_MM 0x800 // gen: two mat-vecs sharing src1 in one dispatch
 #define MAT_VEC_FUSION_FLAGS_PAIR_MM_SIGMOID1 0x1000 // gen: sigmoid epilogue on second mat-vec output
+#define MAT_VEC_FUSION_FLAGS_SCALE0_TOK 0x2000 // s10: MUL_MAT_ID SCALE0 indexed per (slot, token)
+#define MAT_VEC_FUSION_FLAGS_SCALE1_TOK 0x4000 // s10: MUL_MAT_ID SCALE1 indexed per (slot, token)
+#define MAT_VEC_FUSION_FLAGS_COL_SPLIT 0x8000 // s10: multi-column batch_n split across y workgroups
 
 struct vk_staging_memcpy {
     vk_staging_memcpy(void * _dst, const void * _src, size_t _n) : dst(_dst), src(_src), n(_n) {}
@@ -1320,6 +1331,36 @@ class vk_perf_logger {
     uint32_t print_count {};
 };
 
+static constexpr uint32_t VK_PREALLOC_RING = 4;
+static constexpr size_t   VK_REPLAY_CACHE_MAX = 8;
+
+struct vk_graph_replay_entry {
+    uint64_t hash1 {};
+    uint64_t hash2 {};
+    uint64_t destroy_count {};
+    uint64_t pre_x_handle {}, pre_y_handle {}, pre_sk_handle {}, pre_arp_handle {};
+    size_t   pre_x_size {}, pre_y_size {}, pre_sk_size {}, pre_arp_size {};
+    uint32_t stable_runs {};
+    uint64_t lru_tick {};
+    bool     ready {};
+
+    std::vector<uint64_t> sig_words;
+
+    vk_command_pool cmd_pool;
+    vk::CommandBuffer cmd_buf {};
+    std::vector<vk_staging_memset> memsets;
+
+    std::vector<vk::DescriptorPool> descriptor_pools;
+    std::vector<vk::DescriptorSet> descriptor_sets;
+    std::vector<std::vector<vk::DescriptorBufferInfo>> descriptor_set_bindings;
+    uint64_t descriptor_destroy_count {};
+
+    uint64_t total_flops {};
+    uint64_t stat_dispatches {};
+    uint64_t stat_syncs {};
+    double   ema_gpu_us {};
+};
+
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -1335,6 +1376,7 @@ struct ggml_backend_vk_context {
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
+    bool fence_submitted {};
     bool almost_ready_fence_pending {};
     // Set before op_add and unset after op_rms_norm to indicate that the add should
     // write partial sums to accumulate the square of the vector components
@@ -1348,6 +1390,8 @@ struct ggml_backend_vk_context {
     const ggml_tensor * gen_gdn_state_out {};
     // gen: RMS_NORM_SCALE writes into this SCALE node (found a few nodes later, which is then skipped)
     const ggml_tensor * gen_rms_scale_dst {};
+    const ggml_tensor * gen_rms_scale_dst2 {};
+    const ggml_tensor * gen_rms_scale_rsrc2 {};
     // gen: dense MUL_MAT forward-elision epilogue target and auxiliary inputs (GGML_GEN_FUSE=mmgate,shexp)
     const ggml_tensor * gen_mm_dst {};
     const ggml_tensor * gen_mm_f0 {};
@@ -1356,6 +1400,24 @@ struct ggml_backend_vk_context {
     // gen: paired dense MUL_MAT sharing src1 (GGML_GEN_FUSE=pairmm)
     const ggml_tensor * gen_pair_mm1 {};
     const ggml_tensor * gen_pair_dst1 {};
+    int gen_pair_mul0_rel {};
+    // Series 10: SSM_CONV fusion (mode 1 = CONCAT_SLIDING, mode 2 = WRITE_STATE_OUT, mode 3 = CONCAT_SLIDING_ROLLBACK)
+    int s10_ssm_conv_mode {};
+    const ggml_tensor * s10_ssm_state_out {};
+    const ggml_tensor * s10_ssm_old_st {};
+    const ggml_tensor * s10_ssm_qkv {};
+    const ggml_tensor * s10_ssm_conv_node {};
+    uint32_t s10_ssm_st_k {};
+    uint32_t s10_ssm_st_slot_nb {};
+    // Series 10: MULTI_ADD + RMS_NORM + [MUL] fusion
+    const ggml_tensor * s10_add_rms_dst {};
+    const ggml_tensor * s10_add_rms_weight {};
+    const ggml_tensor * s10_add_rms_add_dst {};
+    float    s10_add_rms_eps {};
+    uint32_t s10_add_rms_num_adds {};
+    uint32_t s10_add_rms_tree_mode {};
+    uint32_t s10_add_rms_write_add {};
+    const ggml_tensor * s10_add_rms_srcs[10] {};
     uint32_t gen_n1_partials_offset {};
     uint64_t stat_syncs {};
 
@@ -1364,6 +1426,45 @@ struct ggml_backend_vk_context {
     const ggml_tensor * prealloc_y_last_tensor_used {};
     // True when the K dimension in prealloc_y is padded.
     bool prealloc_y_last_k_padded {};
+
+    // Series 9: K=4 ring-sliced prealloc_y and prealloc_split_k to eliminate WAR drain barriers
+    uint32_t prealloc_y_ring_idx {};
+    size_t   prealloc_y_ring_stride {};
+    uint32_t prealloc_y_ring_count {1};
+    bool     prealloc_y_slot_need_sync[VK_PREALLOC_RING] {};
+    vk_pipeline_struct * prealloc_y_last_pipeline_ring[VK_PREALLOC_RING] {};
+    const ggml_tensor *  prealloc_y_last_tensor_ring[VK_PREALLOC_RING] {};
+    bool                 prealloc_y_last_k_padded_ring[VK_PREALLOC_RING] {};
+
+    uint32_t prealloc_split_k_ring_idx {};
+    size_t   prealloc_split_k_ring_stride {};
+    uint32_t prealloc_split_k_ring_count {1};
+    bool     prealloc_split_k_slot_need_sync[VK_PREALLOC_RING] {};
+
+    // Series 9: Reuse count_experts output across MoE projections sharing non-negative ARGSORT ids
+    const ggml_tensor * last_expert_ids_tensor {};
+    uint32_t            last_expert_bn {};
+    uint32_t            last_expert_row_ids_offset {};
+    uint32_t            last_expert_n_as {};
+    uint32_t            last_expert_slot {};
+    vk_subbuffer        last_expert_count_buf {};
+    bool                last_expert_count_valid {};
+
+    // Series 9: Single-Front reusable command buffer LRU cache + zero-submit UMA async readbacks
+    std::vector<vk_graph_replay_entry> replay_cache;
+    uint64_t replay_lru_clock {};
+    uint64_t replay_probation_h1[8] {};
+    uint64_t replay_probation_h2[8] {};
+    uint64_t replay_probation_destroy[8] {};
+    uint32_t replay_probation_clock {};
+    uint32_t replay_consec_misses {};
+    int32_t  replay_miss_n_nodes {};
+    bool     recording_replay {};
+    bool     replay_abort {};
+    vk_command_pool * active_replay_cmd_pool {};
+    vk_graph_replay_entry * active_replay_entry {};
+    int64_t  replay_submit_us {};
+    std::vector<vk_staging_memcpy> uma_out_memcpys;
 
     // Track which nodes have been used since the last sync, and whether they were written to
     std::vector<const ggml_tensor *> unsynced_nodes_written;

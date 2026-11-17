@@ -24,18 +24,13 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
     const FLOAT_TYPE PFX##_sc3 = FLOAT_TYPE(ARR_A[ib0 + i].scales[s_offset + 6]); \
     const FLOAT_TYPE PFX##_d   = FLOAT_TYPE(ARR_A[ib0 + i].d)
 
-#define DOT_Q6_K_16(PFX, DST_TEMP) do { \
-    const uint b4 = (j * p.batch_stride_b + b_offset + y_idx) / 4; \
-    const vec4 by0  = vec4(data_b_v4[b4     ]); \
-    const vec4 by32 = vec4(data_b_v4[b4 +  8]); \
-    const vec4 by64 = vec4(data_b_v4[b4 + 16]); \
-    const vec4 by96 = vec4(data_b_v4[b4 + 24]); \
+#define DOT_Q6_K_16_WITH_BY(PFX, DST_TEMP, BY0, BY32, BY64, BY96) do { \
     FLOAT_TYPE sum[4] = {0, 0, 0, 0}; \
     [[unroll]] for (uint l = 0; l < 4; ++l) { \
-        sum[0] = fma(FLOAT_TYPE(by0[l]),  PFX##_q0[l], sum[0]); \
-        sum[1] = fma(FLOAT_TYPE(by32[l]), PFX##_q1[l], sum[1]); \
-        sum[2] = fma(FLOAT_TYPE(by64[l]), PFX##_q2[l], sum[2]); \
-        sum[3] = fma(FLOAT_TYPE(by96[l]), PFX##_q3[l], sum[3]); \
+        sum[0] = fma(FLOAT_TYPE((BY0)[l]),  PFX##_q0[l], sum[0]); \
+        sum[1] = fma(FLOAT_TYPE((BY32)[l]), PFX##_q1[l], sum[1]); \
+        sum[2] = fma(FLOAT_TYPE((BY64)[l]), PFX##_q2[l], sum[2]); \
+        sum[3] = fma(FLOAT_TYPE((BY96)[l]), PFX##_q3[l], sum[3]); \
     } \
     DST_TEMP[j][n] = fma(fma(sum[0], PFX##_sc0, fma(sum[1], PFX##_sc1, fma(sum[2], PFX##_sc2, sum[3] * PFX##_sc3))), PFX##_d, DST_TEMP[j][n]); \
 } while (false)
@@ -43,16 +38,48 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 void calc_superblock_a(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_TYPE temp2[NUM_COLS][NUM_ROWS], const uint a_offset, const uint b_offset, const uint ql_offset, const uint qh_offset, const uint s_offset, const uint y_offset, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
     const uint y_idx = i * QUANT_K + y_offset;
 
-    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-        const uint ib0 = a_offset + (first_row + n) * num_blocks_per_row;
-        LOAD_Q6_K_16(a1, data_a, data_a_packed16);
+    if (NUM_COLS <= 4) {
+        vec4 by0_a[4], by32_a[4], by64_a[4], by96_a[4];
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-            DOT_Q6_K_16(a1, temp);
+            const uint b4 = (j * p.batch_stride_b + b_offset + y_idx) / 4;
+            by0_a[j]  = vec4(data_b_v4[b4     ]);
+            by32_a[j] = vec4(data_b_v4[b4 +  8]);
+            by64_a[j] = vec4(data_b_v4[b4 + 16]);
+            by96_a[j] = vec4(data_b_v4[b4 + 24]);
         }
-        if (GEN_GLU == 3) {
-            LOAD_Q6_K_16(a2, data_a2, data_a2_packed16);
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint rn = (n == 0 || n < num_rows) ? n : 0;
+            const uint ib0 = a_offset + (first_row + rn) * num_blocks_per_row;
+            LOAD_Q6_K_16(a1, data_a, data_a_packed16);
             [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-                DOT_Q6_K_16(a2, temp2);
+                DOT_Q6_K_16_WITH_BY(a1, temp, by0_a[j], by32_a[j], by64_a[j], by96_a[j]);
+            }
+            if (GEN_GLU == 3) {
+                LOAD_Q6_K_16(a2, data_a2, data_a2_packed16);
+                [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                    DOT_Q6_K_16_WITH_BY(a2, temp2, by0_a[j], by32_a[j], by64_a[j], by96_a[j]);
+                }
+            }
+        }
+    } else {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint rn = (n == 0 || n < num_rows) ? n : 0;
+            const uint ib0 = a_offset + (first_row + rn) * num_blocks_per_row;
+            LOAD_Q6_K_16(a1, data_a, data_a_packed16);
+            if (GEN_GLU == 3) {
+                LOAD_Q6_K_16(a2, data_a2, data_a2_packed16);
+                [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                    const uint b4 = (j * p.batch_stride_b + b_offset + y_idx) / 4;
+                    const vec4 by0 = vec4(data_b_v4[b4]), by32 = vec4(data_b_v4[b4 + 8]), by64 = vec4(data_b_v4[b4 + 16]), by96 = vec4(data_b_v4[b4 + 24]);
+                    DOT_Q6_K_16_WITH_BY(a1, temp,  by0, by32, by64, by96);
+                    DOT_Q6_K_16_WITH_BY(a2, temp2, by0, by32, by64, by96);
+                }
+            } else {
+                [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                    const uint b4 = (j * p.batch_stride_b + b_offset + y_idx) / 4;
+                    const vec4 by0 = vec4(data_b_v4[b4]), by32 = vec4(data_b_v4[b4 + 8]), by64 = vec4(data_b_v4[b4 + 16]), by96 = vec4(data_b_v4[b4 + 24]);
+                    DOT_Q6_K_16_WITH_BY(a1, temp, by0, by32, by64, by96);
+                }
             }
         }
     }
@@ -61,11 +88,33 @@ void calc_superblock_a(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_TY
 void calc_superblock_a2(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint a_offset, const uint b_offset, const uint ql_offset, const uint qh_offset, const uint s_offset, const uint y_offset, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
     const uint y_idx = i * QUANT_K + y_offset;
 
-    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-        const uint ib0 = a_offset + (first_row + n) * num_blocks_per_row;
-        LOAD_Q6_K_16(a2, data_a2, data_a2_packed16);
+    if (NUM_COLS <= 4) {
+        vec4 by0_a[4], by32_a[4], by64_a[4], by96_a[4];
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-            DOT_Q6_K_16(a2, temp);
+            const uint b4 = (j * p.batch_stride_b + b_offset + y_idx) / 4;
+            by0_a[j]  = vec4(data_b_v4[b4     ]);
+            by32_a[j] = vec4(data_b_v4[b4 +  8]);
+            by64_a[j] = vec4(data_b_v4[b4 + 16]);
+            by96_a[j] = vec4(data_b_v4[b4 + 24]);
+        }
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint rn = (n == 0 || n < num_rows) ? n : 0;
+            const uint ib0 = a_offset + (first_row + rn) * num_blocks_per_row;
+            LOAD_Q6_K_16(a2, data_a2, data_a2_packed16);
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                DOT_Q6_K_16_WITH_BY(a2, temp, by0_a[j], by32_a[j], by64_a[j], by96_a[j]);
+            }
+        }
+    } else {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint rn = (n == 0 || n < num_rows) ? n : 0;
+            const uint ib0 = a_offset + (first_row + rn) * num_blocks_per_row;
+            LOAD_Q6_K_16(a2, data_a2, data_a2_packed16);
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                const uint b4 = (j * p.batch_stride_b + b_offset + y_idx) / 4;
+                const vec4 by0 = vec4(data_b_v4[b4]), by32 = vec4(data_b_v4[b4 + 8]), by64 = vec4(data_b_v4[b4 + 16]), by96 = vec4(data_b_v4[b4 + 24]);
+                DOT_Q6_K_16_WITH_BY(a2, temp, by0, by32, by64, by96);
+            }
         }
     }
 }
@@ -99,8 +148,9 @@ void calc_superblock_a2(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint a_
 
 void calc_superblock_8_a(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_TYPE temp2[NUM_COLS][NUM_ROWS], const uint a_offset, const uint b_offset, const uint itid8, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
     const uint y_idx = i * QUANT_K + 4 * itid8;
-    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-        const uint ib = a_offset + (first_row + n) * num_blocks_per_row + i;
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        const uint rn = (n == 0 || n < num_rows) ? n : 0;
+        const uint ib = a_offset + (first_row + rn) * num_blocks_per_row + i;
         RUN_Q6_K_8(data_a, data_a_packed16, temp);
         if (GEN_GLU == 3) {
             RUN_Q6_K_8(data_a2, data_a2_packed16, temp2);
@@ -110,8 +160,9 @@ void calc_superblock_8_a(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_
 
 void calc_superblock_8_a2(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint a_offset, const uint b_offset, const uint itid8, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
     const uint y_idx = i * QUANT_K + 4 * itid8;
-    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-        const uint ib = a_offset + (first_row + n) * num_blocks_per_row + i;
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        const uint rn = (n == 0 || n < num_rows) ? n : 0;
+        const uint ib = a_offset + (first_row + rn) * num_blocks_per_row + i;
         RUN_Q6_K_8(data_a2, data_a2_packed16, temp);
     }
 }
@@ -122,9 +173,11 @@ void compute_outputs(const uint first_row, const uint num_rows) {
 #ifndef MUL_MAT_ID
     const bool use_a2   = (GEN_GLU == 2) && (first_row >= p.pair_m0);
     const uint row_base = use_a2 ? (first_row - p.pair_m0) : first_row;
+    const uint eff_rows = (!use_a2 && GEN_GLU == 2) ? min(num_rows, p.pair_m0 - first_row) : num_rows;
 #else
     const bool use_a2   = false;
     const uint row_base = first_row;
+    const uint eff_rows = num_rows;
 #endif
 
     const uint num_blocks_per_row = p.ncols / QUANT_K;
@@ -152,12 +205,12 @@ void compute_outputs(const uint first_row, const uint num_rows) {
         const uint itid8 = tid & 7;
         const uint ix8 = tid >> 3;
         if (GEN_GLU == 2 && use_a2) {
-            [[unroll]] for (uint i = ix8; i < num_blocks_per_row; i += it_size8) {
-                calc_superblock_8_a2(temp, a_offset, b_offset, itid8, i, num_blocks_per_row, row_base, num_rows);
+            for (uint i = ix8; i < num_blocks_per_row; i += it_size8) {
+                calc_superblock_8_a2(temp, a_offset, b_offset, itid8, i, num_blocks_per_row, row_base, eff_rows);
             }
         } else {
-            [[unroll]] for (uint i = ix8; i < num_blocks_per_row; i += it_size8) {
-                calc_superblock_8_a(temp, temp2, a_offset, b_offset, itid8, i, num_blocks_per_row, row_base, num_rows);
+            for (uint i = ix8; i < num_blocks_per_row; i += it_size8) {
+                calc_superblock_8_a(temp, temp2, a_offset, b_offset, itid8, i, num_blocks_per_row, row_base, eff_rows);
             }
         }
     } else {
@@ -178,26 +231,26 @@ void compute_outputs(const uint first_row, const uint num_rows) {
         const uint y_offset = 128*v_im + l0;
 
         if (GEN_GLU == 2 && use_a2) {
-            [[unroll]] for (uint i = ix; i < num_blocks_per_row; i += it_size) {
-                calc_superblock_a2(temp, a_offset, b_offset, ql_offset, qh_offset, s_offset, y_offset, i, num_blocks_per_row, row_base, num_rows);
+            for (uint i = ix; i < num_blocks_per_row; i += it_size) {
+                calc_superblock_a2(temp, a_offset, b_offset, ql_offset, qh_offset, s_offset, y_offset, i, num_blocks_per_row, row_base, eff_rows);
             }
         } else {
-            [[unroll]] for (uint i = ix; i < num_blocks_per_row; i += it_size) {
-                calc_superblock_a(temp, temp2, a_offset, b_offset, ql_offset, qh_offset, s_offset, y_offset, i, num_blocks_per_row, row_base, num_rows);
+            for (uint i = ix; i < num_blocks_per_row; i += it_size) {
+                calc_superblock_a(temp, temp2, a_offset, b_offset, ql_offset, qh_offset, s_offset, y_offset, i, num_blocks_per_row, row_base, eff_rows);
             }
         }
     }
 
     if (GEN_GLU == 3) {
-        reduce_pair_glu(temp, temp2, d_offset, first_row, num_rows, tid);
+        reduce_pair_glu(temp, temp2, d_offset, first_row, eff_rows, tid);
     }
 #ifndef MUL_MAT_ID
     else if (GEN_GLU == 2 && use_a2) {
-        reduce_result_d2(temp, row_base, num_rows, tid);
+        reduce_result_d2(temp, row_base, eff_rows, tid);
     }
 #endif
     else {
-        reduce_result(temp, d_offset, first_row, num_rows, tid);
+        reduce_result(temp, d_offset, first_row, eff_rows, tid);
     }
 }
 
@@ -208,13 +261,8 @@ void main() {
     const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
 #endif
 
-    // do NUM_ROWS at a time, unless there aren't enough remaining rows
-    if (first_row + NUM_ROWS <= p.stride_d) {
-        compute_outputs(first_row, NUM_ROWS);
-    } else {
-        if (first_row >= p.stride_d) {
-            return;
-        }
-        compute_outputs(first_row, p.stride_d - first_row);
+    if (first_row >= p.stride_d) {
+        return;
     }
+    compute_outputs(first_row, min(NUM_ROWS, p.stride_d - first_row));
 }

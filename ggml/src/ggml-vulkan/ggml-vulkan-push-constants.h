@@ -519,14 +519,22 @@ struct vk_op_multi_add_push_constants {
     uint32_t ne20; uint32_t ne21; uint32_t ne22; uint32_t ne23;
 
     // strides for srcs+dst
-    uint32_t nb[MAX_PARAMETER_COUNT][4];
+    uint32_t nb[12][4];
 
     uint32_t rms_partials;
 };
 
-static_assert(MAX_PARAMETER_COUNT == 12);
-
 static_assert(sizeof(vk_op_multi_add_push_constants) <= 256);
+
+struct vk_op_multi_add_rms_push_constants {
+    uint32_t ne0;
+    uint32_t nrows;
+    float eps;
+    uint32_t write_add_dst;
+    uint32_t nb1[10];
+};
+
+static_assert(sizeof(vk_op_multi_add_rms_push_constants) <= 128);
 
 struct vk_op_topk_moe_push_constants {
     uint32_t n_rows;
@@ -801,6 +809,7 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t spk1, spk2, spk3; // replay: pend_k, pend_v and pend_gb strides in floats
     uint32_t spv1, spv2, spv3;
     uint32_t spg1, spg2, spg3;
+    uint32_t sout_nb2;
 };
 
 struct vk_op_ssm_scan_push_constants {
@@ -817,6 +826,9 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t nb11;
     uint32_t dst_nb0, dst_nb1, dst_nb2;
     uint32_t nc, ncs, nr, n_t, n_s;
+    uint32_t st_nb1, st_nb2;
+    uint32_t qkv_nb0, qkv_nb1, qkv_nb2;
+    uint32_t st_k, st_slot_nb;
 };
 
 struct vk_op_conv2d_push_constants {

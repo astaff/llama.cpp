@@ -520,15 +520,15 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
                                     a_q4_k_p32.data[ib].scales[2]);
         const uint scalesoffs = (is & 3) * 8;
 
-        const uint scidx0 = (is < 4) ? 0 : 2;
         const uint scidxshift0 = scalesoffs;
         const uint scidxshift1 = (is < 4) ? scalesoffs : scalesoffs + 2;
-        const uint mbidx0 = (is < 4) ? 1 : 2;
         const uint mbidxshift0 = (is < 4) ? scalesoffs : scalesoffs + 4;
         const uint mbidxshift1 = (is < 4) ? scalesoffs : scalesoffs + 2;
 
-        const uint8_t sc    = uint8_t(((scales[scidx0] >> scidxshift0) & 0xF) | ((scales[0] >> scidxshift1) & 0x30));
-        const uint8_t mbyte = uint8_t(((scales[mbidx0] >> mbidxshift0) & 0xF) | ((scales[1] >> mbidxshift1) & 0x30));
+        const uint sc_word = (is < 4) ? scales.x : scales.z;
+        const uint mb_word = (is < 4) ? scales.y : scales.z;
+        const uint8_t sc    = uint8_t(((sc_word >> scidxshift0) & 0xF) | ((scales.x >> scidxshift1) & 0x30));
+        const uint8_t mbyte = uint8_t(((mb_word >> mbidxshift0) & 0xF) | ((scales.y >> mbidxshift1) & 0x30));
 
         const float d = loadd.x * sc;
         const float m = -loadd.y * mbyte;
@@ -557,15 +557,15 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
                                     a_q5_k_p32.data[ib].scales[2]);
         const uint scalesoffs = (is & 3) * 8;
 
-        const uint scidx0 = (is < 4) ? 0 : 2;
         const uint scidxshift0 = scalesoffs;
         const uint scidxshift1 = (is < 4) ? scalesoffs : scalesoffs + 2;
-        const uint mbidx0 = (is < 4) ? 1 : 2;
         const uint mbidxshift0 = (is < 4) ? scalesoffs : scalesoffs + 4;
         const uint mbidxshift1 = (is < 4) ? scalesoffs : scalesoffs + 2;
 
-        const uint8_t sc    = uint8_t(((scales[scidx0] >> scidxshift0) & 0xF) | ((scales[0] >> scidxshift1) & 0x30));
-        const uint8_t mbyte = uint8_t(((scales[mbidx0] >> mbidxshift0) & 0xF) | ((scales[1] >> mbidxshift1) & 0x30));
+        const uint sc_word = (is < 4) ? scales.x : scales.z;
+        const uint mb_word = (is < 4) ? scales.y : scales.z;
+        const uint8_t sc    = uint8_t(((sc_word >> scidxshift0) & 0xF) | ((scales.x >> scidxshift1) & 0x30));
+        const uint8_t mbyte = uint8_t(((mb_word >> mbidxshift0) & 0xF) | ((scales.y >> mbidxshift1) & 0x30));
 
         const float d = loadd.x * sc;
         const float m = -loadd.y * mbyte;

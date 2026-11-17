@@ -1,0 +1,249 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+layout(constant_id = 0) const uint NUM_SRCS = 2;
+layout(constant_id = 1) const uint RMS_TREE_MODE = 0;
+layout(constant_id = 2) const uint DO_MUL = 1;
+
+const uint BLOCK_SIZE = 512;
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0)  readonly  buffer A0     { float data_a0[]; };
+layout(binding = 1)  readonly  buffer A1     { float data_a1[]; };
+layout(binding = 2)  readonly  buffer A2     { float data_a2[]; };
+layout(binding = 3)  readonly  buffer A3     { float data_a3[]; };
+layout(binding = 4)  readonly  buffer A4     { float data_a4[]; };
+layout(binding = 5)  readonly  buffer A5     { float data_a5[]; };
+layout(binding = 6)  readonly  buffer A6     { float data_a6[]; };
+layout(binding = 7)  readonly  buffer A7     { float data_a7[]; };
+layout(binding = 8)  readonly  buffer A8     { float data_a8[]; };
+layout(binding = 9)  readonly  buffer A9     { float data_a9[]; };
+layout(binding = 10) writeonly buffer AddDst { float add_dst[]; };
+layout(binding = 11) readonly  buffer Weight { float data_w[];  };
+layout(binding = 12) writeonly buffer RmsDst { float rms_dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint ne0;
+    uint nrows;
+    float eps;
+    uint write_add_dst;
+    uint nb1[10];
+} p;
+
+shared float sumsh[BLOCK_SIZE];
+
+float load_sum(const uint row, const uint col) {
+    precise float s;
+    if (NUM_SRCS == 2) {
+        s = data_a0[row * p.nb1[0] + col] + data_a1[row * p.nb1[1] + col];
+    } else {
+        s = 0.0f;
+        s += data_a0[row * p.nb1[0] + col];
+        s += data_a1[row * p.nb1[1] + col];
+        if (NUM_SRCS > 2) s += data_a2[row * p.nb1[2] + col];
+        if (NUM_SRCS > 3) s += data_a3[row * p.nb1[3] + col];
+        if (NUM_SRCS > 4) s += data_a4[row * p.nb1[4] + col];
+        if (NUM_SRCS > 5) s += data_a5[row * p.nb1[5] + col];
+        if (NUM_SRCS > 6) s += data_a6[row * p.nb1[6] + col];
+        if (NUM_SRCS > 7) s += data_a7[row * p.nb1[7] + col];
+        if (NUM_SRCS > 8) s += data_a8[row * p.nb1[8] + col];
+        if (NUM_SRCS > 9) s += data_a9[row * p.nb1[9] + col];
+    }
+    return s;
+}
+
+void main() {
+    const uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (row >= p.nrows) {
+        return;
+    }
+
+    const uint tid = gl_LocalInvocationID.x;
+    const uint row_off = row * p.ne0;
+
+    if (RMS_TREE_MODE == 0) {
+        float vals[8];
+        float sum = 0.0f;
+
+        if (p.ne0 <= 2048u) {
+            [[unroll]] for (uint idx = 0; idx < 4; ++idx) {
+                const uint col = tid + idx * BLOCK_SIZE;
+                float xi = 0.0f;
+                if (col < p.ne0) {
+                    xi = load_sum(row, col);
+                    if (p.write_add_dst != 0) {
+                        add_dst[row_off + col] = xi;
+                    }
+                }
+                vals[idx] = xi;
+                sum += xi * xi;
+            }
+        } else {
+            [[unroll]] for (uint idx = 0; idx < 8; ++idx) {
+                const uint col = tid + idx * BLOCK_SIZE;
+                float xi = 0.0f;
+                if (col < p.ne0) {
+                    xi = load_sum(row, col);
+                    if (p.write_add_dst != 0) {
+                        add_dst[row_off + col] = xi;
+                    }
+                }
+                vals[idx] = xi;
+                sum += xi * xi;
+            }
+        }
+
+        sumsh[tid] = sum;
+        barrier();
+
+        if (gl_SubgroupSize == 32) {
+            if (gl_SubgroupID == 0) {
+                const uint lane = gl_SubgroupInvocationID;
+                precise float p0_a = sumsh[lane]        + sumsh[lane + 256u];
+                precise float p0_b = sumsh[lane + 128u] + sumsh[lane + 384u];
+                precise float p1_a = sumsh[lane + 32u]  + sumsh[lane + 288u];
+                precise float p1_b = sumsh[lane + 160u] + sumsh[lane + 416u];
+                precise float p2_a = sumsh[lane + 64u]  + sumsh[lane + 320u];
+                precise float p2_b = sumsh[lane + 192u] + sumsh[lane + 448u];
+                precise float p3_a = sumsh[lane + 96u]  + sumsh[lane + 352u];
+                precise float p3_b = sumsh[lane + 224u] + sumsh[lane + 480u];
+                precise float p0 = p0_a + p0_b;
+                precise float p1 = p1_a + p1_b;
+                precise float p2 = p2_a + p2_b;
+                precise float p3 = p3_a + p3_b;
+                precise float s_lo = p0 + p2;
+                precise float s_hi = p1 + p3;
+                precise float s32 = s_lo + s_hi;
+                precise float s16 = s32 + subgroupShuffleXor(s32, 16);
+                precise float s8  = s16 + subgroupShuffleXor(s16, 8);
+                precise float s4  = s8  + subgroupShuffleXor(s8, 4);
+                precise float s2  = s4  + subgroupShuffleXor(s4, 2);
+                precise float s1  = s2  + subgroupShuffleXor(s2, 1);
+                if (lane == 0) {
+                    sumsh[0] = s1;
+                }
+            }
+            barrier();
+        } else {
+            [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
+                if (int(tid) < s) {
+                    sum += sumsh[tid + uint(s)];
+                    sumsh[tid] = sum;
+                }
+                barrier();
+            }
+        }
+
+        const float mean = sumsh[0] / float(p.ne0);
+        const float scale = inversesqrt(mean + p.eps);
+
+        if (p.ne0 <= 2048u) {
+            [[unroll]] for (uint idx = 0; idx < 4; ++idx) {
+                const uint col = tid + idx * BLOCK_SIZE;
+                if (col < p.ne0) {
+                    const float value = (DO_MUL != 0) ? (scale * vals[idx] * data_w[col]) : (scale * vals[idx]);
+                    rms_dst[row_off + col] = value;
+                }
+            }
+        } else {
+            [[unroll]] for (uint idx = 0; idx < 8; ++idx) {
+                const uint col = tid + idx * BLOCK_SIZE;
+                if (col < p.ne0) {
+                    const float value = (DO_MUL != 0) ? (scale * vals[idx] * data_w[col]) : (scale * vals[idx]);
+                    rms_dst[row_off + col] = value;
+                }
+            }
+        }
+    } else {
+        const uint num_partials = p.ne0 / 512u;
+        const uint num_iters = (num_partials + 1u) >> 1;
+        const uint team = tid >> 8;
+        const uint t256 = tid & 255u;
+        const uint num_sub_per_team = 256u / gl_SubgroupSize;
+        const uint sg_in_team = t256 / gl_SubgroupSize;
+
+        float vals_lo[4];
+        float vals_hi[4];
+
+        [[unroll]] for (uint k = 0; k < 4; ++k) {
+            if (k < num_iters) {
+                const uint c = k * 2u + team;
+                float sum_sq = 0.0f;
+                float s0 = 0.0f;
+                float s1 = 0.0f;
+                if (c < num_partials) {
+                    const uint col_lo = c * 512u + t256;
+                    const uint c_off = row_off + c * 512u;
+                    s0 = load_sum(row, col_lo);
+                    if (p.write_add_dst != 0) {
+                        add_dst[c_off + t256] = s0;
+                    }
+                    s1 = load_sum(row, col_lo + 256u);
+                    if (p.write_add_dst != 0) {
+                        add_dst[c_off + t256 + 256u] = s1;
+                    }
+                    precise float sq0 = s0 * s0;
+                    sum_sq = fma(s1, s1, sq0);
+                }
+                vals_lo[k] = s0;
+                vals_hi[k] = s1;
+
+                sum_sq = subgroupAdd(sum_sq);
+                if (gl_SubgroupInvocationID == 0 && c < num_partials) {
+                    sumsh[c * 16u + sg_in_team] = sum_sq;
+                }
+            }
+        }
+        barrier();
+
+        if (gl_SubgroupID == 0) {
+            const uint lane = gl_SubgroupInvocationID;
+            float psum = 0.0f;
+            if (gl_SubgroupSize == 32) {
+                if (lane < num_partials) {
+                    const uint base = lane * 16u;
+                    precise float a0 = sumsh[base + 0u] + sumsh[base + 4u];
+                    precise float a1 = sumsh[base + 1u] + sumsh[base + 5u];
+                    precise float a2 = sumsh[base + 2u] + sumsh[base + 6u];
+                    precise float a3 = sumsh[base + 3u] + sumsh[base + 7u];
+                    precise float b0 = a0 + a2;
+                    precise float b1 = a1 + a3;
+                    psum += (b0 + b1);
+                }
+            } else {
+                for (uint i = lane; i < num_partials; i += gl_SubgroupSize) {
+                    const uint base = i * 16u;
+                    float c_sum = 0.0f;
+                    for (uint s = 0u; s < num_sub_per_team; ++s) {
+                        c_sum += sumsh[base + s];
+                    }
+                    psum += c_sum;
+                }
+            }
+            psum = subgroupAdd(psum);
+            if (lane == 0u) {
+                sumsh[0] = psum;
+            }
+        }
+        barrier();
+
+        const float mean = sumsh[0] / float(p.ne0);
+        const float scale = inversesqrt(mean + p.eps);
+
+        [[unroll]] for (uint k = 0; k < 4; ++k) {
+            if (k < num_iters) {
+                const uint c = k * 2u + team;
+                if (c < num_partials) {
+                    const uint col_lo = c * 512u + t256;
+                    const uint col_hi = col_lo + 256u;
+                    rms_dst[row_off + col_lo] = (DO_MUL != 0) ? (scale * vals_lo[k] * data_w[col_lo]) : (scale * vals_lo[k]);
+                    rms_dst[row_off + col_hi] = (DO_MUL != 0) ? (scale * vals_hi[k] * data_w[col_hi]) : (scale * vals_hi[k]);
+                }
+            }
+        }
+    }
+}

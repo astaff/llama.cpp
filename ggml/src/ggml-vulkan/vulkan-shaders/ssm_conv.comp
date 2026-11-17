@@ -8,6 +8,8 @@ layout(constant_id = 0) const uint BLOCK_SIZE = 32;
 layout(constant_id = 1) const uint TOKENS_PER_WG = 16;
 layout(constant_id = 2) const bool APPLY_BIAS = false;
 layout(constant_id = 3) const bool APPLY_SILU = false;
+layout(constant_id = 4) const bool WRITE_STATE_OUT = false;
+layout(constant_id = 5) const bool CONCAT_SLIDING = false;
 
 layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
 
@@ -15,18 +17,69 @@ layout(binding = 0) readonly buffer Src0 { float src0[]; };
 layout(binding = 1) readonly buffer Src1 { float src1[]; };
 layout(binding = 2) readonly buffer Bias { float bias[]; };
 layout(binding = 3) buffer Dst { float dst[]; };
+layout(binding = 4) writeonly buffer StateOut { float state_out[]; };
 
 layout(push_constant) uniform PushConstants {
     uint nb01; uint nb02;
     uint nb11;
     uint dst_nb0; uint dst_nb1; uint dst_nb2;
     uint nc; uint ncs; uint nr; uint n_t; uint n_s;
+    uint st_nb1; uint st_nb2;
+    uint qkv_nb0; uint qkv_nb1; uint qkv_nb2;
+    uint st_k; uint st_slot_nb;
 };
 
 void main() {
     const uint i1 = gl_GlobalInvocationID.x;
-    const uint i2 = gl_WorkGroupID.y * TOKENS_PER_WG + gl_LocalInvocationID.y;
     const uint i3 = gl_WorkGroupID.z;
+
+    if (CONCAT_SLIDING) {
+        if (i1 >= nr || i3 >= n_s) {
+            return;
+        }
+        const uint os_base = i3 * (nb02 / 4) + i1 * (nb01 / 4);
+        const uint w_base  = i1 * (nb11 / 4);
+        const vec4 w = vec4(src1[w_base], src1[w_base + 1], src1[w_base + 2], src1[w_base + 3]);
+        float s0 = src0[os_base];
+        float s1 = src0[os_base + 1];
+        float s2 = src0[os_base + 2];
+
+        const uint q_base = i3 * (qkv_nb2 / 4) + i1 * (qkv_nb1 / 4);
+        const uint q_step = qkv_nb0 / 4;
+        const uint d_base = i3 * (dst_nb2 / 4) + i1 * (dst_nb0 / 4);
+        const uint d_step = dst_nb1 / 4;
+
+        const uint st_base = i3 * (st_nb2 / 4) + i1 * (st_nb1 / 4);
+        for (uint t = 0; t < n_t; ++t) {
+            const float x = bias[q_base + t * q_step];
+            float sum = dot(vec4(s0, s1, s2, x), w);
+            if (APPLY_SILU) {
+                sum = sum / (1.0f + exp(-sum));
+            }
+            dst[d_base + t * d_step] = sum;
+            s0 = s1;
+            s1 = s2;
+            s2 = x;
+            if (st_k > 0u) {
+                const int target_slot = int(n_t) - 1 - int(t);
+                if (target_slot >= 0 && target_slot < int(st_k)) {
+                    const uint st_dst = uint(target_slot) * (st_slot_nb / 4) + st_base;
+                    state_out[st_dst    ] = s0;
+                    state_out[st_dst + 1] = s1;
+                    state_out[st_dst + 2] = s2;
+                }
+            }
+        }
+
+        if (st_k == 0u) {
+            state_out[st_base    ] = s0;
+            state_out[st_base + 1] = s1;
+            state_out[st_base + 2] = s2;
+        }
+        return;
+    }
+
+    const uint i2 = gl_WorkGroupID.y * TOKENS_PER_WG + gl_LocalInvocationID.y;
 
     if (i1 >= nr || i2 >= n_t || i3 >= n_s) {
         return;
@@ -38,13 +91,30 @@ void main() {
     float sum = 0.0;
 
     if (nc == 4) {
+        const float x0 = src0[src0_base];
+        const float x1 = src0[src0_base + 1];
+        const float x2 = src0[src0_base + 2];
+        const float x3 = src0[src0_base + 3];
         sum = dot(
-            vec4(src0[src0_base], src0[src0_base + 1], src0[src0_base + 2], src0[src0_base + 3]),
+            vec4(x0, x1, x2, x3),
             vec4(src1[src1_base], src1[src1_base + 1], src1[src1_base + 2], src1[src1_base + 3])
         );
+        if (WRITE_STATE_OUT && i2 + 1 == n_t) {
+            const uint st_dst = i3 * (st_nb2 / 4) + i1 * (st_nb1 / 4);
+            state_out[st_dst    ] = x1;
+            state_out[st_dst + 1] = x2;
+            state_out[st_dst + 2] = x3;
+        }
     } else {
         [[unroll]] for (uint i0 = 0; i0 < nc; i0++) {
             sum += src0[src0_base + i0] * src1[src1_base + i0];
+        }
+        if (WRITE_STATE_OUT && i2 + 1 == n_t) {
+            const uint st_src = i3 * (nb02 / 4) + n_t + i1 * (nb01 / 4);
+            const uint st_dst = i3 * (st_nb2 / 4) + i1 * (st_nb1 / 4);
+            for (uint c = 0; c + 1 < nc; ++c) {
+                state_out[st_dst + c] = src0[st_src + c];
+            }
         }
     }
 

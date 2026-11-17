@@ -16,6 +16,9 @@
 #define MAT_VEC_FUSION_FLAGS_PAIR_GLU 0x400
 #define MAT_VEC_FUSION_FLAGS_PAIR_MM 0x800
 #define MAT_VEC_FUSION_FLAGS_PAIR_MM_SIGMOID1 0x1000
+#define MAT_VEC_FUSION_FLAGS_SCALE0_TOK 0x2000
+#define MAT_VEC_FUSION_FLAGS_SCALE1_TOK 0x4000
+#define MAT_VEC_FUSION_FLAGS_COL_SPLIT 0x8000
 
 layout (binding = 3) readonly buffer A2 {A_TYPE data_a2[];};
 #if defined(A_TYPEV4)
@@ -33,6 +36,7 @@ layout (binding = 3) readonly buffer A2_PACKED64 {A_TYPE_PACKED64 data_a2_packed
 
 #ifndef MUL_MAT_ID
 layout (binding = 5) writeonly buffer D2 {D_TYPE data_d2[];};
+layout (binding = 6) readonly buffer Fuse2 {D_TYPE data_fuse2[];};
 #endif
 
 layout (push_constant) uniform parameter
@@ -74,17 +78,29 @@ uint gen_expert_i0() { return (p.fusion_flags & MAT_VEC_FUSION_FLAGS_GEN_TOKY) !
 uint gen_expert_i1() { return (p.fusion_flags & MAT_VEC_FUSION_FLAGS_GEN_TOKY) != 0 ? gl_WorkGroupID.y / p.nei0 : p.expert_i1; }
 #endif
 
+layout (constant_id = 0) const uint BLOCK_SIZE = 32;
+layout (constant_id = 1) const uint NUM_ROWS = 1;
+layout (constant_id = 2) const uint NUM_COLS = 1;
+// gen: 0 = plain, 1 = single-op epilogue (glu/mmgate/shexp), 2 = PAIR_MM, 3 = PAIR_GLU
+layout (constant_id = 3) const uint GEN_GLU = 0;
+// gen: independent subgroups per workgroup in SHADER_REDUCTION_MODE_SUBGROUP (row-split)
+layout (constant_id = 4) const uint NUM_SUBGROUPS = 1;
+// gen: K-quant fast reduction mode (0 = strict 0-ULP upstream layout, 1 = 16-lane vec4/packed32, 2 = 8-lane/superblock)
+layout (constant_id = 5) const uint GEN_FAST_KQ = 0;
+
 void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 #ifdef MUL_MAT_ID
     const uint expert_i0 = gen_expert_i0();
     const uint expert_i1 = gen_expert_i1();
 #else
-    const uint batch_idx = gl_WorkGroupID.y + p.base_work_group_y;
+    const bool col_split = (p.fusion_flags & MAT_VEC_FUSION_FLAGS_COL_SPLIT) != 0;
+    const uint batch_idx = col_split ? (gl_WorkGroupID.y * NUM_COLS + p.base_work_group_y)
+                                     : (gl_WorkGroupID.y + p.base_work_group_y);
 #endif
 
 #ifndef MUL_MAT_ID
     uint batch_idx_a = 0;
-    if (batch_idx != 0) {
+    if (!col_split && batch_idx != 0) {
         const uint i13 = batch_idx / p.ne12;
         const uint i12 = batch_idx % p.ne12;
 
@@ -119,16 +135,6 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 #endif
 }
 
-layout (constant_id = 0) const uint BLOCK_SIZE = 32;
-layout (constant_id = 1) const uint NUM_ROWS = 1;
-layout (constant_id = 2) const uint NUM_COLS = 1;
-// gen: 0 = plain, 1 = single-op epilogue (glu/mmgate/shexp), 2 = PAIR_MM, 3 = PAIR_GLU
-layout (constant_id = 3) const uint GEN_GLU = 0;
-// gen: independent subgroups per workgroup in SHADER_REDUCTION_MODE_SUBGROUP (row-split)
-layout (constant_id = 4) const uint NUM_SUBGROUPS = 1;
-// gen: K-quant fast reduction mode (0 = strict 0-ULP upstream layout, 1 = 16-lane vec4/packed32, 2 = 8-lane/superblock)
-layout (constant_id = 5) const uint GEN_FAST_KQ = 0;
-
 #ifndef MUL_MAT_ID
 FLOAT_TYPE gen_apply_mm_epilogue(FLOAT_TYPE val, const uint j, const uint first_row, const uint n) {
     if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SIGMOID) != 0) {
@@ -143,9 +149,21 @@ FLOAT_TYPE gen_apply_mm_epilogue(FLOAT_TYPE val, const uint j, const uint first_
         return FLOAT_TYPE(gen_y);
     }
     if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_ROW_SCALE0) != 0) {
+        const uint col_j = (p.fusion_flags & MAT_VEC_FUSION_FLAGS_COL_SPLIT) != 0
+            ? (gl_WorkGroupID.y * NUM_COLS + p.base_work_group_y + j) : j;
         precise float gen_x = float(D_TYPE(val));
-        precise float gen_g = float(data_fuse0[j]);
+        precise float gen_g = float(data_fuse0[col_j]);
         precise float gen_y = gen_x * gen_g;
+        return FLOAT_TYPE(gen_y);
+    }
+    return val;
+}
+
+FLOAT_TYPE gen_apply_pair_mm0_epilogue(FLOAT_TYPE val, const uint first_row, const uint n) {
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SOFTPLUS_GATE) != 0) {
+        precise float gen_x = float(D_TYPE(val)) + float(data_fuse1[first_row + n]);
+        precise float gen_sp = (gen_x > 20.0f) ? gen_x : log(1.0f + exp(gen_x));
+        precise float gen_y = gen_sp * float(data_fuse2[first_row + n]);
         return FLOAT_TYPE(gen_y);
     }
     return val;
@@ -155,25 +173,28 @@ FLOAT_TYPE gen_apply_mm_epilogue(FLOAT_TYPE val, const uint j, const uint first_
 #ifdef USE_SUBGROUP_ADD_NO_SHMEM
 void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offset, const in uint32_t first_row, const in uint32_t num_rows, const in uint32_t tid) {
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
             temp[j][n] = subgroupAdd(temp[j][n]);
         }
     }
 
     if (tid == 0) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                if (n >= num_rows) {
+                    continue;
+                }
 #ifdef MUL_MAT_ID
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
                     temp[j][n] += FLOAT_TYPE(data_fuse0[expert_id*p.stride_d + first_row + n]);
                 }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0) != 0) {
-                    const uint expert_i0 = gen_expert_i0();
-                    temp[j][n] *= FLOAT_TYPE(data_fuse0[expert_i0]);
+                    const uint s0_idx = gen_expert_i0() + ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0_TOK) != 0 ? gen_expert_i1() * p.nei0 : 0u);
+                    temp[j][n] *= FLOAT_TYPE(data_fuse0[s0_idx]);
                 }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1) != 0) {
-                    const uint expert_i0 = gen_expert_i0();
-                    temp[j][n] *= FLOAT_TYPE(data_fuse1[expert_i0]);
+                    const uint s1_idx = gen_expert_i0() + ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1_TOK) != 0 ? gen_expert_i1() * p.nei0 : 0u);
+                    temp[j][n] *= FLOAT_TYPE(data_fuse1[s1_idx]);
                 }
                 if (expert_skip) {
                     temp[j][n] = FLOAT_TYPE(0);
@@ -187,6 +208,9 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
                 }
                 if (GEN_GLU == 1 && (p.fusion_flags & (MAT_VEC_FUSION_FLAGS_SIGMOID | MAT_VEC_FUSION_FLAGS_SOFTPLUS_GATE | MAT_VEC_FUSION_FLAGS_ROW_SCALE0)) != 0) {
                     temp[j][n] = gen_apply_mm_epilogue(temp[j][n], j, first_row, n);
+                }
+                if (GEN_GLU == 2 && (p.fusion_flags & MAT_VEC_FUSION_FLAGS_SOFTPLUS_GATE) != 0) {
+                    temp[j][n] = gen_apply_pair_mm0_epilogue(temp[j][n], first_row, n);
                 }
 #endif
                 if (GEN_GLU == 1 && (p.fusion_flags & (MAT_VEC_FUSION_FLAGS_GLU_A | MAT_VEC_FUSION_FLAGS_GLU_B)) != 0) {
@@ -204,14 +228,17 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
 
 void reduce_pair_glu(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_TYPE temp2[NUM_COLS][NUM_ROWS], const in uint32_t d_offset, const in uint32_t first_row, const in uint32_t num_rows, const in uint32_t tid) {
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
             temp[j][n]  = subgroupAdd(temp[j][n]);
             temp2[j][n] = subgroupAdd(temp2[j][n]);
         }
     }
     if (tid == 0) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                if (n >= num_rows) {
+                    continue;
+                }
 #ifdef MUL_MAT_ID
                 if (expert_skip) {
                     data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(0);
@@ -229,14 +256,19 @@ void reduce_pair_glu(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_TYPE
 #ifndef MUL_MAT_ID
 void reduce_result_d2(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t first_row, const in uint32_t num_rows, const in uint32_t tid) {
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
             temp[j][n] = subgroupAdd(temp[j][n]);
         }
     }
     if (tid == 0) {
-        const uint d2_offset = (gl_WorkGroupID.y + p.base_work_group_y) * p.batch_stride_d2;
+        const uint d2_offset = (((p.fusion_flags & MAT_VEC_FUSION_FLAGS_COL_SPLIT) != 0)
+        ? (gl_WorkGroupID.y * NUM_COLS + p.base_work_group_y)
+        : (gl_WorkGroupID.y + p.base_work_group_y)) * p.batch_stride_d2;
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                if (n >= num_rows) {
+                    continue;
+                }
                 FLOAT_TYPE val = temp[j][n];
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_PAIR_MM_SIGMOID1) != 0) {
                     precise float gen_x = float(D_TYPE(val));
@@ -262,7 +294,7 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
 #if USE_SUBGROUP_ADD
     // sum up partial sums within a subgroup
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
             temp[j][n] = subgroupAdd(temp[j][n]);
         }
     }
@@ -270,7 +302,7 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
     // Go through shared memory to sum partials across subgroups
     if (gl_SubgroupInvocationID == 0) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
                 tmpsh[j][n][gl_SubgroupID] = temp[j][n];
             }
         }
@@ -278,7 +310,10 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
     barrier();
     if (tid == 0) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                if (n >= num_rows) {
+                    continue;
+                }
                 temp[j][n] = FLOAT_TYPE(0);
                 [[unroll]] for (uint s = 0; s < gl_NumSubgroups; ++s) {
                     temp[j][n] += tmpsh[j][n][s];
@@ -288,12 +323,12 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                     temp[j][n] += FLOAT_TYPE(data_fuse0[expert_id*p.stride_d + first_row + n]);
                 }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0) != 0) {
-                    const uint expert_i0 = gen_expert_i0();
-                    temp[j][n] *= FLOAT_TYPE(data_fuse0[expert_i0]);
+                    const uint s0_idx = gen_expert_i0() + ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0_TOK) != 0 ? gen_expert_i1() * p.nei0 : 0u);
+                    temp[j][n] *= FLOAT_TYPE(data_fuse0[s0_idx]);
                 }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1) != 0) {
-                    const uint expert_i0 = gen_expert_i0();
-                    temp[j][n] *= FLOAT_TYPE(data_fuse1[expert_i0]);
+                    const uint s1_idx = gen_expert_i0() + ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1_TOK) != 0 ? gen_expert_i1() * p.nei0 : 0u);
+                    temp[j][n] *= FLOAT_TYPE(data_fuse1[s1_idx]);
                 }
                 if (expert_skip) {
                     temp[j][n] = FLOAT_TYPE(0);
@@ -307,6 +342,9 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                 }
                 if (GEN_GLU == 1 && (p.fusion_flags & (MAT_VEC_FUSION_FLAGS_SIGMOID | MAT_VEC_FUSION_FLAGS_SOFTPLUS_GATE | MAT_VEC_FUSION_FLAGS_ROW_SCALE0)) != 0) {
                     temp[j][n] = gen_apply_mm_epilogue(temp[j][n], j, first_row, n);
+                }
+                if (GEN_GLU == 2 && (p.fusion_flags & MAT_VEC_FUSION_FLAGS_SOFTPLUS_GATE) != 0) {
+                    temp[j][n] = gen_apply_pair_mm0_epilogue(temp[j][n], first_row, n);
                 }
 #endif
                 if (GEN_GLU == 1 && (p.fusion_flags & (MAT_VEC_FUSION_FLAGS_GLU_A | MAT_VEC_FUSION_FLAGS_GLU_B)) != 0) {
@@ -323,7 +361,7 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
 #else
     // sum up partial sums and write back result
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
             tmpsh[j][n][tid] = temp[j][n];
         }
     }
@@ -331,7 +369,7 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
     [[unroll]] for (uint s = BLOCK_SIZE/2; s > 0; s >>= 1) {
         if (tid < s) {
             [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-                [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
                     tmpsh[j][n][tid] += tmpsh[j][n][tid + s];
                 }
             }
@@ -340,18 +378,21 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
     }
     if (tid == 0) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                if (n >= num_rows) {
+                    continue;
+                }
 #ifdef MUL_MAT_ID
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
                     tmpsh[j][n][0] += FLOAT_TYPE(data_fuse0[expert_id*p.stride_d + first_row + n]);
                 }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0) != 0) {
-                    const uint expert_i0 = gen_expert_i0();
-                    tmpsh[j][n][0] *= FLOAT_TYPE(data_fuse0[expert_i0]);
+                    const uint s0_idx = gen_expert_i0() + ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0_TOK) != 0 ? gen_expert_i1() * p.nei0 : 0u);
+                    tmpsh[j][n][0] *= FLOAT_TYPE(data_fuse0[s0_idx]);
                 }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1) != 0) {
-                    const uint expert_i0 = gen_expert_i0();
-                    tmpsh[j][n][0] *= FLOAT_TYPE(data_fuse1[expert_i0]);
+                    const uint s1_idx = gen_expert_i0() + ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1_TOK) != 0 ? gen_expert_i1() * p.nei0 : 0u);
+                    tmpsh[j][n][0] *= FLOAT_TYPE(data_fuse1[s1_idx]);
                 }
                 if (expert_skip) {
                     tmpsh[j][n][0] = FLOAT_TYPE(0);
@@ -365,6 +406,9 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                 }
                 if (GEN_GLU == 1 && (p.fusion_flags & (MAT_VEC_FUSION_FLAGS_SIGMOID | MAT_VEC_FUSION_FLAGS_SOFTPLUS_GATE | MAT_VEC_FUSION_FLAGS_ROW_SCALE0)) != 0) {
                     tmpsh[j][n][0] = gen_apply_mm_epilogue(tmpsh[j][n][0], j, first_row, n);
+                }
+                if (GEN_GLU == 2 && (p.fusion_flags & MAT_VEC_FUSION_FLAGS_SOFTPLUS_GATE) != 0) {
+                    tmpsh[j][n][0] = gen_apply_pair_mm0_epilogue(tmpsh[j][n][0], first_row, n);
                 }
 #endif
                 if (GEN_GLU == 1 && (p.fusion_flags & (MAT_VEC_FUSION_FLAGS_GLU_A | MAT_VEC_FUSION_FLAGS_GLU_B)) != 0) {
@@ -384,14 +428,14 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
 void reduce_pair_glu(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_TYPE temp2[NUM_COLS][NUM_ROWS], const in uint32_t d_offset, const in uint32_t first_row, const in uint32_t num_rows, const in uint32_t tid) {
 #if USE_SUBGROUP_ADD
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
             temp[j][n]  = subgroupAdd(temp[j][n]);
             temp2[j][n] = subgroupAdd(temp2[j][n]);
         }
     }
     if (gl_SubgroupInvocationID == 0) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
                 tmpsh[j][n][gl_SubgroupID] = temp[j][n];
             }
         }
@@ -399,7 +443,7 @@ void reduce_pair_glu(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_TYPE
     barrier();
     if (tid == 0) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
                 FLOAT_TYPE acc = FLOAT_TYPE(0);
                 [[unroll]] for (uint s = 0; s < gl_NumSubgroups; ++s) {
                     acc += tmpsh[j][n][s];
@@ -411,7 +455,7 @@ void reduce_pair_glu(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_TYPE
     barrier();
     if (gl_SubgroupInvocationID == 0) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
                 tmpsh[j][n][gl_SubgroupID] = temp2[j][n];
             }
         }
@@ -419,7 +463,10 @@ void reduce_pair_glu(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_TYPE
     barrier();
     if (tid == 0) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                if (n >= num_rows) {
+                    continue;
+                }
                 FLOAT_TYPE acc2 = FLOAT_TYPE(0);
                 [[unroll]] for (uint s = 0; s < gl_NumSubgroups; ++s) {
                     acc2 += tmpsh[j][n][s];
@@ -438,7 +485,7 @@ void reduce_pair_glu(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_TYPE
     }
 #else
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
             tmpsh[j][n][tid] = temp[j][n];
         }
     }
@@ -446,7 +493,7 @@ void reduce_pair_glu(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_TYPE
     [[unroll]] for (uint s = BLOCK_SIZE/2; s > 0; s >>= 1) {
         if (tid < s) {
             [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-                [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
                     tmpsh[j][n][tid] += tmpsh[j][n][tid + s];
                 }
             }
@@ -455,14 +502,14 @@ void reduce_pair_glu(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_TYPE
     }
     if (tid == 0) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
                 temp[j][n] = tmpsh[j][n][0];
             }
         }
     }
     barrier();
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
             tmpsh[j][n][tid] = temp2[j][n];
         }
     }
@@ -470,7 +517,7 @@ void reduce_pair_glu(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_TYPE
     [[unroll]] for (uint s = BLOCK_SIZE/2; s > 0; s >>= 1) {
         if (tid < s) {
             [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-                [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
                     tmpsh[j][n][tid] += tmpsh[j][n][tid + s];
                 }
             }
@@ -479,7 +526,10 @@ void reduce_pair_glu(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_TYPE
     }
     if (tid == 0) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                if (n >= num_rows) {
+                    continue;
+                }
 #ifdef MUL_MAT_ID
                 if (expert_skip) {
                     data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(0);
@@ -497,16 +547,18 @@ void reduce_pair_glu(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_TYPE
 
 #ifndef MUL_MAT_ID
 void reduce_result_d2(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t first_row, const in uint32_t num_rows, const in uint32_t tid) {
-    const uint d2_offset = (gl_WorkGroupID.y + p.base_work_group_y) * p.batch_stride_d2;
+    const uint d2_offset = (((p.fusion_flags & MAT_VEC_FUSION_FLAGS_COL_SPLIT) != 0)
+        ? (gl_WorkGroupID.y * NUM_COLS + p.base_work_group_y)
+        : (gl_WorkGroupID.y + p.base_work_group_y)) * p.batch_stride_d2;
 #if USE_SUBGROUP_ADD
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
             temp[j][n] = subgroupAdd(temp[j][n]);
         }
     }
     if (gl_SubgroupInvocationID == 0) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
                 tmpsh[j][n][gl_SubgroupID] = temp[j][n];
             }
         }
@@ -514,7 +566,10 @@ void reduce_result_d2(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t fir
     barrier();
     if (tid == 0) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                if (n >= num_rows) {
+                    continue;
+                }
                 FLOAT_TYPE val = FLOAT_TYPE(0);
                 [[unroll]] for (uint s = 0; s < gl_NumSubgroups; ++s) {
                     val += tmpsh[j][n][s];
@@ -530,7 +585,7 @@ void reduce_result_d2(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t fir
     }
 #else
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
             tmpsh[j][n][tid] = temp[j][n];
         }
     }
@@ -538,7 +593,7 @@ void reduce_result_d2(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t fir
     [[unroll]] for (uint s = BLOCK_SIZE/2; s > 0; s >>= 1) {
         if (tid < s) {
             [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-                [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
                     tmpsh[j][n][tid] += tmpsh[j][n][tid + s];
                 }
             }
@@ -547,7 +602,10 @@ void reduce_result_d2(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t fir
     }
     if (tid == 0) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                if (n >= num_rows) {
+                    continue;
+                }
                 FLOAT_TYPE val = tmpsh[j][n][0];
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_PAIR_MM_SIGMOID1) != 0) {
                     precise float gen_x = float(D_TYPE(val));

@@ -57,6 +57,10 @@ layout (binding = 3) readonly buffer I {uvec2 data_i[];};
 // gen: (rms_norm(x) * w) * silu(z), z laid out like dst (the Gated-DeltaNet output norm)
 layout (binding = 3) readonly buffer Z {float data_z[];};
 
+#elif RMS_NORM_SCALE_FUSION
+
+layout (binding = 3) writeonly buffer D2 {D_TYPE data_d2[];};
+
 #endif
 
 layout (constant_id = 1) const bool do_multiply = false;
@@ -66,7 +70,46 @@ layout (constant_id = 2) const bool do_post_multiply = false;
 
 shared FLOAT_TYPE sumsh[BLOCK_SIZE];
 
-void rms_norm(uint num_iters) {
+void write_rms_col(const uint col, const FLOAT_TYPE scale, const uint32_t a_offset, const uint32_t b_offset, const uint32_t d_offset, const bool use_fastmod) {
+    if (do_multiply) {
+        const uint b_col = use_fastmod ? fastmod(col, p.ne10) : col;
+        FLOAT_TYPE value = scale * FLOAT_TYPE(A_TO_FLOAT(data_a[a_offset + col])) * FLOAT_TYPE(B_TO_FLOAT(data_b[b_offset + b_col]));
+#if RMS_NORM_ADD_FUSION
+        value += FLOAT_TYPE(C_TO_FLOAT(data_c[d_offset + col]));
+        if (do_post_multiply) {
+            value *= FLOAT_TYPE(data_e[0]);
+        }
+#endif
+#if RMS_NORM_SILU_GATE_FUSION
+        {
+            // same expressions and roundings as rms_norm_mul (store) then silu_mul (unary.comp op_silu)
+            precise float gen_n = float(D_TYPE(value));
+            precise float gen_zv = data_z[d_offset + col];
+            precise float gen_g = gen_zv / (1.0f + exp(-gen_zv));
+            precise FLOAT_TYPE gen_o = FLOAT_TYPE(gen_g) * FLOAT_TYPE(gen_n);
+            value = gen_o;
+        }
+#endif
+        data_d[d_offset + col] = FLOAT_TO_D(value);
+    } else {
+#if RMS_NORM_SCALE_FUSION
+        // gen: rms_norm followed by scale(param2, bias 0), same expressions as scale.comp
+        // precise: no contraction or reassociation, so the two roundings match rms_norm + scale run separately
+        precise FLOAT_TYPE gen_v = scale * FLOAT_TYPE(A_TO_FLOAT(data_a[a_offset + col]));
+        precise FLOAT_TYPE gen_s = gen_v * FLOAT_TYPE(p.param2);
+        precise FLOAT_TYPE gen_o = gen_s + FLOAT_TYPE(0.0f);
+        if ((p.param3 & 1) != 0 && gl_WorkGroupID.x >= p.ne21) {
+            data_d2[d_offset + col] = FLOAT_TO_D(gen_o);
+        } else {
+            data_d[d_offset + col] = FLOAT_TO_D(gen_o);
+        }
+#else
+        data_d[d_offset + col] = FLOAT_TO_D(scale * FLOAT_TYPE(A_TO_FLOAT(data_a[a_offset + col])));
+#endif
+    }
+}
+
+void main() {
     const uint ncols     = p.ne00;
     const uint nrows     = gl_NumWorkGroups.x;
     const uint nchannels = p.ne02;
@@ -78,6 +121,7 @@ void rms_norm(uint num_iters) {
     const uint stride_row       = p.nb01;
     const uint stride_channel   = p.nb02;
     const uint stride_sample    = p.nb03;
+    const uint num_blocks       = (ncols + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
     // grid.y/z are clamped to the device workgroup limit, iterate over the excess channels/samples
     for (uint samp = gl_WorkGroupID.z; samp < nsamples; samp += gl_NumWorkGroups.z) {
@@ -93,23 +137,57 @@ void rms_norm(uint num_iters) {
             uint32_t d_offset = 0;
 #elif RMS_NORM_SET_ROWS_FUSION
             uint32_t d_offset = data_i[channel].x*p.nb21 + row*ncols + get_doffset();
+#elif RMS_NORM_SCALE_FUSION
+            const bool is_d2 = (p.param3 & 1) != 0 && row >= p.ne21;
+            const uint eff_nrows = (p.param3 & 1) != 0 ? p.ne21 : nrows;
+            const uint eff_row   = is_d2 ? (row - p.ne21) : row;
+            uint32_t d_offset = ((samp*nchannels + channel)*eff_nrows + eff_row)*ncols + (is_d2 ? uint(p.param3 >> 8) : get_doffset());
 #else
             uint32_t d_offset = ((samp*nchannels + channel)*nrows + row)*ncols + get_doffset();
 #endif
             FLOAT_TYPE sum = FLOAT_TYPE(0.0f); // partial sum for thread in warp
 
 #if RMS_NORM_ROPE_FUSION
-            for (uint col = tid; col < ncols; col += BLOCK_SIZE) {
-                const FLOAT_TYPE xi = FLOAT_TYPE(data_a[a_offset + col]);
-                sum += xi * xi;
-            }
-#else
-            [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
+            if (num_blocks == 1) {
                 FLOAT_TYPE xi = FLOAT_TYPE(0);
-                if (col < ncols) {
-                    xi = FLOAT_TYPE(A_TO_FLOAT(data_a[a_offset + col]));
+                if (tid < ncols) {
+                    xi = FLOAT_TYPE(A_TO_FLOAT(data_a[a_offset + tid]));
                 }
                 sum += xi * xi;
+            } else {
+                [[unroll]] for (uint idx = 0; idx < 2; ++idx) {
+                    const uint col = tid + idx * BLOCK_SIZE;
+                    FLOAT_TYPE xi = FLOAT_TYPE(0);
+                    if (col < ncols) {
+                        xi = FLOAT_TYPE(A_TO_FLOAT(data_a[a_offset + col]));
+                    }
+                    sum += xi * xi;
+                }
+            }
+#else
+            if (num_blocks == 1) {
+                FLOAT_TYPE xi = FLOAT_TYPE(0);
+                if (tid < ncols) {
+                    xi = FLOAT_TYPE(A_TO_FLOAT(data_a[a_offset + tid]));
+                }
+                sum += xi * xi;
+            } else if (num_blocks == 4) {
+                [[unroll]] for (uint idx = 0; idx < 4; ++idx) {
+                    const uint col = tid + idx * BLOCK_SIZE;
+                    FLOAT_TYPE xi = FLOAT_TYPE(0);
+                    if (col < ncols) {
+                        xi = FLOAT_TYPE(A_TO_FLOAT(data_a[a_offset + col]));
+                    }
+                    sum += xi * xi;
+                }
+            } else {
+                [[dont_unroll]] for (uint col = tid, idx = 0; idx < num_blocks; col += BLOCK_SIZE, ++idx) {
+                    FLOAT_TYPE xi = FLOAT_TYPE(0);
+                    if (col < ncols) {
+                        xi = FLOAT_TYPE(A_TO_FLOAT(data_a[a_offset + col]));
+                    }
+                    sum += xi * xi;
+                }
             }
 #endif
 
@@ -136,7 +214,55 @@ void rms_norm(uint num_iters) {
                 sumsh[tid] = sum;
                 // sum up partial sums and write back result
                 barrier();
-                if (BLOCK_SIZE >= 128 && gl_SubgroupSize == 32) {
+                if (BLOCK_SIZE == 512 && gl_SubgroupSize == 32) {
+                    if (gl_SubgroupID == 0) {
+                        const uint lane = gl_SubgroupInvocationID;
+                        precise FLOAT_TYPE p0_a = sumsh[lane]        + sumsh[lane + 256u];
+                        precise FLOAT_TYPE p0_b = sumsh[lane + 128u] + sumsh[lane + 384u];
+                        precise FLOAT_TYPE p1_a = sumsh[lane + 32u]  + sumsh[lane + 288u];
+                        precise FLOAT_TYPE p1_b = sumsh[lane + 160u] + sumsh[lane + 416u];
+                        precise FLOAT_TYPE p2_a = sumsh[lane + 64u]  + sumsh[lane + 320u];
+                        precise FLOAT_TYPE p2_b = sumsh[lane + 192u] + sumsh[lane + 448u];
+                        precise FLOAT_TYPE p3_a = sumsh[lane + 96u]  + sumsh[lane + 352u];
+                        precise FLOAT_TYPE p3_b = sumsh[lane + 224u] + sumsh[lane + 480u];
+                        precise FLOAT_TYPE p0 = p0_a + p0_b;
+                        precise FLOAT_TYPE p1 = p1_a + p1_b;
+                        precise FLOAT_TYPE p2 = p2_a + p2_b;
+                        precise FLOAT_TYPE p3 = p3_a + p3_b;
+                        precise FLOAT_TYPE s_lo = p0 + p2;
+                        precise FLOAT_TYPE s_hi = p1 + p3;
+                        precise FLOAT_TYPE s32 = s_lo + s_hi;
+                        precise FLOAT_TYPE s16 = s32 + subgroupShuffleXor(s32, 16);
+                        precise FLOAT_TYPE s8  = s16 + subgroupShuffleXor(s16, 8);
+                        precise FLOAT_TYPE s4  = s8  + subgroupShuffleXor(s8, 4);
+                        precise FLOAT_TYPE s2  = s4  + subgroupShuffleXor(s4, 2);
+                        precise FLOAT_TYPE s1  = s2  + subgroupShuffleXor(s2, 1);
+                        if (lane == 0) {
+                            sumsh[0] = s1;
+                        }
+                    }
+                    barrier();
+                } else if (BLOCK_SIZE == 256 && gl_SubgroupSize == 32) {
+                    if (gl_SubgroupID == 0) {
+                        const uint lane = gl_SubgroupInvocationID;
+                        precise FLOAT_TYPE p0 = sumsh[lane]       + sumsh[lane + 128u];
+                        precise FLOAT_TYPE p1 = sumsh[lane + 32u] + sumsh[lane + 160u];
+                        precise FLOAT_TYPE p2 = sumsh[lane + 64u] + sumsh[lane + 192u];
+                        precise FLOAT_TYPE p3 = sumsh[lane + 96u] + sumsh[lane + 224u];
+                        precise FLOAT_TYPE s_lo = p0 + p2;
+                        precise FLOAT_TYPE s_hi = p1 + p3;
+                        precise FLOAT_TYPE s32 = s_lo + s_hi;
+                        precise FLOAT_TYPE s16 = s32 + subgroupShuffleXor(s32, 16);
+                        precise FLOAT_TYPE s8  = s16 + subgroupShuffleXor(s16, 8);
+                        precise FLOAT_TYPE s4  = s8  + subgroupShuffleXor(s8, 4);
+                        precise FLOAT_TYPE s2  = s4  + subgroupShuffleXor(s4, 2);
+                        precise FLOAT_TYPE s1  = s2  + subgroupShuffleXor(s2, 1);
+                        if (lane == 0) {
+                            sumsh[0] = s1;
+                        }
+                    }
+                    barrier();
+                } else if (BLOCK_SIZE >= 128 && gl_SubgroupSize == 32) {
                     [[unroll]] for (int s = BLOCK_SIZE / 2; s >= 128; s >>= 1) {
                         if (tid < s) {
                             sum += sumsh[tid + s];
@@ -174,81 +300,64 @@ void rms_norm(uint num_iters) {
 
             const FLOAT_TYPE mean = sum / FLOAT_TYPE(ncols);
             const FLOAT_TYPE scale = inversesqrt(mean + FLOAT_TYPE(p.param1));
+            const bool use_fastmod = (ncols > p.ne10);
 
 #if RMS_NORM_ROPE_FUSION
-            for (uint col = tid; col < ncols; col += BLOCK_SIZE) {
-                FLOAT_TYPE value = scale * FLOAT_TYPE(data_a[a_offset + col]);
-                if (do_multiply) {
-                    value *= FLOAT_TYPE(data_b[b_offset + fastmod(col, p.ne10)]);
+            if (num_blocks == 1) {
+                if (tid < ncols) {
+                    write_rms_col(tid, scale, a_offset, b_offset, d_offset, use_fastmod);
                 }
-                data_d[d_offset + col] = D_TYPE(value);
-            }
-#else
-            if (do_multiply) {
-                if (ncols > p.ne10) {
-                    [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
-                        if (col >= ncols) {
-                            continue;
+            } else {
+                if (use_fastmod) {
+                    [[unroll]] for (uint idx = 0; idx < 2; ++idx) {
+                        const uint col = tid + idx * BLOCK_SIZE;
+                        if (col < ncols) {
+                            write_rms_col(col, scale, a_offset, b_offset, d_offset, true);
                         }
-                        FLOAT_TYPE value = scale * FLOAT_TYPE(A_TO_FLOAT(data_a[a_offset + col])) * FLOAT_TYPE(B_TO_FLOAT(data_b[b_offset + fastmod(col, p.ne10)]));
-#if RMS_NORM_ADD_FUSION
-                        value += FLOAT_TYPE(C_TO_FLOAT(data_c[d_offset + col]));
-                        if (do_post_multiply) {
-                            value *= FLOAT_TYPE(data_e[0]);
-                        }
-#endif
-#if RMS_NORM_SILU_GATE_FUSION
-                        {
-                            // same expressions and roundings as rms_norm_mul (store) then silu_mul (unary.comp op_silu)
-                            precise float gen_n = float(D_TYPE(value));
-                            precise float gen_zv = data_z[d_offset + col];
-                            precise float gen_g = gen_zv / (1.0f + exp(-gen_zv));
-                            precise FLOAT_TYPE gen_o = FLOAT_TYPE(gen_g) * FLOAT_TYPE(gen_n);
-                            value = gen_o;
-                        }
-#endif
-                        data_d[d_offset + col] = FLOAT_TO_D(value);
                     }
                 } else {
-                    [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
-                        if (col >= ncols) {
-                            continue;
+                    [[unroll]] for (uint idx = 0; idx < 2; ++idx) {
+                        const uint col = tid + idx * BLOCK_SIZE;
+                        if (col < ncols) {
+                            write_rms_col(col, scale, a_offset, b_offset, d_offset, false);
                         }
-                        FLOAT_TYPE value = scale * FLOAT_TYPE(A_TO_FLOAT(data_a[a_offset + col])) * FLOAT_TYPE(B_TO_FLOAT(data_b[b_offset + col]));
-#if RMS_NORM_ADD_FUSION
-                        value += FLOAT_TYPE(C_TO_FLOAT(data_c[d_offset + col]));
-                        if (do_post_multiply) {
-                            value *= FLOAT_TYPE(data_e[0]);
+                    }
+                }
+            }
+#else
+            if (num_blocks == 1) {
+                if (tid < ncols) {
+                    write_rms_col(tid, scale, a_offset, b_offset, d_offset, use_fastmod);
+                }
+            } else if (num_blocks == 4) {
+                if (use_fastmod) {
+                    [[unroll]] for (uint idx = 0; idx < 4; ++idx) {
+                        const uint col = tid + idx * BLOCK_SIZE;
+                        if (col < ncols) {
+                            write_rms_col(col, scale, a_offset, b_offset, d_offset, true);
                         }
-#endif
-#if RMS_NORM_SILU_GATE_FUSION
-                        {
-                            // same expressions and roundings as rms_norm_mul (store) then silu_mul (unary.comp op_silu)
-                            precise float gen_n = float(D_TYPE(value));
-                            precise float gen_zv = data_z[d_offset + col];
-                            precise float gen_g = gen_zv / (1.0f + exp(-gen_zv));
-                            precise FLOAT_TYPE gen_o = FLOAT_TYPE(gen_g) * FLOAT_TYPE(gen_n);
-                            value = gen_o;
+                    }
+                } else {
+                    [[unroll]] for (uint idx = 0; idx < 4; ++idx) {
+                        const uint col = tid + idx * BLOCK_SIZE;
+                        if (col < ncols) {
+                            write_rms_col(col, scale, a_offset, b_offset, d_offset, false);
                         }
-#endif
-                        data_d[d_offset + col] = FLOAT_TO_D(value);
                     }
                 }
             } else {
-                [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
-                    if (col >= ncols) {
-                        continue;
+                if (use_fastmod) {
+                    [[dont_unroll]] for (uint col = tid, idx = 0; idx < num_blocks; col += BLOCK_SIZE, ++idx) {
+                        if (col < ncols) {
+                            write_rms_col(col, scale, a_offset, b_offset, d_offset, true);
+                        }
                     }
-#if RMS_NORM_SCALE_FUSION
-                    // gen: rms_norm followed by scale(param2, bias 0), same expressions as scale.comp
-                    // precise: no contraction or reassociation, so the two roundings match rms_norm + scale run separately
-                    precise FLOAT_TYPE gen_v = scale * FLOAT_TYPE(A_TO_FLOAT(data_a[a_offset + col]));
-                    precise FLOAT_TYPE gen_s = gen_v * FLOAT_TYPE(p.param2);
-                    precise FLOAT_TYPE gen_o = gen_s + FLOAT_TYPE(0.0f);
-                    data_d[d_offset + col] = FLOAT_TO_D(gen_o);
-#else
-                    data_d[d_offset + col] = FLOAT_TO_D(scale * FLOAT_TYPE(A_TO_FLOAT(data_a[a_offset + col])));
-#endif
+                } else {
+                    [[dont_unroll]] for (uint col = tid, idx = 0; idx < num_blocks; col += BLOCK_SIZE, ++idx) {
+                        if (col < ncols) {
+                            write_rms_col(col, scale, a_offset, b_offset, d_offset, false);
+                        }
+                    }
                 }
             }
 #endif
@@ -267,36 +376,4 @@ void rms_norm(uint num_iters) {
 #endif
         }
     }
-}
-
-void main() {
-#if RMS_NORM_ROPE_FUSION
-    const uint num_blocks = (p.ne00 + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    rms_norm(num_blocks);
-#else
-    // instantiate the rms_norm function for several different
-    // dimensions, to allow loop unrolling
-    uint num_blocks = (p.ne00 + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    if (!UNROLL || num_blocks > 32) {
-        rms_norm(num_blocks);
-    } else if (num_blocks > 16) {
-        rms_norm(32);
-    } else if (num_blocks > 12) {
-        rms_norm(16);
-    } else if (num_blocks > 10) {
-        rms_norm(12);
-    } else if (num_blocks > 8) {
-        rms_norm(10);
-    } else if (num_blocks > 4) {
-        rms_norm(8);
-    } else if (num_blocks == 4) {
-        rms_norm(4);
-    } else if (num_blocks == 3) {
-        rms_norm(3);
-    } else if (num_blocks == 2) {
-        rms_norm(2);
-    } else if (num_blocks == 1) {
-        rms_norm(1);
-    }
-#endif
 }

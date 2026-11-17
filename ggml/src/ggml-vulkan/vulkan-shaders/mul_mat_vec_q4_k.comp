@@ -26,22 +26,22 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
     const vec4 PFX##_qs0_hi4  = vec4(unpack8((PFX##_qs0_u32  >> 4) & 0x0F0F0F0Fu)); \
     const vec4 PFX##_qs64_hi4 = vec4(unpack8((PFX##_qs64_u32 >> 4) & 0x0F0F0F0Fu))
 
-#define DOT_Q4_K_16(PFX, DST_TEMP) do { \
+#define DOT_Q4_K_16_WITH_BY(PFX, DST_TEMP, BY10, BY132, BY20, BY232, SY10, SY132, SY20, SY232) do { \
     const FLOAT_TYPE sc0 = PFX##_sc03.x, sc1 = PFX##_sc03.y, sc2 = PFX##_sc03.z, sc3 = PFX##_sc03.w; \
     const FLOAT_TYPE sc4 = PFX##_sc47.x, sc5 = PFX##_sc47.y, sc6 = PFX##_sc47.z, sc7 = PFX##_sc47.w; \
-    const FLOAT_TYPE sx = fma(FLOAT_TYPE(by10.x),  PFX##_qs0_lo4.x,  fma(FLOAT_TYPE(by10.y),  PFX##_qs0_lo4.y,  fma(FLOAT_TYPE(by10.z),  PFX##_qs0_lo4.z,  FLOAT_TYPE(by10.w)  * PFX##_qs0_lo4.w))); \
-    const FLOAT_TYPE sy = fma(FLOAT_TYPE(by132.x), PFX##_qs0_hi4.x,  fma(FLOAT_TYPE(by132.y), PFX##_qs0_hi4.y,  fma(FLOAT_TYPE(by132.z), PFX##_qs0_hi4.z,  FLOAT_TYPE(by132.w) * PFX##_qs0_hi4.w))); \
-    const FLOAT_TYPE sz = fma(FLOAT_TYPE(by20.x),  PFX##_qs64_lo4.x, fma(FLOAT_TYPE(by20.y),  PFX##_qs64_lo4.y, fma(FLOAT_TYPE(by20.z),  PFX##_qs64_lo4.z, FLOAT_TYPE(by20.w)  * PFX##_qs64_lo4.w))); \
-    const FLOAT_TYPE sw = fma(FLOAT_TYPE(by232.x), PFX##_qs64_hi4.x, fma(FLOAT_TYPE(by232.y), PFX##_qs64_hi4.y, fma(FLOAT_TYPE(by232.z), PFX##_qs64_hi4.z, FLOAT_TYPE(by232.w) * PFX##_qs64_hi4.w))); \
+    const FLOAT_TYPE sx = fma(FLOAT_TYPE((BY10).x),  PFX##_qs0_lo4.x,  fma(FLOAT_TYPE((BY10).y),  PFX##_qs0_lo4.y,  fma(FLOAT_TYPE((BY10).z),  PFX##_qs0_lo4.z,  FLOAT_TYPE((BY10).w)  * PFX##_qs0_lo4.w))); \
+    const FLOAT_TYPE sy = fma(FLOAT_TYPE((BY132).x), PFX##_qs0_hi4.x,  fma(FLOAT_TYPE((BY132).y), PFX##_qs0_hi4.y,  fma(FLOAT_TYPE((BY132).z), PFX##_qs0_hi4.z,  FLOAT_TYPE((BY132).w) * PFX##_qs0_hi4.w))); \
+    const FLOAT_TYPE sz = fma(FLOAT_TYPE((BY20).x),  PFX##_qs64_lo4.x, fma(FLOAT_TYPE((BY20).y),  PFX##_qs64_lo4.y, fma(FLOAT_TYPE((BY20).z),  PFX##_qs64_lo4.z, FLOAT_TYPE((BY20).w)  * PFX##_qs64_lo4.w))); \
+    const FLOAT_TYPE sw = fma(FLOAT_TYPE((BY232).x), PFX##_qs64_hi4.x, fma(FLOAT_TYPE((BY232).y), PFX##_qs64_hi4.y, fma(FLOAT_TYPE((BY232).z), PFX##_qs64_hi4.z, FLOAT_TYPE((BY232).w) * PFX##_qs64_hi4.w))); \
     FLOAT_TYPE smin; \
     if (GEN_FAST_KQ == 0) { \
         smin = \
-            fma(FLOAT_TYPE(by10.x), sc2, fma(FLOAT_TYPE(by132.x), sc3, fma(FLOAT_TYPE(by20.x), sc6, fma(FLOAT_TYPE(by232.x), sc7, \
-            fma(FLOAT_TYPE(by10.y), sc2, fma(FLOAT_TYPE(by132.y), sc3, fma(FLOAT_TYPE(by20.y), sc6, fma(FLOAT_TYPE(by232.y), sc7, \
-            fma(FLOAT_TYPE(by10.z), sc2, fma(FLOAT_TYPE(by132.z), sc3, fma(FLOAT_TYPE(by20.z), sc6, fma(FLOAT_TYPE(by232.z), sc7, \
-            fma(FLOAT_TYPE(by10.w), sc2, fma(FLOAT_TYPE(by132.w), sc3, fma(FLOAT_TYPE(by20.w), sc6,     FLOAT_TYPE(by232.w) * sc7))))))))))))))); \
+            fma(FLOAT_TYPE((BY10).x), sc2, fma(FLOAT_TYPE((BY132).x), sc3, fma(FLOAT_TYPE((BY20).x), sc6, fma(FLOAT_TYPE((BY232).x), sc7, \
+            fma(FLOAT_TYPE((BY10).y), sc2, fma(FLOAT_TYPE((BY132).y), sc3, fma(FLOAT_TYPE((BY20).y), sc6, fma(FLOAT_TYPE((BY232).y), sc7, \
+            fma(FLOAT_TYPE((BY10).z), sc2, fma(FLOAT_TYPE((BY132).z), sc3, fma(FLOAT_TYPE((BY20).z), sc6, fma(FLOAT_TYPE((BY232).z), sc7, \
+            fma(FLOAT_TYPE((BY10).w), sc2, fma(FLOAT_TYPE((BY132).w), sc3, fma(FLOAT_TYPE((BY20).w), sc6,     FLOAT_TYPE((BY232).w) * sc7))))))))))))))); \
     } else { \
-        smin = fma(sumy10, sc2, fma(sumy132, sc3, fma(sumy20, sc6, sumy232 * sc7))); \
+        smin = fma(SY10, sc2, fma(SY132, sc3, fma(SY20, sc6, (SY232) * sc7))); \
     } \
     DST_TEMP[j][n] = fma(PFX##_dm.x, fma(sx, sc0, fma(sy, sc1, fma(sz, sc4, sw * sc5))), fma(-PFX##_dm.y, smin, DST_TEMP[j][n])); \
 } while (false)
@@ -50,26 +50,118 @@ void calc_superblock_a(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_TY
     const uint y1_idx = i * QUANT_K + y_offset;
     const uint y2_idx = y1_idx + 128;
 
-    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-        const uint ib0 = a_offset + (first_row + n) * num_blocks_per_row;
-        LOAD_Q4_K_16(a1, data_a, data_a_packed16, data_a_packed32);
+    if (NUM_COLS <= 4) {
+        vec4 by10_a[4], by132_a[4], by20_a[4], by232_a[4];
+        FLOAT_TYPE sy10_a[4], sy132_a[4], sy20_a[4], sy232_a[4];
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
             const uint b4_1 = (j * p.batch_stride_b + b_offset + y1_idx) / 4;
             const uint b4_2 = (j * p.batch_stride_b + b_offset + y2_idx) / 4;
-            const vec4 by10  = vec4(data_b_v4[b4_1    ]);
-            const vec4 by132 = vec4(data_b_v4[b4_1 + 8]);
-            const vec4 by20  = vec4(data_b_v4[b4_2    ]);
-            const vec4 by232 = vec4(data_b_v4[b4_2 + 8]);
-            FLOAT_TYPE sumy10 = FLOAT_TYPE(0), sumy132 = FLOAT_TYPE(0), sumy20 = FLOAT_TYPE(0), sumy232 = FLOAT_TYPE(0);
+            by10_a[j]  = vec4(data_b_v4[b4_1    ]);
+            by132_a[j] = vec4(data_b_v4[b4_1 + 8]);
+            by20_a[j]  = vec4(data_b_v4[b4_2    ]);
+            by232_a[j] = vec4(data_b_v4[b4_2 + 8]);
+            sy10_a[j] = FLOAT_TYPE(0); sy132_a[j] = FLOAT_TYPE(0); sy20_a[j] = FLOAT_TYPE(0); sy232_a[j] = FLOAT_TYPE(0);
             if (GEN_FAST_KQ != 0) {
-                sumy10  = (FLOAT_TYPE(by10.x)  + FLOAT_TYPE(by10.y))  + (FLOAT_TYPE(by10.z)  + FLOAT_TYPE(by10.w));
-                sumy132 = (FLOAT_TYPE(by132.x) + FLOAT_TYPE(by132.y)) + (FLOAT_TYPE(by132.z) + FLOAT_TYPE(by132.w));
-                sumy20  = (FLOAT_TYPE(by20.x)  + FLOAT_TYPE(by20.y))  + (FLOAT_TYPE(by20.z)  + FLOAT_TYPE(by20.w));
-                sumy232 = (FLOAT_TYPE(by232.x) + FLOAT_TYPE(by232.y)) + (FLOAT_TYPE(by232.z) + FLOAT_TYPE(by232.w));
+                sy10_a[j]  = (FLOAT_TYPE(by10_a[j].x)  + FLOAT_TYPE(by10_a[j].y))  + (FLOAT_TYPE(by10_a[j].z)  + FLOAT_TYPE(by10_a[j].w));
+                sy132_a[j] = (FLOAT_TYPE(by132_a[j].x) + FLOAT_TYPE(by132_a[j].y)) + (FLOAT_TYPE(by132_a[j].z) + FLOAT_TYPE(by132_a[j].w));
+                sy20_a[j]  = (FLOAT_TYPE(by20_a[j].x)  + FLOAT_TYPE(by20_a[j].y))  + (FLOAT_TYPE(by20_a[j].z)  + FLOAT_TYPE(by20_a[j].w));
+                sy232_a[j] = (FLOAT_TYPE(by232_a[j].x) + FLOAT_TYPE(by232_a[j].y)) + (FLOAT_TYPE(by232_a[j].z) + FLOAT_TYPE(by232_a[j].w));
             }
-            DOT_Q4_K_16(a1, temp);
         }
-        if (GEN_GLU == 3) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint rn = (n == 0 || n < num_rows) ? n : 0;
+            const uint ib0 = a_offset + (first_row + rn) * num_blocks_per_row;
+            LOAD_Q4_K_16(a1, data_a, data_a_packed16, data_a_packed32);
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                DOT_Q4_K_16_WITH_BY(a1, temp, by10_a[j], by132_a[j], by20_a[j], by232_a[j], sy10_a[j], sy132_a[j], sy20_a[j], sy232_a[j]);
+            }
+            if (GEN_GLU == 3) {
+                LOAD_Q4_K_16(a2, data_a2, data_a2_packed16, data_a2_packed32);
+                [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                    DOT_Q4_K_16_WITH_BY(a2, temp2, by10_a[j], by132_a[j], by20_a[j], by232_a[j], sy10_a[j], sy132_a[j], sy20_a[j], sy232_a[j]);
+                }
+            }
+        }
+    } else {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint rn = (n == 0 || n < num_rows) ? n : 0;
+            const uint ib0 = a_offset + (first_row + rn) * num_blocks_per_row;
+            LOAD_Q4_K_16(a1, data_a, data_a_packed16, data_a_packed32);
+            if (GEN_GLU == 3) {
+                LOAD_Q4_K_16(a2, data_a2, data_a2_packed16, data_a2_packed32);
+                [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                    const uint b4_1 = (j * p.batch_stride_b + b_offset + y1_idx) / 4;
+                    const uint b4_2 = (j * p.batch_stride_b + b_offset + y2_idx) / 4;
+                    const vec4 by10  = vec4(data_b_v4[b4_1    ]);
+                    const vec4 by132 = vec4(data_b_v4[b4_1 + 8]);
+                    const vec4 by20  = vec4(data_b_v4[b4_2    ]);
+                    const vec4 by232 = vec4(data_b_v4[b4_2 + 8]);
+                    FLOAT_TYPE sumy10 = FLOAT_TYPE(0), sumy132 = FLOAT_TYPE(0), sumy20 = FLOAT_TYPE(0), sumy232 = FLOAT_TYPE(0);
+                    if (GEN_FAST_KQ != 0) {
+                        sumy10  = (FLOAT_TYPE(by10.x)  + FLOAT_TYPE(by10.y))  + (FLOAT_TYPE(by10.z)  + FLOAT_TYPE(by10.w));
+                        sumy132 = (FLOAT_TYPE(by132.x) + FLOAT_TYPE(by132.y)) + (FLOAT_TYPE(by132.z) + FLOAT_TYPE(by132.w));
+                        sumy20  = (FLOAT_TYPE(by20.x)  + FLOAT_TYPE(by20.y))  + (FLOAT_TYPE(by20.z)  + FLOAT_TYPE(by20.w));
+                        sumy232 = (FLOAT_TYPE(by232.x) + FLOAT_TYPE(by232.y)) + (FLOAT_TYPE(by232.z) + FLOAT_TYPE(by232.w));
+                    }
+                    DOT_Q4_K_16_WITH_BY(a1, temp, by10, by132, by20, by232, sumy10, sumy132, sumy20, sumy232);
+                    DOT_Q4_K_16_WITH_BY(a2, temp2, by10, by132, by20, by232, sumy10, sumy132, sumy20, sumy232);
+                }
+            } else {
+                [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                    const uint b4_1 = (j * p.batch_stride_b + b_offset + y1_idx) / 4;
+                    const uint b4_2 = (j * p.batch_stride_b + b_offset + y2_idx) / 4;
+                    const vec4 by10  = vec4(data_b_v4[b4_1    ]);
+                    const vec4 by132 = vec4(data_b_v4[b4_1 + 8]);
+                    const vec4 by20  = vec4(data_b_v4[b4_2    ]);
+                    const vec4 by232 = vec4(data_b_v4[b4_2 + 8]);
+                    FLOAT_TYPE sumy10 = FLOAT_TYPE(0), sumy132 = FLOAT_TYPE(0), sumy20 = FLOAT_TYPE(0), sumy232 = FLOAT_TYPE(0);
+                    if (GEN_FAST_KQ != 0) {
+                        sumy10  = (FLOAT_TYPE(by10.x)  + FLOAT_TYPE(by10.y))  + (FLOAT_TYPE(by10.z)  + FLOAT_TYPE(by10.w));
+                        sumy132 = (FLOAT_TYPE(by132.x) + FLOAT_TYPE(by132.y)) + (FLOAT_TYPE(by132.z) + FLOAT_TYPE(by132.w));
+                        sumy20  = (FLOAT_TYPE(by20.x)  + FLOAT_TYPE(by20.y))  + (FLOAT_TYPE(by20.z)  + FLOAT_TYPE(by20.w));
+                        sumy232 = (FLOAT_TYPE(by232.x) + FLOAT_TYPE(by232.y)) + (FLOAT_TYPE(by232.z) + FLOAT_TYPE(by232.w));
+                    }
+                    DOT_Q4_K_16_WITH_BY(a1, temp, by10, by132, by20, by232, sumy10, sumy132, sumy20, sumy232);
+                }
+            }
+        }
+    }
+}
+
+void calc_superblock_a2(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint a_offset, const uint b_offset, const uint v_im, const uint q_offset, const uint y_offset, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
+    const uint y1_idx = i * QUANT_K + y_offset;
+    const uint y2_idx = y1_idx + 128;
+
+    if (NUM_COLS <= 4) {
+        vec4 by10_a[4], by132_a[4], by20_a[4], by232_a[4];
+        FLOAT_TYPE sy10_a[4], sy132_a[4], sy20_a[4], sy232_a[4];
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const uint b4_1 = (j * p.batch_stride_b + b_offset + y1_idx) / 4;
+            const uint b4_2 = (j * p.batch_stride_b + b_offset + y2_idx) / 4;
+            by10_a[j]  = vec4(data_b_v4[b4_1    ]);
+            by132_a[j] = vec4(data_b_v4[b4_1 + 8]);
+            by20_a[j]  = vec4(data_b_v4[b4_2    ]);
+            by232_a[j] = vec4(data_b_v4[b4_2 + 8]);
+            sy10_a[j] = FLOAT_TYPE(0); sy132_a[j] = FLOAT_TYPE(0); sy20_a[j] = FLOAT_TYPE(0); sy232_a[j] = FLOAT_TYPE(0);
+            if (GEN_FAST_KQ != 0) {
+                sy10_a[j]  = (FLOAT_TYPE(by10_a[j].x)  + FLOAT_TYPE(by10_a[j].y))  + (FLOAT_TYPE(by10_a[j].z)  + FLOAT_TYPE(by10_a[j].w));
+                sy132_a[j] = (FLOAT_TYPE(by132_a[j].x) + FLOAT_TYPE(by132_a[j].y)) + (FLOAT_TYPE(by132_a[j].z) + FLOAT_TYPE(by132_a[j].w));
+                sy20_a[j]  = (FLOAT_TYPE(by20_a[j].x)  + FLOAT_TYPE(by20_a[j].y))  + (FLOAT_TYPE(by20_a[j].z)  + FLOAT_TYPE(by20_a[j].w));
+                sy232_a[j] = (FLOAT_TYPE(by232_a[j].x) + FLOAT_TYPE(by232_a[j].y)) + (FLOAT_TYPE(by232_a[j].z) + FLOAT_TYPE(by232_a[j].w));
+            }
+        }
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint rn = (n == 0 || n < num_rows) ? n : 0;
+            const uint ib0 = a_offset + (first_row + rn) * num_blocks_per_row;
+            LOAD_Q4_K_16(a2, data_a2, data_a2_packed16, data_a2_packed32);
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                DOT_Q4_K_16_WITH_BY(a2, temp, by10_a[j], by132_a[j], by20_a[j], by232_a[j], sy10_a[j], sy132_a[j], sy20_a[j], sy232_a[j]);
+            }
+        }
+    } else {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint rn = (n == 0 || n < num_rows) ? n : 0;
+            const uint ib0 = a_offset + (first_row + rn) * num_blocks_per_row;
             LOAD_Q4_K_16(a2, data_a2, data_a2_packed16, data_a2_packed32);
             [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
                 const uint b4_1 = (j * p.batch_stride_b + b_offset + y1_idx) / 4;
@@ -85,34 +177,8 @@ void calc_superblock_a(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_TY
                     sumy20  = (FLOAT_TYPE(by20.x)  + FLOAT_TYPE(by20.y))  + (FLOAT_TYPE(by20.z)  + FLOAT_TYPE(by20.w));
                     sumy232 = (FLOAT_TYPE(by232.x) + FLOAT_TYPE(by232.y)) + (FLOAT_TYPE(by232.z) + FLOAT_TYPE(by232.w));
                 }
-                DOT_Q4_K_16(a2, temp2);
+                DOT_Q4_K_16_WITH_BY(a2, temp, by10, by132, by20, by232, sumy10, sumy132, sumy20, sumy232);
             }
-        }
-    }
-}
-
-void calc_superblock_a2(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint a_offset, const uint b_offset, const uint v_im, const uint q_offset, const uint y_offset, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
-    const uint y1_idx = i * QUANT_K + y_offset;
-    const uint y2_idx = y1_idx + 128;
-
-    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-        const uint ib0 = a_offset + (first_row + n) * num_blocks_per_row;
-        LOAD_Q4_K_16(a2, data_a2, data_a2_packed16, data_a2_packed32);
-        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-            const uint b4_1 = (j * p.batch_stride_b + b_offset + y1_idx) / 4;
-            const uint b4_2 = (j * p.batch_stride_b + b_offset + y2_idx) / 4;
-            const vec4 by10  = vec4(data_b_v4[b4_1    ]);
-            const vec4 by132 = vec4(data_b_v4[b4_1 + 8]);
-            const vec4 by20  = vec4(data_b_v4[b4_2    ]);
-            const vec4 by232 = vec4(data_b_v4[b4_2 + 8]);
-            FLOAT_TYPE sumy10 = FLOAT_TYPE(0), sumy132 = FLOAT_TYPE(0), sumy20 = FLOAT_TYPE(0), sumy232 = FLOAT_TYPE(0);
-            if (GEN_FAST_KQ != 0) {
-                sumy10  = (FLOAT_TYPE(by10.x)  + FLOAT_TYPE(by10.y))  + (FLOAT_TYPE(by10.z)  + FLOAT_TYPE(by10.w));
-                sumy132 = (FLOAT_TYPE(by132.x) + FLOAT_TYPE(by132.y)) + (FLOAT_TYPE(by132.z) + FLOAT_TYPE(by132.w));
-                sumy20  = (FLOAT_TYPE(by20.x)  + FLOAT_TYPE(by20.y))  + (FLOAT_TYPE(by20.z)  + FLOAT_TYPE(by20.w));
-                sumy232 = (FLOAT_TYPE(by232.x) + FLOAT_TYPE(by232.y)) + (FLOAT_TYPE(by232.z) + FLOAT_TYPE(by232.w));
-            }
-            DOT_Q4_K_16(a2, temp);
         }
     }
 }
@@ -164,8 +230,9 @@ void calc_superblock_a2(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint a_
 
 void calc_superblock_8_a(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_TYPE temp2[NUM_COLS][NUM_ROWS], const uint a_offset, const uint b_offset, const uint itid8, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
     const uint y_idx = i * QUANT_K + 4 * itid8;
-    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-        const uint ib = a_offset + (first_row + n) * num_blocks_per_row + i;
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        const uint rn = (n == 0 || n < num_rows) ? n : 0;
+        const uint ib = a_offset + (first_row + rn) * num_blocks_per_row + i;
         LOAD_Q4_K_8(a1, data_a_packed32);
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
             DOT_Q4_K_8(a1, temp);
@@ -181,8 +248,9 @@ void calc_superblock_8_a(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_
 
 void calc_superblock_8_a2(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint a_offset, const uint b_offset, const uint itid8, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
     const uint y_idx = i * QUANT_K + 4 * itid8;
-    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-        const uint ib = a_offset + (first_row + n) * num_blocks_per_row + i;
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        const uint rn = (n == 0 || n < num_rows) ? n : 0;
+        const uint ib = a_offset + (first_row + rn) * num_blocks_per_row + i;
         LOAD_Q4_K_8(a2, data_a2_packed32);
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
             DOT_Q4_K_8(a2, temp);
@@ -196,9 +264,11 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
 #ifndef MUL_MAT_ID
     const bool use_a2   = (GEN_GLU == 2) && (first_row >= p.pair_m0);
     const uint row_base = use_a2 ? (first_row - p.pair_m0) : first_row;
+    const uint eff_rows = (!use_a2 && GEN_GLU == 2) ? min(num_rows, p.pair_m0 - first_row) : num_rows;
 #else
     const bool use_a2   = false;
     const uint row_base = first_row;
+    const uint eff_rows = num_rows;
 #endif
 
     const uint num_blocks_per_row = p.ncols / QUANT_K;
@@ -226,12 +296,12 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
         const uint itid8 = tid & 7;
         const uint ix8 = tid >> 3;
         if (GEN_GLU == 2 && use_a2) {
-            [[unroll]] for (uint i = ix8; i < num_blocks_per_row; i += it_size8) {
-                calc_superblock_8_a2(temp, a_offset, b_offset, itid8, i, num_blocks_per_row, row_base, num_rows);
+            for (uint i = ix8; i < num_blocks_per_row; i += it_size8) {
+                calc_superblock_8_a2(temp, a_offset, b_offset, itid8, i, num_blocks_per_row, row_base, eff_rows);
             }
         } else {
-            [[unroll]] for (uint i = ix8; i < num_blocks_per_row; i += it_size8) {
-                calc_superblock_8_a(temp, temp2, a_offset, b_offset, itid8, i, num_blocks_per_row, row_base, num_rows);
+            for (uint i = ix8; i < num_blocks_per_row; i += it_size8) {
+                calc_superblock_8_a(temp, temp2, a_offset, b_offset, itid8, i, num_blocks_per_row, row_base, eff_rows);
             }
         }
     } else {
@@ -252,26 +322,26 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
         const uint y_offset = 64*v_im + l0;
 
         if (GEN_GLU == 2 && use_a2) {
-            [[unroll]] for (uint i = ix; i < num_blocks_per_row; i += it_size) {
-                calc_superblock_a2(temp, a_offset, b_offset, v_im, q_offset, y_offset, i, num_blocks_per_row, row_base, num_rows);
+            for (uint i = ix; i < num_blocks_per_row; i += it_size) {
+                calc_superblock_a2(temp, a_offset, b_offset, v_im, q_offset, y_offset, i, num_blocks_per_row, row_base, eff_rows);
             }
         } else {
-            [[unroll]] for (uint i = ix; i < num_blocks_per_row; i += it_size) {
-                calc_superblock_a(temp, temp2, a_offset, b_offset, v_im, q_offset, y_offset, i, num_blocks_per_row, row_base, num_rows);
+            for (uint i = ix; i < num_blocks_per_row; i += it_size) {
+                calc_superblock_a(temp, temp2, a_offset, b_offset, v_im, q_offset, y_offset, i, num_blocks_per_row, row_base, eff_rows);
             }
         }
     }
 
     if (GEN_GLU == 3) {
-        reduce_pair_glu(temp, temp2, d_offset, first_row, num_rows, tid);
+        reduce_pair_glu(temp, temp2, d_offset, first_row, eff_rows, tid);
     }
 #ifndef MUL_MAT_ID
     else if (GEN_GLU == 2 && use_a2) {
-        reduce_result_d2(temp, row_base, num_rows, tid);
+        reduce_result_d2(temp, row_base, eff_rows, tid);
     }
 #endif
     else {
-        reduce_result(temp, d_offset, first_row, num_rows, tid);
+        reduce_result(temp, d_offset, first_row, eff_rows, tid);
     }
 }
 
@@ -282,13 +352,8 @@ void main() {
     const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
 #endif
 
-    // do NUM_ROWS at a time, unless there aren't enough remaining rows
-    if (first_row + NUM_ROWS <= p.stride_d) {
-        compute_outputs(first_row, NUM_ROWS);
-    } else {
-        if (first_row >= p.stride_d) {
-            return;
-        }
-        compute_outputs(first_row, p.stride_d - first_row);
+    if (first_row >= p.stride_d) {
+        return;
     }
+    compute_outputs(first_row, min(NUM_ROWS, p.stride_d - first_row));
 }
