@@ -111,7 +111,7 @@ void ggml_vk_dsv4_hc_pre(ggml_backend_vk_context * ctx, vk_context& subctx, cons
 void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * x, const ggml_tensor * residual, const ggml_tensor * post, const ggml_tensor * comb, ggml_tensor * dst, const ggml_tensor * gate_scale_in = nullptr);
 void ggml_vk_top_k_mask(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst);
 void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx);
-bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int node_idx);
+bool ggml_vk_use_mul_mat_vec_id(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx);
 void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx);
 
 // flash-attn
@@ -303,6 +303,14 @@ inline void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     GGML_ASSERT(pipeline->parameter_count == descriptor_buffer_infos.size());
     GGML_ASSERT(pipeline->push_constant_size == push_constant_size(push_constants));
 
+    ctx->stat_dispatches++;
+    {
+        // gen: GGML_VK_GRAPH_STATS=2 lists every dispatch (pipeline and workgroups)
+        static const int gen_stats_level = getenv("GGML_VK_GRAPH_STATS") ? atoi(getenv("GGML_VK_GRAPH_STATS")) : 0;
+        if (gen_stats_level >= 2) {
+            fprintf(stderr, "ggml_vk_dispatch: %s %u %u %u\n", pipeline->name.c_str(), wg0, wg1, wg2);
+        }
+    }
     const uint32_t descriptor_set_idx = ctx->descriptor_set_idx++;
     vk::DescriptorSet& descriptor_set = ctx->descriptor_sets[descriptor_set_idx];
 

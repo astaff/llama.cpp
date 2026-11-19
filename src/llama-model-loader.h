@@ -27,6 +27,10 @@ enum llama_fver {
 
 const char * llama_file_version_name(llama_fver version);
 
+// gen: names of F32 weights stored as BF16 by GGML_GEN_BF16_EXACT (filled at load, read during graph build)
+bool    llama_gen_bf16_converted(const char * name);
+int64_t llama_gen_bf16_cast_above();
+
 struct llama_model_loader {
     // Holds information on a model weight
     struct llama_tensor_weight {
@@ -221,6 +225,9 @@ struct llama_model_loader {
     const llama_tensor_weight * get_weight(const char * name) const;
 
     const llama_tensor_weight & require_weight(const char * name) const;
+
+    // gen: F32 weights stored as BF16 because every value is exactly representable (GGML_GEN_BF16_EXACT=1)
+    std::set<std::string> gen_bf16_tensors;
 
     struct ggml_tensor * get_tensor_meta(const char * name) const;
 

@@ -5,6 +5,8 @@
 
 const uint num_threads = 128;
 
+layout(constant_id = 0) const bool ZERO_FILL = false;
+
 layout(local_size_x = num_threads, local_size_y = 1, local_size_z = 1) in;
 
 void main() {
@@ -18,7 +20,11 @@ void main() {
             continue;
         }
 
-        data_d[get_doffset() + idx] = D_TYPE(FLOAT_TYPE(data_a[get_aoffset() + idx]) * FLOAT_TYPE(p.param1) + FLOAT_TYPE(p.param2));
+        if (ZERO_FILL) {
+            data_d[get_doffset() + idx] = D_TYPE(0);
+        } else {
+            data_d[get_doffset() + idx] = D_TYPE(FLOAT_TYPE(data_a[get_aoffset() + idx]) * FLOAT_TYPE(p.param1) + FLOAT_TYPE(p.param2));
+        }
         idx += num_threads;
     }
 }

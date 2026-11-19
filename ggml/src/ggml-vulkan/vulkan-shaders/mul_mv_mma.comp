@@ -1,0 +1,1828 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_cooperative_matrix : enable
+
+#ifndef FLOAT_TYPE
+#define FLOAT_TYPE float16_t
+#endif
+
+#include "types.glsl"
+
+// Zero-spill register-direct 8x8x8 cooperative-matrix few-column matmul / MoE matmul_id for Apple AGX (G17P).
+// Subgroup layout (AGX3B 8x8 coopmat):
+//   lane l in [0..31] owns:
+//     fm = ((l >> 1) & 3) | ((l >> 2) & 4)   in [0..7]
+//     fn = ((l & 1) << 1) | ((l >> 1) & 4)   in {0, 2, 4, 6}  (elements e=0,1 -> fn, fn+1)
+
+layout(local_size_x = 32, local_size_y_id = 0, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint WG_SG     = 1; // total subgroups per workgroup = NSG * MSG * CSG
+layout(constant_id = 1) const uint NT        = 2; // 8*NT M-rows per subgroup
+layout(constant_id = 2) const uint RT        = 1; // 8*RT N-cols per subgroup (1, 2, 4)
+layout(constant_id = 3) const uint NSG       = 1; // K-split subgroups
+// 0 = plain, 1 = single-op epilogue, 2 = PAIR_MM (dense only), 3 = PAIR_GLU, 4 = fast epilogue
+layout(constant_id = 4) const uint FUSE_MODE = 0;
+layout(constant_id = 5) const uint USE_SH_B  = 1;
+layout(constant_id = 6) const uint K_PAIRS   = 1;
+layout(constant_id = 7) const uint CSG       = 1; // column-split subgroups (MUL_MAT_ID cooperative dequant)
+layout(constant_id = 8) const uint B_IS_F16  = 0; // compile-time FP16 B buffer specialization
+layout(constant_id = 9) const uint FUSE_LORA = 0; // compile-time fused dynamic LoRA specialization
+
+const uint MSG        = WG_SG / (NSG * CSG);
+const uint WG_THREADS = 32u * WG_SG;
+const uint BN_COLS    = 8u * RT * CSG;
+
+#if defined(DATA_A_F32)
+#define MMA_FTYPE float
+#define MMA_FVEC4 vec4
+#define MMA_FVEC2 vec2
+#define MMA_ELEM_SHIFT 0u
+#elif defined(DATA_A_F32_F16)
+#define MMA_FTYPE float16_t
+#define MMA_FVEC4 f16vec4
+#define MMA_FVEC2 f16vec2
+#define MMA_ELEM_SHIFT 0u
+#elif defined(DATA_A_F16)
+#define MMA_FTYPE float16_t
+#define MMA_FVEC4 f16vec4
+#define MMA_FVEC2 f16vec2
+#define MMA_ELEM_SHIFT 0u
+#elif defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K) || defined(DATA_A_Q6_K) || defined(DATA_A_IQ4_XS)
+#define MMA_FTYPE float16_t
+#define MMA_FVEC4 f16vec4
+#define MMA_FVEC2 f16vec2
+#define MMA_ELEM_SHIFT 8u
+#else
+#define MMA_FTYPE float16_t
+#define MMA_FVEC4 f16vec4
+#define MMA_FVEC2 f16vec2
+#define MMA_ELEM_SHIFT 5u
+#endif
+
+#ifdef MUL_MAT_ID
+#define MMA_BIND_U    5
+#define MMA_BIND_AUX0 6
+#define MMA_BIND_AUX1 7
+#else
+// Matches mul_mat_vec 7-binding layout: {A=0, B=1, D=2, F0/U=3, F1=4, D2=5, F2=6}
+#define MMA_BIND_U    3
+#define MMA_BIND_AUX0 3
+#define MMA_BIND_AUX1 4
+#endif
+
+// Per-type SSBO bindings (only the active type's descriptors are declared)
+#if defined(DATA_A_F32) || defined(DATA_A_F32_F16)
+layout(binding = 0)          readonly buffer BUF_A_F32   { float data[]; } a_f32;
+layout(binding = 0)          readonly buffer BUF_A_F32V4 { vec4  data[]; } a_f32v4;
+layout(binding = MMA_BIND_U) readonly buffer BUF_U_F32   { float data[]; } u_f32;
+layout(binding = MMA_BIND_U) readonly buffer BUF_U_F32V4 { vec4  data[]; } u_f32v4;
+#elif defined(DATA_A_F16)
+layout(binding = 0)          readonly buffer BUF_A_F16   { float16_t data[]; } a_f16;
+layout(binding = 0)          readonly buffer BUF_A_F16V4 { f16vec4   data[]; } a_f16v4;
+layout(binding = MMA_BIND_U) readonly buffer BUF_U_F16   { float16_t data[]; } u_f16;
+layout(binding = MMA_BIND_U) readonly buffer BUF_U_F16V4 { f16vec4   data[]; } u_f16v4;
+#elif defined(DATA_A_Q8_0)
+layout(binding = 0)          readonly buffer BUF_A_Q8_0  { block_q8_0_packed16 data[]; } a_q8_0;
+layout(binding = 0)          readonly buffer BUF_A_U32   { uint                data[]; } a_u32;
+layout(binding = MMA_BIND_U) readonly buffer BUF_U_Q8_0  { block_q8_0_packed16 data[]; } u_q8_0;
+layout(binding = MMA_BIND_U) readonly buffer BUF_U_U32   { uint                data[]; } u_u32;
+#elif defined(DATA_A_Q4_0)
+layout(binding = 0)          readonly buffer BUF_A_Q4_0  { block_q4_0_packed16 data[]; } a_q4_0;
+layout(binding = MMA_BIND_U) readonly buffer BUF_U_Q4_0  { block_q4_0_packed16 data[]; } u_q4_0;
+#elif defined(DATA_A_Q4_1)
+layout(binding = 0)          readonly buffer BUF_A_Q4_1  { block_q4_1_packed32 data[]; } a_q4_1;
+layout(binding = MMA_BIND_U) readonly buffer BUF_U_Q4_1  { block_q4_1_packed32 data[]; } u_q4_1;
+#elif defined(DATA_A_Q5_0)
+layout(binding = 0)          readonly buffer BUF_A_Q5_0  { block_q5_0_packed16 data[]; } a_q5_0;
+layout(binding = MMA_BIND_U) readonly buffer BUF_U_Q5_0  { block_q5_0_packed16 data[]; } u_q5_0;
+#elif defined(DATA_A_Q5_1)
+layout(binding = 0)          readonly buffer BUF_A_Q5_1  { block_q5_1_packed32 data[]; } a_q5_1;
+layout(binding = MMA_BIND_U) readonly buffer BUF_U_Q5_1  { block_q5_1_packed32 data[]; } u_q5_1;
+#elif defined(DATA_A_Q4_K)
+layout(binding = 0)          readonly buffer BUF_A_Q4_K    { block_q4_K          data[]; } a_q4_k;
+layout(binding = 0)          readonly buffer BUF_A_Q4_KP32 { block_q4_K_packed32 data[]; } a_q4_k_p32;
+layout(binding = MMA_BIND_U) readonly buffer BUF_U_Q4_K    { block_q4_K          data[]; } u_q4_k;
+layout(binding = MMA_BIND_U) readonly buffer BUF_U_Q4_KP32 { block_q4_K_packed32 data[]; } u_q4_k_p32;
+#elif defined(DATA_A_Q5_K)
+layout(binding = 0)          readonly buffer BUF_A_Q5_K    { block_q5_K          data[]; } a_q5_k;
+layout(binding = 0)          readonly buffer BUF_A_Q5_KP32 { block_q5_K_packed32 data[]; } a_q5_k_p32;
+layout(binding = MMA_BIND_U) readonly buffer BUF_U_Q5_K    { block_q5_K          data[]; } u_q5_k;
+layout(binding = MMA_BIND_U) readonly buffer BUF_U_Q5_KP32 { block_q5_K_packed32 data[]; } u_q5_k_p32;
+#elif defined(DATA_A_Q6_K)
+layout(binding = 0)          readonly buffer BUF_A_Q6_K    { block_q6_K          data[]; } a_q6_k;
+layout(binding = 0)          readonly buffer BUF_A_Q6_KP16 { block_q6_K_packed16 data[]; } a_q6_k_p16;
+layout(binding = MMA_BIND_U) readonly buffer BUF_U_Q6_K    { block_q6_K          data[]; } u_q6_k;
+layout(binding = MMA_BIND_U) readonly buffer BUF_U_Q6_KP16 { block_q6_K_packed16 data[]; } u_q6_k_p16;
+#elif defined(DATA_A_IQ4_XS)
+layout(binding = 0)          readonly buffer BUF_A_IQ4_XS   { block_iq4_xs          data[]; } a_iq4_xs;
+layout(binding = 0)          readonly buffer BUF_A_IQ4XSP32 { block_iq4_xs_packed32 data[]; } a_iq4_xs_p32;
+layout(binding = MMA_BIND_U) readonly buffer BUF_U_IQ4_XS   { block_iq4_xs          data[]; } u_iq4_xs;
+layout(binding = MMA_BIND_U) readonly buffer BUF_U_IQ4XSP32 { block_iq4_xs_packed32 data[]; } u_iq4_xs_p32;
+#elif defined(DATA_A_IQ4_NL)
+layout(binding = 0)          readonly buffer BUF_A_IQ4_NL { block_iq4_nl_packed16 data[]; } a_iq4_nl;
+layout(binding = MMA_BIND_U) readonly buffer BUF_U_IQ4_NL { block_iq4_nl_packed16 data[]; } u_iq4_nl;
+#endif
+
+// B bindings (binding = 1)
+layout(binding = 1) readonly buffer BUF_B_F32   { float     data_b[];       };
+layout(binding = 1) readonly buffer BUF_B_F32V2 { vec2      data_b_v2[];    };
+layout(binding = 1) readonly buffer BUF_B_F32V4 { vec4      data_b_v4[];    };
+layout(binding = 1) readonly buffer BUF_B_F16   { float16_t data_b_f16[];   };
+layout(binding = 1) readonly buffer BUF_B_F16V2 { f16vec2   data_b_f16v2[]; };
+layout(binding = 1) readonly buffer BUF_B_F16V4 { f16vec4   data_b_f16v4[]; };
+
+// D binding (binding = 2)
+layout(binding = 2) writeonly buffer BUF_D_F32  { float data_d[]; };
+
+#ifdef MUL_MAT_ID
+layout(binding = 3) readonly buffer BUF_IDS     { int   data_ids[];     };
+layout(binding = 4) readonly buffer BUF_ROW_MAP { uint  data_row_map[]; };
+layout(binding = MMA_BIND_AUX1) writeonly buffer BUF_D_F16 { float16_t data_d_f16[]; };
+#else
+layout(binding = 5)  writeonly buffer BUF_D2_F32     { float data_d2[];    };
+layout(binding = 6)  readonly  buffer BUF_F2_F32     { float data_aux2[];  };
+layout(binding = 7)  readonly  buffer BUF_LORA_B0    { float data[]; } lora_b0;
+layout(binding = 7)  readonly  buffer BUF_LORA_B0_V4 { vec4  data[]; } lora_b0_v4;
+layout(binding = 8)  readonly  buffer BUF_LORA_H0    { float data[]; } lora_h0;
+layout(binding = 8)  readonly  buffer BUF_LORA_H0_V4 { vec4  data[]; } lora_h0_v4;
+layout(binding = 9)  readonly  buffer BUF_LORA_B1    { float data[]; } lora_b1;
+layout(binding = 9)  readonly  buffer BUF_LORA_B1_V4 { vec4  data[]; } lora_b1_v4;
+layout(binding = 10) readonly  buffer BUF_LORA_H1    { float data[]; } lora_h1;
+layout(binding = 10) readonly  buffer BUF_LORA_H1_V4 { vec4  data[]; } lora_h1_v4;
+#endif
+
+layout(binding = MMA_BIND_AUX0) readonly buffer BUF_AUX0 { float data_aux0[]; };
+layout(binding = MMA_BIND_AUX1) readonly buffer BUF_AUX1 { float data_aux1[]; };
+
+#define MAT_VEC_FUSION_FLAGS_BIAS0            0x1u
+#define MAT_VEC_FUSION_FLAGS_BIAS1            0x2u
+#define MAT_VEC_FUSION_FLAGS_SCALE0           0x4u
+#define MAT_VEC_FUSION_FLAGS_SCALE1           0x8u
+#define MAT_VEC_FUSION_FLAGS_GLU_A            0x10u
+#define MAT_VEC_FUSION_FLAGS_GLU_B            0x20u
+#define MAT_VEC_FUSION_FLAGS_SIGMOID          0x80u
+#define MAT_VEC_FUSION_FLAGS_SOFTPLUS_GATE    0x100u
+#define MAT_VEC_FUSION_FLAGS_ROW_SCALE0       0x200u
+#define MAT_VEC_FUSION_FLAGS_PAIR_GLU         0x400u
+#define MAT_VEC_FUSION_FLAGS_PAIR_MM          0x800u
+#define MAT_VEC_FUSION_FLAGS_PAIR_MM_SIGMOID1 0x1000u
+#define MAT_VEC_FUSION_FLAGS_SCALE0_TOK       0x2000u
+#define MAT_VEC_FUSION_FLAGS_SCALE1_TOK       0x4000u
+#define MAT_VEC_FUSION_FLAGS_B_F16            0x10000u
+#define MAT_VEC_FUSION_FLAGS_D_F16_AUX1       0x20000u
+#define MAT_VEC_FUSION_FLAGS_SKIP_F32_D       0x40000u
+#define MAT_VEC_FUSION_FLAGS_LORA0            0x80000u
+#define MAT_VEC_FUSION_FLAGS_LORA1            0x100000u
+
+layout(push_constant) uniform parameter {
+#ifdef MUL_MAT_ID
+    uint M;
+    uint N;
+    uint K;
+    uint stride_a;
+    uint stride_b;
+    uint stride_d;
+    uint batch_stride_a;
+    uint batch_stride_b;
+    uint batch_stride_d;
+    uint nei0;
+    uint nei1;
+    uint nbi1;
+    uint ne11;
+    uint n_experts;
+    uint row_ids_offset;
+    uint fusion_flags;
+#else
+    uint M;
+    uint N;
+    uint K;
+    uint stride_a;
+    uint stride_b;
+    uint stride_d;
+    uint batch_stride_a;
+    uint batch_stride_b;
+    uint batch_stride_d;
+    uint fusion_flags;
+    uint base_work_group_z;
+    uint ne02;
+    uint ne12;
+    uint broadcast2;
+    uint broadcast3;
+    uint pair_m0;
+    uint stride_d2;
+    uint batch_stride_d2;
+    uint lora_r;
+    float lora_scale0;
+    float lora_scale1;
+#endif
+} p;
+
+#ifndef MUL_MAT_ID
+const uint RED_SLOTS = (NSG > 1u) ? (NSG * MSG * RT * NT * 64u * ((FUSE_MODE == 3u) ? 2u : 1u)) : 1u;
+shared float red_shmem[RED_SLOTS];
+#endif
+
+// Cooperative B staging tile when MSG > 1 && USE_SH_B != 0
+const bool COOP_SH_B = (MSG > 1u) && (USE_SH_B != 0u);
+const uint SH_B_COLS = COOP_SH_B ? BN_COLS         : 1u;
+const uint SH_B_K4   = COOP_SH_B ? (16u * K_PAIRS) : 1u;
+shared MMA_FVEC4 sh_b[SH_B_COLS][SH_B_K4];
+
+#ifdef MUL_MAT_ID
+const bool USE_SH_IDS = (SH_B_COLS * SH_B_K4 * 8u) < 16384u;
+shared uint  sh_b_base[USE_SH_IDS ? BN_COLS : 1u];
+shared uint  sh_r_ids[USE_SH_IDS ? BN_COLS : 1u];
+shared float sh_col_scale[(USE_SH_IDS && FUSE_MODE == 4u) ? BN_COLS : 1u];
+
+uint mma_id_col_packed(uint row_begin, uint tile_ne1, uint col_i) {
+    if (USE_SH_IDS) {
+        return sh_r_ids[min(col_i, BN_COLS - 1u)];
+    }
+    return data_row_map[p.row_ids_offset + row_begin + min(col_i, tile_ne1 - 1u)];
+}
+uint mma_id_col_b_base(uint row_begin, uint tile_ne1, uint col_i) {
+    if (USE_SH_IDS) {
+        return sh_b_base[min(col_i, BN_COLS - 1u)];
+    }
+    const uint packed = mma_id_col_packed(row_begin, tile_ne1, col_i);
+    return (packed >> 16u) * p.batch_stride_b + ((packed & 0xFFFFu) % p.ne11) * p.stride_b;
+}
+#endif
+
+uint mma_lane_fm(uint l) { return ((l >> 1u) & 3u) | ((l >> 2u) & 4u); }
+uint mma_lane_fn(uint l) { return ((l & 1u) << 1u) | ((l >> 1u) & 4u); }
+
+#if defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL)
+float iq4nl_lut(uint idx) {
+    switch (idx) {
+    case  0u: return -127.0f;
+    case  1u: return -104.0f;
+    case  2u: return  -83.0f;
+    case  3u: return  -65.0f;
+    case  4u: return  -49.0f;
+    case  5u: return  -35.0f;
+    case  6u: return  -22.0f;
+    case  7u: return  -10.0f;
+    case  8u: return    1.0f;
+    case  9u: return   13.0f;
+    case 10u: return   25.0f;
+    case 11u: return   38.0f;
+    case 12u: return   53.0f;
+    case 13u: return   69.0f;
+    case 14u: return   89.0f;
+    default:  return  113.0f;
+    }
+}
+#endif
+
+MMA_FVEC4 load_b_mvec4(uint elem_idx, bool v4_ok, bool b_is_f16) {
+    if (b_is_f16) {
+        if (v4_ok) {
+            return MMA_FVEC4(data_b_f16v4[elem_idx >> 2u]);
+        }
+        return MMA_FVEC4(data_b_f16[elem_idx + 0u], data_b_f16[elem_idx + 1u], data_b_f16[elem_idx + 2u], data_b_f16[elem_idx + 3u]);
+    }
+    if (v4_ok) {
+        return MMA_FVEC4(data_b_v4[elem_idx >> 2u]);
+    }
+    return MMA_FVEC4(data_b[elem_idx + 0u], data_b[elem_idx + 1u], data_b[elem_idx + 2u], data_b[elem_idx + 3u]);
+}
+
+MMA_FVEC2 load_b_mvec2(uint elem_idx, bool v2_ok, bool b_is_f16) {
+    if (b_is_f16) {
+        if (v2_ok) {
+            return MMA_FVEC2(data_b_f16v2[elem_idx >> 1u]);
+        }
+        return MMA_FVEC2(data_b_f16[elem_idx + 0u], data_b_f16[elem_idx + 1u]);
+    }
+    if (v2_ok) {
+        return MMA_FVEC2(data_b_v2[elem_idx >> 1u]);
+    }
+    return MMA_FVEC2(data_b[elem_idx + 0u], data_b[elem_idx + 1u]);
+}
+
+// Unified single-body dequant16 (prevents duplicate temporary live ranges in PAIR_GLU / PAIR_MM!)
+void dequant16(bool use_u, uint row_unit_base, uint ci, out MMA_FVEC4 w0, out MMA_FVEC4 w1, out MMA_FVEC4 w2, out MMA_FVEC4 w3) {
+#if defined(DATA_A_F32) || defined(DATA_A_F32_F16)
+    const uint base = row_unit_base + (ci << 4u);
+    if ((base & 3u) == 0u) {
+        const uint v4 = base >> 2u;
+        if (use_u) {
+            w0 = MMA_FVEC4(u_f32v4.data[v4 + 0u]); w1 = MMA_FVEC4(u_f32v4.data[v4 + 1u]); w2 = MMA_FVEC4(u_f32v4.data[v4 + 2u]); w3 = MMA_FVEC4(u_f32v4.data[v4 + 3u]);
+        } else {
+            w0 = MMA_FVEC4(a_f32v4.data[v4 + 0u]); w1 = MMA_FVEC4(a_f32v4.data[v4 + 1u]); w2 = MMA_FVEC4(a_f32v4.data[v4 + 2u]); w3 = MMA_FVEC4(a_f32v4.data[v4 + 3u]);
+        }
+    } else if (use_u) {
+        w0 = MMA_FVEC4(u_f32.data[base+0u],  u_f32.data[base+1u],  u_f32.data[base+2u],  u_f32.data[base+3u]);
+        w1 = MMA_FVEC4(u_f32.data[base+4u],  u_f32.data[base+5u],  u_f32.data[base+6u],  u_f32.data[base+7u]);
+        w2 = MMA_FVEC4(u_f32.data[base+8u],  u_f32.data[base+9u],  u_f32.data[base+10u], u_f32.data[base+11u]);
+        w3 = MMA_FVEC4(u_f32.data[base+12u], u_f32.data[base+13u], u_f32.data[base+14u], u_f32.data[base+15u]);
+    } else {
+        w0 = MMA_FVEC4(a_f32.data[base+0u],  a_f32.data[base+1u],  a_f32.data[base+2u],  a_f32.data[base+3u]);
+        w1 = MMA_FVEC4(a_f32.data[base+4u],  a_f32.data[base+5u],  a_f32.data[base+6u],  a_f32.data[base+7u]);
+        w2 = MMA_FVEC4(a_f32.data[base+8u],  a_f32.data[base+9u],  a_f32.data[base+10u], a_f32.data[base+11u]);
+        w3 = MMA_FVEC4(a_f32.data[base+12u], a_f32.data[base+13u], a_f32.data[base+14u], a_f32.data[base+15u]);
+    }
+#elif defined(DATA_A_F16)
+    const uint base = row_unit_base + (ci << 4u);
+    if ((base & 3u) == 0u) {
+        const uint v4 = base >> 2u;
+        if (use_u) {
+            w0 = u_f16v4.data[v4 + 0u]; w1 = u_f16v4.data[v4 + 1u]; w2 = u_f16v4.data[v4 + 2u]; w3 = u_f16v4.data[v4 + 3u];
+        } else {
+            w0 = a_f16v4.data[v4 + 0u]; w1 = a_f16v4.data[v4 + 1u]; w2 = a_f16v4.data[v4 + 2u]; w3 = a_f16v4.data[v4 + 3u];
+        }
+    } else if (use_u) {
+        w0 = f16vec4(u_f16.data[base+0u],  u_f16.data[base+1u],  u_f16.data[base+2u],  u_f16.data[base+3u]);
+        w1 = f16vec4(u_f16.data[base+4u],  u_f16.data[base+5u],  u_f16.data[base+6u],  u_f16.data[base+7u]);
+        w2 = f16vec4(u_f16.data[base+8u],  u_f16.data[base+9u],  u_f16.data[base+10u], u_f16.data[base+11u]);
+        w3 = f16vec4(u_f16.data[base+12u], u_f16.data[base+13u], u_f16.data[base+14u], u_f16.data[base+15u]);
+    } else {
+        w0 = f16vec4(a_f16.data[base+0u],  a_f16.data[base+1u],  a_f16.data[base+2u],  a_f16.data[base+3u]);
+        w1 = f16vec4(a_f16.data[base+4u],  a_f16.data[base+5u],  a_f16.data[base+6u],  a_f16.data[base+7u]);
+        w2 = f16vec4(a_f16.data[base+8u],  a_f16.data[base+9u],  a_f16.data[base+10u], a_f16.data[base+11u]);
+        w3 = f16vec4(a_f16.data[base+12u], a_f16.data[base+13u], a_f16.data[base+14u], a_f16.data[base+15u]);
+    }
+#elif defined(DATA_A_Q8_0)
+    const uint ib  = row_unit_base + (ci >> 1u);
+    const uint iqs = (ci & 1u) << 3u;
+    float16_t d;
+    uint q01, q23, q45, q67;
+    if (use_u) {
+        d   = u_q8_0.data[ib].d;
+        q01 = pack32(u16vec2(uint16_t(u_q8_0.data[ib].qs[iqs + 0u]), uint16_t(u_q8_0.data[ib].qs[iqs + 1u]))) ^ 0x80808080u;
+        q23 = pack32(u16vec2(uint16_t(u_q8_0.data[ib].qs[iqs + 2u]), uint16_t(u_q8_0.data[ib].qs[iqs + 3u]))) ^ 0x80808080u;
+        q45 = pack32(u16vec2(uint16_t(u_q8_0.data[ib].qs[iqs + 4u]), uint16_t(u_q8_0.data[ib].qs[iqs + 5u]))) ^ 0x80808080u;
+        q67 = pack32(u16vec2(uint16_t(u_q8_0.data[ib].qs[iqs + 6u]), uint16_t(u_q8_0.data[ib].qs[iqs + 7u]))) ^ 0x80808080u;
+    } else {
+        d   = a_q8_0.data[ib].d;
+        q01 = pack32(u16vec2(uint16_t(a_q8_0.data[ib].qs[iqs + 0u]), uint16_t(a_q8_0.data[ib].qs[iqs + 1u]))) ^ 0x80808080u;
+        q23 = pack32(u16vec2(uint16_t(a_q8_0.data[ib].qs[iqs + 2u]), uint16_t(a_q8_0.data[ib].qs[iqs + 3u]))) ^ 0x80808080u;
+        q45 = pack32(u16vec2(uint16_t(a_q8_0.data[ib].qs[iqs + 4u]), uint16_t(a_q8_0.data[ib].qs[iqs + 5u]))) ^ 0x80808080u;
+        q67 = pack32(u16vec2(uint16_t(a_q8_0.data[ib].qs[iqs + 6u]), uint16_t(a_q8_0.data[ib].qs[iqs + 7u]))) ^ 0x80808080u;
+    }
+    const f16vec2 bias16 = f16vec2(float16_t(1152.0));
+    const f16vec2 e0 = unpackFloat2x16((q01 & 0x00FF00FFu) | 0x64006400u) - bias16;
+    const f16vec2 o0 = unpackFloat2x16(((q01 >> 8u) & 0x00FF00FFu) | 0x64006400u) - bias16;
+    const f16vec2 e1 = unpackFloat2x16((q23 & 0x00FF00FFu) | 0x64006400u) - bias16;
+    const f16vec2 o1 = unpackFloat2x16(((q23 >> 8u) & 0x00FF00FFu) | 0x64006400u) - bias16;
+    const f16vec2 e2 = unpackFloat2x16((q45 & 0x00FF00FFu) | 0x64006400u) - bias16;
+    const f16vec2 o2 = unpackFloat2x16(((q45 >> 8u) & 0x00FF00FFu) | 0x64006400u) - bias16;
+    const f16vec2 e3 = unpackFloat2x16((q67 & 0x00FF00FFu) | 0x64006400u) - bias16;
+    const f16vec2 o3 = unpackFloat2x16(((q67 >> 8u) & 0x00FF00FFu) | 0x64006400u) - bias16;
+    w0 = d * f16vec4(e0.x, o0.x, e0.y, o0.y);
+    w1 = d * f16vec4(e1.x, o1.x, e1.y, o1.y);
+    w2 = d * f16vec4(e2.x, o2.x, e2.y, o2.y);
+    w3 = d * f16vec4(e3.x, o3.x, e3.y, o3.y);
+#elif defined(DATA_A_Q4_0)
+    const uint ib    = row_unit_base + (ci >> 1u);
+    const uint shift = (ci & 1u) * 4u;
+    float d;
+    uint u0, u1, u2, u3;
+    if (use_u) {
+        d  = float(u_q4_0.data[ib].d);
+        u0 = ((uint(u_q4_0.data[ib].qs[0]) | (uint(u_q4_0.data[ib].qs[1]) << 16u)) >> shift) & 0x0F0F0F0Fu;
+        u1 = ((uint(u_q4_0.data[ib].qs[2]) | (uint(u_q4_0.data[ib].qs[3]) << 16u)) >> shift) & 0x0F0F0F0Fu;
+        u2 = ((uint(u_q4_0.data[ib].qs[4]) | (uint(u_q4_0.data[ib].qs[5]) << 16u)) >> shift) & 0x0F0F0F0Fu;
+        u3 = ((uint(u_q4_0.data[ib].qs[6]) | (uint(u_q4_0.data[ib].qs[7]) << 16u)) >> shift) & 0x0F0F0F0Fu;
+    } else {
+        d  = float(a_q4_0.data[ib].d);
+        u0 = ((uint(a_q4_0.data[ib].qs[0]) | (uint(a_q4_0.data[ib].qs[1]) << 16u)) >> shift) & 0x0F0F0F0Fu;
+        u1 = ((uint(a_q4_0.data[ib].qs[2]) | (uint(a_q4_0.data[ib].qs[3]) << 16u)) >> shift) & 0x0F0F0F0Fu;
+        u2 = ((uint(a_q4_0.data[ib].qs[4]) | (uint(a_q4_0.data[ib].qs[5]) << 16u)) >> shift) & 0x0F0F0F0Fu;
+        u3 = ((uint(a_q4_0.data[ib].qs[6]) | (uint(a_q4_0.data[ib].qs[7]) << 16u)) >> shift) & 0x0F0F0F0Fu;
+    }
+    const f16vec4 dv = f16vec4(d);
+    const f16vec4 mv = f16vec4(-8.0f * d);
+    w0 = fma(dv, f16vec4(unpack8(u0)), mv);
+    w1 = fma(dv, f16vec4(unpack8(u1)), mv);
+    w2 = fma(dv, f16vec4(unpack8(u2)), mv);
+    w3 = fma(dv, f16vec4(unpack8(u3)), mv);
+#elif defined(DATA_A_Q4_1)
+    const uint ib    = row_unit_base + (ci >> 1u);
+    const uint shift = (ci & 1u) * 4u;
+    vec2 dm;
+    uint q0, q1, q2, q3;
+    if (use_u) {
+        dm = vec2(u_q4_1.data[ib].dm);
+        q0 = u_q4_1.data[ib].qs[0]; q1 = u_q4_1.data[ib].qs[1]; q2 = u_q4_1.data[ib].qs[2]; q3 = u_q4_1.data[ib].qs[3];
+    } else {
+        dm = vec2(a_q4_1.data[ib].dm);
+        q0 = a_q4_1.data[ib].qs[0]; q1 = a_q4_1.data[ib].qs[1]; q2 = a_q4_1.data[ib].qs[2]; q3 = a_q4_1.data[ib].qs[3];
+    }
+    const vec4 d = vec4(dm.x), m = vec4(dm.y);
+    w0 = f16vec4(fma(d, vec4(unpack8((q0 >> shift) & 0x0F0F0F0Fu)), m));
+    w1 = f16vec4(fma(d, vec4(unpack8((q1 >> shift) & 0x0F0F0F0Fu)), m));
+    w2 = f16vec4(fma(d, vec4(unpack8((q2 >> shift) & 0x0F0F0F0Fu)), m));
+    w3 = f16vec4(fma(d, vec4(unpack8((q3 >> shift) & 0x0F0F0F0Fu)), m));
+#elif defined(DATA_A_Q5_0)
+    const uint ib     = row_unit_base + (ci >> 1u);
+    const uint half_i = ci & 1u;
+    const uint shift  = half_i * 4u;
+    float d;
+    uint qh, u0, u1, u2, u3;
+    if (use_u) {
+        d  = float(u_q5_0.data[ib].d);
+        qh = (uint(u_q5_0.data[ib].qh[0]) | (uint(u_q5_0.data[ib].qh[1]) << 16u)) >> (half_i * 16u);
+        u0 = ((uint(u_q5_0.data[ib].qs[0]) | (uint(u_q5_0.data[ib].qs[1]) << 16u)) >> shift) & 0x0F0F0F0Fu;
+        u1 = ((uint(u_q5_0.data[ib].qs[2]) | (uint(u_q5_0.data[ib].qs[3]) << 16u)) >> shift) & 0x0F0F0F0Fu;
+        u2 = ((uint(u_q5_0.data[ib].qs[4]) | (uint(u_q5_0.data[ib].qs[5]) << 16u)) >> shift) & 0x0F0F0F0Fu;
+        u3 = ((uint(u_q5_0.data[ib].qs[6]) | (uint(u_q5_0.data[ib].qs[7]) << 16u)) >> shift) & 0x0F0F0F0Fu;
+    } else {
+        d  = float(a_q5_0.data[ib].d);
+        qh = (uint(a_q5_0.data[ib].qh[0]) | (uint(a_q5_0.data[ib].qh[1]) << 16u)) >> (half_i * 16u);
+        u0 = ((uint(a_q5_0.data[ib].qs[0]) | (uint(a_q5_0.data[ib].qs[1]) << 16u)) >> shift) & 0x0F0F0F0Fu;
+        u1 = ((uint(a_q5_0.data[ib].qs[2]) | (uint(a_q5_0.data[ib].qs[3]) << 16u)) >> shift) & 0x0F0F0F0Fu;
+        u2 = ((uint(a_q5_0.data[ib].qs[4]) | (uint(a_q5_0.data[ib].qs[5]) << 16u)) >> shift) & 0x0F0F0F0Fu;
+        u3 = ((uint(a_q5_0.data[ib].qs[6]) | (uint(a_q5_0.data[ib].qs[7]) << 16u)) >> shift) & 0x0F0F0F0Fu;
+    }
+    const float m = -16.0f * d;
+    const vec4 h0 = vec4(((qh >> 0u) & 1u) << 4u, ((qh >> 1u) & 1u) << 4u, ((qh >> 2u) & 1u) << 4u, ((qh >> 3u) & 1u) << 4u);
+    const vec4 h1 = vec4(((qh >> 4u) & 1u) << 4u, ((qh >> 5u) & 1u) << 4u, ((qh >> 6u) & 1u) << 4u, ((qh >> 7u) & 1u) << 4u);
+    const vec4 h2 = vec4(((qh >> 8u) & 1u) << 4u, ((qh >> 9u) & 1u) << 4u, ((qh >>10u) & 1u) << 4u, ((qh >>11u) & 1u) << 4u);
+    const vec4 h3 = vec4(((qh >>12u) & 1u) << 4u, ((qh >>13u) & 1u) << 4u, ((qh >>14u) & 1u) << 4u, ((qh >>15u) & 1u) << 4u);
+    w0 = f16vec4(fma(vec4(d), vec4(unpack8(u0)) + h0, vec4(m)));
+    w1 = f16vec4(fma(vec4(d), vec4(unpack8(u1)) + h1, vec4(m)));
+    w2 = f16vec4(fma(vec4(d), vec4(unpack8(u2)) + h2, vec4(m)));
+    w3 = f16vec4(fma(vec4(d), vec4(unpack8(u3)) + h3, vec4(m)));
+#elif defined(DATA_A_Q5_1)
+    const uint ib     = row_unit_base + (ci >> 1u);
+    const uint half_i = ci & 1u;
+    const uint shift  = half_i * 4u;
+    vec2 dm;
+    uint qh, q0, q1, q2, q3;
+    if (use_u) {
+        dm = vec2(u_q5_1.data[ib].dm); qh = u_q5_1.data[ib].qh >> (half_i * 16u);
+        q0 = u_q5_1.data[ib].qs[0]; q1 = u_q5_1.data[ib].qs[1]; q2 = u_q5_1.data[ib].qs[2]; q3 = u_q5_1.data[ib].qs[3];
+    } else {
+        dm = vec2(a_q5_1.data[ib].dm); qh = a_q5_1.data[ib].qh >> (half_i * 16u);
+        q0 = a_q5_1.data[ib].qs[0]; q1 = a_q5_1.data[ib].qs[1]; q2 = a_q5_1.data[ib].qs[2]; q3 = a_q5_1.data[ib].qs[3];
+    }
+    const vec4 d = vec4(dm.x), m = vec4(dm.y);
+    const vec4 h0 = vec4(((qh >> 0u) & 1u) << 4u, ((qh >> 1u) & 1u) << 4u, ((qh >> 2u) & 1u) << 4u, ((qh >> 3u) & 1u) << 4u);
+    const vec4 h1 = vec4(((qh >> 4u) & 1u) << 4u, ((qh >> 5u) & 1u) << 4u, ((qh >> 6u) & 1u) << 4u, ((qh >> 7u) & 1u) << 4u);
+    const vec4 h2 = vec4(((qh >> 8u) & 1u) << 4u, ((qh >> 9u) & 1u) << 4u, ((qh >>10u) & 1u) << 4u, ((qh >>11u) & 1u) << 4u);
+    const vec4 h3 = vec4(((qh >>12u) & 1u) << 4u, ((qh >>13u) & 1u) << 4u, ((qh >>14u) & 1u) << 4u, ((qh >>15u) & 1u) << 4u);
+    w0 = f16vec4(fma(d, vec4(unpack8((q0 >> shift) & 0x0F0F0F0Fu)) + h0, m));
+    w1 = f16vec4(fma(d, vec4(unpack8((q1 >> shift) & 0x0F0F0F0Fu)) + h1, m));
+    w2 = f16vec4(fma(d, vec4(unpack8((q2 >> shift) & 0x0F0F0F0Fu)) + h2, m));
+    w3 = f16vec4(fma(d, vec4(unpack8((q3 >> shift) & 0x0F0F0F0Fu)) + h3, m));
+#elif defined(DATA_A_Q4_K)
+    const uint ib    = row_unit_base + (ci >> 4u);
+    const uint il    = ci & 15u;
+    const uint is    = il >> 1u;
+    const uint b     = is & 1u;
+    const uint n     = il >> 2u;
+    const uint w_idx = (n << 3u) + ((il & 1u) << 2u);
+    vec2 loadd;
+    uvec3 scales;
+    uint q0, q1, q2, q3;
+    if (use_u) {
+        loadd  = vec2(u_q4_k.data[ib].dm);
+        scales = uvec3(u_q4_k_p32.data[ib].scales[0], u_q4_k_p32.data[ib].scales[1], u_q4_k_p32.data[ib].scales[2]);
+        q0 = u_q4_k_p32.data[ib].qs[w_idx + 0u]; q1 = u_q4_k_p32.data[ib].qs[w_idx + 1u];
+        q2 = u_q4_k_p32.data[ib].qs[w_idx + 2u]; q3 = u_q4_k_p32.data[ib].qs[w_idx + 3u];
+    } else {
+        loadd  = vec2(a_q4_k.data[ib].dm);
+        scales = uvec3(a_q4_k_p32.data[ib].scales[0], a_q4_k_p32.data[ib].scales[1], a_q4_k_p32.data[ib].scales[2]);
+        q0 = a_q4_k_p32.data[ib].qs[w_idx + 0u]; q1 = a_q4_k_p32.data[ib].qs[w_idx + 1u];
+        q2 = a_q4_k_p32.data[ib].qs[w_idx + 2u]; q3 = a_q4_k_p32.data[ib].qs[w_idx + 3u];
+    }
+    const uint scalesoffs  = (is & 3u) * 8u;
+    const uint scidxshift1 = (is < 4u) ? scalesoffs : (scalesoffs + 2u);
+    const uint mbidxshift0 = (is < 4u) ? scalesoffs : (scalesoffs + 4u);
+    const uint sc_word     = (is < 4u) ? scales.x : scales.z;
+    const uint mb_word     = (is < 4u) ? scales.y : scales.z;
+    const uint sc          = ((sc_word >> scalesoffs) & 0xFu) | ((scales.x >> scidxshift1) & 0x30u);
+    const uint mbyte       = ((mb_word >> mbidxshift0) & 0xFu) | ((scales.y >> scidxshift1) & 0x30u);
+    const float d_hi = (b == 0u) ? loadd.x : (loadd.x * 0.0625f);
+    const uint  q_mk = (b == 0u) ? 0x0F0F0F0Fu : 0xF0F0F0F0u;
+    const f16vec4 d = f16vec4(d_hi * float(sc));
+    const f16vec4 m = f16vec4(-loadd.y * float(mbyte));
+    w0 = fma(d, f16vec4(unpack8(q0 & q_mk)), m);
+    w1 = fma(d, f16vec4(unpack8(q1 & q_mk)), m);
+    w2 = fma(d, f16vec4(unpack8(q2 & q_mk)), m);
+    w3 = fma(d, f16vec4(unpack8(q3 & q_mk)), m);
+#elif defined(DATA_A_Q5_K)
+    const uint ib     = row_unit_base + (ci >> 4u);
+    const uint il     = ci & 15u;
+    const uint is     = il >> 1u;
+    const uint b      = is & 1u;
+    const uint n      = il >> 2u;
+    const uint w_idx  = (n << 3u) + ((il & 1u) << 2u);
+    const uint qh_idx = (il & 1u) << 2u;
+    vec2 loadd;
+    uvec3 scales;
+    uint ql0, ql1, ql2, ql3, qh0, qh1, qh2, qh3;
+    if (use_u) {
+        loadd  = vec2(u_q5_k.data[ib].dm);
+        scales = uvec3(u_q5_k_p32.data[ib].scales[0], u_q5_k_p32.data[ib].scales[1], u_q5_k_p32.data[ib].scales[2]);
+        ql0 = u_q5_k_p32.data[ib].qs[w_idx + 0u]; ql1 = u_q5_k_p32.data[ib].qs[w_idx + 1u];
+        ql2 = u_q5_k_p32.data[ib].qs[w_idx + 2u]; ql3 = u_q5_k_p32.data[ib].qs[w_idx + 3u];
+        qh0 = u_q5_k_p32.data[ib].qh[qh_idx + 0u]; qh1 = u_q5_k_p32.data[ib].qh[qh_idx + 1u];
+        qh2 = u_q5_k_p32.data[ib].qh[qh_idx + 2u]; qh3 = u_q5_k_p32.data[ib].qh[qh_idx + 3u];
+    } else {
+        loadd  = vec2(a_q5_k.data[ib].dm);
+        scales = uvec3(a_q5_k_p32.data[ib].scales[0], a_q5_k_p32.data[ib].scales[1], a_q5_k_p32.data[ib].scales[2]);
+        ql0 = a_q5_k_p32.data[ib].qs[w_idx + 0u]; ql1 = a_q5_k_p32.data[ib].qs[w_idx + 1u];
+        ql2 = a_q5_k_p32.data[ib].qs[w_idx + 2u]; ql3 = a_q5_k_p32.data[ib].qs[w_idx + 3u];
+        qh0 = a_q5_k_p32.data[ib].qh[qh_idx + 0u]; qh1 = a_q5_k_p32.data[ib].qh[qh_idx + 1u];
+        qh2 = a_q5_k_p32.data[ib].qh[qh_idx + 2u]; qh3 = a_q5_k_p32.data[ib].qh[qh_idx + 3u];
+    }
+    const uint scalesoffs  = (is & 3u) * 8u;
+    const uint scidxshift1 = (is < 4u) ? scalesoffs : (scalesoffs + 2u);
+    const uint mbidxshift0 = (is < 4u) ? scalesoffs : (scalesoffs + 4u);
+    const uint sc_word     = (is < 4u) ? scales.x : scales.z;
+    const uint mb_word     = (is < 4u) ? scales.y : scales.z;
+    const uint sc          = ((sc_word >> scalesoffs) & 0xFu) | ((scales.x >> scidxshift1) & 0x30u);
+    const uint mbyte       = ((mb_word >> mbidxshift0) & 0xFu) | ((scales.y >> scidxshift1) & 0x30u);
+    const f16vec4 d = f16vec4(loadd.x * float(sc));
+    const f16vec4 m = f16vec4(-loadd.y * float(mbyte));
+    const uint shift = b * 4u;
+    const bool qh_left = (is <= 4u);
+    const uint qh_sh   = qh_left ? (4u - is) : (is - 4u);
+    const uint qhb0    = (qh_left ? (qh0 << qh_sh) : (qh0 >> qh_sh)) & 0x10101010u;
+    const uint qhb1    = (qh_left ? (qh1 << qh_sh) : (qh1 >> qh_sh)) & 0x10101010u;
+    const uint qhb2    = (qh_left ? (qh2 << qh_sh) : (qh2 >> qh_sh)) & 0x10101010u;
+    const uint qhb3    = (qh_left ? (qh3 << qh_sh) : (qh3 >> qh_sh)) & 0x10101010u;
+    w0 = fma(d, f16vec4(unpack8(((ql0 >> shift) & 0x0F0F0F0Fu) | qhb0)), m);
+    w1 = fma(d, f16vec4(unpack8(((ql1 >> shift) & 0x0F0F0F0Fu) | qhb1)), m);
+    w2 = fma(d, f16vec4(unpack8(((ql2 >> shift) & 0x0F0F0F0Fu) | qhb2)), m);
+    w3 = fma(d, f16vec4(unpack8(((ql3 >> shift) & 0x0F0F0F0Fu) | qhb3)), m);
+#elif defined(DATA_A_Q6_K)
+    const uint ib      = row_unit_base + (ci >> 4u);
+    const uint il      = ci & 15u;
+    const uint b       = ((il >> 2u) & 1u) * 4u;
+    const uint qhshift = ((il >> 1u) & 3u) * 2u;
+    const uint qsi     = ((il & 8u) << 2u) + ((il & 3u) << 3u);
+    const uint qhi     = ((il & 8u) << 1u) + ((il & 1u) << 3u);
+    float dscale;
+    uint ql01, ql23, ql45, ql67, qh01, qh23, qh45, qh67;
+    if (use_u) {
+        dscale = float(u_q6_k.data[ib].d) * float(u_q6_k.data[ib].scales[il]);
+        ql01 = ((uint(u_q6_k_p16.data[ib].ql[qsi + 0u]) | (uint(u_q6_k_p16.data[ib].ql[qsi + 1u]) << 16u)) >> b) & 0x0F0F0F0Fu;
+        ql23 = ((uint(u_q6_k_p16.data[ib].ql[qsi + 2u]) | (uint(u_q6_k_p16.data[ib].ql[qsi + 3u]) << 16u)) >> b) & 0x0F0F0F0Fu;
+        ql45 = ((uint(u_q6_k_p16.data[ib].ql[qsi + 4u]) | (uint(u_q6_k_p16.data[ib].ql[qsi + 5u]) << 16u)) >> b) & 0x0F0F0F0Fu;
+        ql67 = ((uint(u_q6_k_p16.data[ib].ql[qsi + 6u]) | (uint(u_q6_k_p16.data[ib].ql[qsi + 7u]) << 16u)) >> b) & 0x0F0F0F0Fu;
+        qh01 = ((uint(u_q6_k_p16.data[ib].qh[qhi + 0u]) | (uint(u_q6_k_p16.data[ib].qh[qhi + 1u]) << 16u)) >> qhshift) & 0x03030303u;
+        qh23 = ((uint(u_q6_k_p16.data[ib].qh[qhi + 2u]) | (uint(u_q6_k_p16.data[ib].qh[qhi + 3u]) << 16u)) >> qhshift) & 0x03030303u;
+        qh45 = ((uint(u_q6_k_p16.data[ib].qh[qhi + 4u]) | (uint(u_q6_k_p16.data[ib].qh[qhi + 5u]) << 16u)) >> qhshift) & 0x03030303u;
+        qh67 = ((uint(u_q6_k_p16.data[ib].qh[qhi + 6u]) | (uint(u_q6_k_p16.data[ib].qh[qhi + 7u]) << 16u)) >> qhshift) & 0x03030303u;
+    } else {
+        dscale = float(a_q6_k.data[ib].d) * float(a_q6_k.data[ib].scales[il]);
+        ql01 = ((uint(a_q6_k_p16.data[ib].ql[qsi + 0u]) | (uint(a_q6_k_p16.data[ib].ql[qsi + 1u]) << 16u)) >> b) & 0x0F0F0F0Fu;
+        ql23 = ((uint(a_q6_k_p16.data[ib].ql[qsi + 2u]) | (uint(a_q6_k_p16.data[ib].ql[qsi + 3u]) << 16u)) >> b) & 0x0F0F0F0Fu;
+        ql45 = ((uint(a_q6_k_p16.data[ib].ql[qsi + 4u]) | (uint(a_q6_k_p16.data[ib].ql[qsi + 5u]) << 16u)) >> b) & 0x0F0F0F0Fu;
+        ql67 = ((uint(a_q6_k_p16.data[ib].ql[qsi + 6u]) | (uint(a_q6_k_p16.data[ib].ql[qsi + 7u]) << 16u)) >> b) & 0x0F0F0F0Fu;
+        qh01 = ((uint(a_q6_k_p16.data[ib].qh[qhi + 0u]) | (uint(a_q6_k_p16.data[ib].qh[qhi + 1u]) << 16u)) >> qhshift) & 0x03030303u;
+        qh23 = ((uint(a_q6_k_p16.data[ib].qh[qhi + 2u]) | (uint(a_q6_k_p16.data[ib].qh[qhi + 3u]) << 16u)) >> qhshift) & 0x03030303u;
+        qh45 = ((uint(a_q6_k_p16.data[ib].qh[qhi + 4u]) | (uint(a_q6_k_p16.data[ib].qh[qhi + 5u]) << 16u)) >> qhshift) & 0x03030303u;
+        qh67 = ((uint(a_q6_k_p16.data[ib].qh[qhi + 6u]) | (uint(a_q6_k_p16.data[ib].qh[qhi + 7u]) << 16u)) >> qhshift) & 0x03030303u;
+    }
+    const f16vec4 dv = f16vec4(dscale);
+    const f16vec4 mv = f16vec4(-32.0f * dscale);
+    w0 = fma(f16vec4(unpack8(ql01 | (qh01 << 4u))), dv, mv);
+    w1 = fma(f16vec4(unpack8(ql23 | (qh23 << 4u))), dv, mv);
+    w2 = fma(f16vec4(unpack8(ql45 | (qh45 << 4u))), dv, mv);
+    w3 = fma(f16vec4(unpack8(ql67 | (qh67 << 4u))), dv, mv);
+#elif defined(DATA_A_IQ4_XS)
+    const uint ib    = row_unit_base + (ci >> 4u);
+    const uint il    = ci & 15u;
+    const uint ib32  = il >> 1u;
+    const uint shift = (il & 1u) * 4u;
+    const uint qbase = ib32 << 2u;
+    float dl;
+    uint r0, r1, r2, r3;
+    if (use_u) {
+        const uint sl = (uint(u_iq4_xs.data[ib].scales_l[ib32 >> 1u]) >> (4u * (ib32 & 1u))) & 0xFu;
+        const uint sh = (uint(u_iq4_xs.data[ib].scales_h) >> (2u * ib32)) & 3u;
+        dl = float(u_iq4_xs.data[ib].d) * float(int(sl | (sh << 4u)) - 32);
+        r0 = u_iq4_xs_p32.data[ib].qs[qbase + 0u]; r1 = u_iq4_xs_p32.data[ib].qs[qbase + 1u];
+        r2 = u_iq4_xs_p32.data[ib].qs[qbase + 2u]; r3 = u_iq4_xs_p32.data[ib].qs[qbase + 3u];
+    } else {
+        const uint sl = (uint(a_iq4_xs.data[ib].scales_l[ib32 >> 1u]) >> (4u * (ib32 & 1u))) & 0xFu;
+        const uint sh = (uint(a_iq4_xs.data[ib].scales_h) >> (2u * ib32)) & 3u;
+        dl = float(a_iq4_xs.data[ib].d) * float(int(sl | (sh << 4u)) - 32);
+        r0 = a_iq4_xs_p32.data[ib].qs[qbase + 0u]; r1 = a_iq4_xs_p32.data[ib].qs[qbase + 1u];
+        r2 = a_iq4_xs_p32.data[ib].qs[qbase + 2u]; r3 = a_iq4_xs_p32.data[ib].qs[qbase + 3u];
+    }
+    const u8vec4 q0 = unpack8((r0 >> shift) & 0x0F0F0F0Fu);
+    const u8vec4 q1 = unpack8((r1 >> shift) & 0x0F0F0F0Fu);
+    const u8vec4 q2 = unpack8((r2 >> shift) & 0x0F0F0F0Fu);
+    const u8vec4 q3 = unpack8((r3 >> shift) & 0x0F0F0F0Fu);
+    w0 = f16vec4(dl * vec4(iq4nl_lut(q0.x), iq4nl_lut(q0.y), iq4nl_lut(q0.z), iq4nl_lut(q0.w)));
+    w1 = f16vec4(dl * vec4(iq4nl_lut(q1.x), iq4nl_lut(q1.y), iq4nl_lut(q1.z), iq4nl_lut(q1.w)));
+    w2 = f16vec4(dl * vec4(iq4nl_lut(q2.x), iq4nl_lut(q2.y), iq4nl_lut(q2.z), iq4nl_lut(q2.w)));
+    w3 = f16vec4(dl * vec4(iq4nl_lut(q3.x), iq4nl_lut(q3.y), iq4nl_lut(q3.z), iq4nl_lut(q3.w)));
+#elif defined(DATA_A_IQ4_NL)
+    const uint ib    = row_unit_base + (ci >> 1u);
+    const uint shift = (ci & 1u) * 4u;
+    float d;
+    uint r0, r1, r2, r3;
+    if (use_u) {
+        d  = float(u_iq4_nl.data[ib].d);
+        r0 = (uint(u_iq4_nl.data[ib].qs[0]) | (uint(u_iq4_nl.data[ib].qs[1]) << 16u));
+        r1 = (uint(u_iq4_nl.data[ib].qs[2]) | (uint(u_iq4_nl.data[ib].qs[3]) << 16u));
+        r2 = (uint(u_iq4_nl.data[ib].qs[4]) | (uint(u_iq4_nl.data[ib].qs[5]) << 16u));
+        r3 = (uint(u_iq4_nl.data[ib].qs[6]) | (uint(u_iq4_nl.data[ib].qs[7]) << 16u));
+    } else {
+        d  = float(a_iq4_nl.data[ib].d);
+        r0 = (uint(a_iq4_nl.data[ib].qs[0]) | (uint(a_iq4_nl.data[ib].qs[1]) << 16u));
+        r1 = (uint(a_iq4_nl.data[ib].qs[2]) | (uint(a_iq4_nl.data[ib].qs[3]) << 16u));
+        r2 = (uint(a_iq4_nl.data[ib].qs[4]) | (uint(a_iq4_nl.data[ib].qs[5]) << 16u));
+        r3 = (uint(a_iq4_nl.data[ib].qs[6]) | (uint(a_iq4_nl.data[ib].qs[7]) << 16u));
+    }
+    const u8vec4 q0 = unpack8((r0 >> shift) & 0x0F0F0F0Fu);
+    const u8vec4 q1 = unpack8((r1 >> shift) & 0x0F0F0F0Fu);
+    const u8vec4 q2 = unpack8((r2 >> shift) & 0x0F0F0F0Fu);
+    const u8vec4 q3 = unpack8((r3 >> shift) & 0x0F0F0F0Fu);
+    w0 = f16vec4(d * vec4(iq4nl_lut(q0.x), iq4nl_lut(q0.y), iq4nl_lut(q0.z), iq4nl_lut(q0.w)));
+    w1 = f16vec4(d * vec4(iq4nl_lut(q1.x), iq4nl_lut(q1.y), iq4nl_lut(q1.z), iq4nl_lut(q1.w)));
+    w2 = f16vec4(d * vec4(iq4nl_lut(q2.x), iq4nl_lut(q2.y), iq4nl_lut(q2.z), iq4nl_lut(q2.w)));
+    w3 = f16vec4(d * vec4(iq4nl_lut(q3.x), iq4nl_lut(q3.y), iq4nl_lut(q3.z), iq4nl_lut(q3.w)));
+#endif
+}
+
+#ifdef MUL_MAT_ID
+float mma_apply_id_epilogue(float val, uint expert_idx, u16vec2 row_idx, uint d_row, uint d_idx) {
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0u) {
+        val += data_aux0[expert_idx * p.stride_d + d_row];
+    }
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0) != 0u) {
+        const uint s0_idx = uint(row_idx.x) + ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0_TOK) != 0u ? uint(row_idx.y) * p.nei0 : 0u);
+        val *= data_aux0[s0_idx];
+    }
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1) != 0u) {
+        const uint s1_idx = uint(row_idx.x) + ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1_TOK) != 0u ? uint(row_idx.y) * p.nei0 : 0u);
+        val *= data_aux1[s1_idx];
+    }
+    if ((p.fusion_flags & (MAT_VEC_FUSION_FLAGS_GLU_A | MAT_VEC_FUSION_FLAGS_GLU_B)) != 0u) {
+        const float o = data_aux0[d_idx];
+        val = ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_GLU_A) != 0u)
+            ? (val / (1.0f + exp(-val)) * o)
+            : (o / (1.0f + exp(-o)) * val);
+    }
+    return val;
+}
+#else
+float mma_apply_dense_epilogue(float val, uint d_row, uint d_col, uint d_idx, bool is_pair_second) {
+    if (is_pair_second) {
+        if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_PAIR_MM_SIGMOID1) != 0u) {
+            val = 1.0f / (1.0f + exp(-val));
+        }
+        return val;
+    }
+    if (FUSE_MODE == 2u) {
+        if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SOFTPLUS_GATE) != 0u) {
+            const float x = val + data_aux1[d_row];
+            const float sp = (x > 20.0f) ? x : log(1.0f + exp(x));
+            val = sp * data_aux2[d_row];
+        }
+        if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SIGMOID) != 0u) {
+            val = 1.0f / (1.0f + exp(-val));
+        }
+        return val;
+    }
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0u) {
+        val += data_aux0[d_idx];
+    }
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0u) {
+        val += data_aux1[d_idx];
+    }
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SIGMOID) != 0u) {
+        val = 1.0f / (1.0f + exp(-val));
+    }
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SOFTPLUS_GATE) != 0u) {
+        const float x = val + data_aux0[d_row];
+        const float sp = (x > 20.0f) ? x : log(1.0f + exp(x));
+        val = sp * data_aux1[d_row];
+    }
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_ROW_SCALE0) != 0u) {
+        val *= data_aux0[d_col];
+    }
+    if ((p.fusion_flags & (MAT_VEC_FUSION_FLAGS_GLU_A | MAT_VEC_FUSION_FLAGS_GLU_B)) != 0u) {
+        const float o = data_aux0[d_idx];
+        val = ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_GLU_A) != 0u)
+            ? (val / (1.0f + exp(-val)) * o)
+            : (o / (1.0f + exp(-o)) * val);
+    }
+    return val;
+}
+
+float mma_eval_lora0(uint row, uint col) {
+    if (FUSE_LORA == 0u) { return 0.0f; }
+    float acc = 0.0f;
+    if ((p.lora_r & 3u) == 0u) {
+        const uint r4 = p.lora_r >> 2u;
+        const uint b_off = row * r4;
+        const uint h_off = col * r4;
+        for (uint k4 = 0u; k4 < r4; ++k4) {
+            acc += dot(lora_b0_v4.data[b_off + k4], lora_h0_v4.data[h_off + k4]);
+        }
+    } else {
+        const uint b_off = row * p.lora_r;
+        const uint h_off = col * p.lora_r;
+        for (uint k = 0u; k < p.lora_r; ++k) {
+            acc = fma(lora_b0.data[b_off + k], lora_h0.data[h_off + k], acc);
+        }
+    }
+    return acc * p.lora_scale0;
+}
+
+float mma_eval_lora1(uint row, uint col) {
+    if (FUSE_LORA == 0u) { return 0.0f; }
+    float acc = 0.0f;
+    if ((p.lora_r & 3u) == 0u) {
+        const uint r4 = p.lora_r >> 2u;
+        const uint b_off = row * r4;
+        const uint h_off = col * r4;
+        for (uint k4 = 0u; k4 < r4; ++k4) {
+            acc += dot(lora_b1_v4.data[b_off + k4], lora_h1_v4.data[h_off + k4]);
+        }
+    } else {
+        const uint b_off = row * p.lora_r;
+        const uint h_off = col * p.lora_r;
+        for (uint k = 0u; k < p.lora_r; ++k) {
+            acc = fma(lora_b1.data[b_off + k], lora_h1.data[h_off + k], acc);
+        }
+    }
+    return acc * p.lora_scale1;
+}
+#endif
+
+void main() {
+    const uint lane     = gl_LocalInvocationID.x;
+    const uint sgitg    = gl_LocalInvocationID.y;
+    const uint tid      = sgitg * 32u + lane;
+    const uint sg_k     = (CSG > 1u) ? 0u : (sgitg % NSG);
+    const uint sg_c     = (CSG > 1u) ? (sgitg % CSG) : 0u;
+    const uint sg_m     = (CSG > 1u) ? (sgitg / CSG) : (sgitg / NSG);
+    const uint sg_c_off = sg_c * (8u * RT);
+    const uint fm       = mma_lane_fm(lane);
+    const uint fn       = mma_lane_fn(lane);
+
+    const uint wg_m0 = gl_WorkGroupID.x * (8u * NT * MSG);
+    const uint sg_m0 = wg_m0 + sg_m * (8u * NT);
+
+    const uint stride_a_u = p.stride_a >> MMA_ELEM_SHIFT;
+
+#ifdef MUL_MAT_ID
+    const uint tile_idx = gl_WorkGroupID.y + gl_WorkGroupID.z * gl_NumWorkGroups.y;
+    if (tile_idx >= data_row_map[0]) {
+        return;
+    }
+    const uint expert_idx = data_row_map[1u + 2u * tile_idx];
+    const uint row_begin  = tile_idx * BN_COLS;
+    const uint tile_ne1   = data_row_map[2u + 2u * tile_idx];
+    if (tile_ne1 == 0u || wg_m0 >= p.M) {
+        return;
+    }
+    const uint n_valid = tile_ne1;
+    const uint a_batch_base = expert_idx * (p.batch_stride_a >> MMA_ELEM_SHIFT);
+    if (USE_SH_IDS) {
+        for (uint c_it = tid; c_it < BN_COLS; c_it += WG_THREADS) {
+            const uint c = min(c_it, tile_ne1 - 1u);
+            const uint packed = data_row_map[p.row_ids_offset + row_begin + c];
+            const uint slot = packed & 0xFFFFu;
+            const uint tok  = packed >> 16u;
+            sh_r_ids[c_it]  = packed;
+            sh_b_base[c_it] = tok * p.batch_stride_b + (slot % p.ne11) * p.stride_b;
+            if (FUSE_MODE == 4u) {
+                const uint s0_idx = slot + (((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0_TOK) != 0u) ? (tok * p.nei0) : 0u);
+                sh_col_scale[c_it] = data_aux0[s0_idx];
+            }
+        }
+        barrier();
+    }
+#else
+    if (wg_m0 >= p.M) {
+        return;
+    }
+    const uint wg_n0     = gl_WorkGroupID.y * (8u * RT);
+    const uint n_valid   = (wg_n0 < p.N) ? min(8u * RT, p.N - wg_n0) : 0u;
+    if (n_valid == 0u) {
+        return;
+    }
+    const uint batch_idx   = gl_WorkGroupID.z + p.base_work_group_z;
+    const uint i13         = batch_idx / p.ne12;
+    const uint i12         = batch_idx % p.ne12;
+    const uint i03         = i13 / p.broadcast3;
+    const uint i02         = i12 / p.broadcast2;
+    const uint batch_idx_a = i03 * p.ne02 + i02;
+    const uint a_batch_base = batch_idx_a * (p.batch_stride_a >> MMA_ELEM_SHIFT);
+    const uint b_batch_base = batch_idx * p.batch_stride_b;
+#endif
+
+    uint a_row_base[NT];
+    bool tile_second[NT];
+    [[unroll]] for (uint t = 0u; t < NT; ++t) {
+        const uint tile_r = sg_m0 + 8u * t;
+#ifndef MUL_MAT_ID
+        if (FUSE_MODE == 2u && tile_r >= p.pair_m0) {
+            tile_second[t] = true;
+            const uint m1 = p.M - p.pair_m0;
+            const uint r1 = min(tile_r - p.pair_m0 + fm, m1 - 1u);
+            a_row_base[t] = a_batch_base + r1 * stride_a_u;
+        } else if (FUSE_MODE == 2u) {
+            tile_second[t] = false;
+            const uint r0 = min(tile_r + fm, p.pair_m0 - 1u);
+            a_row_base[t] = a_batch_base + r0 * stride_a_u;
+        } else
+#endif
+        {
+            tile_second[t] = false;
+            const uint r0 = min(tile_r + fm, p.M - 1u);
+            a_row_base[t] = a_batch_base + r0 * stride_a_u;
+        }
+    }
+
+    coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> mc[RT][NT];
+    coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> mc_u[RT][NT];
+    [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {
+        [[unroll]] for (uint t = 0u; t < NT; ++t) {
+            mc[rt][t]   = coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0.0f);
+            mc_u[rt][t] = coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0.0f);
+        }
+    }
+
+    const bool b_is_f16 = (B_IS_F16 != 0u);
+
+    // Cooperative B-tile path when MSG > 1 && USE_SH_B != 0 (NSG == 1, CSG == 1, K % 64 == 0)
+    if (MSG > 1u && USE_SH_B != 0u) {
+        const bool v4_ok = ((p.stride_b & 3u) == 0u) && ((p.batch_stride_b & 3u) == 0u);
+        const uint k4_lane_base = 4u * (fm >> 1u) + 2u * (fm & 1u);
+
+#define MMA_SG_FENCE() controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease)
+#define MMA_NO_FENCE() do {} while (false)
+
+#define MMA_ACCUM_SHB_1D(ACC_VEC, SUB_OFF, W0, W1, W2, W3)                                   \
+    do {                                                                                     \
+        [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {                                       \
+            if (rt == 0u || (8u * rt < n_valid)) {                                           \
+                const uint c0 = 8u * rt + fn + 0u;                                           \
+                const uint c1 = 8u * rt + fn + 1u;                                           \
+                const MMA_FVEC4 ba0 = sh_b[c0][(SUB_OFF) + k4_lane_base + 0u];               \
+                const MMA_FVEC4 ba1 = sh_b[c0][(SUB_OFF) + k4_lane_base + 1u];               \
+                const MMA_FVEC4 bb0 = sh_b[c1][(SUB_OFF) + k4_lane_base + 0u];               \
+                const MMA_FVEC4 bb1 = sh_b[c1][(SUB_OFF) + k4_lane_base + 1u];               \
+                [[unroll]] for (uint s = 0u; s < 4u; ++s) {                                  \
+                    coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> ma0, ma1;      \
+                    coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> mb0, mb1;      \
+                    ma0[0] = (W0)[s]; ma0[1] = (W2)[s];                                      \
+                    ma1[0] = (W1)[s]; ma1[1] = (W3)[s];                                      \
+                    mb0[0] = ba0[s];  mb0[1] = bb0[s];                                       \
+                    mb1[0] = ba1[s];  mb1[1] = bb1[s];                                       \
+                    ACC_VEC[rt] = coopMatMulAdd(ma0, mb0, ACC_VEC[rt]);                      \
+                    ACC_VEC[rt] = coopMatMulAdd(ma1, mb1, ACC_VEC[rt]);                      \
+                }                                                                            \
+            }                                                                                \
+        }                                                                                    \
+    } while (false)
+
+#define MMA_ACCUM_SHB(MC_ARR, SUB_OFF, W0, W1, W2, W3)                                       \
+    do {                                                                                     \
+        [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {                                       \
+            if (use_sg_fence) { MMA_SG_FENCE(); }                                            \
+            if (rt == 0u || (8u * rt < n_valid)) {                                           \
+                const uint c0 = 8u * rt + fn + 0u;                                           \
+                const uint c1 = 8u * rt + fn + 1u;                                           \
+                const MMA_FVEC4 ba0 = sh_b[c0][(SUB_OFF) + k4_lane_base + 0u];               \
+                const MMA_FVEC4 ba1 = sh_b[c0][(SUB_OFF) + k4_lane_base + 1u];               \
+                const MMA_FVEC4 bb0 = sh_b[c1][(SUB_OFF) + k4_lane_base + 0u];               \
+                const MMA_FVEC4 bb1 = sh_b[c1][(SUB_OFF) + k4_lane_base + 1u];               \
+                [[unroll]] for (uint s = 0u; s < 4u; ++s) {                                  \
+                    coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> ma0, ma1;      \
+                    coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> mb0, mb1;      \
+                    ma0[0] = (W0)[s]; ma0[1] = (W2)[s];                                      \
+                    ma1[0] = (W1)[s]; ma1[1] = (W3)[s];                                      \
+                    mb0[0] = ba0[s];  mb0[1] = bb0[s];                                       \
+                    mb1[0] = ba1[s];  mb1[1] = bb1[s];                                       \
+                    MC_ARR[rt][t] = coopMatMulAdd(ma0, mb0, MC_ARR[rt][t]);                  \
+                    MC_ARR[rt][t] = coopMatMulAdd(ma1, mb1, MC_ARR[rt][t]);                  \
+                }                                                                            \
+            }                                                                                \
+        }                                                                                    \
+    } while (false)
+
+#if defined(DATA_A_Q4_K)
+#define MMA_ACCUM_KPAIRS_GEN(LOOP_ATTR, FENCE_MACRO, TARGET_MACRO, TARGET_ARR, USE_U, ROW_BASE)                          \
+    do {                                                                                                                 \
+        FENCE_MACRO();                                                                                                   \
+        const uint ib       = (ROW_BASE) + ((g * K_PAIRS) >> 2u);                                                        \
+        const uint sub_base = (g * K_PAIRS) & 3u;                                                                        \
+        const uint fn2      = fn >> 1u;                                                                                  \
+        const uint b        = fn2 >> 1u;                                                                                 \
+        const float d_hi    = (b == 0u) ? 1.0f : 0.0625f;                                                                \
+        const uint  q_mk    = (b == 0u) ? 0x0F0F0F0Fu : 0xF0F0F0F0u;                                                     \
+        const uint w_lo     = (fn2 & 1u) << 2u;                                                                          \
+        vec2 loadd;                                                                                                      \
+        uvec3 scales;                                                                                                    \
+        if (USE_U) {                                                                                                     \
+            loadd  = vec2(u_q4_k.data[ib].dm);                                                                           \
+            scales = uvec3(u_q4_k_p32.data[ib].scales[0], u_q4_k_p32.data[ib].scales[1], u_q4_k_p32.data[ib].scales[2]); \
+        } else {                                                                                                         \
+            loadd  = vec2(a_q4_k.data[ib].dm);                                                                           \
+            scales = uvec3(a_q4_k_p32.data[ib].scales[0], a_q4_k_p32.data[ib].scales[1], a_q4_k_p32.data[ib].scales[2]); \
+        }                                                                                                                \
+        const float dx = loadd.x * d_hi;                                                                                 \
+        LOOP_ATTR for (uint s_kp = 0u; s_kp < K_PAIRS; ++s_kp) {                                                         \
+            FENCE_MACRO();                                                                                               \
+            const uint sub         = sub_base + s_kp;                                                                    \
+            const uint is          = (sub << 1u) | b;                                                                    \
+            const uint scalesoffs  = (is & 3u) * 8u;                                                                     \
+            const uint scidxshift1 = (is < 4u) ? scalesoffs : (scalesoffs + 2u);                                         \
+            const uint mbidxshift0 = (is < 4u) ? scalesoffs : (scalesoffs + 4u);                                         \
+            const uint sc_word     = (is < 4u) ? scales.x : scales.z;                                                    \
+            const uint mb_word     = (is < 4u) ? scales.y : scales.z;                                                    \
+            const uint sc          = ((sc_word >> scalesoffs) & 0xFu) | ((scales.x >> scidxshift1) & 0x30u);             \
+            const uint mbyte       = ((mb_word >> mbidxshift0) & 0xFu) | ((scales.y >> scidxshift1) & 0x30u);            \
+            const f16vec4 d        = f16vec4(dx * float(sc));                                                            \
+            const f16vec4 m        = f16vec4(-loadd.y * float(mbyte));                                                   \
+            const uint w_idx       = (sub << 3u) + w_lo;                                                                 \
+            uint q0, q1, q2, q3;                                                                                         \
+            if (USE_U) {                                                                                                 \
+                q0 = u_q4_k_p32.data[ib].qs[w_idx + 0u]; q1 = u_q4_k_p32.data[ib].qs[w_idx + 1u];                        \
+                q2 = u_q4_k_p32.data[ib].qs[w_idx + 2u]; q3 = u_q4_k_p32.data[ib].qs[w_idx + 3u];                        \
+            } else {                                                                                                     \
+                q0 = a_q4_k_p32.data[ib].qs[w_idx + 0u]; q1 = a_q4_k_p32.data[ib].qs[w_idx + 1u];                        \
+                q2 = a_q4_k_p32.data[ib].qs[w_idx + 2u]; q3 = a_q4_k_p32.data[ib].qs[w_idx + 3u];                        \
+            }                                                                                                            \
+            const f16vec4 w0 = fma(d, f16vec4(unpack8(q0 & q_mk)), m);                                                   \
+            const f16vec4 w1 = fma(d, f16vec4(unpack8(q1 & q_mk)), m);                                                   \
+            const f16vec4 w2 = fma(d, f16vec4(unpack8(q2 & q_mk)), m);                                                   \
+            const f16vec4 w3 = fma(d, f16vec4(unpack8(q3 & q_mk)), m);                                                   \
+            FENCE_MACRO();                                                                                               \
+            TARGET_MACRO(TARGET_ARR, (s_kp << 4u), w0, w1, w2, w3);                                                      \
+        }                                                                                                                \
+    } while (false)
+#elif defined(DATA_A_Q5_K)
+#define MMA_ACCUM_KPAIRS_GEN(LOOP_ATTR, FENCE_MACRO, TARGET_MACRO, TARGET_ARR, USE_U, ROW_BASE)                          \
+    do {                                                                                                                 \
+        FENCE_MACRO();                                                                                                   \
+        const uint ib       = (ROW_BASE) + ((g * K_PAIRS) >> 2u);                                                        \
+        const uint sub_base = (g * K_PAIRS) & 3u;                                                                        \
+        const uint fn2      = fn >> 1u;                                                                                  \
+        const uint shift    = (fn2 >> 1u) * 4u;                                                                          \
+        const uint w_lo     = (fn2 & 1u) << 2u;                                                                          \
+        vec2 loadd;                                                                                                      \
+        uvec3 scales;                                                                                                    \
+        uint qh0, qh1, qh2, qh3;                                                                                         \
+        if (USE_U) {                                                                                                     \
+            loadd  = vec2(u_q5_k.data[ib].dm);                                                                           \
+            scales = uvec3(u_q5_k_p32.data[ib].scales[0], u_q5_k_p32.data[ib].scales[1], u_q5_k_p32.data[ib].scales[2]); \
+            qh0 = u_q5_k_p32.data[ib].qh[w_lo + 0u]; qh1 = u_q5_k_p32.data[ib].qh[w_lo + 1u];                            \
+            qh2 = u_q5_k_p32.data[ib].qh[w_lo + 2u]; qh3 = u_q5_k_p32.data[ib].qh[w_lo + 3u];                            \
+        } else {                                                                                                         \
+            loadd  = vec2(a_q5_k.data[ib].dm);                                                                           \
+            scales = uvec3(a_q5_k_p32.data[ib].scales[0], a_q5_k_p32.data[ib].scales[1], a_q5_k_p32.data[ib].scales[2]); \
+            qh0 = a_q5_k_p32.data[ib].qh[w_lo + 0u]; qh1 = a_q5_k_p32.data[ib].qh[w_lo + 1u];                            \
+            qh2 = a_q5_k_p32.data[ib].qh[w_lo + 2u]; qh3 = a_q5_k_p32.data[ib].qh[w_lo + 3u];                            \
+        }                                                                                                                \
+        LOOP_ATTR for (uint s_kp = 0u; s_kp < K_PAIRS; ++s_kp) {                                                         \
+            FENCE_MACRO();                                                                                               \
+            const uint sub         = sub_base + s_kp;                                                                    \
+            const uint is          = (sub << 1u) | (fn2 >> 1u);                                                          \
+            const uint scalesoffs  = (is & 3u) * 8u;                                                                     \
+            const uint scidxshift1 = (is < 4u) ? scalesoffs : (scalesoffs + 2u);                                         \
+            const uint mbidxshift0 = (is < 4u) ? scalesoffs : (scalesoffs + 4u);                                         \
+            const uint sc_word     = (is < 4u) ? scales.x : scales.z;                                                    \
+            const uint mb_word     = (is < 4u) ? scales.y : scales.z;                                                    \
+            const uint sc          = ((sc_word >> scalesoffs) & 0xFu) | ((scales.x >> scidxshift1) & 0x30u);             \
+            const uint mbyte       = ((mb_word >> mbidxshift0) & 0xFu) | ((scales.y >> scidxshift1) & 0x30u);            \
+            const f16vec4 d        = f16vec4(loadd.x * float(sc));                                                       \
+            const f16vec4 m        = f16vec4(-loadd.y * float(mbyte));                                                   \
+            const uint w_idx       = (sub << 3u) + w_lo;                                                                 \
+            uint ql0, ql1, ql2, ql3;                                                                                     \
+            if (USE_U) {                                                                                                 \
+                ql0 = u_q5_k_p32.data[ib].qs[w_idx + 0u]; ql1 = u_q5_k_p32.data[ib].qs[w_idx + 1u];                      \
+                ql2 = u_q5_k_p32.data[ib].qs[w_idx + 2u]; ql3 = u_q5_k_p32.data[ib].qs[w_idx + 3u];                      \
+            } else {                                                                                                     \
+                ql0 = a_q5_k_p32.data[ib].qs[w_idx + 0u]; ql1 = a_q5_k_p32.data[ib].qs[w_idx + 1u];                      \
+                ql2 = a_q5_k_p32.data[ib].qs[w_idx + 2u]; ql3 = a_q5_k_p32.data[ib].qs[w_idx + 3u];                      \
+            }                                                                                                            \
+            const bool qh_left = (is <= 4u);                                                                             \
+            const uint qh_sh   = qh_left ? (4u - is) : (is - 4u);                                                        \
+            const uint qhb0    = (qh_left ? (qh0 << qh_sh) : (qh0 >> qh_sh)) & 0x10101010u;                              \
+            const uint qhb1    = (qh_left ? (qh1 << qh_sh) : (qh1 >> qh_sh)) & 0x10101010u;                              \
+            const uint qhb2    = (qh_left ? (qh2 << qh_sh) : (qh2 >> qh_sh)) & 0x10101010u;                              \
+            const uint qhb3    = (qh_left ? (qh3 << qh_sh) : (qh3 >> qh_sh)) & 0x10101010u;                              \
+            const f16vec4 w0 = fma(d, f16vec4(unpack8(((ql0 >> shift) & 0x0F0F0F0Fu) | qhb0)), m);                       \
+            const f16vec4 w1 = fma(d, f16vec4(unpack8(((ql1 >> shift) & 0x0F0F0F0Fu) | qhb1)), m);                       \
+            const f16vec4 w2 = fma(d, f16vec4(unpack8(((ql2 >> shift) & 0x0F0F0F0Fu) | qhb2)), m);                       \
+            const f16vec4 w3 = fma(d, f16vec4(unpack8(((ql3 >> shift) & 0x0F0F0F0Fu) | qhb3)), m);                       \
+            FENCE_MACRO();                                                                                               \
+            TARGET_MACRO(TARGET_ARR, (s_kp << 4u), w0, w1, w2, w3);                                                      \
+        }                                                                                                                \
+    } while (false)
+#elif defined(DATA_A_Q6_K)
+#define MMA_ACCUM_KPAIRS_GEN(LOOP_ATTR, FENCE_MACRO, TARGET_MACRO, TARGET_ARR, USE_U, ROW_BASE)                          \
+    do {                                                                                                                 \
+        FENCE_MACRO();                                                                                                   \
+        const uint ib       = (ROW_BASE) + ((g * K_PAIRS) >> 2u);                                                        \
+        const uint sub_base = (g * K_PAIRS) & 3u;                                                                        \
+        const uint fn2      = fn >> 1u;                                                                                  \
+        const float d_sb    = float((USE_U) ? u_q6_k.data[ib].d : a_q6_k.data[ib].d);                                    \
+        LOOP_ATTR for (uint s_kp = 0u; s_kp < K_PAIRS; ++s_kp) {                                                         \
+            FENCE_MACRO();                                                                                               \
+            const uint il      = ((sub_base + s_kp) << 2u) | fn2;                                                        \
+            const uint b       = ((il >> 2u) & 1u) * 4u;                                                                 \
+            const uint qhshift = ((il >> 1u) & 3u) * 2u;                                                                 \
+            const uint qsi     = ((il & 8u) << 2u) + ((il & 3u) << 3u);                                                  \
+            const uint qhi     = ((il & 8u) << 1u) + ((il & 1u) << 3u);                                                  \
+            float dscale;                                                                                                \
+            uint ql01, ql23, ql45, ql67, qh01, qh23, qh45, qh67;                                                         \
+            if (USE_U) {                                                                                                 \
+                dscale = d_sb * float(u_q6_k.data[ib].scales[il]);                                                       \
+                ql01 = ((uint(u_q6_k_p16.data[ib].ql[qsi + 0u]) | (uint(u_q6_k_p16.data[ib].ql[qsi + 1u]) << 16u)) >> b) & 0x0F0F0F0Fu; \
+                ql23 = ((uint(u_q6_k_p16.data[ib].ql[qsi + 2u]) | (uint(u_q6_k_p16.data[ib].ql[qsi + 3u]) << 16u)) >> b) & 0x0F0F0F0Fu; \
+                ql45 = ((uint(u_q6_k_p16.data[ib].ql[qsi + 4u]) | (uint(u_q6_k_p16.data[ib].ql[qsi + 5u]) << 16u)) >> b) & 0x0F0F0F0Fu; \
+                ql67 = ((uint(u_q6_k_p16.data[ib].ql[qsi + 6u]) | (uint(u_q6_k_p16.data[ib].ql[qsi + 7u]) << 16u)) >> b) & 0x0F0F0F0Fu; \
+                qh01 = ((uint(u_q6_k_p16.data[ib].qh[qhi + 0u]) | (uint(u_q6_k_p16.data[ib].qh[qhi + 1u]) << 16u)) >> qhshift) & 0x03030303u; \
+                qh23 = ((uint(u_q6_k_p16.data[ib].qh[qhi + 2u]) | (uint(u_q6_k_p16.data[ib].qh[qhi + 3u]) << 16u)) >> qhshift) & 0x03030303u; \
+                qh45 = ((uint(u_q6_k_p16.data[ib].qh[qhi + 4u]) | (uint(u_q6_k_p16.data[ib].qh[qhi + 5u]) << 16u)) >> qhshift) & 0x03030303u; \
+                qh67 = ((uint(u_q6_k_p16.data[ib].qh[qhi + 6u]) | (uint(u_q6_k_p16.data[ib].qh[qhi + 7u]) << 16u)) >> qhshift) & 0x03030303u; \
+            } else {                                                                                                     \
+                dscale = d_sb * float(a_q6_k.data[ib].scales[il]);                                                       \
+                ql01 = ((uint(a_q6_k_p16.data[ib].ql[qsi + 0u]) | (uint(a_q6_k_p16.data[ib].ql[qsi + 1u]) << 16u)) >> b) & 0x0F0F0F0Fu; \
+                ql23 = ((uint(a_q6_k_p16.data[ib].ql[qsi + 2u]) | (uint(a_q6_k_p16.data[ib].ql[qsi + 3u]) << 16u)) >> b) & 0x0F0F0F0Fu; \
+                ql45 = ((uint(a_q6_k_p16.data[ib].ql[qsi + 4u]) | (uint(a_q6_k_p16.data[ib].ql[qsi + 5u]) << 16u)) >> b) & 0x0F0F0F0Fu; \
+                ql67 = ((uint(a_q6_k_p16.data[ib].ql[qsi + 6u]) | (uint(a_q6_k_p16.data[ib].ql[qsi + 7u]) << 16u)) >> b) & 0x0F0F0F0Fu; \
+                qh01 = ((uint(a_q6_k_p16.data[ib].qh[qhi + 0u]) | (uint(a_q6_k_p16.data[ib].qh[qhi + 1u]) << 16u)) >> qhshift) & 0x03030303u; \
+                qh23 = ((uint(a_q6_k_p16.data[ib].qh[qhi + 2u]) | (uint(a_q6_k_p16.data[ib].qh[qhi + 3u]) << 16u)) >> qhshift) & 0x03030303u; \
+                qh45 = ((uint(a_q6_k_p16.data[ib].qh[qhi + 4u]) | (uint(a_q6_k_p16.data[ib].qh[qhi + 5u]) << 16u)) >> qhshift) & 0x03030303u; \
+                qh67 = ((uint(a_q6_k_p16.data[ib].qh[qhi + 6u]) | (uint(a_q6_k_p16.data[ib].qh[qhi + 7u]) << 16u)) >> qhshift) & 0x03030303u; \
+            }                                                                                                            \
+            const f16vec4 dv = f16vec4(dscale);                                                                          \
+            const f16vec4 mv = f16vec4(-32.0f * dscale);                                                                 \
+            const f16vec4 w0 = fma(f16vec4(unpack8(ql01 | (qh01 << 4u))), dv, mv);                                       \
+            const f16vec4 w1 = fma(f16vec4(unpack8(ql23 | (qh23 << 4u))), dv, mv);                                       \
+            const f16vec4 w2 = fma(f16vec4(unpack8(ql45 | (qh45 << 4u))), dv, mv);                                       \
+            const f16vec4 w3 = fma(f16vec4(unpack8(ql67 | (qh67 << 4u))), dv, mv);                                       \
+            FENCE_MACRO();                                                                                               \
+            TARGET_MACRO(TARGET_ARR, (s_kp << 4u), w0, w1, w2, w3);                                                      \
+        }                                                                                                                \
+    } while (false)
+#else
+#define MMA_ACCUM_KPAIRS_GEN(LOOP_ATTR, FENCE_MACRO, TARGET_MACRO, TARGET_ARR, USE_U, ROW_BASE)                          \
+    do {                                                                                                                 \
+        FENCE_MACRO();                                                                                                   \
+        LOOP_ATTR for (uint s_kp = 0u; s_kp < K_PAIRS; ++s_kp) {                                                         \
+            FENCE_MACRO();                                                                                               \
+            MMA_FVEC4 w0, w1, w2, w3;                                                                                    \
+            dequant16((USE_U), (ROW_BASE), ((g * K_PAIRS + s_kp) << 2u) + (fn >> 1u), w0, w1, w2, w3);                   \
+            FENCE_MACRO();                                                                                               \
+            TARGET_MACRO(TARGET_ARR, (s_kp << 4u), w0, w1, w2, w3);                                                      \
+        }                                                                                                                \
+    } while (false)
+#endif
+
+#define MMA_ACCUM_KPAIRS(MC_ARR, USE_U, ROW_BASE) \
+    MMA_ACCUM_KPAIRS_GEN([[dont_unroll]], MMA_NO_FENCE, MMA_ACCUM_SHB, MC_ARR, USE_U, ROW_BASE)
+#define MMA_ACCUM_KPAIRS_UNROLLED(ACC_VEC, USE_U, ROW_BASE) \
+    MMA_ACCUM_KPAIRS_GEN([[unroll]], MMA_NO_FENCE, MMA_ACCUM_SHB_1D, ACC_VEC, USE_U, ROW_BASE)
+#define MMA_ACCUM_KPAIRS_FENCED(MC_ARR, USE_U, ROW_BASE) \
+    MMA_ACCUM_KPAIRS_GEN([[unroll]], MMA_SG_FENCE, MMA_ACCUM_SHB, MC_ARR, USE_U, ROW_BASE)
+#define MMA_ACCUM_PRELOADED_MB(MC_ARR, SUB_OFF, W0, W1, W2, W3)                              \
+    do {                                                                                     \
+        const uint _kp_i = (SUB_OFF) >> 4u;                                                  \
+        [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {                                       \
+            if (rt == 0u || (8u * rt < n_valid)) {                                           \
+                [[unroll]] for (uint s = 0u; s < 4u; ++s) {                                  \
+                    coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> ma0, ma1;      \
+                    ma0[0] = (W0)[s]; ma0[1] = (W2)[s];                                      \
+                    ma1[0] = (W1)[s]; ma1[1] = (W3)[s];                                      \
+                    MC_ARR[rt][t] = coopMatMulAdd(ma0, mb0_all[_kp_i][rt][s], MC_ARR[rt][t]); \
+                    MC_ARR[rt][t] = coopMatMulAdd(ma1, mb1_all[_kp_i][rt][s], MC_ARR[rt][t]); \
+                }                                                                            \
+            }                                                                                \
+        }                                                                                    \
+    } while (false)
+
+        const uint K4_PER_COL = 16u * K_PAIRS;
+        const uint K_CHUNK    = 64u * K_PAIRS;
+        const uint nch        = p.K / K_CHUNK;
+        const uint B_ELEMS    = K4_PER_COL * 8u * RT;
+        const uint B_LOADS    = (B_ELEMS + WG_THREADS - 1u) / WG_THREADS;
+
+        const bool stage_tmp_b    = (USE_SH_B == 1u) ? true : ((USE_SH_B == 5u) ? true : (USE_SH_B == 8u));
+        const bool use_sg_fence   = (USE_SH_B == 5u) ? true : (USE_SH_B == 6u);
+        const bool load_mb_once   = (USE_SH_B == 7u) ? true : ((USE_SH_B == 8u) ? true : (USE_SH_B == 9u));
+        const bool fence_mb_once  = (USE_SH_B != 9u);
+        const bool preload_mb_all = (USE_SH_B == 10u) ? true : (USE_SH_B == 11u);
+
+        for (uint g = 0u; g < nch; ++g) {
+            if (stage_tmp_b) {
+                MMA_FVEC4 tmp_b[B_LOADS];
+                [[unroll]] for (uint li = 0u; li < B_LOADS; ++li) {
+                    tmp_b[li] = MMA_FVEC4(0.0f);
+                }
+                [[unroll]] for (uint li = 0u; li < B_LOADS; ++li) {
+                    const uint col_min = (li * WG_THREADS) / K4_PER_COL;
+                    if (li == 0u || col_min < n_valid) {
+                        const uint idx = li * WG_THREADS + tid;
+                        const uint col_in_tile = idx / K4_PER_COL;
+                        const uint k4 = idx % K4_PER_COL;
+                        if (idx < B_ELEMS && col_in_tile < n_valid) {
+#ifdef MUL_MAT_ID
+                            const uint b_base = mma_id_col_b_base(row_begin, tile_ne1, col_in_tile);
+#else
+                            const uint b_base = b_batch_base + (wg_n0 + col_in_tile) * p.stride_b;
+#endif
+                            tmp_b[li] = load_b_mvec4(b_base + g * K_CHUNK + (k4 << 2u), v4_ok, b_is_f16);
+                        }
+                    }
+                }
+
+                if (g > 0u) {
+                    barrier();
+                }
+
+                [[unroll]] for (uint li = 0u; li < B_LOADS; ++li) {
+#ifdef MUL_MAT_ID
+                    const uint col_min = (li * WG_THREADS) / K4_PER_COL;
+                    if (li == 0u || col_min < n_valid) {
+                        const uint idx = li * WG_THREADS + tid;
+                        if (idx < B_ELEMS) {
+                            sh_b[idx / K4_PER_COL][idx % K4_PER_COL] = tmp_b[li];
+                        }
+                    }
+#else
+                    const uint idx = li * WG_THREADS + tid;
+                    if (idx < B_ELEMS) {
+                        sh_b[idx / K4_PER_COL][idx % K4_PER_COL] = tmp_b[li];
+                    }
+#endif
+                }
+                barrier();
+            } else {
+#ifndef MUL_MAT_ID
+                if (B_LOADS * WG_THREADS == B_ELEMS && n_valid == 8u * RT && v4_ok) {
+                    MMA_FVEC4 bv_arr[B_LOADS];
+                    [[unroll]] for (uint li = 0u; li < B_LOADS; ++li) {
+                        const uint idx = li * WG_THREADS + tid;
+                        const uint col_in_tile = idx / K4_PER_COL;
+                        const uint k4 = idx % K4_PER_COL;
+                        const uint b4 = (b_batch_base + (wg_n0 + col_in_tile) * p.stride_b + g * K_CHUNK) >> 2u;
+                        bv_arr[li] = b_is_f16 ? MMA_FVEC4(data_b_f16v4[b4 + k4]) : MMA_FVEC4(data_b_v4[b4 + k4]);
+                    }
+                    if (g > 0u) {
+                        barrier();
+                    }
+                    [[unroll]] for (uint li = 0u; li < B_LOADS; ++li) {
+                        const uint idx = li * WG_THREADS + tid;
+                        sh_b[idx / K4_PER_COL][idx % K4_PER_COL] = bv_arr[li];
+                    }
+                    barrier();
+                } else
+#endif
+                {
+                    if (g > 0u) {
+                        barrier();
+                    }
+                    [[unroll]] for (uint li = 0u; li < B_LOADS; ++li) {
+                        const uint idx = li * WG_THREADS + tid;
+                        if (idx < B_ELEMS) {
+                            const uint col_in_tile = idx / K4_PER_COL;
+                            const uint k4 = idx % K4_PER_COL;
+                            MMA_FVEC4 bv = MMA_FVEC4(0.0f);
+                            if (col_in_tile < n_valid) {
+#ifdef MUL_MAT_ID
+                                const uint b_base = mma_id_col_b_base(row_begin, tile_ne1, col_in_tile);
+#else
+                                const uint b_base = b_batch_base + (wg_n0 + col_in_tile) * p.stride_b;
+#endif
+                                bv = load_b_mvec4(b_base + g * K_CHUNK + (k4 << 2u), v4_ok, b_is_f16);
+                            }
+                            sh_b[col_in_tile][k4] = bv;
+                        }
+                    }
+                    barrier();
+                }
+            }
+
+            if (load_mb_once) {
+                [[unroll]] for (uint s_kp = 0u; s_kp < K_PAIRS; ++s_kp) {
+                    if (fence_mb_once) { MMA_SG_FENCE(); }
+                    const uint sub_off = (s_kp << 4u) + k4_lane_base;
+                    coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> mb0[RT][4];
+                    coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> mb1[RT][4];
+                    [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {
+                        if (rt == 0u || (8u * rt < n_valid)) {
+                            const uint c0 = 8u * rt + fn + 0u;
+                            const uint c1 = 8u * rt + fn + 1u;
+                            const MMA_FVEC4 ba0 = sh_b[c0][sub_off + 0u];
+                            const MMA_FVEC4 ba1 = sh_b[c0][sub_off + 1u];
+                            const MMA_FVEC4 bb0 = sh_b[c1][sub_off + 0u];
+                            const MMA_FVEC4 bb1 = sh_b[c1][sub_off + 1u];
+                            [[unroll]] for (uint s = 0u; s < 4u; ++s) {
+                                mb0[rt][s][0] = ba0[s]; mb0[rt][s][1] = bb0[s];
+                                mb1[rt][s][0] = ba1[s]; mb1[rt][s][1] = bb1[s];
+                            }
+                        }
+                    }
+                    const uint ci_kp = ((g * K_PAIRS + s_kp) << 2u) + (fn >> 1u);
+                    [[unroll]] for (uint t = 0u; t < NT; ++t) {
+                        if (fence_mb_once) { MMA_SG_FENCE(); }
+                        MMA_FVEC4 w0, w1, w2, w3;
+                        dequant16(FUSE_MODE == 2u && tile_second[t], a_row_base[t], ci_kp, w0, w1, w2, w3);
+                        if (fence_mb_once) { MMA_SG_FENCE(); }
+                        [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {
+                            if (rt == 0u || (8u * rt < n_valid)) {
+                                [[unroll]] for (uint s = 0u; s < 4u; ++s) {
+                                    coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> ma0, ma1;
+                                    ma0[0] = w0[s]; ma0[1] = w2[s];
+                                    ma1[0] = w1[s]; ma1[1] = w3[s];
+                                    mc[rt][t] = coopMatMulAdd(ma0, mb0[rt][s], mc[rt][t]);
+                                    mc[rt][t] = coopMatMulAdd(ma1, mb1[rt][s], mc[rt][t]);
+                                }
+                            }
+                        }
+                        if (FUSE_MODE == 3u) {
+                            if (fence_mb_once) { MMA_SG_FENCE(); }
+                            MMA_FVEC4 uw0, uw1, uw2, uw3;
+                            dequant16(true, a_row_base[t], ci_kp, uw0, uw1, uw2, uw3);
+                            if (fence_mb_once) { MMA_SG_FENCE(); }
+                            [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {
+                                if (rt == 0u || (8u * rt < n_valid)) {
+                                    [[unroll]] for (uint s = 0u; s < 4u; ++s) {
+                                        coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> uma0, uma1;
+                                        uma0[0] = uw0[s]; uma0[1] = uw2[s];
+                                        uma1[0] = uw1[s]; uma1[1] = uw3[s];
+                                        mc_u[rt][t] = coopMatMulAdd(uma0, mb0[rt][s], mc_u[rt][t]);
+                                        mc_u[rt][t] = coopMatMulAdd(uma1, mb1[rt][s], mc_u[rt][t]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if (preload_mb_all) {
+                coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> mb0_all[K_PAIRS][RT][4];
+                coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> mb1_all[K_PAIRS][RT][4];
+                [[unroll]] for (uint s_kp = 0u; s_kp < K_PAIRS; ++s_kp) {
+                    const uint sub_off = (s_kp << 4u) + k4_lane_base;
+                    [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {
+                        if (rt == 0u || (8u * rt < n_valid)) {
+                            const uint c0 = 8u * rt + fn + 0u;
+                            const uint c1 = 8u * rt + fn + 1u;
+                            const MMA_FVEC4 ba0 = sh_b[c0][sub_off + 0u];
+                            const MMA_FVEC4 ba1 = sh_b[c0][sub_off + 1u];
+                            const MMA_FVEC4 bb0 = sh_b[c1][sub_off + 0u];
+                            const MMA_FVEC4 bb1 = sh_b[c1][sub_off + 1u];
+                            [[unroll]] for (uint s = 0u; s < 4u; ++s) {
+                                mb0_all[s_kp][rt][s][0] = ba0[s]; mb0_all[s_kp][rt][s][1] = bb0[s];
+                                mb1_all[s_kp][rt][s][0] = ba1[s]; mb1_all[s_kp][rt][s][1] = bb1[s];
+                            }
+                        }
+                    }
+                }
+                if (USE_SH_B == 11u) {
+                    [[unroll]] for (uint t = 0u; t < NT; ++t) {
+                        MMA_ACCUM_KPAIRS_GEN([[unroll]], MMA_SG_FENCE, MMA_ACCUM_PRELOADED_MB, mc, (FUSE_MODE == 2u && tile_second[t]), a_row_base[t]);
+                        if (FUSE_MODE == 3u) {
+                            MMA_ACCUM_KPAIRS_GEN([[unroll]], MMA_SG_FENCE, MMA_ACCUM_PRELOADED_MB, mc_u, true, a_row_base[t]);
+                        }
+                    }
+                } else {
+                    [[unroll]] for (uint t = 0u; t < NT; ++t) {
+                        MMA_ACCUM_KPAIRS_GEN([[unroll]], MMA_NO_FENCE, MMA_ACCUM_PRELOADED_MB, mc, (FUSE_MODE == 2u && tile_second[t]), a_row_base[t]);
+                        if (FUSE_MODE == 3u) {
+                            MMA_ACCUM_KPAIRS_GEN([[unroll]], MMA_NO_FENCE, MMA_ACCUM_PRELOADED_MB, mc_u, true, a_row_base[t]);
+                        }
+                    }
+                }
+            } else if (USE_SH_B == 4u) {
+                const uint total_mats = NT * ((FUSE_MODE == 3u) ? 2u : 1u);
+                [[dont_unroll]] for (uint mi = 0u; mi < total_mats; ++mi) {
+                    const bool is_u  = (FUSE_MODE == 3u) && ((mi & 1u) != 0u);
+                    const uint ti    = (FUSE_MODE == 3u) ? (mi >> 1u) : mi;
+                    const uint rbase = (ti == 0u) ? a_row_base[0] : a_row_base[NT - 1u];
+                    const bool use_u = is_u || (FUSE_MODE == 2u && ((ti == 0u) ? tile_second[0] : tile_second[NT - 1u]));
+                    coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> acc_p[RT];
+                    [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {
+                        acc_p[rt] = is_u
+                            ? ((ti == 0u) ? mc_u[rt][0] : mc_u[rt][NT - 1u])
+                            : ((ti == 0u) ? mc[rt][0]   : mc[rt][NT - 1u]);
+                    }
+                    MMA_ACCUM_KPAIRS_UNROLLED(acc_p, use_u, rbase);
+                    [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {
+                        if (is_u) {
+                            if (ti == 0u) { mc_u[rt][0] = acc_p[rt]; } else if (NT > 1u) { mc_u[rt][1] = acc_p[rt]; }
+                        } else {
+                            if (ti == 0u) { mc[rt][0]   = acc_p[rt]; } else if (NT > 1u) { mc[rt][1]   = acc_p[rt]; }
+                        }
+                    }
+                }
+            } else if (use_sg_fence) {
+                [[unroll]] for (uint t = 0u; t < NT; ++t) {
+                    MMA_ACCUM_KPAIRS_FENCED(mc, (FUSE_MODE == 2u && tile_second[t]), a_row_base[t]);
+                    if (FUSE_MODE == 3u) {
+                        MMA_ACCUM_KPAIRS_FENCED(mc_u, true, a_row_base[t]);
+                    }
+                }
+            } else if (USE_SH_B == 12u) {
+                [[unroll]] for (uint s_kp = 0u; s_kp < K_PAIRS; ++s_kp) {
+                    const uint ci_kp   = ((g * K_PAIRS + s_kp) << 2u) + (fn >> 1u);
+                    const uint sub_off = (s_kp << 4u) + k4_lane_base;
+                    if (FUSE_MODE == 3u) {
+                        [[unroll]] for (uint t = 0u; t < NT; ++t) {
+                            MMA_FVEC4 w0, w1, w2, w3;
+                            MMA_FVEC4 uw0, uw1, uw2, uw3;
+                            dequant16(false, a_row_base[t], ci_kp, w0,  w1,  w2,  w3);
+                            dequant16(true,  a_row_base[t], ci_kp, uw0, uw1, uw2, uw3);
+                            [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {
+                                const uint c0 = 8u * rt + fn + 0u;
+                                const uint c1 = 8u * rt + fn + 1u;
+                                const MMA_FVEC4 ba0 = sh_b[c0][sub_off + 0u];
+                                const MMA_FVEC4 ba1 = sh_b[c0][sub_off + 1u];
+                                const MMA_FVEC4 bb0 = sh_b[c1][sub_off + 0u];
+                                const MMA_FVEC4 bb1 = sh_b[c1][sub_off + 1u];
+                                [[unroll]] for (uint s = 0u; s < 4u; ++s) {
+                                    coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> ma0, ma1, uma0, uma1;
+                                    coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> mb0, mb1;
+                                    ma0[0]  = w0[s];  ma0[1]  = w2[s];
+                                    ma1[0]  = w1[s];  ma1[1]  = w3[s];
+                                    uma0[0] = uw0[s]; uma0[1] = uw2[s];
+                                    uma1[0] = uw1[s]; uma1[1] = uw3[s];
+                                    mb0[0]  = ba0[s]; mb0[1]  = bb0[s];
+                                    mb1[0]  = ba1[s]; mb1[1]  = bb1[s];
+                                    mc[rt][t]   = coopMatMulAdd(ma0,  mb0, mc[rt][t]);
+                                    mc[rt][t]   = coopMatMulAdd(ma1,  mb1, mc[rt][t]);
+                                    mc_u[rt][t] = coopMatMulAdd(uma0, mb0, mc_u[rt][t]);
+                                    mc_u[rt][t] = coopMatMulAdd(uma1, mb1, mc_u[rt][t]);
+                                }
+                            }
+                        }
+                    } else if (NT == 2u) {
+                        MMA_FVEC4 w0_0, w1_0, w2_0, w3_0;
+                        MMA_FVEC4 w0_1, w1_1, w2_1, w3_1;
+                        dequant16(FUSE_MODE == 2u && tile_second[0], a_row_base[0], ci_kp, w0_0, w1_0, w2_0, w3_0);
+                        dequant16(FUSE_MODE == 2u && tile_second[1], a_row_base[1], ci_kp, w0_1, w1_1, w2_1, w3_1);
+                        [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {
+                            const uint c0 = 8u * rt + fn + 0u;
+                            const uint c1 = 8u * rt + fn + 1u;
+                            const MMA_FVEC4 ba0 = sh_b[c0][sub_off + 0u];
+                            const MMA_FVEC4 ba1 = sh_b[c0][sub_off + 1u];
+                            const MMA_FVEC4 bb0 = sh_b[c1][sub_off + 0u];
+                            const MMA_FVEC4 bb1 = sh_b[c1][sub_off + 1u];
+                            [[unroll]] for (uint s = 0u; s < 4u; ++s) {
+                                coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> ma0_0, ma1_0, ma0_1, ma1_1;
+                                coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> mb0, mb1;
+                                ma0_0[0] = w0_0[s]; ma0_0[1] = w2_0[s];
+                                ma1_0[0] = w1_0[s]; ma1_0[1] = w3_0[s];
+                                ma0_1[0] = w0_1[s]; ma0_1[1] = w2_1[s];
+                                ma1_1[0] = w1_1[s]; ma1_1[1] = w3_1[s];
+                                mb0[0]   = ba0[s];  mb0[1]   = bb0[s];
+                                mb1[0]   = ba1[s];  mb1[1]   = bb1[s];
+                                mc[rt][0] = coopMatMulAdd(ma0_0, mb0, mc[rt][0]);
+                                mc[rt][0] = coopMatMulAdd(ma1_0, mb1, mc[rt][0]);
+                                mc[rt][1] = coopMatMulAdd(ma0_1, mb0, mc[rt][1]);
+                                mc[rt][1] = coopMatMulAdd(ma1_1, mb1, mc[rt][1]);
+                            }
+                        }
+                    } else {
+                        [[unroll]] for (uint t = 0u; t < NT; ++t) {
+                            MMA_ACCUM_KPAIRS(mc, (FUSE_MODE == 2u && tile_second[t]), a_row_base[t]);
+                        }
+                    }
+                }
+            } else {
+                [[unroll]] for (uint t = 0u; t < NT; ++t) {
+                    MMA_ACCUM_KPAIRS(mc, (FUSE_MODE == 2u && tile_second[t]), a_row_base[t]);
+                    if (FUSE_MODE == 3u) {
+                        MMA_ACCUM_KPAIRS(mc_u, true, a_row_base[t]);
+                    }
+                }
+            }
+        }
+#undef MMA_ACCUM_PRELOADED_MB
+#undef MMA_ACCUM_KPAIRS_FENCED
+#undef MMA_ACCUM_KPAIRS_UNROLLED
+#undef MMA_ACCUM_KPAIRS
+#undef MMA_ACCUM_KPAIRS_GEN
+#undef MMA_NO_FENCE
+#undef MMA_SG_FENCE
+#undef MMA_ACCUM_SHB
+#undef MMA_ACCUM_SHB_1D
+    }
+#if defined(DATA_A_Q8_0)
+    else if (RT == 1u || (p.K & 63u) != 0u) {
+        const bool v2_ok = ((p.stride_b & 1u) == 0u) && ((p.batch_stride_b & 1u) == 0u);
+        const uint b_lane_off = 8u * (fm >> 1u) + 2u * (fm & 1u);
+        const uint nb = p.K >> 5u;
+
+        for (uint ib = sg_k; ib < nb; ib += NSG) {
+            MMA_FVEC2 b0[RT][2];
+            MMA_FVEC2 b1[RT][2];
+            [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {
+                if (rt == 0u || (8u * rt < n_valid)) {
+                    [[unroll]] for (uint e = 0u; e < 2u; ++e) {
+#ifdef MUL_MAT_ID
+                        const uint b_base = mma_id_col_b_base(row_begin, tile_ne1, min(8u * rt + fn + e, n_valid - 1u));
+#else
+                        const uint b_base = b_batch_base + (wg_n0 + min(8u * rt + fn + e, n_valid - 1u)) * p.stride_b;
+#endif
+                        const uint base = b_base + (ib << 5u) + b_lane_off;
+                        b0[rt][e] = load_b_mvec2(base,      v2_ok, b_is_f16);
+                        b1[rt][e] = load_b_mvec2(base + 4u, v2_ok, b_is_f16);
+                    }
+                }
+            }
+
+            [[unroll]] for (uint t = 0u; t < NT; ++t) {
+                const uint blk_idx = a_row_base[t] + ib;
+                const uint q_off   = 2u * fn;
+                float d_a;
+                i8vec4 v0_a, v1_a;
+                if (FUSE_MODE == 2u && tile_second[t]) {
+                    d_a = float(u_q8_0.data[blk_idx].d);
+                    v0_a = unpack8(int32_t((uint(int(u_q8_0.data[blk_idx].qs[q_off + 0u])) & 0xFFFFu) | (uint(int(u_q8_0.data[blk_idx].qs[q_off + 1u])) << 16u)));
+                    v1_a = unpack8(int32_t((uint(int(u_q8_0.data[blk_idx].qs[q_off + 2u])) & 0xFFFFu) | (uint(int(u_q8_0.data[blk_idx].qs[q_off + 3u])) << 16u)));
+                } else {
+                    d_a = float(a_q8_0.data[blk_idx].d);
+                    v0_a = unpack8(int32_t((uint(int(a_q8_0.data[blk_idx].qs[q_off + 0u])) & 0xFFFFu) | (uint(int(a_q8_0.data[blk_idx].qs[q_off + 1u])) << 16u)));
+                    v1_a = unpack8(int32_t((uint(int(a_q8_0.data[blk_idx].qs[q_off + 2u])) & 0xFFFFu) | (uint(int(a_q8_0.data[blk_idx].qs[q_off + 3u])) << 16u)));
+                }
+
+                [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {
+                    if (rt == 0u || (8u * rt < n_valid)) {
+                        coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> mp = coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0.0f);
+                        coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> ma;
+                        coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> mb;
+                        ma[0] = MMA_FTYPE(v0_a.x); ma[1] = MMA_FTYPE(v0_a.z); mb[0] = b0[rt][0].x; mb[1] = b0[rt][1].x; mp = coopMatMulAdd(ma, mb, mp);
+                        ma[0] = MMA_FTYPE(v0_a.y); ma[1] = MMA_FTYPE(v0_a.w); mb[0] = b0[rt][0].y; mb[1] = b0[rt][1].y; mp = coopMatMulAdd(ma, mb, mp);
+                        ma[0] = MMA_FTYPE(v1_a.x); ma[1] = MMA_FTYPE(v1_a.z); mb[0] = b1[rt][0].x; mb[1] = b1[rt][1].x; mp = coopMatMulAdd(ma, mb, mp);
+                        ma[0] = MMA_FTYPE(v1_a.y); ma[1] = MMA_FTYPE(v1_a.w); mb[0] = b1[rt][0].y; mb[1] = b1[rt][1].y; mp = coopMatMulAdd(ma, mb, mp);
+                        mc[rt][t][0] = fma(d_a, mp[0], mc[rt][t][0]);
+                        mc[rt][t][1] = fma(d_a, mp[1], mc[rt][t][1]);
+                    }
+                }
+
+                if (FUSE_MODE == 3u) {
+                    const float d_u = float(u_q8_0.data[blk_idx].d);
+                    const i8vec4 v0_u = unpack8(int32_t((uint(int(u_q8_0.data[blk_idx].qs[q_off + 0u])) & 0xFFFFu) | (uint(int(u_q8_0.data[blk_idx].qs[q_off + 1u])) << 16u)));
+                    const i8vec4 v1_u = unpack8(int32_t((uint(int(u_q8_0.data[blk_idx].qs[q_off + 2u])) & 0xFFFFu) | (uint(int(u_q8_0.data[blk_idx].qs[q_off + 3u])) << 16u)));
+                    [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {
+                        if (rt == 0u || (8u * rt < n_valid)) {
+                            coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> mpu = coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0.0f);
+                            coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> ma;
+                            coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> mb;
+                            ma[0] = MMA_FTYPE(v0_u.x); ma[1] = MMA_FTYPE(v0_u.z); mb[0] = b0[rt][0].x; mb[1] = b0[rt][1].x; mpu = coopMatMulAdd(ma, mb, mpu);
+                            ma[0] = MMA_FTYPE(v0_u.y); ma[1] = MMA_FTYPE(v0_u.w); mb[0] = b0[rt][0].y; mb[1] = b0[rt][1].y; mpu = coopMatMulAdd(ma, mb, mpu);
+                            ma[0] = MMA_FTYPE(v1_u.x); ma[1] = MMA_FTYPE(v1_u.z); mb[0] = b1[rt][0].x; mb[1] = b1[rt][1].x; mpu = coopMatMulAdd(ma, mb, mpu);
+                            ma[0] = MMA_FTYPE(v1_u.y); ma[1] = MMA_FTYPE(v1_u.w); mb[0] = b1[rt][0].y; mb[1] = b1[rt][1].y; mpu = coopMatMulAdd(ma, mb, mpu);
+                            mc_u[rt][t][0] = fma(d_u, mpu[0], mc_u[rt][t][0]);
+                            mc_u[rt][t][1] = fma(d_u, mpu[1], mc_u[rt][t][1]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+#elif defined(DATA_A_Q4_0)
+    else if ((p.K & 63u) != 0u) {
+        const bool v2_ok = ((p.stride_b & 1u) == 0u) && ((p.batch_stride_b & 1u) == 0u);
+        const uint b_lane_off = 2u * fm;
+        const uint nb = p.K >> 5u;
+
+        for (uint ib = sg_k; ib < nb; ib += NSG) {
+            MMA_FVEC2 b0[RT][2];
+            MMA_FVEC2 b1[RT][2];
+            [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {
+                if (rt == 0u || (8u * rt < n_valid)) {
+                    [[unroll]] for (uint e = 0u; e < 2u; ++e) {
+#ifdef MUL_MAT_ID
+                        const uint b_base = mma_id_col_b_base(row_begin, tile_ne1, min(8u * rt + fn + e, n_valid - 1u));
+#else
+                        const uint b_base = b_batch_base + (wg_n0 + min(8u * rt + fn + e, n_valid - 1u)) * p.stride_b;
+#endif
+                        const uint base = b_base + (ib << 5u) + b_lane_off;
+                        b0[rt][e] = load_b_mvec2(base,       v2_ok, b_is_f16);
+                        b1[rt][e] = load_b_mvec2(base + 16u, v2_ok, b_is_f16);
+                    }
+                }
+            }
+
+            [[unroll]] for (uint t = 0u; t < NT; ++t) {
+                const uint blk_idx = a_row_base[t] + ib;
+                float d_a;
+                uint raw_u;
+                if (FUSE_MODE == 2u && tile_second[t]) {
+                    d_a = float(u_q4_0.data[blk_idx].d);
+                    raw_u = uint(u_q4_0.data[blk_idx].qs[fn]) | (uint(u_q4_0.data[blk_idx].qs[fn + 1u]) << 16u);
+                } else {
+                    d_a = float(a_q4_0.data[blk_idx].d);
+                    raw_u = uint(a_q4_0.data[blk_idx].qs[fn]) | (uint(a_q4_0.data[blk_idx].qs[fn + 1u]) << 16u);
+                }
+                const u8vec4 lo = unpack8( raw_u        & 0x0F0F0F0Fu);
+                const u8vec4 hi = unpack8((raw_u >> 4u) & 0x0F0F0F0Fu);
+
+                [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {
+                    if (rt == 0u || (8u * rt < n_valid)) {
+                        coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> mp = coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0.0f);
+                        coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> ma;
+                        coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> mb;
+                        ma[0] = MMA_FTYPE(int(lo.x) - 8); ma[1] = MMA_FTYPE(int(lo.z) - 8); mb[0] = b0[rt][0].x; mb[1] = b0[rt][1].x; mp = coopMatMulAdd(ma, mb, mp);
+                        ma[0] = MMA_FTYPE(int(lo.y) - 8); ma[1] = MMA_FTYPE(int(lo.w) - 8); mb[0] = b0[rt][0].y; mb[1] = b0[rt][1].y; mp = coopMatMulAdd(ma, mb, mp);
+                        ma[0] = MMA_FTYPE(int(hi.x) - 8); ma[1] = MMA_FTYPE(int(hi.z) - 8); mb[0] = b1[rt][0].x; mb[1] = b1[rt][1].x; mp = coopMatMulAdd(ma, mb, mp);
+                        ma[0] = MMA_FTYPE(int(hi.y) - 8); ma[1] = MMA_FTYPE(int(hi.w) - 8); mb[0] = b1[rt][0].y; mb[1] = b1[rt][1].y; mp = coopMatMulAdd(ma, mb, mp);
+                        mc[rt][t][0] = fma(d_a, mp[0], mc[rt][t][0]);
+                        mc[rt][t][1] = fma(d_a, mp[1], mc[rt][t][1]);
+                    }
+                }
+
+                if (FUSE_MODE == 3u) {
+                    const float d_u = float(u_q4_0.data[blk_idx].d);
+                    const uint uraw = uint(u_q4_0.data[blk_idx].qs[fn]) | (uint(u_q4_0.data[blk_idx].qs[fn + 1u]) << 16u);
+                    const u8vec4 ulo = unpack8( uraw        & 0x0F0F0F0Fu);
+                    const u8vec4 uhi = unpack8((uraw >> 4u) & 0x0F0F0F0Fu);
+                    [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {
+                        if (rt == 0u || (8u * rt < n_valid)) {
+                            coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> mpu = coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0.0f);
+                            coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> ma;
+                            coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> mb;
+                            ma[0] = MMA_FTYPE(int(ulo.x) - 8); ma[1] = MMA_FTYPE(int(ulo.z) - 8); mb[0] = b0[rt][0].x; mb[1] = b0[rt][1].x; mpu = coopMatMulAdd(ma, mb, mpu);
+                            ma[0] = MMA_FTYPE(int(ulo.y) - 8); ma[1] = MMA_FTYPE(int(ulo.w) - 8); mb[0] = b0[rt][0].y; mb[1] = b0[rt][1].y; mpu = coopMatMulAdd(ma, mb, mpu);
+                            ma[0] = MMA_FTYPE(int(uhi.x) - 8); ma[1] = MMA_FTYPE(int(uhi.z) - 8); mb[0] = b1[rt][0].x; mb[1] = b1[rt][1].x; mpu = coopMatMulAdd(ma, mb, mpu);
+                            ma[0] = MMA_FTYPE(int(uhi.y) - 8); ma[1] = MMA_FTYPE(int(uhi.w) - 8); mb[0] = b1[rt][0].y; mb[1] = b1[rt][1].y; mpu = coopMatMulAdd(ma, mb, mpu);
+                            mc_u[rt][t][0] = fma(d_u, mpu[0], mc_u[rt][t][0]);
+                            mc_u[rt][t][1] = fma(d_u, mpu[1], mc_u[rt][t][1]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+#endif
+    else {
+        // K-split (MSG == 1, NSG >= 1) 64-weight chunk loop with on-the-fly mb construction
+        const bool v4_ok = ((p.stride_b & 3u) == 0u) && ((p.batch_stride_b & 3u) == 0u);
+        const uint b_lane_off = 16u * (fm >> 1u) + 8u * (fm & 1u);
+        const uint nch = p.K >> 6u;
+
+        uint base0_rt[RT], base1_rt[RT];
+        [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {
+            if (rt == 0u || (8u * rt < n_valid)) {
+#ifdef MUL_MAT_ID
+                base0_rt[rt] = mma_id_col_b_base(row_begin, tile_ne1, min(8u * rt + fn + 0u, n_valid - 1u)) + b_lane_off;
+                base1_rt[rt] = mma_id_col_b_base(row_begin, tile_ne1, min(8u * rt + fn + 1u, n_valid - 1u)) + b_lane_off;
+#else
+                base0_rt[rt] = b_batch_base + (wg_n0 + min(8u * rt + fn + 0u, n_valid - 1u)) * p.stride_b + b_lane_off;
+                base1_rt[rt] = b_batch_base + (wg_n0 + min(8u * rt + fn + 1u, n_valid - 1u)) * p.stride_b + b_lane_off;
+#endif
+            } else {
+                base0_rt[rt] = 0u;
+                base1_rt[rt] = 0u;
+            }
+        }
+
+        for (uint g = sg_k; g < nch; g += NSG) {
+            MMA_FVEC4 ba0[RT], ba1[RT], bb0[RT], bb1[RT];
+            [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {
+                if (rt == 0u || (8u * rt < n_valid)) {
+                    const uint base0 = base0_rt[rt] + (g << 6u);
+                    const uint base1 = base1_rt[rt] + (g << 6u);
+                    ba0[rt] = load_b_mvec4(base0,      v4_ok, b_is_f16);
+                    ba1[rt] = load_b_mvec4(base0 + 4u, v4_ok, b_is_f16);
+                    bb0[rt] = load_b_mvec4(base1,      v4_ok, b_is_f16);
+                    bb1[rt] = load_b_mvec4(base1 + 4u, v4_ok, b_is_f16);
+                }
+            }
+
+            const uint ci = (g << 2u) + (fn >> 1u);
+
+            [[unroll]] for (uint t = 0u; t < NT; ++t) {
+                MMA_FVEC4 w0, w1, w2, w3;
+                dequant16(FUSE_MODE == 2u && tile_second[t], a_row_base[t], ci, w0, w1, w2, w3);
+
+                [[unroll]] for (uint s = 0u; s < 4u; ++s) {
+                    coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> ma0, ma1;
+                    ma0[0] = w0[s]; ma0[1] = w2[s];
+                    ma1[0] = w1[s]; ma1[1] = w3[s];
+                    [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {
+                        if (rt == 0u || (8u * rt < n_valid)) {
+                            coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> mb0, mb1;
+                            mb0[0] = ba0[rt][s]; mb0[1] = bb0[rt][s];
+                            mb1[0] = ba1[rt][s]; mb1[1] = bb1[rt][s];
+                            mc[rt][t] = coopMatMulAdd(ma0, mb0, mc[rt][t]);
+                            mc[rt][t] = coopMatMulAdd(ma1, mb1, mc[rt][t]);
+                        }
+                    }
+                }
+
+                if (FUSE_MODE == 3u) {
+                    MMA_FVEC4 uw0, uw1, uw2, uw3;
+                    dequant16(true, a_row_base[t], ci, uw0, uw1, uw2, uw3);
+                    [[unroll]] for (uint s = 0u; s < 4u; ++s) {
+                        coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> mu0, mu1;
+                        mu0[0] = uw0[s]; mu0[1] = uw2[s];
+                        mu1[0] = uw1[s]; mu1[1] = uw3[s];
+                        [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {
+                            if (rt == 0u || (8u * rt < n_valid)) {
+                                coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> mb0, mb1;
+                                mb0[0] = ba0[rt][s]; mb0[1] = bb0[rt][s];
+                                mb1[0] = ba1[rt][s]; mb1[1] = bb1[rt][s];
+                                mc_u[rt][t] = coopMatMulAdd(mu0, mb0, mc_u[rt][t]);
+                                mc_u[rt][t] = coopMatMulAdd(mu1, mb1, mc_u[rt][t]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Store path: when NSG == 1, write directly from registers with ZERO reduction shmem and ZERO barriers!
+    if (NSG == 1u) {
+        [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {
+            if ((CSG == 1u && rt == 0u) || (sg_c_off + 8u * rt < n_valid)) {
+                [[unroll]] for (uint e = 0u; e < 2u; ++e) {
+#ifdef MUL_MAT_ID
+                    const uint col_in_tile = sg_c_off + 8u * rt + fn + e;
+                    if (col_in_tile < tile_ne1) {
+                        const uint packed = mma_id_col_packed(row_begin, tile_ne1, col_in_tile);
+                        const u16vec2 rid = u16vec2(packed & 0xFFFFu, packed >> 16u);
+                        const uint d_col_base = uint(rid.y) * p.batch_stride_d + uint(rid.x) * p.stride_d;
+                        float col_scale = 1.0f;
+                        if (FUSE_MODE == 4u) {
+                            if (USE_SH_IDS) {
+                                col_scale = sh_col_scale[col_in_tile];
+                            } else {
+                                const uint s0_idx = uint(rid.x) + (((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0_TOK) != 0u) ? (uint(rid.y) * p.nei0) : 0u);
+                                col_scale = data_aux0[s0_idx];
+                            }
+                        }
+                        [[unroll]] for (uint t = 0u; t < NT; ++t) {
+                            const uint r0 = sg_m0 + 8u * t + fm;
+                            if (r0 < p.M) {
+                                const uint d_idx = d_col_base + r0;
+                                float val = mc[rt][t][e];
+                                if (FUSE_MODE == 3u) {
+                                    const float u = mc_u[rt][t][e];
+                                    val = (val / (1.0f + exp(-val))) * u;
+                                    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_D_F16_AUX1) != 0u) {
+                                        data_d_f16[d_idx] = float16_t(val);
+                                    }
+                                    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SKIP_F32_D) == 0u) {
+                                        data_d[d_idx] = val;
+                                    }
+                                } else {
+                                    if (FUSE_MODE == 4u) {
+                                        val *= col_scale;
+                                    } else if (FUSE_MODE == 1u) {
+                                        val = mma_apply_id_epilogue(val, expert_idx, rid, r0, d_idx);
+                                    }
+                                    data_d[d_idx] = val;
+                                }
+                            }
+                        }
+                    }
+#else
+                    const uint col = wg_n0 + 8u * rt + fn + e;
+                    if (col < p.N) {
+                        const uint tok_col = batch_idx * p.N + col;
+                        [[unroll]] for (uint t = 0u; t < NT; ++t) {
+                            const uint r_global = sg_m0 + 8u * t + fm;
+                            if (FUSE_MODE == 2u && tile_second[t]) {
+                                const uint r1 = r_global - p.pair_m0;
+                                const uint m1 = p.M - p.pair_m0;
+                                if (r1 < m1) {
+                                    const uint d2_idx = batch_idx * p.batch_stride_d2 + col * p.stride_d2 + r1;
+                                    float v2 = mc[rt][t][e];
+                                    if (FUSE_LORA != 0u && (p.fusion_flags & MAT_VEC_FUSION_FLAGS_LORA1) != 0u) {
+                                        v2 += mma_eval_lora1(r1, tok_col);
+                                    }
+                                    data_d2[d2_idx] = mma_apply_dense_epilogue(v2, r1, col, d2_idx, true);
+                                }
+                            } else {
+                                const uint m_lim = (FUSE_MODE == 2u) ? p.pair_m0 : p.M;
+                                if (r_global < m_lim) {
+                                    const uint d_idx = batch_idx * p.batch_stride_d + col * p.stride_d + r_global;
+                                    float val = mc[rt][t][e];
+                                    if (FUSE_LORA != 0u && FUSE_MODE != 0u && (p.fusion_flags & MAT_VEC_FUSION_FLAGS_LORA0) != 0u) {
+                                        val += mma_eval_lora0(r_global, tok_col);
+                                    }
+                                    if (FUSE_MODE == 3u) {
+                                        float u = mc_u[rt][t][e];
+                                        if (FUSE_LORA != 0u && (p.fusion_flags & MAT_VEC_FUSION_FLAGS_LORA1) != 0u) {
+                                            u += mma_eval_lora1(r_global, tok_col);
+                                        }
+                                        val = (val / (1.0f + exp(-val))) * u;
+                                    } else if (FUSE_MODE == 4u) {
+                                        if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0u) {
+                                            val += data_aux0[d_idx];
+                                        }
+                                        if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0u) {
+                                            val += data_aux1[d_idx];
+                                        }
+                                    } else if (FUSE_MODE == 1u || FUSE_MODE == 2u) {
+                                        val = mma_apply_dense_epilogue(val, r_global, col, d_idx, false);
+                                    }
+                                    data_d[d_idx] = val;
+                                }
+                            }
+                        }
+                    }
+#endif
+                }
+            }
+        }
+        return;
+    }
+
+#ifndef MUL_MAT_ID
+    // NSG > 1 (MSG == 1) reduction through shared memory (dense only)
+    const uint stride_sg = RT * NT * 64u;
+    [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {
+        [[unroll]] for (uint t = 0u; t < NT; ++t) {
+            const uint base = sg_k * stride_sg + (rt * NT + t) * 64u + 2u * lane;
+            red_shmem[base + 0u] = mc[rt][t][0];
+            red_shmem[base + 1u] = mc[rt][t][1];
+            if (FUSE_MODE == 3u) {
+                const uint ubase = NSG * stride_sg + base;
+                red_shmem[ubase + 0u] = mc_u[rt][t][0];
+                red_shmem[ubase + 1u] = mc_u[rt][t][1];
+            }
+        }
+    }
+    barrier();
+
+    for (uint idx = tid; idx < stride_sg; idx += WG_THREADS) {
+        const uint rt = idx / (NT * 64u);
+        if (rt > 0u && (8u * rt >= n_valid)) {
+            continue;
+        }
+        const uint t = (idx / 64u) % NT;
+        const uint l = (idx & 63u) >> 1u;
+        const uint e = idx & 1u;
+
+        float sum = 0.0f;
+        float sum_u = 0.0f;
+        [[unroll]] for (uint sg = 0u; sg < NSG; ++sg) {
+            sum += red_shmem[sg * stride_sg + idx];
+            if (FUSE_MODE == 3u) {
+                sum_u += red_shmem[(NSG + sg) * stride_sg + idx];
+            }
+        }
+
+        const uint l_fm = mma_lane_fm(l);
+        const uint l_fn = mma_lane_fn(l);
+
+        const uint col = wg_n0 + 8u * rt + l_fn + e;
+        if (col < p.N) {
+            const uint tok_col = batch_idx * p.N + col;
+            const uint tile_r = sg_m0 + 8u * t;
+            const uint r_global = tile_r + l_fm;
+            if (FUSE_MODE == 2u && tile_r >= p.pair_m0) {
+                const uint r1 = r_global - p.pair_m0;
+                const uint m1 = p.M - p.pair_m0;
+                if (r1 < m1) {
+                    const uint d2_idx = batch_idx * p.batch_stride_d2 + col * p.stride_d2 + r1;
+                    float v2 = sum;
+                    if (FUSE_LORA != 0u && (p.fusion_flags & MAT_VEC_FUSION_FLAGS_LORA1) != 0u) {
+                        v2 += mma_eval_lora1(r1, tok_col);
+                    }
+                    data_d2[d2_idx] = mma_apply_dense_epilogue(v2, r1, col, d2_idx, true);
+                }
+            } else {
+                const uint m_lim = (FUSE_MODE == 2u) ? p.pair_m0 : p.M;
+                if (r_global < m_lim) {
+                    const uint d_idx = batch_idx * p.batch_stride_d + col * p.stride_d + r_global;
+                    float val = sum;
+                    if (FUSE_LORA != 0u && FUSE_MODE != 0u && (p.fusion_flags & MAT_VEC_FUSION_FLAGS_LORA0) != 0u) {
+                        val += mma_eval_lora0(r_global, tok_col);
+                    }
+                    if (FUSE_MODE == 3u) {
+                        float u = sum_u;
+                        if (FUSE_LORA != 0u && (p.fusion_flags & MAT_VEC_FUSION_FLAGS_LORA1) != 0u) {
+                            u += mma_eval_lora1(r_global, tok_col);
+                        }
+                        val = (val / (1.0f + exp(-val))) * u;
+                    } else if (FUSE_MODE == 4u) {
+                        if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0u) {
+                            val += data_aux0[d_idx];
+                        }
+                        if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0u) {
+                            val += data_aux1[d_idx];
+                        }
+                    } else if (FUSE_MODE == 1u || FUSE_MODE == 2u) {
+                        val = mma_apply_dense_epilogue(val, r_global, col, d_idx, false);
+                    }
+                    data_d[d_idx] = val;
+                }
+            }
+        }
+    }
+#endif
+}
