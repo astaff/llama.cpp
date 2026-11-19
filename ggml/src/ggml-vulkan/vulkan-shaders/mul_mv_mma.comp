@@ -37,6 +37,7 @@ layout(constant_id = 5) const uint USE_SH_B  = 1;
 layout(constant_id = 6) const uint K_PAIRS   = 1;
 layout(constant_id = 7) const uint CSG       = 1; // column-split subgroups (MUL_MAT_ID cooperative dequant)
 layout(constant_id = 8) const uint B_IS_F16  = 0; // compile-time FP16 B buffer specialization
+layout(constant_id = 9) const uint FUSE_LORA = 0; // compile-time fused dynamic LoRA specialization
 
 const uint MSG        = WG_SG / (NSG * CSG);
 const uint WG_THREADS = 32u * WG_SG;
@@ -93,7 +94,9 @@ layout(binding = MMA_BIND_U) readonly buffer BUF_U_F16   { float16_t data[]; } u
 layout(binding = MMA_BIND_U) readonly buffer BUF_U_F16V4 { f16vec4   data[]; } u_f16v4;
 #elif defined(DATA_A_Q8_0)
 layout(binding = 0)          readonly buffer BUF_A_Q8_0  { block_q8_0_packed16 data[]; } a_q8_0;
+layout(binding = 0)          readonly buffer BUF_A_U32   { uint                data[]; } a_u32;
 layout(binding = MMA_BIND_U) readonly buffer BUF_U_Q8_0  { block_q8_0_packed16 data[]; } u_q8_0;
+layout(binding = MMA_BIND_U) readonly buffer BUF_U_U32   { uint                data[]; } u_u32;
 #elif defined(DATA_A_Q4_0)
 layout(binding = 0)          readonly buffer BUF_A_Q4_0  { block_q4_0_packed16 data[]; } a_q4_0;
 layout(binding = MMA_BIND_U) readonly buffer BUF_U_Q4_0  { block_q4_0_packed16 data[]; } u_q4_0;
@@ -147,8 +150,16 @@ layout(binding = 3) readonly buffer BUF_IDS     { int   data_ids[];     };
 layout(binding = 4) readonly buffer BUF_ROW_MAP { uint  data_row_map[]; };
 layout(binding = MMA_BIND_AUX1) writeonly buffer BUF_D_F16 { float16_t data_d_f16[]; };
 #else
-layout(binding = 5) writeonly buffer BUF_D2_F32 { float data_d2[];    };
-layout(binding = 6) readonly  buffer BUF_F2_F32 { float data_aux2[];  };
+layout(binding = 5)  writeonly buffer BUF_D2_F32     { float data_d2[];    };
+layout(binding = 6)  readonly  buffer BUF_F2_F32     { float data_aux2[];  };
+layout(binding = 7)  readonly  buffer BUF_LORA_B0    { float data[]; } lora_b0;
+layout(binding = 7)  readonly  buffer BUF_LORA_B0_V4 { vec4  data[]; } lora_b0_v4;
+layout(binding = 8)  readonly  buffer BUF_LORA_H0    { float data[]; } lora_h0;
+layout(binding = 8)  readonly  buffer BUF_LORA_H0_V4 { vec4  data[]; } lora_h0_v4;
+layout(binding = 9)  readonly  buffer BUF_LORA_B1    { float data[]; } lora_b1;
+layout(binding = 9)  readonly  buffer BUF_LORA_B1_V4 { vec4  data[]; } lora_b1_v4;
+layout(binding = 10) readonly  buffer BUF_LORA_H1    { float data[]; } lora_h1;
+layout(binding = 10) readonly  buffer BUF_LORA_H1_V4 { vec4  data[]; } lora_h1_v4;
 #endif
 
 layout(binding = MMA_BIND_AUX0) readonly buffer BUF_AUX0 { float data_aux0[]; };
@@ -171,6 +182,8 @@ layout(binding = MMA_BIND_AUX1) readonly buffer BUF_AUX1 { float data_aux1[]; };
 #define MAT_VEC_FUSION_FLAGS_B_F16            0x10000u
 #define MAT_VEC_FUSION_FLAGS_D_F16_AUX1       0x20000u
 #define MAT_VEC_FUSION_FLAGS_SKIP_F32_D       0x40000u
+#define MAT_VEC_FUSION_FLAGS_LORA0            0x80000u
+#define MAT_VEC_FUSION_FLAGS_LORA1            0x100000u
 
 layout(push_constant) uniform parameter {
 #ifdef MUL_MAT_ID
@@ -209,6 +222,9 @@ layout(push_constant) uniform parameter {
     uint pair_m0;
     uint stride_d2;
     uint batch_stride_d2;
+    uint lora_r;
+    float lora_scale0;
+    float lora_scale1;
 #endif
 } p;
 
@@ -342,24 +358,33 @@ void dequant16(bool use_u, uint row_unit_base, uint ci, out MMA_FVEC4 w0, out MM
     const uint ib  = row_unit_base + (ci >> 1u);
     const uint iqs = (ci & 1u) << 3u;
     float16_t d;
-    i8vec2 p0, p1, p2, p3, p4, p5, p6, p7;
+    uint q01, q23, q45, q67;
     if (use_u) {
-        d  = u_q8_0.data[ib].d;
-        p0 = unpack8(u_q8_0.data[ib].qs[iqs + 0u]); p1 = unpack8(u_q8_0.data[ib].qs[iqs + 1u]);
-        p2 = unpack8(u_q8_0.data[ib].qs[iqs + 2u]); p3 = unpack8(u_q8_0.data[ib].qs[iqs + 3u]);
-        p4 = unpack8(u_q8_0.data[ib].qs[iqs + 4u]); p5 = unpack8(u_q8_0.data[ib].qs[iqs + 5u]);
-        p6 = unpack8(u_q8_0.data[ib].qs[iqs + 6u]); p7 = unpack8(u_q8_0.data[ib].qs[iqs + 7u]);
+        d   = u_q8_0.data[ib].d;
+        q01 = pack32(u16vec2(uint16_t(u_q8_0.data[ib].qs[iqs + 0u]), uint16_t(u_q8_0.data[ib].qs[iqs + 1u]))) ^ 0x80808080u;
+        q23 = pack32(u16vec2(uint16_t(u_q8_0.data[ib].qs[iqs + 2u]), uint16_t(u_q8_0.data[ib].qs[iqs + 3u]))) ^ 0x80808080u;
+        q45 = pack32(u16vec2(uint16_t(u_q8_0.data[ib].qs[iqs + 4u]), uint16_t(u_q8_0.data[ib].qs[iqs + 5u]))) ^ 0x80808080u;
+        q67 = pack32(u16vec2(uint16_t(u_q8_0.data[ib].qs[iqs + 6u]), uint16_t(u_q8_0.data[ib].qs[iqs + 7u]))) ^ 0x80808080u;
     } else {
-        d  = a_q8_0.data[ib].d;
-        p0 = unpack8(a_q8_0.data[ib].qs[iqs + 0u]); p1 = unpack8(a_q8_0.data[ib].qs[iqs + 1u]);
-        p2 = unpack8(a_q8_0.data[ib].qs[iqs + 2u]); p3 = unpack8(a_q8_0.data[ib].qs[iqs + 3u]);
-        p4 = unpack8(a_q8_0.data[ib].qs[iqs + 4u]); p5 = unpack8(a_q8_0.data[ib].qs[iqs + 5u]);
-        p6 = unpack8(a_q8_0.data[ib].qs[iqs + 6u]); p7 = unpack8(a_q8_0.data[ib].qs[iqs + 7u]);
+        d   = a_q8_0.data[ib].d;
+        q01 = pack32(u16vec2(uint16_t(a_q8_0.data[ib].qs[iqs + 0u]), uint16_t(a_q8_0.data[ib].qs[iqs + 1u]))) ^ 0x80808080u;
+        q23 = pack32(u16vec2(uint16_t(a_q8_0.data[ib].qs[iqs + 2u]), uint16_t(a_q8_0.data[ib].qs[iqs + 3u]))) ^ 0x80808080u;
+        q45 = pack32(u16vec2(uint16_t(a_q8_0.data[ib].qs[iqs + 4u]), uint16_t(a_q8_0.data[ib].qs[iqs + 5u]))) ^ 0x80808080u;
+        q67 = pack32(u16vec2(uint16_t(a_q8_0.data[ib].qs[iqs + 6u]), uint16_t(a_q8_0.data[ib].qs[iqs + 7u]))) ^ 0x80808080u;
     }
-    w0 = d * f16vec4(p0, p1);
-    w1 = d * f16vec4(p2, p3);
-    w2 = d * f16vec4(p4, p5);
-    w3 = d * f16vec4(p6, p7);
+    const f16vec2 bias16 = f16vec2(float16_t(1152.0));
+    const f16vec2 e0 = unpackFloat2x16((q01 & 0x00FF00FFu) | 0x64006400u) - bias16;
+    const f16vec2 o0 = unpackFloat2x16(((q01 >> 8u) & 0x00FF00FFu) | 0x64006400u) - bias16;
+    const f16vec2 e1 = unpackFloat2x16((q23 & 0x00FF00FFu) | 0x64006400u) - bias16;
+    const f16vec2 o1 = unpackFloat2x16(((q23 >> 8u) & 0x00FF00FFu) | 0x64006400u) - bias16;
+    const f16vec2 e2 = unpackFloat2x16((q45 & 0x00FF00FFu) | 0x64006400u) - bias16;
+    const f16vec2 o2 = unpackFloat2x16(((q45 >> 8u) & 0x00FF00FFu) | 0x64006400u) - bias16;
+    const f16vec2 e3 = unpackFloat2x16((q67 & 0x00FF00FFu) | 0x64006400u) - bias16;
+    const f16vec2 o3 = unpackFloat2x16(((q67 >> 8u) & 0x00FF00FFu) | 0x64006400u) - bias16;
+    w0 = d * f16vec4(e0.x, o0.x, e0.y, o0.y);
+    w1 = d * f16vec4(e1.x, o1.x, e1.y, o1.y);
+    w2 = d * f16vec4(e2.x, o2.x, e2.y, o2.y);
+    w3 = d * f16vec4(e3.x, o3.x, e3.y, o3.y);
 #elif defined(DATA_A_Q4_0)
     const uint ib    = row_unit_base + (ci >> 1u);
     const uint shift = (ci & 1u) * 4u;
@@ -693,6 +718,46 @@ float mma_apply_dense_epilogue(float val, uint d_row, uint d_col, uint d_idx, bo
             : (o / (1.0f + exp(-o)) * val);
     }
     return val;
+}
+
+float mma_eval_lora0(uint row, uint col) {
+    if (FUSE_LORA == 0u) { return 0.0f; }
+    float acc = 0.0f;
+    if ((p.lora_r & 3u) == 0u) {
+        const uint r4 = p.lora_r >> 2u;
+        const uint b_off = row * r4;
+        const uint h_off = col * r4;
+        for (uint k4 = 0u; k4 < r4; ++k4) {
+            acc += dot(lora_b0_v4.data[b_off + k4], lora_h0_v4.data[h_off + k4]);
+        }
+    } else {
+        const uint b_off = row * p.lora_r;
+        const uint h_off = col * p.lora_r;
+        for (uint k = 0u; k < p.lora_r; ++k) {
+            acc = fma(lora_b0.data[b_off + k], lora_h0.data[h_off + k], acc);
+        }
+    }
+    return acc * p.lora_scale0;
+}
+
+float mma_eval_lora1(uint row, uint col) {
+    if (FUSE_LORA == 0u) { return 0.0f; }
+    float acc = 0.0f;
+    if ((p.lora_r & 3u) == 0u) {
+        const uint r4 = p.lora_r >> 2u;
+        const uint b_off = row * r4;
+        const uint h_off = col * r4;
+        for (uint k4 = 0u; k4 < r4; ++k4) {
+            acc += dot(lora_b1_v4.data[b_off + k4], lora_h1_v4.data[h_off + k4]);
+        }
+    } else {
+        const uint b_off = row * p.lora_r;
+        const uint h_off = col * p.lora_r;
+        for (uint k = 0u; k < p.lora_r; ++k) {
+            acc = fma(lora_b1.data[b_off + k], lora_h1.data[h_off + k], acc);
+        }
+    }
+    return acc * p.lora_scale1;
 }
 #endif
 
@@ -1084,6 +1149,7 @@ void main() {
                 }
 
                 [[unroll]] for (uint li = 0u; li < B_LOADS; ++li) {
+#ifdef MUL_MAT_ID
                     const uint col_min = (li * WG_THREADS) / K4_PER_COL;
                     if (li == 0u || col_min < n_valid) {
                         const uint idx = li * WG_THREADS + tid;
@@ -1091,15 +1157,40 @@ void main() {
                             sh_b[idx / K4_PER_COL][idx % K4_PER_COL] = tmp_b[li];
                         }
                     }
+#else
+                    const uint idx = li * WG_THREADS + tid;
+                    if (idx < B_ELEMS) {
+                        sh_b[idx / K4_PER_COL][idx % K4_PER_COL] = tmp_b[li];
+                    }
+#endif
                 }
                 barrier();
             } else {
-                if (g > 0u) {
+#ifndef MUL_MAT_ID
+                if (B_LOADS * WG_THREADS == B_ELEMS && n_valid == 8u * RT && v4_ok) {
+                    MMA_FVEC4 bv_arr[B_LOADS];
+                    [[unroll]] for (uint li = 0u; li < B_LOADS; ++li) {
+                        const uint idx = li * WG_THREADS + tid;
+                        const uint col_in_tile = idx / K4_PER_COL;
+                        const uint k4 = idx % K4_PER_COL;
+                        const uint b4 = (b_batch_base + (wg_n0 + col_in_tile) * p.stride_b + g * K_CHUNK) >> 2u;
+                        bv_arr[li] = b_is_f16 ? MMA_FVEC4(data_b_f16v4[b4 + k4]) : MMA_FVEC4(data_b_v4[b4 + k4]);
+                    }
+                    if (g > 0u) {
+                        barrier();
+                    }
+                    [[unroll]] for (uint li = 0u; li < B_LOADS; ++li) {
+                        const uint idx = li * WG_THREADS + tid;
+                        sh_b[idx / K4_PER_COL][idx % K4_PER_COL] = bv_arr[li];
+                    }
                     barrier();
-                }
-                [[unroll]] for (uint li = 0u; li < B_LOADS; ++li) {
-                    const uint col_min = (li * WG_THREADS) / K4_PER_COL;
-                    if (li == 0u || col_min < n_valid) {
+                } else
+#endif
+                {
+                    if (g > 0u) {
+                        barrier();
+                    }
+                    [[unroll]] for (uint li = 0u; li < B_LOADS; ++li) {
                         const uint idx = li * WG_THREADS + tid;
                         if (idx < B_ELEMS) {
                             const uint col_in_tile = idx / K4_PER_COL;
@@ -1116,8 +1207,8 @@ void main() {
                             sh_b[col_in_tile][k4] = bv;
                         }
                     }
+                    barrier();
                 }
-                barrier();
             }
 
             if (load_mb_once) {
@@ -1238,6 +1329,72 @@ void main() {
                     MMA_ACCUM_KPAIRS_FENCED(mc, (FUSE_MODE == 2u && tile_second[t]), a_row_base[t]);
                     if (FUSE_MODE == 3u) {
                         MMA_ACCUM_KPAIRS_FENCED(mc_u, true, a_row_base[t]);
+                    }
+                }
+            } else if (USE_SH_B == 12u) {
+                [[unroll]] for (uint s_kp = 0u; s_kp < K_PAIRS; ++s_kp) {
+                    const uint ci_kp   = ((g * K_PAIRS + s_kp) << 2u) + (fn >> 1u);
+                    const uint sub_off = (s_kp << 4u) + k4_lane_base;
+                    if (FUSE_MODE == 3u) {
+                        [[unroll]] for (uint t = 0u; t < NT; ++t) {
+                            MMA_FVEC4 w0, w1, w2, w3;
+                            MMA_FVEC4 uw0, uw1, uw2, uw3;
+                            dequant16(false, a_row_base[t], ci_kp, w0,  w1,  w2,  w3);
+                            dequant16(true,  a_row_base[t], ci_kp, uw0, uw1, uw2, uw3);
+                            [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {
+                                const uint c0 = 8u * rt + fn + 0u;
+                                const uint c1 = 8u * rt + fn + 1u;
+                                const MMA_FVEC4 ba0 = sh_b[c0][sub_off + 0u];
+                                const MMA_FVEC4 ba1 = sh_b[c0][sub_off + 1u];
+                                const MMA_FVEC4 bb0 = sh_b[c1][sub_off + 0u];
+                                const MMA_FVEC4 bb1 = sh_b[c1][sub_off + 1u];
+                                [[unroll]] for (uint s = 0u; s < 4u; ++s) {
+                                    coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> ma0, ma1, uma0, uma1;
+                                    coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> mb0, mb1;
+                                    ma0[0]  = w0[s];  ma0[1]  = w2[s];
+                                    ma1[0]  = w1[s];  ma1[1]  = w3[s];
+                                    uma0[0] = uw0[s]; uma0[1] = uw2[s];
+                                    uma1[0] = uw1[s]; uma1[1] = uw3[s];
+                                    mb0[0]  = ba0[s]; mb0[1]  = bb0[s];
+                                    mb1[0]  = ba1[s]; mb1[1]  = bb1[s];
+                                    mc[rt][t]   = coopMatMulAdd(ma0,  mb0, mc[rt][t]);
+                                    mc[rt][t]   = coopMatMulAdd(ma1,  mb1, mc[rt][t]);
+                                    mc_u[rt][t] = coopMatMulAdd(uma0, mb0, mc_u[rt][t]);
+                                    mc_u[rt][t] = coopMatMulAdd(uma1, mb1, mc_u[rt][t]);
+                                }
+                            }
+                        }
+                    } else if (NT == 2u) {
+                        MMA_FVEC4 w0_0, w1_0, w2_0, w3_0;
+                        MMA_FVEC4 w0_1, w1_1, w2_1, w3_1;
+                        dequant16(FUSE_MODE == 2u && tile_second[0], a_row_base[0], ci_kp, w0_0, w1_0, w2_0, w3_0);
+                        dequant16(FUSE_MODE == 2u && tile_second[1], a_row_base[1], ci_kp, w0_1, w1_1, w2_1, w3_1);
+                        [[unroll]] for (uint rt = 0u; rt < RT; ++rt) {
+                            const uint c0 = 8u * rt + fn + 0u;
+                            const uint c1 = 8u * rt + fn + 1u;
+                            const MMA_FVEC4 ba0 = sh_b[c0][sub_off + 0u];
+                            const MMA_FVEC4 ba1 = sh_b[c0][sub_off + 1u];
+                            const MMA_FVEC4 bb0 = sh_b[c1][sub_off + 0u];
+                            const MMA_FVEC4 bb1 = sh_b[c1][sub_off + 1u];
+                            [[unroll]] for (uint s = 0u; s < 4u; ++s) {
+                                coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> ma0_0, ma1_0, ma0_1, ma1_1;
+                                coopmat<MMA_FTYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> mb0, mb1;
+                                ma0_0[0] = w0_0[s]; ma0_0[1] = w2_0[s];
+                                ma1_0[0] = w1_0[s]; ma1_0[1] = w3_0[s];
+                                ma0_1[0] = w0_1[s]; ma0_1[1] = w2_1[s];
+                                ma1_1[0] = w1_1[s]; ma1_1[1] = w3_1[s];
+                                mb0[0]   = ba0[s];  mb0[1]   = bb0[s];
+                                mb1[0]   = ba1[s];  mb1[1]   = bb1[s];
+                                mc[rt][0] = coopMatMulAdd(ma0_0, mb0, mc[rt][0]);
+                                mc[rt][0] = coopMatMulAdd(ma1_0, mb1, mc[rt][0]);
+                                mc[rt][1] = coopMatMulAdd(ma0_1, mb0, mc[rt][1]);
+                                mc[rt][1] = coopMatMulAdd(ma1_1, mb1, mc[rt][1]);
+                            }
+                        }
+                    } else {
+                        [[unroll]] for (uint t = 0u; t < NT; ++t) {
+                            MMA_ACCUM_KPAIRS(mc, (FUSE_MODE == 2u && tile_second[t]), a_row_base[t]);
+                        }
                     }
                 }
             } else {
@@ -1534,6 +1691,7 @@ void main() {
 #else
                     const uint col = wg_n0 + 8u * rt + fn + e;
                     if (col < p.N) {
+                        const uint tok_col = batch_idx * p.N + col;
                         [[unroll]] for (uint t = 0u; t < NT; ++t) {
                             const uint r_global = sg_m0 + 8u * t + fm;
                             if (FUSE_MODE == 2u && tile_second[t]) {
@@ -1541,15 +1699,25 @@ void main() {
                                 const uint m1 = p.M - p.pair_m0;
                                 if (r1 < m1) {
                                     const uint d2_idx = batch_idx * p.batch_stride_d2 + col * p.stride_d2 + r1;
-                                    data_d2[d2_idx] = mma_apply_dense_epilogue(mc[rt][t][e], r1, col, d2_idx, true);
+                                    float v2 = mc[rt][t][e];
+                                    if (FUSE_LORA != 0u && (p.fusion_flags & MAT_VEC_FUSION_FLAGS_LORA1) != 0u) {
+                                        v2 += mma_eval_lora1(r1, tok_col);
+                                    }
+                                    data_d2[d2_idx] = mma_apply_dense_epilogue(v2, r1, col, d2_idx, true);
                                 }
                             } else {
                                 const uint m_lim = (FUSE_MODE == 2u) ? p.pair_m0 : p.M;
                                 if (r_global < m_lim) {
                                     const uint d_idx = batch_idx * p.batch_stride_d + col * p.stride_d + r_global;
                                     float val = mc[rt][t][e];
+                                    if (FUSE_LORA != 0u && FUSE_MODE != 0u && (p.fusion_flags & MAT_VEC_FUSION_FLAGS_LORA0) != 0u) {
+                                        val += mma_eval_lora0(r_global, tok_col);
+                                    }
                                     if (FUSE_MODE == 3u) {
-                                        const float u = mc_u[rt][t][e];
+                                        float u = mc_u[rt][t][e];
+                                        if (FUSE_LORA != 0u && (p.fusion_flags & MAT_VEC_FUSION_FLAGS_LORA1) != 0u) {
+                                            u += mma_eval_lora1(r_global, tok_col);
+                                        }
                                         val = (val / (1.0f + exp(-val))) * u;
                                     } else if (FUSE_MODE == 4u) {
                                         if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0u) {
@@ -1613,6 +1781,7 @@ void main() {
 
         const uint col = wg_n0 + 8u * rt + l_fn + e;
         if (col < p.N) {
+            const uint tok_col = batch_idx * p.N + col;
             const uint tile_r = sg_m0 + 8u * t;
             const uint r_global = tile_r + l_fm;
             if (FUSE_MODE == 2u && tile_r >= p.pair_m0) {
@@ -1620,15 +1789,26 @@ void main() {
                 const uint m1 = p.M - p.pair_m0;
                 if (r1 < m1) {
                     const uint d2_idx = batch_idx * p.batch_stride_d2 + col * p.stride_d2 + r1;
-                    data_d2[d2_idx] = mma_apply_dense_epilogue(sum, r1, col, d2_idx, true);
+                    float v2 = sum;
+                    if (FUSE_LORA != 0u && (p.fusion_flags & MAT_VEC_FUSION_FLAGS_LORA1) != 0u) {
+                        v2 += mma_eval_lora1(r1, tok_col);
+                    }
+                    data_d2[d2_idx] = mma_apply_dense_epilogue(v2, r1, col, d2_idx, true);
                 }
             } else {
                 const uint m_lim = (FUSE_MODE == 2u) ? p.pair_m0 : p.M;
                 if (r_global < m_lim) {
                     const uint d_idx = batch_idx * p.batch_stride_d + col * p.stride_d + r_global;
                     float val = sum;
+                    if (FUSE_LORA != 0u && FUSE_MODE != 0u && (p.fusion_flags & MAT_VEC_FUSION_FLAGS_LORA0) != 0u) {
+                        val += mma_eval_lora0(r_global, tok_col);
+                    }
                     if (FUSE_MODE == 3u) {
-                        val = (val / (1.0f + exp(-val))) * sum_u;
+                        float u = sum_u;
+                        if (FUSE_LORA != 0u && (p.fusion_flags & MAT_VEC_FUSION_FLAGS_LORA1) != 0u) {
+                            u += mma_eval_lora1(r_global, tok_col);
+                        }
+                        val = (val / (1.0f + exp(-val))) * u;
                     } else if (FUSE_MODE == 4u) {
                         if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0u) {
                             val += data_aux0[d_idx];

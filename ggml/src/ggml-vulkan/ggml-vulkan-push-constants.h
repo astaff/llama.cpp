@@ -75,6 +75,9 @@ struct vk_mat_vec_push_constants {
     uint32_t pair_m0;
     uint32_t stride_d2;
     uint32_t batch_stride_d2;
+    uint32_t lora_r;
+    float    lora_scale0;
+    float    lora_scale1;
 };
 
 struct vk_mat_mv_mma_push_constants {
@@ -96,6 +99,9 @@ struct vk_mat_mv_mma_push_constants {
     uint32_t pair_m0;
     uint32_t stride_d2;
     uint32_t batch_stride_d2;
+    uint32_t lora_r;
+    float    lora_scale0;
+    float    lora_scale1;
 };
 
 struct vk_mat_vec_p021_push_constants {

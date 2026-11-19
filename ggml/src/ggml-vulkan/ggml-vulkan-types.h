@@ -276,6 +276,7 @@ struct vk_pipeline_struct {
     vk_pipeline gen_pair_mm;
     vk_pipeline gen_pair_glu;
     vk_pipeline gen_fast_ep;
+    vk_pipeline gen_lora_twin;
 };
 
 typedef std::weak_ptr<vk_pipeline_struct> vk_pipeline_ref;
@@ -874,8 +875,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols_limit];
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols_limit];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
-    vk_pipeline pipeline_mul_mv_mma[GGML_TYPE_COUNT][3][6][2];
-    vk_pipeline pipeline_mul_mv_mma_f32_f16[3][6][2];
+    vk_pipeline pipeline_mul_mv_mma[GGML_TYPE_COUNT][5][8][2];
+    vk_pipeline pipeline_mul_mv_mma_f32_f16[5][8][2];
     vk_pipeline pipeline_mul_mv_mma_id[GGML_TYPE_COUNT][7][5][2];
 
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols_limit];
@@ -1205,6 +1206,8 @@ typedef std::vector<vk_submission> vk_sequence;
 #define MAT_VEC_FUSION_FLAGS_B_F16 0x10000 // s14: FP16 B buffer bound to mul_mv_mma{_id}
 #define MAT_VEC_FUSION_FLAGS_D_F16_AUX1 0x20000 // s14: mul_mv_mma_id _pairglu writes FP16 D to AUX1 (prealloc_y)
 #define MAT_VEC_FUSION_FLAGS_SKIP_F32_D 0x40000 // s14: mul_mv_mma_id _pairglu skips dead FP32 D store
+#define MAT_VEC_FUSION_FLAGS_LORA0 0x80000 // fused dynamic LoRA0 epilogue
+#define MAT_VEC_FUSION_FLAGS_LORA1 0x100000 // fused dynamic LoRA1 epilogue (up in PAIR_GLU, second mm in PAIR_MM)
 
 struct vk_staging_memcpy {
     vk_staging_memcpy(void * _dst, const void * _src, size_t _n) : dst(_dst), src(_src), n(_n) {}
@@ -1415,6 +1418,16 @@ struct ggml_backend_vk_context {
     const ggml_tensor * gen_pair_mm1 {};
     const ggml_tensor * gen_pair_dst1 {};
     int gen_pair_mul0_rel {};
+    // Fused dynamic LoRA epilogue state
+    const ggml_tensor * gen_lora_b0 {};
+    const ggml_tensor * gen_lora_h0 {};
+    const ggml_tensor * gen_lora_b1 {};
+    const ggml_tensor * gen_lora_h1 {};
+    const ggml_tensor * gen_lora_gate_src0 {};
+    const ggml_tensor * gen_lora_up_src0 {};
+    uint32_t            gen_lora_r {};
+    float               gen_lora_scale0 {};
+    float               gen_lora_scale1 {};
     // Series 10: SSM_CONV fusion (mode 1 = CONCAT_SLIDING, mode 2 = WRITE_STATE_OUT, mode 3 = CONCAT_SLIDING_ROLLBACK)
     int s10_ssm_conv_mode {};
     const ggml_tensor * s10_ssm_state_out {};
