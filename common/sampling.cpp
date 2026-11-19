@@ -125,6 +125,8 @@ struct common_sampler {
     // for rejection sampling; independent of the draft, or the target distribution is not preserved
     std::mt19937 rng;
 
+    bool pure_argmax_fast = false;
+
     void reset() {
         prev.clear();
 
@@ -342,6 +344,8 @@ struct common_sampler * common_sampler_init(
         }
     }
 
+    bool pure_argmax_fast = false;
+
     if (params.mirostat == 0) {
 
         bool use_adaptive_p = false; // see below
@@ -369,12 +373,25 @@ struct common_sampler * common_sampler_init(
                     case COMMON_SAMPLER_TYPE_TEMPERATURE:
                         if (params.temp > 0.0f || params.dynatemp_range != 0.0f) { pure_argmax_chain = false; }
                         break;
+                    case COMMON_SAMPLER_TYPE_PENALTIES:
+                        if (params.penalty_last_n != 0 &&
+                            (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f)) {
+                            pure_argmax_chain = false;
+                        }
+                        break;
+                    case COMMON_SAMPLER_TYPE_DRY:
+                        if (params.dry_multiplier > 0.0f) { pure_argmax_chain = false; }
+                        break;
+                    case COMMON_SAMPLER_TYPE_XTC:
+                        if (params.xtc_probability > 0.0f) { pure_argmax_chain = false; }
+                        break;
                     default:
                         pure_argmax_chain = false;
                         break;
                 }
             }
         }
+        pure_argmax_fast = pure_argmax_chain && samplers.empty();
 
         if (!pure_argmax_chain) {
         for (const auto & cnstr : params.samplers) {
@@ -471,6 +488,7 @@ struct common_sampler * common_sampler_init(
         /* .cur_p   = */ {},
         // mix it, the chain and the draft are seeded from this one too
         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
+        /* .pure_argmax_fast = */ pure_argmax_fast,
     };
 
     return result;
@@ -555,6 +573,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
         /* .rng     = */ gsmpl->rng,
+        /* .pure_argmax_fast = */ gsmpl->pure_argmax_fast,
     };
 }
 
@@ -576,6 +595,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur_p      = src->cur_p;
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
     dst->rng        = src->rng;
+    dst->pure_argmax_fast = src->pure_argmax_fast;
     dst->t_total_us = src->t_total_us;
 }
 
@@ -646,6 +666,28 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
+    if (gsmpl->pure_argmax_fast && !gsmpl->grmr && !gsmpl->rbudget &&
+        llama_get_sampled_token_ith(ctx, idx) == LLAMA_TOKEN_NULL &&
+        !llama_get_sampled_probs_ith(ctx, idx) &&
+        !llama_get_sampled_logits_ith(ctx, idx)) {
+        const float * logits = llama_get_logits_ith(ctx, idx);
+        GGML_ASSERT(logits != nullptr);
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+        llama_token best_id = 0;
+        float best_val = logits[0];
+        for (llama_token token_id = 1; token_id < n_vocab; ++token_id) {
+            const float v = logits[token_id];
+            if (v > best_val) {
+                best_val = v;
+                best_id  = token_id;
+            }
+        }
+        gsmpl->cur.resize(1);
+        gsmpl->cur[0] = llama_token_data{ best_id, best_val, 1.0f };
+        cur_p = { gsmpl->cur.data(), 1, 0, true };
+        return best_id;
+    }
+
     gsmpl->set_logits(ctx, idx);
 
     // Check if a backend sampler has already sampled a token in which case we
@@ -700,6 +742,28 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     // resampling:
     // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
+    if (gsmpl->pure_argmax_fast && !gsmpl->grmr && !gsmpl->rbudget &&
+        llama_get_sampled_token_ith(ctx, idx) == LLAMA_TOKEN_NULL &&
+        !llama_get_sampled_probs_ith(ctx, idx) &&
+        !llama_get_sampled_logits_ith(ctx, idx)) {
+        const float * logits = llama_get_logits_ith(ctx, idx);
+        GGML_ASSERT(logits != nullptr);
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+        llama_token best_id = 0;
+        float best_val = logits[0];
+        for (llama_token token_id = 1; token_id < n_vocab; ++token_id) {
+            const float v = logits[token_id];
+            if (v > best_val) {
+                best_val = v;
+                best_id  = token_id;
+            }
+        }
+        gsmpl->cur.resize(1);
+        gsmpl->cur[0] = llama_token_data{ best_id, best_val, 1.0f };
+        cur_p = { gsmpl->cur.data(), 1, 0, true };
+        return best_id;
+    }
+
     gsmpl->set_logits(ctx, idx);
 
     llama_sampler_apply(rbudget,  &cur_p);
