@@ -1247,6 +1247,21 @@ void server_models::load(const std::string & name, const load_options & opts) {
         std::vector<std::string> child_env  = base_env; // copy
         child_env.push_back(std::string(SERVER_ENV_ROUTER_PORT) + "=" + std::to_string(base_params.port));
 
+        // Scope GGML_VK_BATCH_INVARIANT to child instances that actually enable speculative decoding,
+        // so non-speculative models (--spec-type none) keep full 8x8x8 Flash-Attention and Q8_0 decode speed.
+        if (std::getenv("GGML_VK_FORCE_BATCH_INVARIANT") == nullptr) {
+            bool uses_spec = false;
+            for (size_t ai = 0; ai + 1 < child_args.size(); ++ai) {
+                if (child_args[ai] == "--spec-type" && !child_args[ai + 1].empty() && child_args[ai + 1] != "none") {
+                    uses_spec = true;
+                    break;
+                }
+            }
+            if (!uses_spec) {
+                set_child_env(child_env, "GGML_VK_BATCH_INVARIANT", "0");
+            }
+        }
+
         if (opts.role == SERVER_ROLE_DOWNLOAD) {
             inst.meta.status = SERVER_MODEL_STATUS_DOWNLOADING;
             child_env.push_back(std::string(SERVER_ENV_CHILD_ROLE) + "=" + server_role_type_to_str(SERVER_ROLE_DOWNLOAD));
