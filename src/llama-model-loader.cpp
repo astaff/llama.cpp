@@ -1475,7 +1475,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     // The values are unchanged, so the matrix-vector product gives the same result with half the bytes.
     bool gen_to_bf16 = false;
     {
-        static const bool gen_bf16_exact = getenv("GGML_GEN_BF16_EXACT") == nullptr || atoi(getenv("GGML_GEN_BF16_EXACT")) != 0;
+        static const bool gen_bf16_exact = getenv("GGML_GEN_BF16_EXACT") != nullptr && atoi(getenv("GGML_GEN_BF16_EXACT")) != 0;
         const std::string name = tn.str();
         auto ends_with = [&](const char * suf) {
             const size_t n = strlen(suf);

@@ -1017,7 +1017,66 @@ void main() {
         }                                                                                    \
     } while (false)
 
-#if defined(DATA_A_Q4_K) && !defined(REPACK_PLANAR)
+#if defined(DATA_A_Q4_K)
+#ifdef REPACK_PLANAR
+#define MMA_ACCUM_KPAIRS_GEN(LOOP_ATTR, FENCE_MACRO, TARGET_MACRO, TARGET_ARR, USE_U, ROW_BASE)                          \
+    do {                                                                                                                 \
+        FENCE_MACRO();                                                                                                   \
+        const bool _mma_use_u = (USE_U);                                                                                 \
+        const uint _mma_rbase = (ROW_BASE);                                                                              \
+        if (K_PAIRS == 1u || K_PAIRS == 2u || K_PAIRS == 4u) {                                                           \
+            const uint _mma_sb_u4      = (_mma_rbase + ((g * K_PAIRS) >> 2u)) * REPACK_Q4_K_SB_U4;                       \
+            const uint _mma_sub_base   = (g * K_PAIRS) & 3u;                                                             \
+            const uint _mma_fn2        = fn >> 1u;                                                                       \
+            const uint _mma_b          = _mma_fn2 >> 1u;                                                                 \
+            const uint _mma_shift      = _mma_b * 4u;                                                                    \
+            const uint _mma_w_lo       = (_mma_fn2 & 1u) << 2u;                                                          \
+            const uvec4 _mma_hdr       = _mma_use_u ? u_u4.data[_mma_sb_u4 + REPACK_HDR_OFF_U4]                          \
+                                                    : a_u4.data[_mma_sb_u4 + REPACK_HDR_OFF_U4];                         \
+            const vec2 _mma_loadd      = unpackHalf2x16(_mma_hdr.x);                                                     \
+            const uint _mma_q_base_row = (_mma_sb_u4 + REPACK_QS_OFF_U4 + _mma_w_lo) << 2u;                              \
+            LOOP_ATTR for (uint s_kp = 0u; s_kp < K_PAIRS; ++s_kp) {                                                     \
+                FENCE_MACRO();                                                                                           \
+                const uint _mma_sub         = _mma_sub_base + s_kp;                                                      \
+                const uint _mma_is          = (_mma_sub << 1u) | _mma_b;                                                 \
+                const uint _mma_scalesoffs  = (_mma_is & 3u) * 8u;                                                       \
+                const uint _mma_scidxshift1 = (_mma_is < 4u) ? _mma_scalesoffs : (_mma_scalesoffs + 2u);                 \
+                const uint _mma_mbidxshift0 = (_mma_is < 4u) ? _mma_scalesoffs : (_mma_scalesoffs + 4u);                 \
+                const uint _mma_sc_word     = (_mma_is < 4u) ? _mma_hdr.y : _mma_hdr.w;                                  \
+                const uint _mma_mb_word     = (_mma_is < 4u) ? _mma_hdr.z : _mma_hdr.w;                                  \
+                const uint _mma_sc          = ((_mma_sc_word >> _mma_scalesoffs) & 0xFu)                                 \
+                                            | ((_mma_hdr.y >> _mma_scidxshift1) & 0x30u);                                \
+                const uint _mma_mbyte       = ((_mma_mb_word >> _mma_mbidxshift0) & 0xFu)                                \
+                                            | ((_mma_hdr.z >> _mma_scidxshift1) & 0x30u);                                \
+                const uint _mma_q_base      = _mma_q_base_row + _mma_sub;                                                \
+                uint q0, q1, q2, q3;                                                                                     \
+                if (_mma_use_u) {                                                                                        \
+                    q0 = u_u32.data[_mma_q_base +  0u]; q1 = u_u32.data[_mma_q_base +  4u];                              \
+                    q2 = u_u32.data[_mma_q_base +  8u]; q3 = u_u32.data[_mma_q_base + 12u];                              \
+                } else {                                                                                                 \
+                    q0 = a_u32.data[_mma_q_base +  0u]; q1 = a_u32.data[_mma_q_base +  4u];                              \
+                    q2 = a_u32.data[_mma_q_base +  8u]; q3 = a_u32.data[_mma_q_base + 12u];                              \
+                }                                                                                                        \
+                const f16vec4 d  = f16vec4(_mma_loadd.x * float(_mma_sc));                                               \
+                const f16vec4 m  = f16vec4(-_mma_loadd.y * float(_mma_mbyte));                                           \
+                const f16vec4 w0 = fma(d, repack_magic_u4_h(q0 >> _mma_shift), m);                                       \
+                const f16vec4 w1 = fma(d, repack_magic_u4_h(q1 >> _mma_shift), m);                                       \
+                const f16vec4 w2 = fma(d, repack_magic_u4_h(q2 >> _mma_shift), m);                                       \
+                const f16vec4 w3 = fma(d, repack_magic_u4_h(q3 >> _mma_shift), m);                                       \
+                FENCE_MACRO();                                                                                           \
+                TARGET_MACRO(TARGET_ARR, (s_kp << 4u), w0, w1, w2, w3);                                                  \
+            }                                                                                                            \
+        } else {                                                                                                         \
+            LOOP_ATTR for (uint s_kp = 0u; s_kp < K_PAIRS; ++s_kp) {                                                     \
+                FENCE_MACRO();                                                                                           \
+                MMA_FVEC4 w0, w1, w2, w3;                                                                                \
+                dequant16(_mma_use_u, _mma_rbase, ((g * K_PAIRS + s_kp) << 2u) + (fn >> 1u), w0, w1, w2, w3);            \
+                FENCE_MACRO();                                                                                           \
+                TARGET_MACRO(TARGET_ARR, (s_kp << 4u), w0, w1, w2, w3);                                                  \
+            }                                                                                                            \
+        }                                                                                                                \
+    } while (false)
+#else
 #define MMA_ACCUM_KPAIRS_GEN(LOOP_ATTR, FENCE_MACRO, TARGET_MACRO, TARGET_ARR, USE_U, ROW_BASE)                          \
     do {                                                                                                                 \
         FENCE_MACRO();                                                                                                   \
@@ -1068,7 +1127,77 @@ void main() {
             TARGET_MACRO(TARGET_ARR, (s_kp << 4u), w0, w1, w2, w3);                                                      \
         }                                                                                                                \
     } while (false)
-#elif defined(DATA_A_Q5_K) && !defined(REPACK_PLANAR)
+#endif
+#elif defined(DATA_A_Q5_K)
+#ifdef REPACK_PLANAR
+#define MMA_ACCUM_KPAIRS_GEN(LOOP_ATTR, FENCE_MACRO, TARGET_MACRO, TARGET_ARR, USE_U, ROW_BASE)                          \
+    do {                                                                                                                 \
+        FENCE_MACRO();                                                                                                   \
+        const bool _mma_use_u = (USE_U);                                                                                 \
+        const uint _mma_rbase = (ROW_BASE);                                                                              \
+        if (K_PAIRS == 1u || K_PAIRS == 2u || K_PAIRS == 4u) {                                                           \
+            const uint _mma_sb_u4      = (_mma_rbase + ((g * K_PAIRS) >> 2u)) * REPACK_Q5_K_SB_U4;                       \
+            const uint _mma_sub_base   = (g * K_PAIRS) & 3u;                                                             \
+            const uint _mma_fn2        = fn >> 1u;                                                                       \
+            const uint _mma_b          = _mma_fn2 >> 1u;                                                                 \
+            const uint _mma_shift      = _mma_b * 4u;                                                                    \
+            const uint _mma_w_lo       = (_mma_fn2 & 1u) << 2u;                                                          \
+            const uvec4 _mma_hdr       = _mma_use_u ? u_u4.data[_mma_sb_u4 + REPACK_HDR_OFF_U4]                          \
+                                                    : a_u4.data[_mma_sb_u4 + REPACK_HDR_OFF_U4];                         \
+            const vec2 _mma_loadd      = unpackHalf2x16(_mma_hdr.x);                                                     \
+            const uvec4 _mma_qh_v      = _mma_use_u                                                                      \
+                                       ? u_u4.data[_mma_sb_u4 + REPACK_Q5_K_QH_OFF_U4 + (_mma_fn2 & 1u)]                 \
+                                       : a_u4.data[_mma_sb_u4 + REPACK_Q5_K_QH_OFF_U4 + (_mma_fn2 & 1u)];                \
+            const uint _mma_qh0        = _mma_qh_v.x;                                                                    \
+            const uint _mma_qh1        = _mma_qh_v.y;                                                                    \
+            const uint _mma_qh2        = _mma_qh_v.z;                                                                    \
+            const uint _mma_qh3        = _mma_qh_v.w;                                                                    \
+            const uint _mma_q_base_row = (_mma_sb_u4 + REPACK_QS_OFF_U4 + _mma_w_lo) << 2u;                              \
+            LOOP_ATTR for (uint s_kp = 0u; s_kp < K_PAIRS; ++s_kp) {                                                     \
+                FENCE_MACRO();                                                                                           \
+                const uint _mma_sub         = _mma_sub_base + s_kp;                                                      \
+                const uint _mma_is          = (_mma_sub << 1u) | _mma_b;                                                 \
+                const uint _mma_scalesoffs  = (_mma_is & 3u) * 8u;                                                       \
+                const uint _mma_scidxshift1 = (_mma_is < 4u) ? _mma_scalesoffs : (_mma_scalesoffs + 2u);                 \
+                const uint _mma_mbidxshift0 = (_mma_is < 4u) ? _mma_scalesoffs : (_mma_scalesoffs + 4u);                 \
+                const uint _mma_sc_word     = (_mma_is < 4u) ? _mma_hdr.y : _mma_hdr.w;                                  \
+                const uint _mma_mb_word     = (_mma_is < 4u) ? _mma_hdr.z : _mma_hdr.w;                                  \
+                const uint _mma_sc          = ((_mma_sc_word >> _mma_scalesoffs) & 0xFu)                                 \
+                                            | ((_mma_hdr.y >> _mma_scidxshift1) & 0x30u);                                \
+                const uint _mma_mbyte       = ((_mma_mb_word >> _mma_mbidxshift0) & 0xFu)                                \
+                                            | ((_mma_hdr.z >> _mma_scidxshift1) & 0x30u);                                \
+                const uint _mma_q_base      = _mma_q_base_row + _mma_sub;                                                \
+                uint ql0, ql1, ql2, ql3;                                                                                 \
+                if (_mma_use_u) {                                                                                        \
+                    ql0 = u_u32.data[_mma_q_base +  0u]; ql1 = u_u32.data[_mma_q_base +  4u];                            \
+                    ql2 = u_u32.data[_mma_q_base +  8u]; ql3 = u_u32.data[_mma_q_base + 12u];                            \
+                } else {                                                                                                 \
+                    ql0 = a_u32.data[_mma_q_base +  0u]; ql1 = a_u32.data[_mma_q_base +  4u];                            \
+                    ql2 = a_u32.data[_mma_q_base +  8u]; ql3 = a_u32.data[_mma_q_base + 12u];                            \
+                }                                                                                                        \
+                const bool _mma_qh_left = (_mma_is <= 4u);                                                               \
+                const uint _mma_qh_sh   = _mma_qh_left ? (4u - _mma_is) : (_mma_is - 4u);                                \
+                const uint _mma_sh_13   = _mma_is + 4u;                                                                  \
+                const f16vec4 d  = f16vec4(_mma_loadd.x * float(_mma_sc));                                               \
+                const f16vec4 m  = f16vec4(-_mma_loadd.y * float(_mma_mbyte));                                           \
+                const f16vec4 w0 = fma(d, repack_magic_u5_h(((ql0 >> _mma_shift) & 0x000F000Fu) | ((_mma_qh_left ? (_mma_qh0 << _mma_qh_sh) : (_mma_qh0 >> _mma_qh_sh)) & 0x00100010u), ((ql0 >> (_mma_shift + 8u)) & 0x000F000Fu) | ((_mma_qh0 >> _mma_sh_13) & 0x00100010u)), m); \
+                const f16vec4 w1 = fma(d, repack_magic_u5_h(((ql1 >> _mma_shift) & 0x000F000Fu) | ((_mma_qh_left ? (_mma_qh1 << _mma_qh_sh) : (_mma_qh1 >> _mma_qh_sh)) & 0x00100010u), ((ql1 >> (_mma_shift + 8u)) & 0x000F000Fu) | ((_mma_qh1 >> _mma_sh_13) & 0x00100010u)), m); \
+                const f16vec4 w2 = fma(d, repack_magic_u5_h(((ql2 >> _mma_shift) & 0x000F000Fu) | ((_mma_qh_left ? (_mma_qh2 << _mma_qh_sh) : (_mma_qh2 >> _mma_qh_sh)) & 0x00100010u), ((ql2 >> (_mma_shift + 8u)) & 0x000F000Fu) | ((_mma_qh2 >> _mma_sh_13) & 0x00100010u)), m); \
+                const f16vec4 w3 = fma(d, repack_magic_u5_h(((ql3 >> _mma_shift) & 0x000F000Fu) | ((_mma_qh_left ? (_mma_qh3 << _mma_qh_sh) : (_mma_qh3 >> _mma_qh_sh)) & 0x00100010u), ((ql3 >> (_mma_shift + 8u)) & 0x000F000Fu) | ((_mma_qh3 >> _mma_sh_13) & 0x00100010u)), m); \
+                FENCE_MACRO();                                                                                           \
+                TARGET_MACRO(TARGET_ARR, (s_kp << 4u), w0, w1, w2, w3);                                                  \
+            }                                                                                                            \
+        } else {                                                                                                         \
+            LOOP_ATTR for (uint s_kp = 0u; s_kp < K_PAIRS; ++s_kp) {                                                     \
+                FENCE_MACRO();                                                                                           \
+                MMA_FVEC4 w0, w1, w2, w3;                                                                                \
+                dequant16(_mma_use_u, _mma_rbase, ((g * K_PAIRS + s_kp) << 2u) + (fn >> 1u), w0, w1, w2, w3);            \
+                FENCE_MACRO();                                                                                           \
+                TARGET_MACRO(TARGET_ARR, (s_kp << 4u), w0, w1, w2, w3);                                                  \
+            }                                                                                                            \
+        }                                                                                                                \
+    } while (false)
+#else
 #define MMA_ACCUM_KPAIRS_GEN(LOOP_ATTR, FENCE_MACRO, TARGET_MACRO, TARGET_ARR, USE_U, ROW_BASE)                          \
     do {                                                                                                                 \
         FENCE_MACRO();                                                                                                   \
@@ -1127,7 +1256,119 @@ void main() {
             TARGET_MACRO(TARGET_ARR, (s_kp << 4u), w0, w1, w2, w3);                                                      \
         }                                                                                                                \
     } while (false)
-#elif defined(DATA_A_Q6_K) && !defined(REPACK_PLANAR)
+#endif
+#elif defined(DATA_A_Q6_K)
+#ifdef REPACK_PLANAR
+#define MMA_ACCUM_KPAIRS_GEN(LOOP_ATTR, FENCE_MACRO, TARGET_MACRO, TARGET_ARR, USE_U, ROW_BASE)                          \
+    do {                                                                                                                 \
+        FENCE_MACRO();                                                                                                   \
+        const bool _mma_use_u = (USE_U);                                                                                 \
+        const uint _mma_rbase = (ROW_BASE);                                                                              \
+        if (K_PAIRS <= 2u) {                                                                                             \
+            const uint _mma_sb_u4    = (_mma_rbase + ((g * K_PAIRS) >> 2u)) * REPACK_Q6_K_SB_U4;                         \
+            const uint _mma_sb_u32   = _mma_sb_u4 << 2u;                                                                 \
+            const uint _mma_sub_base = (g * K_PAIRS) & 3u;                                                               \
+            const uint _mma_fn2      = fn >> 1u;                                                                         \
+            const uint _mma_h        = _mma_sub_base >> 1u;                                                              \
+            const uint _mma_w_lo     = (_mma_fn2 & 1u) << 2u;                                                            \
+            const uint _mma_q_comp   = (_mma_h << 1u) | (_mma_fn2 >> 1u);                                                \
+            const float _mma_d_f     = unpackHalf2x16(_mma_use_u                                                         \
+                                                    ? u_u32.data[_mma_sb_u32 + REPACK_Q6_K_D_OFF_U32]                    \
+                                                    : a_u32.data[_mma_sb_u32 + REPACK_Q6_K_D_OFF_U32]).x;                \
+            const uint _mma_q_base   = ((_mma_sb_u4 + REPACK_Q6_K_QL_OFF_U4 + _mma_w_lo) << 2u) + _mma_q_comp;           \
+            const uint _mma_qh_base  = _mma_sb_u32 + REPACK_Q6_K_QH_OFF_U32 + _mma_w_lo * 2u + _mma_h;                   \
+            uint _mma_ql0, _mma_ql1, _mma_ql2, _mma_ql3;                                                                 \
+            uint _mma_qh_raw0, _mma_qh_raw1, _mma_qh_raw2, _mma_qh_raw3;                                                 \
+            if (_mma_use_u) {                                                                                            \
+                _mma_ql0     = u_u32.data[_mma_q_base +  0u]; _mma_ql1     = u_u32.data[_mma_q_base +  4u];              \
+                _mma_ql2     = u_u32.data[_mma_q_base +  8u]; _mma_ql3     = u_u32.data[_mma_q_base + 12u];              \
+                _mma_qh_raw0 = u_u32.data[_mma_qh_base + 0u]; _mma_qh_raw1 = u_u32.data[_mma_qh_base + 2u];              \
+                _mma_qh_raw2 = u_u32.data[_mma_qh_base + 4u]; _mma_qh_raw3 = u_u32.data[_mma_qh_base + 6u];              \
+            } else {                                                                                                     \
+                _mma_ql0     = a_u32.data[_mma_q_base +  0u]; _mma_ql1     = a_u32.data[_mma_q_base +  4u];              \
+                _mma_ql2     = a_u32.data[_mma_q_base +  8u]; _mma_ql3     = a_u32.data[_mma_q_base + 12u];              \
+                _mma_qh_raw0 = a_u32.data[_mma_qh_base + 0u]; _mma_qh_raw1 = a_u32.data[_mma_qh_base + 2u];              \
+                _mma_qh_raw2 = a_u32.data[_mma_qh_base + 4u]; _mma_qh_raw3 = a_u32.data[_mma_qh_base + 6u];              \
+            }                                                                                                            \
+            LOOP_ATTR for (uint s_kp = 0u; s_kp < K_PAIRS; ++s_kp) {                                                     \
+                FENCE_MACRO();                                                                                           \
+                const uint _mma_sub     = _mma_sub_base + s_kp;                                                         \
+                const uint _mma_sh_n    = (_mma_sub & 1u) * 4u;                                                          \
+                const uint _mma_qhshift = (((_mma_sub & 1u) << 1u) | (_mma_fn2 >> 1u)) * 2u;                             \
+                const uint _mma_sc_word = _mma_use_u                                                                     \
+                                        ? u_u32.data[_mma_sb_u32 + REPACK_Q6_K_SC_OFF_U32 + _mma_sub]                    \
+                                        : a_u32.data[_mma_sb_u32 + REPACK_Q6_K_SC_OFF_U32 + _mma_sub];                   \
+                const float16_t _mma_sc = float16_t(_mma_d_f * float(bitfieldExtract(int(_mma_sc_word), int(_mma_fn2 * 8u), 8))); \
+                const uint qh0 = _mma_qh_raw0 >> _mma_qhshift;                                                           \
+                const uint qh1 = _mma_qh_raw1 >> _mma_qhshift;                                                           \
+                const uint qh2 = _mma_qh_raw2 >> _mma_qhshift;                                                           \
+                const uint qh3 = _mma_qh_raw3 >> _mma_qhshift;                                                           \
+                const f16vec4 dv = f16vec4(_mma_sc);                                                                     \
+                const f16vec4 w0 = repack_magic_q6_h(((_mma_ql0 >> _mma_sh_n) & 0x000F000Fu) | ((qh0 & 0x00030003u) << 4u), ((_mma_ql0 >> (_mma_sh_n + 8u)) & 0x000F000Fu) | ((qh0 >> 4u) & 0x00300030u)) * dv; \
+                const f16vec4 w1 = repack_magic_q6_h(((_mma_ql1 >> _mma_sh_n) & 0x000F000Fu) | ((qh1 & 0x00030003u) << 4u), ((_mma_ql1 >> (_mma_sh_n + 8u)) & 0x000F000Fu) | ((qh1 >> 4u) & 0x00300030u)) * dv; \
+                const f16vec4 w2 = repack_magic_q6_h(((_mma_ql2 >> _mma_sh_n) & 0x000F000Fu) | ((qh2 & 0x00030003u) << 4u), ((_mma_ql2 >> (_mma_sh_n + 8u)) & 0x000F000Fu) | ((qh2 >> 4u) & 0x00300030u)) * dv; \
+                const f16vec4 w3 = repack_magic_q6_h(((_mma_ql3 >> _mma_sh_n) & 0x000F000Fu) | ((qh3 & 0x00030003u) << 4u), ((_mma_ql3 >> (_mma_sh_n + 8u)) & 0x000F000Fu) | ((qh3 >> 4u) & 0x00300030u)) * dv; \
+                FENCE_MACRO();                                                                                           \
+                TARGET_MACRO(TARGET_ARR, (s_kp << 4u), w0, w1, w2, w3);                                                  \
+            }                                                                                                            \
+        } else if (K_PAIRS == 4u) {                                                                                      \
+            const uint _mma_sb_u4      = (_mma_rbase + g) * REPACK_Q6_K_SB_U4;                                           \
+            const uint _mma_sb_u32     = _mma_sb_u4 << 2u;                                                               \
+            const uint _mma_fn2        = fn >> 1u;                                                                       \
+            const uint _mma_w_lo       = (_mma_fn2 & 1u) << 2u;                                                          \
+            const float _mma_d_f       = unpackHalf2x16(_mma_use_u                                                       \
+                                                      ? u_u32.data[_mma_sb_u32 + REPACK_Q6_K_D_OFF_U32]                  \
+                                                      : a_u32.data[_mma_sb_u32 + REPACK_Q6_K_D_OFF_U32]).x;              \
+            const uvec4 _mma_sc_all    = _mma_use_u                                                                      \
+                                       ? u_u4.data[_mma_sb_u4 + REPACK_Q6_K_SC_OFF_U4]                                   \
+                                       : a_u4.data[_mma_sb_u4 + REPACK_Q6_K_SC_OFF_U4];                                  \
+            const uint _mma_q_base_row = (_mma_sb_u4 + REPACK_Q6_K_QL_OFF_U4 + _mma_w_lo) << 2u;                         \
+            const uint _mma_qh_base_r  = _mma_sb_u32 + REPACK_Q6_K_QH_OFF_U32 + _mma_w_lo * 2u;                          \
+            LOOP_ATTR for (uint s_kp = 0u; s_kp < K_PAIRS; ++s_kp) {                                                     \
+                FENCE_MACRO();                                                                                           \
+                const uint _mma_h       = s_kp >> 1u;                                                                    \
+                const uint _mma_sh_n    = (s_kp & 1u) * 4u;                                                              \
+                const uint _mma_qhshift = (((s_kp & 1u) << 1u) | (_mma_fn2 >> 1u)) * 2u;                                 \
+                const uint _mma_q_comp  = (_mma_h << 1u) | (_mma_fn2 >> 1u);                                             \
+                const uint _mma_sc_word = _mma_sc_all[s_kp];                                                             \
+                const float16_t _mma_sc = float16_t(_mma_d_f * float(bitfieldExtract(int(_mma_sc_word), int(_mma_fn2 * 8u), 8))); \
+                const uint _mma_q_base  = _mma_q_base_row + _mma_q_comp;                                                \
+                const uint _mma_qh_base = _mma_qh_base_r + _mma_h;                                                       \
+                uint ql0, ql1, ql2, ql3, qh0, qh1, qh2, qh3;                                                             \
+                if (_mma_use_u) {                                                                                        \
+                    ql0 = u_u32.data[_mma_q_base +  0u]; ql1 = u_u32.data[_mma_q_base +  4u];                            \
+                    ql2 = u_u32.data[_mma_q_base +  8u]; ql3 = u_u32.data[_mma_q_base + 12u];                            \
+                    qh0 = u_u32.data[_mma_qh_base + 0u] >> _mma_qhshift;                                                 \
+                    qh1 = u_u32.data[_mma_qh_base + 2u] >> _mma_qhshift;                                                 \
+                    qh2 = u_u32.data[_mma_qh_base + 4u] >> _mma_qhshift;                                                 \
+                    qh3 = u_u32.data[_mma_qh_base + 6u] >> _mma_qhshift;                                                 \
+                } else {                                                                                                 \
+                    ql0 = a_u32.data[_mma_q_base +  0u]; ql1 = a_u32.data[_mma_q_base +  4u];                            \
+                    ql2 = a_u32.data[_mma_q_base +  8u]; ql3 = a_u32.data[_mma_q_base + 12u];                            \
+                    qh0 = a_u32.data[_mma_qh_base + 0u] >> _mma_qhshift;                                                 \
+                    qh1 = a_u32.data[_mma_qh_base + 2u] >> _mma_qhshift;                                                 \
+                    qh2 = a_u32.data[_mma_qh_base + 4u] >> _mma_qhshift;                                                 \
+                    qh3 = a_u32.data[_mma_qh_base + 6u] >> _mma_qhshift;                                                 \
+                }                                                                                                        \
+                const f16vec4 dv = f16vec4(_mma_sc);                                                                     \
+                const f16vec4 w0 = repack_magic_q6_h(((ql0 >> _mma_sh_n) & 0x000F000Fu) | ((qh0 & 0x00030003u) << 4u), ((ql0 >> (_mma_sh_n + 8u)) & 0x000F000Fu) | ((qh0 >> 4u) & 0x00300030u)) * dv; \
+                const f16vec4 w1 = repack_magic_q6_h(((ql1 >> _mma_sh_n) & 0x000F000Fu) | ((qh1 & 0x00030003u) << 4u), ((ql1 >> (_mma_sh_n + 8u)) & 0x000F000Fu) | ((qh1 >> 4u) & 0x00300030u)) * dv; \
+                const f16vec4 w2 = repack_magic_q6_h(((ql2 >> _mma_sh_n) & 0x000F000Fu) | ((qh2 & 0x00030003u) << 4u), ((ql2 >> (_mma_sh_n + 8u)) & 0x000F000Fu) | ((qh2 >> 4u) & 0x00300030u)) * dv; \
+                const f16vec4 w3 = repack_magic_q6_h(((ql3 >> _mma_sh_n) & 0x000F000Fu) | ((qh3 & 0x00030003u) << 4u), ((ql3 >> (_mma_sh_n + 8u)) & 0x000F000Fu) | ((qh3 >> 4u) & 0x00300030u)) * dv; \
+                FENCE_MACRO();                                                                                           \
+                TARGET_MACRO(TARGET_ARR, (s_kp << 4u), w0, w1, w2, w3);                                                  \
+            }                                                                                                            \
+        } else {                                                                                                         \
+            LOOP_ATTR for (uint s_kp = 0u; s_kp < K_PAIRS; ++s_kp) {                                                     \
+                FENCE_MACRO();                                                                                           \
+                MMA_FVEC4 w0, w1, w2, w3;                                                                                \
+                dequant16(_mma_use_u, _mma_rbase, ((g * K_PAIRS + s_kp) << 2u) + (fn >> 1u), w0, w1, w2, w3);            \
+                FENCE_MACRO();                                                                                           \
+                TARGET_MACRO(TARGET_ARR, (s_kp << 4u), w0, w1, w2, w3);                                                  \
+            }                                                                                                            \
+        }                                                                                                                \
+    } while (false)
+#else
 #define MMA_ACCUM_KPAIRS_GEN(LOOP_ATTR, FENCE_MACRO, TARGET_MACRO, TARGET_ARR, USE_U, ROW_BASE)                          \
     do {                                                                                                                 \
         FENCE_MACRO();                                                                                                   \
@@ -1175,6 +1416,7 @@ void main() {
             TARGET_MACRO(TARGET_ARR, (s_kp << 4u), w0, w1, w2, w3);                                                      \
         }                                                                                                                \
     } while (false)
+#endif
 #else
 #define MMA_ACCUM_KPAIRS_GEN(LOOP_ATTR, FENCE_MACRO, TARGET_MACRO, TARGET_ARR, USE_U, ROW_BASE)                          \
     do {                                                                                                                 \
