@@ -8,10 +8,6 @@
 #include "mul_mat_vec_base.glsl"
 #include "dequant_funcs.glsl"
 
-#if defined(DATA_A_Q8_0) && defined(USE_SH_B)
-shared B_TYPEV4 sh_b[NUM_COLS][8 * BLOCK_SIZE];
-#endif
-
 #if defined(USE_SUBGROUP_ADD_NO_SHMEM) && !defined(NEEDS_INIT_IQ_SHMEM)
 layout(local_size_x_id = 0, local_size_y_id = 4, local_size_z = 1) in;
 #else
@@ -359,7 +355,50 @@ void iter2_aligned_q8_0_a(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT
     const uint ib_col_1 = ib_col_0 + (BLOCK_SIZE >> 2);
     const uint blocks_per_row = p.ncols >> 5;
 
-    if (NUM_COLS <= 4) {
+    if (NUM_ROWS == 1 && NUM_COLS > 1 && NUM_COLS <= 4) {
+        const uint row_off = a_offset + row_base * blocks_per_row;
+        const uint ib0 = row_off + ib_col_0;
+        const vec4 v0_0 = q8_0_decode_magic(i16vec2(data_a_packed16[ib0].qs[iqs_h    ], data_a_packed16[ib0].qs[iqs_h + 1]));
+        const vec4 v1_0 = q8_0_decode_magic(i16vec2(data_a_packed16[ib0].qs[iqs_h + 2], data_a_packed16[ib0].qs[iqs_h + 3]));
+        const FLOAT_TYPE da0 = float(data_a_packed16[ib0].d);
+        vec4 w0_0 = vec4(0.0), w1_0 = vec4(0.0);
+        FLOAT_TYPE du0 = FLOAT_TYPE(0);
+        if (GEN_GLU == 3) {
+            w0_0 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib0].qs[iqs_h    ], data_a2_packed16[ib0].qs[iqs_h + 1]));
+            w1_0 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib0].qs[iqs_h + 2], data_a2_packed16[ib0].qs[iqs_h + 3]));
+            du0  = float(data_a2_packed16[ib0].d);
+        }
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const uint b4 = (j * p.batch_stride_b + b_offset) >> 2;
+            const vec4 bv0 = vec4(data_b_v4[b4 + b_col4_0]);
+            const vec4 bv1 = vec4(data_b_v4[b4 + b_col4_0 + 1]);
+            temp[j][0] += (dot(bv0, v0_0) + dot(bv1, v1_0)) * da0;
+            if (GEN_GLU == 3) {
+                temp2[j][0] += (dot(bv0, w0_0) + dot(bv1, w1_0)) * du0;
+            }
+        }
+
+        const uint ib1 = row_off + ib_col_1;
+        const vec4 v0_1 = q8_0_decode_magic(i16vec2(data_a_packed16[ib1].qs[iqs_h    ], data_a_packed16[ib1].qs[iqs_h + 1]));
+        const vec4 v1_1 = q8_0_decode_magic(i16vec2(data_a_packed16[ib1].qs[iqs_h + 2], data_a_packed16[ib1].qs[iqs_h + 3]));
+        const FLOAT_TYPE da1 = float(data_a_packed16[ib1].d);
+        vec4 w0_1 = vec4(0.0), w1_1 = vec4(0.0);
+        FLOAT_TYPE du1 = FLOAT_TYPE(0);
+        if (GEN_GLU == 3) {
+            w0_1 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib1].qs[iqs_h    ], data_a2_packed16[ib1].qs[iqs_h + 1]));
+            w1_1 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib1].qs[iqs_h + 2], data_a2_packed16[ib1].qs[iqs_h + 3]));
+            du1  = float(data_a2_packed16[ib1].d);
+        }
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const uint b4 = (j * p.batch_stride_b + b_offset) >> 2;
+            const vec4 bv0 = vec4(data_b_v4[b4 + b_col4_1]);
+            const vec4 bv1 = vec4(data_b_v4[b4 + b_col4_1 + 1]);
+            temp[j][0] += (dot(bv0, v0_1) + dot(bv1, v1_1)) * da1;
+            if (GEN_GLU == 3) {
+                temp2[j][0] += (dot(bv0, w0_1) + dot(bv1, w1_1)) * du1;
+            }
+        }
+    } else if (NUM_COLS <= 4) {
         vec4 bv0_0[NUM_COLS], bv1_0[NUM_COLS];
         vec4 bv0_1[NUM_COLS], bv1_1[NUM_COLS];
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
@@ -418,7 +457,30 @@ void iter2_aligned_q8_0_a2(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint
     const uint ib_col_1 = ib_col_0 + (BLOCK_SIZE >> 2);
     const uint blocks_per_row = p.ncols >> 5;
 
-    if (NUM_COLS <= 4) {
+    if (NUM_ROWS == 1 && NUM_COLS > 1 && NUM_COLS <= 4) {
+        const uint row_off = a_offset + row_base * blocks_per_row;
+        const uint ib0 = row_off + ib_col_0;
+        const vec4 v0_0 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib0].qs[iqs_h    ], data_a2_packed16[ib0].qs[iqs_h + 1]));
+        const vec4 v1_0 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib0].qs[iqs_h + 2], data_a2_packed16[ib0].qs[iqs_h + 3]));
+        const FLOAT_TYPE da0 = float(data_a2_packed16[ib0].d);
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const uint b4 = (j * p.batch_stride_b + b_offset) >> 2;
+            const vec4 bv0 = vec4(data_b_v4[b4 + b_col4_0]);
+            const vec4 bv1 = vec4(data_b_v4[b4 + b_col4_0 + 1]);
+            temp[j][0] += (dot(bv0, v0_0) + dot(bv1, v1_0)) * da0;
+        }
+
+        const uint ib1 = row_off + ib_col_1;
+        const vec4 v0_1 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib1].qs[iqs_h    ], data_a2_packed16[ib1].qs[iqs_h + 1]));
+        const vec4 v1_1 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib1].qs[iqs_h + 2], data_a2_packed16[ib1].qs[iqs_h + 3]));
+        const FLOAT_TYPE da1 = float(data_a2_packed16[ib1].d);
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const uint b4 = (j * p.batch_stride_b + b_offset) >> 2;
+            const vec4 bv0 = vec4(data_b_v4[b4 + b_col4_1]);
+            const vec4 bv1 = vec4(data_b_v4[b4 + b_col4_1 + 1]);
+            temp[j][0] += (dot(bv0, v0_1) + dot(bv1, v1_1)) * da1;
+        }
+    } else if (NUM_COLS <= 4) {
         vec4 bv0_0[NUM_COLS], bv1_0[NUM_COLS];
         vec4 bv0_1[NUM_COLS], bv1_1[NUM_COLS];
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
@@ -450,351 +512,6 @@ void iter2_aligned_q8_0_a2(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint
         iter_aligned_q8_0_a2(temp, row_base, num_rows, tid, iter_idx);
         iter_aligned_q8_0_a2(temp, row_base, num_rows, tid, iter_idx + 1);
     }
-}
-
-void iter4_aligned_q8_0_a(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_TYPE temp2[NUM_COLS][NUM_ROWS], const uint row_base, const uint num_rows, const uint tid, const uint iter_idx)
-{
-    const uint iqs_h = 4 * (tid & 3);
-    const uint ib_col_0 = iter_idx * (BLOCK_SIZE >> 2) + (tid >> 2);
-    const uint ib_col_1 = ib_col_0 + (BLOCK_SIZE >> 2);
-    const uint ib_col_2 = ib_col_0 + 2 * (BLOCK_SIZE >> 2);
-    const uint ib_col_3 = ib_col_0 + 3 * (BLOCK_SIZE >> 2);
-    const uint blocks_per_row = p.ncols >> 5;
-
-#ifdef USE_SH_B
-    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
-        const uint rn = (n == 0 || n < num_rows) ? n : 0;
-        const uint row_off = a_offset + (row_base + rn) * blocks_per_row;
-        const uint ib0 = row_off + ib_col_0;
-        const uint ib1 = row_off + ib_col_1;
-        const uint ib2 = row_off + ib_col_2;
-        const uint ib3 = row_off + ib_col_3;
-
-        const vec4 v0_0 = q8_0_decode_magic(i16vec2(data_a_packed16[ib0].qs[iqs_h    ], data_a_packed16[ib0].qs[iqs_h + 1]));
-        const vec4 v1_0 = q8_0_decode_magic(i16vec2(data_a_packed16[ib0].qs[iqs_h + 2], data_a_packed16[ib0].qs[iqs_h + 3]));
-        const FLOAT_TYPE da0 = float(data_a_packed16[ib0].d);
-        const vec4 v0_1 = q8_0_decode_magic(i16vec2(data_a_packed16[ib1].qs[iqs_h    ], data_a_packed16[ib1].qs[iqs_h + 1]));
-        const vec4 v1_1 = q8_0_decode_magic(i16vec2(data_a_packed16[ib1].qs[iqs_h + 2], data_a_packed16[ib1].qs[iqs_h + 3]));
-        const FLOAT_TYPE da1 = float(data_a_packed16[ib1].d);
-        const vec4 v0_2 = q8_0_decode_magic(i16vec2(data_a_packed16[ib2].qs[iqs_h    ], data_a_packed16[ib2].qs[iqs_h + 1]));
-        const vec4 v1_2 = q8_0_decode_magic(i16vec2(data_a_packed16[ib2].qs[iqs_h + 2], data_a_packed16[ib2].qs[iqs_h + 3]));
-        const FLOAT_TYPE da2 = float(data_a_packed16[ib2].d);
-        const vec4 v0_3 = q8_0_decode_magic(i16vec2(data_a_packed16[ib3].qs[iqs_h    ], data_a_packed16[ib3].qs[iqs_h + 1]));
-        const vec4 v1_3 = q8_0_decode_magic(i16vec2(data_a_packed16[ib3].qs[iqs_h + 2], data_a_packed16[ib3].qs[iqs_h + 3]));
-        const FLOAT_TYPE da3 = float(data_a_packed16[ib3].d);
-
-        vec4 w0_0 = vec4(0.0), w1_0 = vec4(0.0), w0_1 = vec4(0.0), w1_1 = vec4(0.0);
-        vec4 w0_2 = vec4(0.0), w1_2 = vec4(0.0), w0_3 = vec4(0.0), w1_3 = vec4(0.0);
-        FLOAT_TYPE du0 = FLOAT_TYPE(0), du1 = FLOAT_TYPE(0), du2 = FLOAT_TYPE(0), du3 = FLOAT_TYPE(0);
-        if (GEN_GLU == 3) {
-            w0_0 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib0].qs[iqs_h    ], data_a2_packed16[ib0].qs[iqs_h + 1]));
-            w1_0 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib0].qs[iqs_h + 2], data_a2_packed16[ib0].qs[iqs_h + 3]));
-            du0  = float(data_a2_packed16[ib0].d);
-            w0_1 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib1].qs[iqs_h    ], data_a2_packed16[ib1].qs[iqs_h + 1]));
-            w1_1 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib1].qs[iqs_h + 2], data_a2_packed16[ib1].qs[iqs_h + 3]));
-            du1  = float(data_a2_packed16[ib1].d);
-            w0_2 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib2].qs[iqs_h    ], data_a2_packed16[ib2].qs[iqs_h + 1]));
-            w1_2 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib2].qs[iqs_h + 2], data_a2_packed16[ib2].qs[iqs_h + 3]));
-            du2  = float(data_a2_packed16[ib2].d);
-            w0_3 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib3].qs[iqs_h    ], data_a2_packed16[ib3].qs[iqs_h + 1]));
-            w1_3 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib3].qs[iqs_h + 2], data_a2_packed16[ib3].qs[iqs_h + 3]));
-            du3  = float(data_a2_packed16[ib3].d);
-        }
-
-        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-            const vec4 bv0_0 = vec4(sh_b[j][0u * (2u * BLOCK_SIZE) + 2u * tid]);
-            const vec4 bv1_0 = vec4(sh_b[j][0u * (2u * BLOCK_SIZE) + 2u * tid + 1u]);
-            const vec4 bv0_1 = vec4(sh_b[j][1u * (2u * BLOCK_SIZE) + 2u * tid]);
-            const vec4 bv1_1 = vec4(sh_b[j][1u * (2u * BLOCK_SIZE) + 2u * tid + 1u]);
-            const vec4 bv0_2 = vec4(sh_b[j][2u * (2u * BLOCK_SIZE) + 2u * tid]);
-            const vec4 bv1_2 = vec4(sh_b[j][2u * (2u * BLOCK_SIZE) + 2u * tid + 1u]);
-            const vec4 bv0_3 = vec4(sh_b[j][3u * (2u * BLOCK_SIZE) + 2u * tid]);
-            const vec4 bv1_3 = vec4(sh_b[j][3u * (2u * BLOCK_SIZE) + 2u * tid + 1u]);
-
-            const FLOAT_TYPE d0 = (dot(bv0_0, v0_0) + dot(bv1_0, v1_0)) * da0;
-            const FLOAT_TYPE d1 = (dot(bv0_1, v0_1) + dot(bv1_1, v1_1)) * da1;
-            const FLOAT_TYPE d2 = (dot(bv0_2, v0_2) + dot(bv1_2, v1_2)) * da2;
-            const FLOAT_TYPE d3 = (dot(bv0_3, v0_3) + dot(bv1_3, v1_3)) * da3;
-            temp[j][n] = (((temp[j][n] + d0) + d1) + d2) + d3;
-
-            if (GEN_GLU == 3) {
-                const FLOAT_TYPE e0 = (dot(bv0_0, w0_0) + dot(bv1_0, w1_0)) * du0;
-                const FLOAT_TYPE e1 = (dot(bv0_1, w0_1) + dot(bv1_1, w1_1)) * du1;
-                const FLOAT_TYPE e2 = (dot(bv0_2, w0_2) + dot(bv1_2, w1_2)) * du2;
-                const FLOAT_TYPE e3 = (dot(bv0_3, w0_3) + dot(bv1_3, w1_3)) * du3;
-                temp2[j][n] = (((temp2[j][n] + e0) + e1) + e2) + e3;
-            }
-        }
-    }
-#else
-    const uint b_col4_0 = iter_idx * (2 * BLOCK_SIZE) + 2 * tid;
-    const uint b_col4_1 = b_col4_0 + (2 * BLOCK_SIZE);
-    const uint b_col4_2 = b_col4_0 + (4 * BLOCK_SIZE);
-    const uint b_col4_3 = b_col4_0 + (6 * BLOCK_SIZE);
-
-    if (NUM_COLS == 1) {
-        const uint b4 = b_offset >> 2;
-        const vec4 bv0_0 = vec4(data_b_v4[b4 + b_col4_0]);
-        const vec4 bv1_0 = vec4(data_b_v4[b4 + b_col4_0 + 1]);
-        const vec4 bv0_1 = vec4(data_b_v4[b4 + b_col4_1]);
-        const vec4 bv1_1 = vec4(data_b_v4[b4 + b_col4_1 + 1]);
-        const vec4 bv0_2 = vec4(data_b_v4[b4 + b_col4_2]);
-        const vec4 bv1_2 = vec4(data_b_v4[b4 + b_col4_2 + 1]);
-        const vec4 bv0_3 = vec4(data_b_v4[b4 + b_col4_3]);
-        const vec4 bv1_3 = vec4(data_b_v4[b4 + b_col4_3 + 1]);
-
-        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
-            const uint rn = (n == 0 || n < num_rows) ? n : 0;
-            const uint row_off = a_offset + (row_base + rn) * blocks_per_row;
-            const uint ib0 = row_off + ib_col_0;
-            const uint ib1 = row_off + ib_col_1;
-            const uint ib2 = row_off + ib_col_2;
-            const uint ib3 = row_off + ib_col_3;
-
-            const vec4 v0_0 = q8_0_decode_magic(i16vec2(data_a_packed16[ib0].qs[iqs_h    ], data_a_packed16[ib0].qs[iqs_h + 1]));
-            const vec4 v1_0 = q8_0_decode_magic(i16vec2(data_a_packed16[ib0].qs[iqs_h + 2], data_a_packed16[ib0].qs[iqs_h + 3]));
-            const FLOAT_TYPE da0 = float(data_a_packed16[ib0].d);
-            const vec4 v0_1 = q8_0_decode_magic(i16vec2(data_a_packed16[ib1].qs[iqs_h    ], data_a_packed16[ib1].qs[iqs_h + 1]));
-            const vec4 v1_1 = q8_0_decode_magic(i16vec2(data_a_packed16[ib1].qs[iqs_h + 2], data_a_packed16[ib1].qs[iqs_h + 3]));
-            const FLOAT_TYPE da1 = float(data_a_packed16[ib1].d);
-            const vec4 v0_2 = q8_0_decode_magic(i16vec2(data_a_packed16[ib2].qs[iqs_h    ], data_a_packed16[ib2].qs[iqs_h + 1]));
-            const vec4 v1_2 = q8_0_decode_magic(i16vec2(data_a_packed16[ib2].qs[iqs_h + 2], data_a_packed16[ib2].qs[iqs_h + 3]));
-            const FLOAT_TYPE da2 = float(data_a_packed16[ib2].d);
-            const vec4 v0_3 = q8_0_decode_magic(i16vec2(data_a_packed16[ib3].qs[iqs_h    ], data_a_packed16[ib3].qs[iqs_h + 1]));
-            const vec4 v1_3 = q8_0_decode_magic(i16vec2(data_a_packed16[ib3].qs[iqs_h + 2], data_a_packed16[ib3].qs[iqs_h + 3]));
-            const FLOAT_TYPE da3 = float(data_a_packed16[ib3].d);
-
-            const FLOAT_TYPE d0 = (dot(bv0_0, v0_0) + dot(bv1_0, v1_0)) * da0;
-            const FLOAT_TYPE d1 = (dot(bv0_1, v0_1) + dot(bv1_1, v1_1)) * da1;
-            const FLOAT_TYPE d2 = (dot(bv0_2, v0_2) + dot(bv1_2, v1_2)) * da2;
-            const FLOAT_TYPE d3 = (dot(bv0_3, v0_3) + dot(bv1_3, v1_3)) * da3;
-            temp[0][n] = (((temp[0][n] + d0) + d1) + d2) + d3;
-
-            if (GEN_GLU == 3) {
-                const vec4 w0_0 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib0].qs[iqs_h    ], data_a2_packed16[ib0].qs[iqs_h + 1]));
-                const vec4 w1_0 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib0].qs[iqs_h + 2], data_a2_packed16[ib0].qs[iqs_h + 3]));
-                const FLOAT_TYPE du0 = float(data_a2_packed16[ib0].d);
-                const vec4 w0_1 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib1].qs[iqs_h    ], data_a2_packed16[ib1].qs[iqs_h + 1]));
-                const vec4 w1_1 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib1].qs[iqs_h + 2], data_a2_packed16[ib1].qs[iqs_h + 3]));
-                const FLOAT_TYPE du1 = float(data_a2_packed16[ib1].d);
-                const vec4 w0_2 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib2].qs[iqs_h    ], data_a2_packed16[ib2].qs[iqs_h + 1]));
-                const vec4 w1_2 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib2].qs[iqs_h + 2], data_a2_packed16[ib2].qs[iqs_h + 3]));
-                const FLOAT_TYPE du2 = float(data_a2_packed16[ib2].d);
-                const vec4 w0_3 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib3].qs[iqs_h    ], data_a2_packed16[ib3].qs[iqs_h + 1]));
-                const vec4 w1_3 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib3].qs[iqs_h + 2], data_a2_packed16[ib3].qs[iqs_h + 3]));
-                const FLOAT_TYPE du3 = float(data_a2_packed16[ib3].d);
-
-                const FLOAT_TYPE e0 = (dot(bv0_0, w0_0) + dot(bv1_0, w1_0)) * du0;
-                const FLOAT_TYPE e1 = (dot(bv0_1, w0_1) + dot(bv1_1, w1_1)) * du1;
-                const FLOAT_TYPE e2 = (dot(bv0_2, w0_2) + dot(bv1_2, w1_2)) * du2;
-                const FLOAT_TYPE e3 = (dot(bv0_3, w0_3) + dot(bv1_3, w1_3)) * du3;
-                temp2[0][n] = (((temp2[0][n] + e0) + e1) + e2) + e3;
-            }
-        }
-    } else {
-        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
-            const uint rn = (n == 0 || n < num_rows) ? n : 0;
-            const uint row_off = a_offset + (row_base + rn) * blocks_per_row;
-            const uint ib0 = row_off + ib_col_0;
-            const uint ib1 = row_off + ib_col_1;
-            const uint ib2 = row_off + ib_col_2;
-            const uint ib3 = row_off + ib_col_3;
-
-            const vec4 v0_0 = q8_0_decode_magic(i16vec2(data_a_packed16[ib0].qs[iqs_h    ], data_a_packed16[ib0].qs[iqs_h + 1]));
-            const vec4 v1_0 = q8_0_decode_magic(i16vec2(data_a_packed16[ib0].qs[iqs_h + 2], data_a_packed16[ib0].qs[iqs_h + 3]));
-            const FLOAT_TYPE da0 = float(data_a_packed16[ib0].d);
-            const vec4 v0_1 = q8_0_decode_magic(i16vec2(data_a_packed16[ib1].qs[iqs_h    ], data_a_packed16[ib1].qs[iqs_h + 1]));
-            const vec4 v1_1 = q8_0_decode_magic(i16vec2(data_a_packed16[ib1].qs[iqs_h + 2], data_a_packed16[ib1].qs[iqs_h + 3]));
-            const FLOAT_TYPE da1 = float(data_a_packed16[ib1].d);
-            const vec4 v0_2 = q8_0_decode_magic(i16vec2(data_a_packed16[ib2].qs[iqs_h    ], data_a_packed16[ib2].qs[iqs_h + 1]));
-            const vec4 v1_2 = q8_0_decode_magic(i16vec2(data_a_packed16[ib2].qs[iqs_h + 2], data_a_packed16[ib2].qs[iqs_h + 3]));
-            const FLOAT_TYPE da2 = float(data_a_packed16[ib2].d);
-            const vec4 v0_3 = q8_0_decode_magic(i16vec2(data_a_packed16[ib3].qs[iqs_h    ], data_a_packed16[ib3].qs[iqs_h + 1]));
-            const vec4 v1_3 = q8_0_decode_magic(i16vec2(data_a_packed16[ib3].qs[iqs_h + 2], data_a_packed16[ib3].qs[iqs_h + 3]));
-            const FLOAT_TYPE da3 = float(data_a_packed16[ib3].d);
-
-            vec4 w0_0 = vec4(0.0), w1_0 = vec4(0.0), w0_1 = vec4(0.0), w1_1 = vec4(0.0);
-            vec4 w0_2 = vec4(0.0), w1_2 = vec4(0.0), w0_3 = vec4(0.0), w1_3 = vec4(0.0);
-            FLOAT_TYPE du0 = FLOAT_TYPE(0), du1 = FLOAT_TYPE(0), du2 = FLOAT_TYPE(0), du3 = FLOAT_TYPE(0);
-            if (GEN_GLU == 3) {
-                w0_0 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib0].qs[iqs_h    ], data_a2_packed16[ib0].qs[iqs_h + 1]));
-                w1_0 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib0].qs[iqs_h + 2], data_a2_packed16[ib0].qs[iqs_h + 3]));
-                du0  = float(data_a2_packed16[ib0].d);
-                w0_1 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib1].qs[iqs_h    ], data_a2_packed16[ib1].qs[iqs_h + 1]));
-                w1_1 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib1].qs[iqs_h + 2], data_a2_packed16[ib1].qs[iqs_h + 3]));
-                du1  = float(data_a2_packed16[ib1].d);
-                w0_2 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib2].qs[iqs_h    ], data_a2_packed16[ib2].qs[iqs_h + 1]));
-                w1_2 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib2].qs[iqs_h + 2], data_a2_packed16[ib2].qs[iqs_h + 3]));
-                du2  = float(data_a2_packed16[ib2].d);
-                w0_3 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib3].qs[iqs_h    ], data_a2_packed16[ib3].qs[iqs_h + 1]));
-                w1_3 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib3].qs[iqs_h + 2], data_a2_packed16[ib3].qs[iqs_h + 3]));
-                du3  = float(data_a2_packed16[ib3].d);
-            }
-
-            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-                const uint b4 = (j * p.batch_stride_b + b_offset) >> 2;
-                const vec4 bv0_0 = vec4(data_b_v4[b4 + b_col4_0]);
-                const vec4 bv1_0 = vec4(data_b_v4[b4 + b_col4_0 + 1]);
-                const vec4 bv0_1 = vec4(data_b_v4[b4 + b_col4_1]);
-                const vec4 bv1_1 = vec4(data_b_v4[b4 + b_col4_1 + 1]);
-                const vec4 bv0_2 = vec4(data_b_v4[b4 + b_col4_2]);
-                const vec4 bv1_2 = vec4(data_b_v4[b4 + b_col4_2 + 1]);
-                const vec4 bv0_3 = vec4(data_b_v4[b4 + b_col4_3]);
-                const vec4 bv1_3 = vec4(data_b_v4[b4 + b_col4_3 + 1]);
-
-                const FLOAT_TYPE d0 = (dot(bv0_0, v0_0) + dot(bv1_0, v1_0)) * da0;
-                const FLOAT_TYPE d1 = (dot(bv0_1, v0_1) + dot(bv1_1, v1_1)) * da1;
-                const FLOAT_TYPE d2 = (dot(bv0_2, v0_2) + dot(bv1_2, v1_2)) * da2;
-                const FLOAT_TYPE d3 = (dot(bv0_3, v0_3) + dot(bv1_3, v1_3)) * da3;
-                temp[j][n] = (((temp[j][n] + d0) + d1) + d2) + d3;
-
-                if (GEN_GLU == 3) {
-                    const FLOAT_TYPE e0 = (dot(bv0_0, w0_0) + dot(bv1_0, w1_0)) * du0;
-                    const FLOAT_TYPE e1 = (dot(bv0_1, w0_1) + dot(bv1_1, w1_1)) * du1;
-                    const FLOAT_TYPE e2 = (dot(bv0_2, w0_2) + dot(bv1_2, w1_2)) * du2;
-                    const FLOAT_TYPE e3 = (dot(bv0_3, w0_3) + dot(bv1_3, w1_3)) * du3;
-                    temp2[j][n] = (((temp2[j][n] + e0) + e1) + e2) + e3;
-                }
-            }
-        }
-    }
-#endif
-}
-
-void iter4_aligned_q8_0_a2(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint row_base, const uint num_rows, const uint tid, const uint iter_idx)
-{
-    const uint iqs_h = 4 * (tid & 3);
-    const uint ib_col_0 = iter_idx * (BLOCK_SIZE >> 2) + (tid >> 2);
-    const uint ib_col_1 = ib_col_0 + (BLOCK_SIZE >> 2);
-    const uint ib_col_2 = ib_col_0 + 2 * (BLOCK_SIZE >> 2);
-    const uint ib_col_3 = ib_col_0 + 3 * (BLOCK_SIZE >> 2);
-    const uint blocks_per_row = p.ncols >> 5;
-
-#ifdef USE_SH_B
-    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
-        const uint rn = (n == 0 || n < num_rows) ? n : 0;
-        const uint row_off = a_offset + (row_base + rn) * blocks_per_row;
-        const uint ib0 = row_off + ib_col_0;
-        const uint ib1 = row_off + ib_col_1;
-        const uint ib2 = row_off + ib_col_2;
-        const uint ib3 = row_off + ib_col_3;
-
-        const vec4 v0_0 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib0].qs[iqs_h    ], data_a2_packed16[ib0].qs[iqs_h + 1]));
-        const vec4 v1_0 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib0].qs[iqs_h + 2], data_a2_packed16[ib0].qs[iqs_h + 3]));
-        const FLOAT_TYPE da0 = float(data_a2_packed16[ib0].d);
-        const vec4 v0_1 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib1].qs[iqs_h    ], data_a2_packed16[ib1].qs[iqs_h + 1]));
-        const vec4 v1_1 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib1].qs[iqs_h + 2], data_a2_packed16[ib1].qs[iqs_h + 3]));
-        const FLOAT_TYPE da1 = float(data_a2_packed16[ib1].d);
-        const vec4 v0_2 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib2].qs[iqs_h    ], data_a2_packed16[ib2].qs[iqs_h + 1]));
-        const vec4 v1_2 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib2].qs[iqs_h + 2], data_a2_packed16[ib2].qs[iqs_h + 3]));
-        const FLOAT_TYPE da2 = float(data_a2_packed16[ib2].d);
-        const vec4 v0_3 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib3].qs[iqs_h    ], data_a2_packed16[ib3].qs[iqs_h + 1]));
-        const vec4 v1_3 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib3].qs[iqs_h + 2], data_a2_packed16[ib3].qs[iqs_h + 3]));
-        const FLOAT_TYPE da3 = float(data_a2_packed16[ib3].d);
-
-        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-            const vec4 bv0_0 = vec4(sh_b[j][0u * (2u * BLOCK_SIZE) + 2u * tid]);
-            const vec4 bv1_0 = vec4(sh_b[j][0u * (2u * BLOCK_SIZE) + 2u * tid + 1u]);
-            const vec4 bv0_1 = vec4(sh_b[j][1u * (2u * BLOCK_SIZE) + 2u * tid]);
-            const vec4 bv1_1 = vec4(sh_b[j][1u * (2u * BLOCK_SIZE) + 2u * tid + 1u]);
-            const vec4 bv0_2 = vec4(sh_b[j][2u * (2u * BLOCK_SIZE) + 2u * tid]);
-            const vec4 bv1_2 = vec4(sh_b[j][2u * (2u * BLOCK_SIZE) + 2u * tid + 1u]);
-            const vec4 bv0_3 = vec4(sh_b[j][3u * (2u * BLOCK_SIZE) + 2u * tid]);
-            const vec4 bv1_3 = vec4(sh_b[j][3u * (2u * BLOCK_SIZE) + 2u * tid + 1u]);
-
-            const FLOAT_TYPE d0 = (dot(bv0_0, v0_0) + dot(bv1_0, v1_0)) * da0;
-            const FLOAT_TYPE d1 = (dot(bv0_1, v0_1) + dot(bv1_1, v1_1)) * da1;
-            const FLOAT_TYPE d2 = (dot(bv0_2, v0_2) + dot(bv1_2, v1_2)) * da2;
-            const FLOAT_TYPE d3 = (dot(bv0_3, v0_3) + dot(bv1_3, v1_3)) * da3;
-            temp[j][n] = (((temp[j][n] + d0) + d1) + d2) + d3;
-        }
-    }
-#else
-    const uint b_col4_0 = iter_idx * (2 * BLOCK_SIZE) + 2 * tid;
-    const uint b_col4_1 = b_col4_0 + (2 * BLOCK_SIZE);
-    const uint b_col4_2 = b_col4_0 + (4 * BLOCK_SIZE);
-    const uint b_col4_3 = b_col4_0 + (6 * BLOCK_SIZE);
-
-    if (NUM_COLS == 1) {
-        const uint b4 = b_offset >> 2;
-        const vec4 bv0_0 = vec4(data_b_v4[b4 + b_col4_0]);
-        const vec4 bv1_0 = vec4(data_b_v4[b4 + b_col4_0 + 1]);
-        const vec4 bv0_1 = vec4(data_b_v4[b4 + b_col4_1]);
-        const vec4 bv1_1 = vec4(data_b_v4[b4 + b_col4_1 + 1]);
-        const vec4 bv0_2 = vec4(data_b_v4[b4 + b_col4_2]);
-        const vec4 bv1_2 = vec4(data_b_v4[b4 + b_col4_2 + 1]);
-        const vec4 bv0_3 = vec4(data_b_v4[b4 + b_col4_3]);
-        const vec4 bv1_3 = vec4(data_b_v4[b4 + b_col4_3 + 1]);
-
-        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
-            const uint rn = (n == 0 || n < num_rows) ? n : 0;
-            const uint row_off = a_offset + (row_base + rn) * blocks_per_row;
-            const uint ib0 = row_off + ib_col_0;
-            const uint ib1 = row_off + ib_col_1;
-            const uint ib2 = row_off + ib_col_2;
-            const uint ib3 = row_off + ib_col_3;
-
-            const vec4 v0_0 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib0].qs[iqs_h    ], data_a2_packed16[ib0].qs[iqs_h + 1]));
-            const vec4 v1_0 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib0].qs[iqs_h + 2], data_a2_packed16[ib0].qs[iqs_h + 3]));
-            const FLOAT_TYPE da0 = float(data_a2_packed16[ib0].d);
-            const vec4 v0_1 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib1].qs[iqs_h    ], data_a2_packed16[ib1].qs[iqs_h + 1]));
-            const vec4 v1_1 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib1].qs[iqs_h + 2], data_a2_packed16[ib1].qs[iqs_h + 3]));
-            const FLOAT_TYPE da1 = float(data_a2_packed16[ib1].d);
-            const vec4 v0_2 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib2].qs[iqs_h    ], data_a2_packed16[ib2].qs[iqs_h + 1]));
-            const vec4 v1_2 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib2].qs[iqs_h + 2], data_a2_packed16[ib2].qs[iqs_h + 3]));
-            const FLOAT_TYPE da2 = float(data_a2_packed16[ib2].d);
-            const vec4 v0_3 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib3].qs[iqs_h    ], data_a2_packed16[ib3].qs[iqs_h + 1]));
-            const vec4 v1_3 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib3].qs[iqs_h + 2], data_a2_packed16[ib3].qs[iqs_h + 3]));
-            const FLOAT_TYPE da3 = float(data_a2_packed16[ib3].d);
-
-            const FLOAT_TYPE d0 = (dot(bv0_0, v0_0) + dot(bv1_0, v1_0)) * da0;
-            const FLOAT_TYPE d1 = (dot(bv0_1, v0_1) + dot(bv1_1, v1_1)) * da1;
-            const FLOAT_TYPE d2 = (dot(bv0_2, v0_2) + dot(bv1_2, v1_2)) * da2;
-            const FLOAT_TYPE d3 = (dot(bv0_3, v0_3) + dot(bv1_3, v1_3)) * da3;
-            temp[0][n] = (((temp[0][n] + d0) + d1) + d2) + d3;
-        }
-    } else {
-        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
-            const uint rn = (n == 0 || n < num_rows) ? n : 0;
-            const uint row_off = a_offset + (row_base + rn) * blocks_per_row;
-            const uint ib0 = row_off + ib_col_0;
-            const uint ib1 = row_off + ib_col_1;
-            const uint ib2 = row_off + ib_col_2;
-            const uint ib3 = row_off + ib_col_3;
-
-            const vec4 v0_0 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib0].qs[iqs_h    ], data_a2_packed16[ib0].qs[iqs_h + 1]));
-            const vec4 v1_0 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib0].qs[iqs_h + 2], data_a2_packed16[ib0].qs[iqs_h + 3]));
-            const FLOAT_TYPE da0 = float(data_a2_packed16[ib0].d);
-            const vec4 v0_1 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib1].qs[iqs_h    ], data_a2_packed16[ib1].qs[iqs_h + 1]));
-            const vec4 v1_1 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib1].qs[iqs_h + 2], data_a2_packed16[ib1].qs[iqs_h + 3]));
-            const FLOAT_TYPE da1 = float(data_a2_packed16[ib1].d);
-            const vec4 v0_2 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib2].qs[iqs_h    ], data_a2_packed16[ib2].qs[iqs_h + 1]));
-            const vec4 v1_2 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib2].qs[iqs_h + 2], data_a2_packed16[ib2].qs[iqs_h + 3]));
-            const FLOAT_TYPE da2 = float(data_a2_packed16[ib2].d);
-            const vec4 v0_3 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib3].qs[iqs_h    ], data_a2_packed16[ib3].qs[iqs_h + 1]));
-            const vec4 v1_3 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib3].qs[iqs_h + 2], data_a2_packed16[ib3].qs[iqs_h + 3]));
-            const FLOAT_TYPE da3 = float(data_a2_packed16[ib3].d);
-
-            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-                const uint b4 = (j * p.batch_stride_b + b_offset) >> 2;
-                const vec4 bv0_0 = vec4(data_b_v4[b4 + b_col4_0]);
-                const vec4 bv1_0 = vec4(data_b_v4[b4 + b_col4_0 + 1]);
-                const vec4 bv0_1 = vec4(data_b_v4[b4 + b_col4_1]);
-                const vec4 bv1_1 = vec4(data_b_v4[b4 + b_col4_1 + 1]);
-                const vec4 bv0_2 = vec4(data_b_v4[b4 + b_col4_2]);
-                const vec4 bv1_2 = vec4(data_b_v4[b4 + b_col4_2 + 1]);
-                const vec4 bv0_3 = vec4(data_b_v4[b4 + b_col4_3]);
-                const vec4 bv1_3 = vec4(data_b_v4[b4 + b_col4_3 + 1]);
-
-                const FLOAT_TYPE d0 = (dot(bv0_0, v0_0) + dot(bv1_0, v1_0)) * da0;
-                const FLOAT_TYPE d1 = (dot(bv0_1, v0_1) + dot(bv1_1, v1_1)) * da1;
-                const FLOAT_TYPE d2 = (dot(bv0_2, v0_2) + dot(bv1_2, v1_2)) * da2;
-                const FLOAT_TYPE d3 = (dot(bv0_3, v0_3) + dot(bv1_3, v1_3)) * da3;
-                temp[j][n] = (((temp[j][n] + d0) + d1) + d2) + d3;
-            }
-        }
-    }
-#endif
 }
 #endif
 
@@ -837,42 +554,12 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
 
 #if defined(DATA_A_Q8_0)
     if ((p.ncols & 31) == 0 && (p.batch_stride_b & 3) == 0 && (b_offset & 3) == 0 && (BLOCK_SIZE & 3) == 0) {
-        const uint full_iters = p.ncols / (8 * BLOCK_SIZE);
-        const bool has_tail = (full_iters * (8 * BLOCK_SIZE) + 8 * tid < p.ncols);
-        uint it = 0;
-        if (NUM_ROWS == 1 && NUM_COLS <= 4) {
-            for (; it + 3 < full_iters; it += 4) {
-#ifdef USE_SH_B
-                const uint ltid = gl_SubgroupID * BLOCK_SIZE + tid;
-                const uint wg_threads = BLOCK_SIZE * NUM_SUBGROUPS;
-                const uint step_b = 8u * BLOCK_SIZE;
-                for (uint idx = ltid; idx < NUM_COLS * step_b; idx += wg_threads) {
-                    const uint j  = idx / step_b;
-                    const uint k4 = idx % step_b;
-                    const uint b4 = (j * p.batch_stride_b + b_offset) >> 2;
-                    sh_b[j][k4] = data_b_v4[b4 + it * (2u * BLOCK_SIZE) + k4];
-                }
-                barrier();
-                if (eff_rows > 0) {
-                    if (GEN_GLU == 2 && use_a2) {
-                        iter4_aligned_q8_0_a2(temp, row_base, eff_rows, tid, it);
-                    } else {
-                        iter4_aligned_q8_0_a(temp, temp2, row_base, eff_rows, tid, it);
-                    }
-                }
-                barrier();
-#else
-                if (GEN_GLU == 2 && use_a2) {
-                    iter4_aligned_q8_0_a2(temp, row_base, eff_rows, tid, it);
-                } else {
-                    iter4_aligned_q8_0_a(temp, temp2, row_base, eff_rows, tid, it);
-                }
-#endif
-            }
-        }
         if (eff_rows == 0) {
             return;
         }
+        const uint full_iters = p.ncols / (8 * BLOCK_SIZE);
+        const bool has_tail = (full_iters * (8 * BLOCK_SIZE) + 8 * tid < p.ncols);
+        uint it = 0;
         if (GEN_GLU == 2 && use_a2) {
             if (NUM_ROWS == 1 && NUM_COLS <= 4) {
                 for (; it + 1 < full_iters; it += 2) {
@@ -988,13 +675,8 @@ void main() {
     init_iq_shmem(gl_WorkGroupSize);
 #endif
 
-#if defined(DATA_A_Q8_0) && defined(USE_SH_B)
-    const uint num_rows = (first_row < p.stride_d) ? min(NUM_ROWS, p.stride_d - first_row) : 0u;
-    compute_outputs(first_row, num_rows);
-#else
     if (first_row >= p.stride_d) {
         return;
     }
     compute_outputs(first_row, min(NUM_ROWS, p.stride_d - first_row));
-#endif
 }

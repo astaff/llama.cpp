@@ -1,29 +1,43 @@
-// Shared 128B-aligned Planar SoA Tile layout constants & magic-bias decoders
-// for Vulkan_Repack (Q4_K, Q5_K, Q6_K).
+// Shared 16B-aligned Compact 1-Superblock 0-ULP Planar layout constants &
+// magic-bias decoders for Vulkan_Repack (Q4_K, Q5_K, Q6_K).
 //
-// Each 4-superblock (1024-weight) tile contains:
-//   - Scales plane (128 B = 32 uint32 = 8 uvec4):
-//       Q4_K / Q5_K: subblock s in 0..7 -> f16vec2(d*sc, -dmin*m) at k*8 + s
-//       Q6_K:        subblock pair p in 0..7 -> f16vec2(d*sc_{2p}, d*sc_{2p+1}) at k*8 + p
-//   - qs/ql interleaved plane (512 B = 128 uint32 = 32 uvec4):
-//       lane tid = k*8 + itid8 (k=0..3, itid8=0..7):
-//       uvec4(qs[itid8], qs[itid8+8], qs[itid8+16], qs[itid8+24])
-//   - qh plane (starts at byte 640 = uint32 offset 160):
-//       Q4_K: 0 B     (tile = 640 B = 160 u32 = 40 uvec4)
-//       Q5_K: 128 B   (32 uint32: qh[itid8] at 160 + k*8 + itid8; tile = 768 B = 192 u32 = 48 uvec4)
-//       Q6_K: 256 B   (32 uvec2: (qh[itid8], qh[itid8+8]) at 160 + 2*tid; tile = 896 B = 224 u32 = 56 uvec4)
+// Each 1-superblock (256-weight) planar block contains:
+//   Q4_K (144 B = 9 uvec4 = 36 uint32, 0% bloat):
+//     uvec4[0]:     exact raw { dm (u32), scales[0..3], scales[4..7], scales[8..11] }
+//     uvec4[1..8]:  qs lane-interleaved: itid8=0..7 -> uvec4(qs[itid8], qs[itid8+8], qs[itid8+16], qs[itid8+24])
+//   Q5_K (176 B = 11 uvec4 = 44 uint32, 0% bloat):
+//     uvec4[0]:     exact raw { dm (u32), scales[0..3], scales[4..7], scales[8..11] }
+//     uvec4[1..8]:  qs lane-interleaved: itid8=0..7 -> uvec4(qs[itid8], qs[itid8+8], qs[itid8+16], qs[itid8+24])
+//     uvec4[9..10]: 8 qh uint32s (u32[36 + itid8] = qh[itid8])
+//   Q6_K (224 B = 14 uvec4 = 56 uint32):
+//     uvec4[0]:     exact raw scales[0..15] (16 int8_t)
+//     uvec4[1]:     { d (u16 in .x low 16 bits), 0, 0, 0 }
+//     uvec4[2..9]:  ql lane-interleaved: itid8=0..7 -> uvec4(ql[itid8], ql[itid8+8], ql[itid8+16], ql[itid8+24])
+//     uvec4[10..13]: 8 qh uvec2s (u32[40 + itid8*2 + h] = qh[itid8 + 8*h])
 
-#define REPACK_SCALES_OFF_U32 0u
-#define REPACK_QS_OFF_U4      8u
-#define REPACK_QS_OFF_U32     32u
-#define REPACK_QH_OFF_U32     160u
+#define REPACK_HDR_OFF_U4     0u
+#define REPACK_HDR_OFF_U32    0u
+#define REPACK_QS_OFF_U4      1u
+#define REPACK_QS_OFF_U32     4u
 
-#define REPACK_Q4_K_TILE_U4   40u
-#define REPACK_Q4_K_TILE_U32  160u
-#define REPACK_Q5_K_TILE_U4   48u
-#define REPACK_Q5_K_TILE_U32  192u
-#define REPACK_Q6_K_TILE_U4   56u
-#define REPACK_Q6_K_TILE_U32  224u
+#define REPACK_Q4_K_SB_U4     9u
+#define REPACK_Q4_K_SB_U32    36u
+
+#define REPACK_Q5_K_QH_OFF_U4  9u
+#define REPACK_Q5_K_QH_OFF_U32 36u
+#define REPACK_Q5_K_SB_U4     11u
+#define REPACK_Q5_K_SB_U32    44u
+
+#define REPACK_Q6_K_SC_OFF_U4  0u
+#define REPACK_Q6_K_SC_OFF_U32 0u
+#define REPACK_Q6_K_D_OFF_U4   1u
+#define REPACK_Q6_K_D_OFF_U32  4u
+#define REPACK_Q6_K_QL_OFF_U4  2u
+#define REPACK_Q6_K_QL_OFF_U32 8u
+#define REPACK_Q6_K_QH_OFF_U4  10u
+#define REPACK_Q6_K_QH_OFF_U32 40u
+#define REPACK_Q6_K_SB_U4     14u
+#define REPACK_Q6_K_SB_U32    56u
 
 vec4 repack_magic_u4(const uint q4) {
     const f16vec2 p02 = unpackFloat2x16((q4 & 0x000F000Fu) | 0x64006400u) - f16vec2(1024.0);

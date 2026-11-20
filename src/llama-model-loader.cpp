@@ -1775,39 +1775,38 @@ bool llama_model_loader::load_all_data(
             return nullptr;
         }
         // When not using mmaped io use async uploads from pinned memory to GPU memory.
-        // First determine if the backend supports the necessary features for async uploads.
-        auto * buf = bufs.empty() ? nullptr : bufs[0];
-        if (!buf) {
+        // First determine if any buffer's backend supports the necessary features for async uploads.
+        if (bufs.empty()) {
             LLAMA_LOG_DEBUG("%s: no buffer found for async uploads\n", func);
             return nullptr;
         }
 
-        auto * buft = ggml_backend_buffer_get_type(buf);
-        auto * dev = ggml_backend_buft_get_device(buft);
+        ggml_backend_dev_t dev = nullptr;
+        ggml_backend_buffer_type_t host_buft = nullptr;
+        for (auto * buf : bufs) {
+            if (!buf) {
+                continue;
+            }
+            auto * buft = ggml_backend_buffer_get_type(buf);
+            auto * b_dev = ggml_backend_buft_get_device(buft);
+            if (!b_dev || buft != ggml_backend_dev_buffer_type(b_dev)) {
+                continue;
+            }
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(b_dev, &props);
+            if (!props.caps.async || !props.caps.host_buffer || !props.caps.events) {
+                continue;
+            }
+            auto * h_buft = ggml_backend_dev_host_buffer_type(b_dev);
+            if (!h_buft) {
+                continue;
+            }
+            dev = b_dev;
+            host_buft = h_buft;
+            break;
+        }
         if (!dev) {
-            LLAMA_LOG_DEBUG("%s: no device found for buffer type %s for async uploads\n", func,
-                ggml_backend_buft_name(buft));
-            return nullptr;
-        }
-
-        if (buft != ggml_backend_dev_buffer_type(dev)) {
-            LLAMA_LOG_DEBUG("%s: buffer type %s is not the default buffer type for device %s for async uploads\n", func,
-                ggml_backend_buft_name(buft), ggml_backend_dev_name(dev));
-            return nullptr;
-        }
-
-        ggml_backend_dev_props props;
-        ggml_backend_dev_get_props(dev, &props);
-        if (!props.caps.async || !props.caps.host_buffer || !props.caps.events) {
-            LLAMA_LOG_DEBUG("%s: device %s does not support async, host buffers or events\n", func,
-                ggml_backend_dev_name(dev));
-            return nullptr;
-        }
-
-        auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
-        if (!host_buft) {
-            LLAMA_LOG_DEBUG("%s: no host buffer type found for device %s\n", func,
-                ggml_backend_dev_name(dev));
+            LLAMA_LOG_DEBUG("%s: no device supporting async uploads found in model buffers\n", func);
             return nullptr;
         }
 
@@ -1844,10 +1843,13 @@ bool llama_model_loader::load_all_data(
         return backend;
     }(__func__);
 
+    ggml_backend_buffer_type_t upload_buft = upload_backend
+        ? ggml_backend_dev_buffer_type(ggml_backend_get_device(upload_backend))
+        : nullptr;
     if (upload_backend) {
         LLAMA_LOG_DEBUG("%s: using async uploads for device %s, buffer type %s, backend %s\n", __func__,
             ggml_backend_dev_name(ggml_backend_get_device(upload_backend)),
-            ggml_backend_buft_name(ggml_backend_buffer_get_type(bufs[0])),
+            ggml_backend_buft_name(upload_buft),
             ggml_backend_name(upload_backend));
     }
 
@@ -1958,7 +1960,7 @@ bool llama_model_loader::load_all_data(
                 }
             } else {
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
-                if (upload_backend) {
+                if (upload_backend && cur->buffer && ggml_backend_buffer_get_type(cur->buffer) == upload_buft) {
                     size_t offset = weight->offs;
                     alignment = file->read_alignment();
                     size_t aligned_offset = offset & ~(alignment - 1);

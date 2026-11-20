@@ -373,89 +373,260 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     }
 
 #ifdef REPACK_PLANAR
-    const uint itid8 = tid & 7u;
-    const uint ix8 = tid >> 3u;
-    const uint n_tiles = (num_blocks_per_row + 3u) >> 2u;
-    const uint base_row_idx = a_offset / num_blocks_per_row + row_base;
-    for (uint tile = 0u; tile < n_tiles; ++tile) {
-        const uint sb = (tile << 2u) + ix8;
-        if (sb < num_blocks_per_row) {
-            const uint y_idx = sb * QUANT_K + 4u * itid8;
-            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
-                const uint rn = (n == 0 || n < eff_rows) ? n : 0;
-                const uint tile_u4 = ((base_row_idx + rn) * n_tiles + tile) * REPACK_Q4_K_TILE_U4;
-                const uvec4 s_lo = use_a2 ? data_a2_u4[tile_u4 + ix8 * 2u     ] : data_a_u4[tile_u4 + ix8 * 2u     ];
-                const uvec4 s_hi = use_a2 ? data_a2_u4[tile_u4 + ix8 * 2u + 1u] : data_a_u4[tile_u4 + ix8 * 2u + 1u];
-                const uvec4 q    = use_a2 ? data_a2_u4[tile_u4 + REPACK_QS_OFF_U4 + tid] : data_a_u4[tile_u4 + REPACK_QS_OFF_U4 + tid];
-                const f16vec2 dm0 = unpackFloat2x16(s_lo.x), dm1 = unpackFloat2x16(s_lo.y);
-                const f16vec2 dm2 = unpackFloat2x16(s_lo.z), dm3 = unpackFloat2x16(s_lo.w);
-                const f16vec2 dm4 = unpackFloat2x16(s_hi.x), dm5 = unpackFloat2x16(s_hi.y);
-                const f16vec2 dm6 = unpackFloat2x16(s_hi.z), dm7 = unpackFloat2x16(s_hi.w);
-                const vec4 q0_lo = repack_magic_u4(q.x), q0_hi = repack_magic_u4(q.x >> 4u);
-                const vec4 q1_lo = repack_magic_u4(q.y), q1_hi = repack_magic_u4(q.y >> 4u);
-                const vec4 q2_lo = repack_magic_u4(q.z), q2_hi = repack_magic_u4(q.z >> 4u);
-                const vec4 q3_lo = repack_magic_u4(q.w), q3_hi = repack_magic_u4(q.w >> 4u);
+    if ((num_blocks_per_row & 3u) == 0u) {
+        const uint it_size8 = gl_WorkGroupSize.x >> 3u;
+        const uint itid8 = tid & 7u;
+        const uint ix8 = tid >> 3u;
+        for (uint i = ix8; i < num_blocks_per_row; i += it_size8) {
+            const uint y_idx = i * QUANT_K + 4u * itid8;
+            if (NUM_COLS <= 2) {
+                vec4 by0_a[NUM_COLS], by1_a[NUM_COLS], by2_a[NUM_COLS], by3_a[NUM_COLS];
+                vec4 by4_a[NUM_COLS], by5_a[NUM_COLS], by6_a[NUM_COLS], by7_a[NUM_COLS];
+                FLOAT_TYPE sy0_a[NUM_COLS], sy1_a[NUM_COLS], sy2_a[NUM_COLS], sy3_a[NUM_COLS];
+                FLOAT_TYPE sy4_a[NUM_COLS], sy5_a[NUM_COLS], sy6_a[NUM_COLS], sy7_a[NUM_COLS];
                 [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
                     const uint b4 = (j * p.batch_stride_b + b_offset + y_idx) >> 2u;
-                    const vec4 by0 = vec4(data_b_v4[b4      ]), by1 = vec4(data_b_v4[b4 +  8u]);
-                    const vec4 by2 = vec4(data_b_v4[b4 + 16u]), by3 = vec4(data_b_v4[b4 + 24u]);
-                    const vec4 by4 = vec4(data_b_v4[b4 + 32u]), by5 = vec4(data_b_v4[b4 + 40u]);
-                    const vec4 by6 = vec4(data_b_v4[b4 + 48u]), by7 = vec4(data_b_v4[b4 + 56u]);
-                    const FLOAT_TYPE sy0 = (FLOAT_TYPE(by0.x) + FLOAT_TYPE(by0.y)) + (FLOAT_TYPE(by0.z) + FLOAT_TYPE(by0.w));
-                    const FLOAT_TYPE sy1 = (FLOAT_TYPE(by1.x) + FLOAT_TYPE(by1.y)) + (FLOAT_TYPE(by1.z) + FLOAT_TYPE(by1.w));
-                    const FLOAT_TYPE sy2 = (FLOAT_TYPE(by2.x) + FLOAT_TYPE(by2.y)) + (FLOAT_TYPE(by2.z) + FLOAT_TYPE(by2.w));
-                    const FLOAT_TYPE sy3 = (FLOAT_TYPE(by3.x) + FLOAT_TYPE(by3.y)) + (FLOAT_TYPE(by3.z) + FLOAT_TYPE(by3.w));
-                    const FLOAT_TYPE sy4 = (FLOAT_TYPE(by4.x) + FLOAT_TYPE(by4.y)) + (FLOAT_TYPE(by4.z) + FLOAT_TYPE(by4.w));
-                    const FLOAT_TYPE sy5 = (FLOAT_TYPE(by5.x) + FLOAT_TYPE(by5.y)) + (FLOAT_TYPE(by5.z) + FLOAT_TYPE(by5.w));
-                    const FLOAT_TYPE sy6 = (FLOAT_TYPE(by6.x) + FLOAT_TYPE(by6.y)) + (FLOAT_TYPE(by6.z) + FLOAT_TYPE(by6.w));
-                    const FLOAT_TYPE sy7 = (FLOAT_TYPE(by7.x) + FLOAT_TYPE(by7.y)) + (FLOAT_TYPE(by7.z) + FLOAT_TYPE(by7.w));
-                    const FLOAT_TYPE a_sum =
-                        fma(FLOAT_TYPE(dm0.x), dot(by0, q0_lo), FLOAT_TYPE(dm0.y) * sy0) +
-                        fma(FLOAT_TYPE(dm1.x), dot(by1, q0_hi), FLOAT_TYPE(dm1.y) * sy1) +
-                        fma(FLOAT_TYPE(dm2.x), dot(by2, q1_lo), FLOAT_TYPE(dm2.y) * sy2) +
-                        fma(FLOAT_TYPE(dm3.x), dot(by3, q1_hi), FLOAT_TYPE(dm3.y) * sy3) +
-                        fma(FLOAT_TYPE(dm4.x), dot(by4, q2_lo), FLOAT_TYPE(dm4.y) * sy4) +
-                        fma(FLOAT_TYPE(dm5.x), dot(by5, q2_hi), FLOAT_TYPE(dm5.y) * sy5) +
-                        fma(FLOAT_TYPE(dm6.x), dot(by6, q3_lo), FLOAT_TYPE(dm6.y) * sy6) +
-                        fma(FLOAT_TYPE(dm7.x), dot(by7, q3_hi), FLOAT_TYPE(dm7.y) * sy7);
-                    temp[j][n] += a_sum;
+                    by0_a[j] = vec4(data_b_v4[b4      ]); by1_a[j] = vec4(data_b_v4[b4 +  8u]);
+                    by2_a[j] = vec4(data_b_v4[b4 + 16u]); by3_a[j] = vec4(data_b_v4[b4 + 24u]);
+                    by4_a[j] = vec4(data_b_v4[b4 + 32u]); by5_a[j] = vec4(data_b_v4[b4 + 40u]);
+                    by6_a[j] = vec4(data_b_v4[b4 + 48u]); by7_a[j] = vec4(data_b_v4[b4 + 56u]);
+                    sy0_a[j] = (FLOAT_TYPE(by0_a[j].x) + FLOAT_TYPE(by0_a[j].y)) + (FLOAT_TYPE(by0_a[j].z) + FLOAT_TYPE(by0_a[j].w));
+                    sy1_a[j] = (FLOAT_TYPE(by1_a[j].x) + FLOAT_TYPE(by1_a[j].y)) + (FLOAT_TYPE(by1_a[j].z) + FLOAT_TYPE(by1_a[j].w));
+                    sy2_a[j] = (FLOAT_TYPE(by2_a[j].x) + FLOAT_TYPE(by2_a[j].y)) + (FLOAT_TYPE(by2_a[j].z) + FLOAT_TYPE(by2_a[j].w));
+                    sy3_a[j] = (FLOAT_TYPE(by3_a[j].x) + FLOAT_TYPE(by3_a[j].y)) + (FLOAT_TYPE(by3_a[j].z) + FLOAT_TYPE(by3_a[j].w));
+                    sy4_a[j] = (FLOAT_TYPE(by4_a[j].x) + FLOAT_TYPE(by4_a[j].y)) + (FLOAT_TYPE(by4_a[j].z) + FLOAT_TYPE(by4_a[j].w));
+                    sy5_a[j] = (FLOAT_TYPE(by5_a[j].x) + FLOAT_TYPE(by5_a[j].y)) + (FLOAT_TYPE(by5_a[j].z) + FLOAT_TYPE(by5_a[j].w));
+                    sy6_a[j] = (FLOAT_TYPE(by6_a[j].x) + FLOAT_TYPE(by6_a[j].y)) + (FLOAT_TYPE(by6_a[j].z) + FLOAT_TYPE(by6_a[j].w));
+                    sy7_a[j] = (FLOAT_TYPE(by7_a[j].x) + FLOAT_TYPE(by7_a[j].y)) + (FLOAT_TYPE(by7_a[j].z) + FLOAT_TYPE(by7_a[j].w));
                 }
-                if (GEN_GLU == 3) {
-                    const uvec4 u_slo = data_a2_u4[tile_u4 + ix8 * 2u     ];
-                    const uvec4 u_shi = data_a2_u4[tile_u4 + ix8 * 2u + 1u];
-                    const uvec4 uq    = data_a2_u4[tile_u4 + REPACK_QS_OFF_U4 + tid];
-                    const f16vec2 udm0 = unpackFloat2x16(u_slo.x), udm1 = unpackFloat2x16(u_slo.y);
-                    const f16vec2 udm2 = unpackFloat2x16(u_slo.z), udm3 = unpackFloat2x16(u_slo.w);
-                    const f16vec2 udm4 = unpackFloat2x16(u_shi.x), udm5 = unpackFloat2x16(u_shi.y);
-                    const f16vec2 udm6 = unpackFloat2x16(u_shi.z), udm7 = unpackFloat2x16(u_shi.w);
-                    const vec4 uq0_lo = repack_magic_u4(uq.x), uq0_hi = repack_magic_u4(uq.x >> 4u);
-                    const vec4 uq1_lo = repack_magic_u4(uq.y), uq1_hi = repack_magic_u4(uq.y >> 4u);
-                    const vec4 uq2_lo = repack_magic_u4(uq.z), uq2_hi = repack_magic_u4(uq.z >> 4u);
-                    const vec4 uq3_lo = repack_magic_u4(uq.w), uq3_hi = repack_magic_u4(uq.w >> 4u);
-                    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-                        const uint b4 = (j * p.batch_stride_b + b_offset + y_idx) >> 2u;
-                        const vec4 by0 = vec4(data_b_v4[b4      ]), by1 = vec4(data_b_v4[b4 +  8u]);
-                        const vec4 by2 = vec4(data_b_v4[b4 + 16u]), by3 = vec4(data_b_v4[b4 + 24u]);
-                        const vec4 by4 = vec4(data_b_v4[b4 + 32u]), by5 = vec4(data_b_v4[b4 + 40u]);
-                        const vec4 by6 = vec4(data_b_v4[b4 + 48u]), by7 = vec4(data_b_v4[b4 + 56u]);
-                        const FLOAT_TYPE sy0 = (FLOAT_TYPE(by0.x) + FLOAT_TYPE(by0.y)) + (FLOAT_TYPE(by0.z) + FLOAT_TYPE(by0.w));
-                        const FLOAT_TYPE sy1 = (FLOAT_TYPE(by1.x) + FLOAT_TYPE(by1.y)) + (FLOAT_TYPE(by1.z) + FLOAT_TYPE(by1.w));
-                        const FLOAT_TYPE sy2 = (FLOAT_TYPE(by2.x) + FLOAT_TYPE(by2.y)) + (FLOAT_TYPE(by2.z) + FLOAT_TYPE(by2.w));
-                        const FLOAT_TYPE sy3 = (FLOAT_TYPE(by3.x) + FLOAT_TYPE(by3.y)) + (FLOAT_TYPE(by3.z) + FLOAT_TYPE(by3.w));
-                        const FLOAT_TYPE sy4 = (FLOAT_TYPE(by4.x) + FLOAT_TYPE(by4.y)) + (FLOAT_TYPE(by4.z) + FLOAT_TYPE(by4.w));
-                        const FLOAT_TYPE sy5 = (FLOAT_TYPE(by5.x) + FLOAT_TYPE(by5.y)) + (FLOAT_TYPE(by5.z) + FLOAT_TYPE(by5.w));
-                        const FLOAT_TYPE sy6 = (FLOAT_TYPE(by6.x) + FLOAT_TYPE(by6.y)) + (FLOAT_TYPE(by6.z) + FLOAT_TYPE(by6.w));
-                        const FLOAT_TYPE sy7 = (FLOAT_TYPE(by7.x) + FLOAT_TYPE(by7.y)) + (FLOAT_TYPE(by7.z) + FLOAT_TYPE(by7.w));
-                        const FLOAT_TYPE u_sum =
-                            fma(FLOAT_TYPE(udm0.x), dot(by0, uq0_lo), FLOAT_TYPE(udm0.y) * sy0) +
-                            fma(FLOAT_TYPE(udm1.x), dot(by1, uq0_hi), FLOAT_TYPE(udm1.y) * sy1) +
-                            fma(FLOAT_TYPE(udm2.x), dot(by2, uq1_lo), FLOAT_TYPE(udm2.y) * sy2) +
-                            fma(FLOAT_TYPE(udm3.x), dot(by3, uq1_hi), FLOAT_TYPE(udm3.y) * sy3) +
-                            fma(FLOAT_TYPE(udm4.x), dot(by4, uq2_lo), FLOAT_TYPE(udm4.y) * sy4) +
-                            fma(FLOAT_TYPE(udm5.x), dot(by5, uq2_hi), FLOAT_TYPE(udm5.y) * sy5) +
-                            fma(FLOAT_TYPE(udm6.x), dot(by6, uq3_lo), FLOAT_TYPE(udm6.y) * sy6) +
-                            fma(FLOAT_TYPE(udm7.x), dot(by7, uq3_hi), FLOAT_TYPE(udm7.y) * sy7);
-                        temp2[j][n] += u_sum;
+                [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                    const uint rn = (n == 0 || n < eff_rows) ? n : 0;
+                    const uint sb_u4 = (a_offset + (row_base + rn) * num_blocks_per_row + i) * REPACK_Q4_K_SB_U4;
+                    {
+                        const uvec4 hdr = use_a2 ? data_a2_u4[sb_u4 + REPACK_HDR_OFF_U4] : data_a_u4[sb_u4 + REPACK_HDR_OFF_U4];
+                        const vec2 dm = unpackHalf2x16(hdr.x);
+                        const vec4 sc03 = vec4(unpack8(hdr.y & 0x3F3F3F3Fu));
+                        const vec4 m03  = vec4(unpack8(hdr.z & 0x3F3F3F3Fu));
+                        const vec4 sc47 = vec4(unpack8((hdr.w & 0x0F0F0F0Fu) | ((hdr.y >> 2u) & 0x30303030u)));
+                        const vec4 m47  = vec4(unpack8(((hdr.w >> 4u) & 0x0F0F0F0Fu) | ((hdr.z >> 2u) & 0x30303030u)));
+                        const uvec4 q   = use_a2 ? data_a2_u4[sb_u4 + REPACK_QS_OFF_U4 + itid8] : data_a_u4[sb_u4 + REPACK_QS_OFF_U4 + itid8];
+                        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                            const FLOAT_TYPE d0 = dot(by0_a[j], repack_magic_u4(q.x)) * sc03.x + dot(by1_a[j], repack_magic_u4(q.x >> 4u)) * sc03.y;
+                            const FLOAT_TYPE d1 = dot(by2_a[j], repack_magic_u4(q.y)) * sc03.z + dot(by3_a[j], repack_magic_u4(q.y >> 4u)) * sc03.w;
+                            const FLOAT_TYPE d2 = dot(by4_a[j], repack_magic_u4(q.z)) * sc47.x + dot(by5_a[j], repack_magic_u4(q.z >> 4u)) * sc47.y;
+                            const FLOAT_TYPE d3 = dot(by6_a[j], repack_magic_u4(q.w)) * sc47.z + dot(by7_a[j], repack_magic_u4(q.w >> 4u)) * sc47.w;
+                            const FLOAT_TYPE sm = (sy0_a[j] * m03.x + sy1_a[j] * m03.y) + (sy2_a[j] * m03.z + sy3_a[j] * m03.w) +
+                                                  (sy4_a[j] * m47.x + sy5_a[j] * m47.y) + (sy6_a[j] * m47.z + sy7_a[j] * m47.w);
+                            temp[j][n] = fma(dm.x, (d0 + d1) + (d2 + d3), fma(-dm.y, sm, temp[j][n]));
+                        }
+                    }
+                    if (GEN_GLU == 3) {
+                        const uvec4 hdr = data_a2_u4[sb_u4 + REPACK_HDR_OFF_U4];
+                        const vec2 dm = unpackHalf2x16(hdr.x);
+                        const vec4 sc03 = vec4(unpack8(hdr.y & 0x3F3F3F3Fu));
+                        const vec4 m03  = vec4(unpack8(hdr.z & 0x3F3F3F3Fu));
+                        const vec4 sc47 = vec4(unpack8((hdr.w & 0x0F0F0F0Fu) | ((hdr.y >> 2u) & 0x30303030u)));
+                        const vec4 m47  = vec4(unpack8(((hdr.w >> 4u) & 0x0F0F0F0Fu) | ((hdr.z >> 2u) & 0x30303030u)));
+                        const uvec4 q   = data_a2_u4[sb_u4 + REPACK_QS_OFF_U4 + itid8];
+                        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                            const FLOAT_TYPE d0 = dot(by0_a[j], repack_magic_u4(q.x)) * sc03.x + dot(by1_a[j], repack_magic_u4(q.x >> 4u)) * sc03.y;
+                            const FLOAT_TYPE d1 = dot(by2_a[j], repack_magic_u4(q.y)) * sc03.z + dot(by3_a[j], repack_magic_u4(q.y >> 4u)) * sc03.w;
+                            const FLOAT_TYPE d2 = dot(by4_a[j], repack_magic_u4(q.z)) * sc47.x + dot(by5_a[j], repack_magic_u4(q.z >> 4u)) * sc47.y;
+                            const FLOAT_TYPE d3 = dot(by6_a[j], repack_magic_u4(q.w)) * sc47.z + dot(by7_a[j], repack_magic_u4(q.w >> 4u)) * sc47.w;
+                            const FLOAT_TYPE sm = (sy0_a[j] * m03.x + sy1_a[j] * m03.y) + (sy2_a[j] * m03.z + sy3_a[j] * m03.w) +
+                                                  (sy4_a[j] * m47.x + sy5_a[j] * m47.y) + (sy6_a[j] * m47.z + sy7_a[j] * m47.w);
+                            temp2[j][n] = fma(dm.x, (d0 + d1) + (d2 + d3), fma(-dm.y, sm, temp2[j][n]));
+                        }
+                    }
+                }
+            } else {
+                [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                    const uint rn = (n == 0 || n < eff_rows) ? n : 0;
+                    const uint sb_u4 = (a_offset + (row_base + rn) * num_blocks_per_row + i) * REPACK_Q4_K_SB_U4;
+                    {
+                        const uvec4 hdr = use_a2 ? data_a2_u4[sb_u4 + REPACK_HDR_OFF_U4] : data_a_u4[sb_u4 + REPACK_HDR_OFF_U4];
+                        const vec2 dm = unpackHalf2x16(hdr.x);
+                        const vec4 sc03 = vec4(unpack8(hdr.y & 0x3F3F3F3Fu));
+                        const vec4 m03  = vec4(unpack8(hdr.z & 0x3F3F3F3Fu));
+                        const vec4 sc47 = vec4(unpack8((hdr.w & 0x0F0F0F0Fu) | ((hdr.y >> 2u) & 0x30303030u)));
+                        const vec4 m47  = vec4(unpack8(((hdr.w >> 4u) & 0x0F0F0F0Fu) | ((hdr.z >> 2u) & 0x30303030u)));
+                        const uvec4 q   = use_a2 ? data_a2_u4[sb_u4 + REPACK_QS_OFF_U4 + itid8] : data_a_u4[sb_u4 + REPACK_QS_OFF_U4 + itid8];
+                        const vec4 q0_lo = repack_magic_u4(q.x), q0_hi = repack_magic_u4(q.x >> 4u);
+                        const vec4 q1_lo = repack_magic_u4(q.y), q1_hi = repack_magic_u4(q.y >> 4u);
+                        const vec4 q2_lo = repack_magic_u4(q.z), q2_hi = repack_magic_u4(q.z >> 4u);
+                        const vec4 q3_lo = repack_magic_u4(q.w), q3_hi = repack_magic_u4(q.w >> 4u);
+                        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                            const uint b4 = (j * p.batch_stride_b + b_offset + y_idx) >> 2u;
+                            const vec4 by0 = vec4(data_b_v4[b4      ]), by1 = vec4(data_b_v4[b4 +  8u]);
+                            const vec4 by2 = vec4(data_b_v4[b4 + 16u]), by3 = vec4(data_b_v4[b4 + 24u]);
+                            const vec4 by4 = vec4(data_b_v4[b4 + 32u]), by5 = vec4(data_b_v4[b4 + 40u]);
+                            const vec4 by6 = vec4(data_b_v4[b4 + 48u]), by7 = vec4(data_b_v4[b4 + 56u]);
+                            const FLOAT_TYPE sy0 = (FLOAT_TYPE(by0.x) + FLOAT_TYPE(by0.y)) + (FLOAT_TYPE(by0.z) + FLOAT_TYPE(by0.w));
+                            const FLOAT_TYPE sy1 = (FLOAT_TYPE(by1.x) + FLOAT_TYPE(by1.y)) + (FLOAT_TYPE(by1.z) + FLOAT_TYPE(by1.w));
+                            const FLOAT_TYPE sy2 = (FLOAT_TYPE(by2.x) + FLOAT_TYPE(by2.y)) + (FLOAT_TYPE(by2.z) + FLOAT_TYPE(by2.w));
+                            const FLOAT_TYPE sy3 = (FLOAT_TYPE(by3.x) + FLOAT_TYPE(by3.y)) + (FLOAT_TYPE(by3.z) + FLOAT_TYPE(by3.w));
+                            const FLOAT_TYPE sy4 = (FLOAT_TYPE(by4.x) + FLOAT_TYPE(by4.y)) + (FLOAT_TYPE(by4.z) + FLOAT_TYPE(by4.w));
+                            const FLOAT_TYPE sy5 = (FLOAT_TYPE(by5.x) + FLOAT_TYPE(by5.y)) + (FLOAT_TYPE(by5.z) + FLOAT_TYPE(by5.w));
+                            const FLOAT_TYPE sy6 = (FLOAT_TYPE(by6.x) + FLOAT_TYPE(by6.y)) + (FLOAT_TYPE(by6.z) + FLOAT_TYPE(by6.w));
+                            const FLOAT_TYPE sy7 = (FLOAT_TYPE(by7.x) + FLOAT_TYPE(by7.y)) + (FLOAT_TYPE(by7.z) + FLOAT_TYPE(by7.w));
+                            const FLOAT_TYPE d0 = dot(by0, q0_lo) * sc03.x + dot(by1, q0_hi) * sc03.y;
+                            const FLOAT_TYPE d1 = dot(by2, q1_lo) * sc03.z + dot(by3, q1_hi) * sc03.w;
+                            const FLOAT_TYPE d2 = dot(by4, q2_lo) * sc47.x + dot(by5, q2_hi) * sc47.y;
+                            const FLOAT_TYPE d3 = dot(by6, q3_lo) * sc47.z + dot(by7, q3_hi) * sc47.w;
+                            const FLOAT_TYPE sm = (sy0 * m03.x + sy1 * m03.y) + (sy2 * m03.z + sy3 * m03.w) +
+                                                  (sy4 * m47.x + sy5 * m47.y) + (sy6 * m47.z + sy7 * m47.w);
+                            temp[j][n] = fma(dm.x, (d0 + d1) + (d2 + d3), fma(-dm.y, sm, temp[j][n]));
+                        }
+                    }
+                    if (GEN_GLU == 3) {
+                        const uvec4 hdr = data_a2_u4[sb_u4 + REPACK_HDR_OFF_U4];
+                        const vec2 dm = unpackHalf2x16(hdr.x);
+                        const vec4 sc03 = vec4(unpack8(hdr.y & 0x3F3F3F3Fu));
+                        const vec4 m03  = vec4(unpack8(hdr.z & 0x3F3F3F3Fu));
+                        const vec4 sc47 = vec4(unpack8((hdr.w & 0x0F0F0F0Fu) | ((hdr.y >> 2u) & 0x30303030u)));
+                        const vec4 m47  = vec4(unpack8(((hdr.w >> 4u) & 0x0F0F0F0Fu) | ((hdr.z >> 2u) & 0x30303030u)));
+                        const uvec4 q   = data_a2_u4[sb_u4 + REPACK_QS_OFF_U4 + itid8];
+                        const vec4 q0_lo = repack_magic_u4(q.x), q0_hi = repack_magic_u4(q.x >> 4u);
+                        const vec4 q1_lo = repack_magic_u4(q.y), q1_hi = repack_magic_u4(q.y >> 4u);
+                        const vec4 q2_lo = repack_magic_u4(q.z), q2_hi = repack_magic_u4(q.z >> 4u);
+                        const vec4 q3_lo = repack_magic_u4(q.w), q3_hi = repack_magic_u4(q.w >> 4u);
+                        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                            const uint b4 = (j * p.batch_stride_b + b_offset + y_idx) >> 2u;
+                            const vec4 by0 = vec4(data_b_v4[b4      ]), by1 = vec4(data_b_v4[b4 +  8u]);
+                            const vec4 by2 = vec4(data_b_v4[b4 + 16u]), by3 = vec4(data_b_v4[b4 + 24u]);
+                            const vec4 by4 = vec4(data_b_v4[b4 + 32u]), by5 = vec4(data_b_v4[b4 + 40u]);
+                            const vec4 by6 = vec4(data_b_v4[b4 + 48u]), by7 = vec4(data_b_v4[b4 + 56u]);
+                            const FLOAT_TYPE sy0 = (FLOAT_TYPE(by0.x) + FLOAT_TYPE(by0.y)) + (FLOAT_TYPE(by0.z) + FLOAT_TYPE(by0.w));
+                            const FLOAT_TYPE sy1 = (FLOAT_TYPE(by1.x) + FLOAT_TYPE(by1.y)) + (FLOAT_TYPE(by1.z) + FLOAT_TYPE(by1.w));
+                            const FLOAT_TYPE sy2 = (FLOAT_TYPE(by2.x) + FLOAT_TYPE(by2.y)) + (FLOAT_TYPE(by2.z) + FLOAT_TYPE(by2.w));
+                            const FLOAT_TYPE sy3 = (FLOAT_TYPE(by3.x) + FLOAT_TYPE(by3.y)) + (FLOAT_TYPE(by3.z) + FLOAT_TYPE(by3.w));
+                            const FLOAT_TYPE sy4 = (FLOAT_TYPE(by4.x) + FLOAT_TYPE(by4.y)) + (FLOAT_TYPE(by4.z) + FLOAT_TYPE(by4.w));
+                            const FLOAT_TYPE sy5 = (FLOAT_TYPE(by5.x) + FLOAT_TYPE(by5.y)) + (FLOAT_TYPE(by5.z) + FLOAT_TYPE(by5.w));
+                            const FLOAT_TYPE sy6 = (FLOAT_TYPE(by6.x) + FLOAT_TYPE(by6.y)) + (FLOAT_TYPE(by6.z) + FLOAT_TYPE(by6.w));
+                            const FLOAT_TYPE sy7 = (FLOAT_TYPE(by7.x) + FLOAT_TYPE(by7.y)) + (FLOAT_TYPE(by7.z) + FLOAT_TYPE(by7.w));
+                            const FLOAT_TYPE d0 = dot(by0, q0_lo) * sc03.x + dot(by1, q0_hi) * sc03.y;
+                            const FLOAT_TYPE d1 = dot(by2, q1_lo) * sc03.z + dot(by3, q1_hi) * sc03.w;
+                            const FLOAT_TYPE d2 = dot(by4, q2_lo) * sc47.x + dot(by5, q2_hi) * sc47.y;
+                            const FLOAT_TYPE d3 = dot(by6, q3_lo) * sc47.z + dot(by7, q3_hi) * sc47.w;
+                            const FLOAT_TYPE sm = (sy0 * m03.x + sy1 * m03.y) + (sy2 * m03.z + sy3 * m03.w) +
+                                                  (sy4 * m47.x + sy5 * m47.y) + (sy6 * m47.z + sy7 * m47.w);
+                            temp2[j][n] = fma(dm.x, (d0 + d1) + (d2 + d3), fma(-dm.y, sm, temp2[j][n]));
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        const uint it_size16 = gl_WorkGroupSize.x >> 4u;
+        const uint itid16 = tid & 15u;
+        const uint ix16 = tid >> 4u;
+        const uint itid8 = itid16 & 7u;
+        const uint half16 = itid16 >> 3u;
+        for (uint i = ix16; i < num_blocks_per_row; i += it_size16) {
+            const uint y_idx = i * QUANT_K + 128u * half16 + 4u * itid8;
+            if (NUM_COLS <= 2) {
+                vec4 by0_a[NUM_COLS], by1_a[NUM_COLS], by2_a[NUM_COLS], by3_a[NUM_COLS];
+                FLOAT_TYPE sy0_a[NUM_COLS], sy1_a[NUM_COLS], sy2_a[NUM_COLS], sy3_a[NUM_COLS];
+                [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                    const uint b4 = (j * p.batch_stride_b + b_offset + y_idx) >> 2u;
+                    by0_a[j] = vec4(data_b_v4[b4      ]); by1_a[j] = vec4(data_b_v4[b4 +  8u]);
+                    by2_a[j] = vec4(data_b_v4[b4 + 16u]); by3_a[j] = vec4(data_b_v4[b4 + 24u]);
+                    sy0_a[j] = (FLOAT_TYPE(by0_a[j].x) + FLOAT_TYPE(by0_a[j].y)) + (FLOAT_TYPE(by0_a[j].z) + FLOAT_TYPE(by0_a[j].w));
+                    sy1_a[j] = (FLOAT_TYPE(by1_a[j].x) + FLOAT_TYPE(by1_a[j].y)) + (FLOAT_TYPE(by1_a[j].z) + FLOAT_TYPE(by1_a[j].w));
+                    sy2_a[j] = (FLOAT_TYPE(by2_a[j].x) + FLOAT_TYPE(by2_a[j].y)) + (FLOAT_TYPE(by2_a[j].z) + FLOAT_TYPE(by2_a[j].w));
+                    sy3_a[j] = (FLOAT_TYPE(by3_a[j].x) + FLOAT_TYPE(by3_a[j].y)) + (FLOAT_TYPE(by3_a[j].z) + FLOAT_TYPE(by3_a[j].w));
+                }
+                [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                    const uint rn = (n == 0 || n < eff_rows) ? n : 0;
+                    const uint sb_u4 = (a_offset + (row_base + rn) * num_blocks_per_row + i) * REPACK_Q4_K_SB_U4;
+                    const uint q_u32_base = ((sb_u4 + REPACK_QS_OFF_U4 + itid8) << 2u) + half16 * 2u;
+                    {
+                        const uvec4 hdr = use_a2 ? data_a2_u4[sb_u4 + REPACK_HDR_OFF_U4] : data_a_u4[sb_u4 + REPACK_HDR_OFF_U4];
+                        const vec2 dm = unpackHalf2x16(hdr.x);
+                        const vec4 sc_v = (half16 == 0u) ? vec4(unpack8(hdr.y & 0x3F3F3F3Fu))
+                                                         : vec4(unpack8((hdr.w & 0x0F0F0F0Fu) | ((hdr.y >> 2u) & 0x30303030u)));
+                        const vec4 m_v  = (half16 == 0u) ? vec4(unpack8(hdr.z & 0x3F3F3F3Fu))
+                                                         : vec4(unpack8(((hdr.w >> 4u) & 0x0F0F0F0Fu) | ((hdr.z >> 2u) & 0x30303030u)));
+                        const uint qa = use_a2 ? data_a2_u32[q_u32_base + 0u] : data_a_u32[q_u32_base + 0u];
+                        const uint qb = use_a2 ? data_a2_u32[q_u32_base + 1u] : data_a_u32[q_u32_base + 1u];
+                        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                            const FLOAT_TYPE d0 = dot(by0_a[j], repack_magic_u4(qa)) * sc_v.x + dot(by1_a[j], repack_magic_u4(qa >> 4u)) * sc_v.y;
+                            const FLOAT_TYPE d1 = dot(by2_a[j], repack_magic_u4(qb)) * sc_v.z + dot(by3_a[j], repack_magic_u4(qb >> 4u)) * sc_v.w;
+                            const FLOAT_TYPE sm = (sy0_a[j] * m_v.x + sy1_a[j] * m_v.y) + (sy2_a[j] * m_v.z + sy3_a[j] * m_v.w);
+                            temp[j][n] = fma(dm.x, d0 + d1, fma(-dm.y, sm, temp[j][n]));
+                        }
+                    }
+                    if (GEN_GLU == 3) {
+                        const uvec4 hdr = data_a2_u4[sb_u4 + REPACK_HDR_OFF_U4];
+                        const vec2 dm = unpackHalf2x16(hdr.x);
+                        const vec4 sc_v = (half16 == 0u) ? vec4(unpack8(hdr.y & 0x3F3F3F3Fu))
+                                                         : vec4(unpack8((hdr.w & 0x0F0F0F0Fu) | ((hdr.y >> 2u) & 0x30303030u)));
+                        const vec4 m_v  = (half16 == 0u) ? vec4(unpack8(hdr.z & 0x3F3F3F3Fu))
+                                                         : vec4(unpack8(((hdr.w >> 4u) & 0x0F0F0F0Fu) | ((hdr.z >> 2u) & 0x30303030u)));
+                        const uint qa = data_a2_u32[q_u32_base + 0u];
+                        const uint qb = data_a2_u32[q_u32_base + 1u];
+                        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                            const FLOAT_TYPE d0 = dot(by0_a[j], repack_magic_u4(qa)) * sc_v.x + dot(by1_a[j], repack_magic_u4(qa >> 4u)) * sc_v.y;
+                            const FLOAT_TYPE d1 = dot(by2_a[j], repack_magic_u4(qb)) * sc_v.z + dot(by3_a[j], repack_magic_u4(qb >> 4u)) * sc_v.w;
+                            const FLOAT_TYPE sm = (sy0_a[j] * m_v.x + sy1_a[j] * m_v.y) + (sy2_a[j] * m_v.z + sy3_a[j] * m_v.w);
+                            temp2[j][n] = fma(dm.x, d0 + d1, fma(-dm.y, sm, temp2[j][n]));
+                        }
+                    }
+                }
+            } else {
+                [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                    const uint rn = (n == 0 || n < eff_rows) ? n : 0;
+                    const uint sb_u4 = (a_offset + (row_base + rn) * num_blocks_per_row + i) * REPACK_Q4_K_SB_U4;
+                    const uint q_u32_base = ((sb_u4 + REPACK_QS_OFF_U4 + itid8) << 2u) + half16 * 2u;
+                    {
+                        const uvec4 hdr = use_a2 ? data_a2_u4[sb_u4 + REPACK_HDR_OFF_U4] : data_a_u4[sb_u4 + REPACK_HDR_OFF_U4];
+                        const vec2 dm = unpackHalf2x16(hdr.x);
+                        const vec4 sc_v = (half16 == 0u) ? vec4(unpack8(hdr.y & 0x3F3F3F3Fu))
+                                                         : vec4(unpack8((hdr.w & 0x0F0F0F0Fu) | ((hdr.y >> 2u) & 0x30303030u)));
+                        const vec4 m_v  = (half16 == 0u) ? vec4(unpack8(hdr.z & 0x3F3F3F3Fu))
+                                                         : vec4(unpack8(((hdr.w >> 4u) & 0x0F0F0F0Fu) | ((hdr.z >> 2u) & 0x30303030u)));
+                        const uint qa = use_a2 ? data_a2_u32[q_u32_base + 0u] : data_a_u32[q_u32_base + 0u];
+                        const uint qb = use_a2 ? data_a2_u32[q_u32_base + 1u] : data_a_u32[q_u32_base + 1u];
+                        const vec4 qa_lo = repack_magic_u4(qa), qa_hi = repack_magic_u4(qa >> 4u);
+                        const vec4 qb_lo = repack_magic_u4(qb), qb_hi = repack_magic_u4(qb >> 4u);
+                        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                            const uint b4 = (j * p.batch_stride_b + b_offset + y_idx) >> 2u;
+                            const vec4 by0 = vec4(data_b_v4[b4      ]), by1 = vec4(data_b_v4[b4 +  8u]);
+                            const vec4 by2 = vec4(data_b_v4[b4 + 16u]), by3 = vec4(data_b_v4[b4 + 24u]);
+                            const FLOAT_TYPE sy0 = (FLOAT_TYPE(by0.x) + FLOAT_TYPE(by0.y)) + (FLOAT_TYPE(by0.z) + FLOAT_TYPE(by0.w));
+                            const FLOAT_TYPE sy1 = (FLOAT_TYPE(by1.x) + FLOAT_TYPE(by1.y)) + (FLOAT_TYPE(by1.z) + FLOAT_TYPE(by1.w));
+                            const FLOAT_TYPE sy2 = (FLOAT_TYPE(by2.x) + FLOAT_TYPE(by2.y)) + (FLOAT_TYPE(by2.z) + FLOAT_TYPE(by2.w));
+                            const FLOAT_TYPE sy3 = (FLOAT_TYPE(by3.x) + FLOAT_TYPE(by3.y)) + (FLOAT_TYPE(by3.z) + FLOAT_TYPE(by3.w));
+                            const FLOAT_TYPE d0 = dot(by0, qa_lo) * sc_v.x + dot(by1, qa_hi) * sc_v.y;
+                            const FLOAT_TYPE d1 = dot(by2, qb_lo) * sc_v.z + dot(by3, qb_hi) * sc_v.w;
+                            const FLOAT_TYPE sm = (sy0 * m_v.x + sy1 * m_v.y) + (sy2 * m_v.z + sy3 * m_v.w);
+                            temp[j][n] = fma(dm.x, d0 + d1, fma(-dm.y, sm, temp[j][n]));
+                        }
+                    }
+                    if (GEN_GLU == 3) {
+                        const uvec4 hdr = data_a2_u4[sb_u4 + REPACK_HDR_OFF_U4];
+                        const vec2 dm = unpackHalf2x16(hdr.x);
+                        const vec4 sc_v = (half16 == 0u) ? vec4(unpack8(hdr.y & 0x3F3F3F3Fu))
+                                                         : vec4(unpack8((hdr.w & 0x0F0F0F0Fu) | ((hdr.y >> 2u) & 0x30303030u)));
+                        const vec4 m_v  = (half16 == 0u) ? vec4(unpack8(hdr.z & 0x3F3F3F3Fu))
+                                                         : vec4(unpack8(((hdr.w >> 4u) & 0x0F0F0F0Fu) | ((hdr.z >> 2u) & 0x30303030u)));
+                        const uint qa = data_a2_u32[q_u32_base + 0u];
+                        const uint qb = data_a2_u32[q_u32_base + 1u];
+                        const vec4 qa_lo = repack_magic_u4(qa), qa_hi = repack_magic_u4(qa >> 4u);
+                        const vec4 qb_lo = repack_magic_u4(qb), qb_hi = repack_magic_u4(qb >> 4u);
+                        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                            const uint b4 = (j * p.batch_stride_b + b_offset + y_idx) >> 2u;
+                            const vec4 by0 = vec4(data_b_v4[b4      ]), by1 = vec4(data_b_v4[b4 +  8u]);
+                            const vec4 by2 = vec4(data_b_v4[b4 + 16u]), by3 = vec4(data_b_v4[b4 + 24u]);
+                            const FLOAT_TYPE sy0 = (FLOAT_TYPE(by0.x) + FLOAT_TYPE(by0.y)) + (FLOAT_TYPE(by0.z) + FLOAT_TYPE(by0.w));
+                            const FLOAT_TYPE sy1 = (FLOAT_TYPE(by1.x) + FLOAT_TYPE(by1.y)) + (FLOAT_TYPE(by1.z) + FLOAT_TYPE(by1.w));
+                            const FLOAT_TYPE sy2 = (FLOAT_TYPE(by2.x) + FLOAT_TYPE(by2.y)) + (FLOAT_TYPE(by2.z) + FLOAT_TYPE(by2.w));
+                            const FLOAT_TYPE sy3 = (FLOAT_TYPE(by3.x) + FLOAT_TYPE(by3.y)) + (FLOAT_TYPE(by3.z) + FLOAT_TYPE(by3.w));
+                            const FLOAT_TYPE d0 = dot(by0, qa_lo) * sc_v.x + dot(by1, qa_hi) * sc_v.y;
+                            const FLOAT_TYPE d1 = dot(by2, qb_lo) * sc_v.z + dot(by3, qb_hi) * sc_v.w;
+                            const FLOAT_TYPE sm = (sy0 * m_v.x + sy1 * m_v.y) + (sy2 * m_v.z + sy3 * m_v.w);
+                            temp2[j][n] = fma(dm.x, d0 + d1, fma(-dm.y, sm, temp2[j][n]));
+                        }
                     }
                 }
             }

@@ -487,22 +487,28 @@ void dequant16(bool use_u, uint row_unit_base, uint ci, out MMA_FVEC4 w0, out MM
     w3 = f16vec4(fma(d, vec4(unpack8((q3 >> shift) & 0x0F0F0F0Fu)) + h3, m));
 #elif defined(DATA_A_Q4_K)
 #ifdef REPACK_PLANAR
-    const uint sb_idx  = ci >> 4u;
-    const uint tile_u4 = (row_unit_base + (sb_idx >> 2u)) * REPACK_Q4_K_TILE_U4;
-    const uint k       = sb_idx & 3u;
+    const uint sb_u4   = (row_unit_base + (ci >> 4u)) * REPACK_Q4_K_SB_U4;
     const uint il      = ci & 15u;
     const uint is      = il >> 1u;
     const uint shift   = (is & 1u) * 4u;
     const uint sub     = il >> 2u;
     const uint w_lo    = (il & 1u) << 2u;
-    const f16vec2 dm_eff = unpackFloat2x16((use_u ? u_u32.data[(tile_u4 << 2u) + k * 8u + is] : a_u32.data[(tile_u4 << 2u) + k * 8u + is]));
-    const uint q_base  = ((tile_u4 + REPACK_QS_OFF_U4 + k * 8u + w_lo) << 2u) + sub;
+    const uvec4 hdr    = use_u ? u_u4.data[sb_u4 + REPACK_HDR_OFF_U4] : a_u4.data[sb_u4 + REPACK_HDR_OFF_U4];
+    const vec2 loadd   = unpackHalf2x16(hdr.x);
+    const uint scalesoffs  = (is & 3u) * 8u;
+    const uint scidxshift1 = (is < 4u) ? scalesoffs : (scalesoffs + 2u);
+    const uint mbidxshift0 = (is < 4u) ? scalesoffs : (scalesoffs + 4u);
+    const uint sc_word     = (is < 4u) ? hdr.y : hdr.w;
+    const uint mb_word     = (is < 4u) ? hdr.z : hdr.w;
+    const uint sc          = ((sc_word >> scalesoffs) & 0xFu) | ((hdr.y >> scidxshift1) & 0x30u);
+    const uint mbyte       = ((mb_word >> mbidxshift0) & 0xFu) | ((hdr.z >> scidxshift1) & 0x30u);
+    const uint q_base  = ((sb_u4 + REPACK_QS_OFF_U4 + w_lo) << 2u) + sub;
     const uint q0 = use_u ? u_u32.data[q_base +  0u] : a_u32.data[q_base +  0u];
     const uint q1 = use_u ? u_u32.data[q_base +  4u] : a_u32.data[q_base +  4u];
     const uint q2 = use_u ? u_u32.data[q_base +  8u] : a_u32.data[q_base +  8u];
     const uint q3 = use_u ? u_u32.data[q_base + 12u] : a_u32.data[q_base + 12u];
-    const f16vec4 d = f16vec4(dm_eff.x);
-    const f16vec4 m = f16vec4(dm_eff.y);
+    const f16vec4 d = f16vec4(loadd.x * float(sc));
+    const f16vec4 m = f16vec4(-loadd.y * float(mbyte));
     w0 = fma(d, repack_magic_u4_h(q0 >> shift), m);
     w1 = fma(d, repack_magic_u4_h(q1 >> shift), m);
     w2 = fma(d, repack_magic_u4_h(q2 >> shift), m);
@@ -546,17 +552,23 @@ void dequant16(bool use_u, uint row_unit_base, uint ci, out MMA_FVEC4 w0, out MM
 #endif
 #elif defined(DATA_A_Q5_K)
 #ifdef REPACK_PLANAR
-    const uint sb_idx  = ci >> 4u;
-    const uint tile_u4 = (row_unit_base + (sb_idx >> 2u)) * REPACK_Q5_K_TILE_U4;
-    const uint k       = sb_idx & 3u;
+    const uint sb_u4   = (row_unit_base + (ci >> 4u)) * REPACK_Q5_K_SB_U4;
     const uint il      = ci & 15u;
     const uint is      = il >> 1u;
     const uint shift   = (is & 1u) * 4u;
     const uint sub     = il >> 2u;
     const uint w_lo    = (il & 1u) << 2u;
-    const f16vec2 dm_eff = unpackFloat2x16((use_u ? u_u32.data[(tile_u4 << 2u) + k * 8u + is] : a_u32.data[(tile_u4 << 2u) + k * 8u + is]));
-    const uint q_base  = ((tile_u4 + REPACK_QS_OFF_U4 + k * 8u + w_lo) << 2u) + sub;
-    const uint qh_base = (tile_u4 << 2u) + REPACK_QH_OFF_U32 + k * 8u + w_lo;
+    const uvec4 hdr    = use_u ? u_u4.data[sb_u4 + REPACK_HDR_OFF_U4] : a_u4.data[sb_u4 + REPACK_HDR_OFF_U4];
+    const vec2 loadd   = unpackHalf2x16(hdr.x);
+    const uint scalesoffs  = (is & 3u) * 8u;
+    const uint scidxshift1 = (is < 4u) ? scalesoffs : (scalesoffs + 2u);
+    const uint mbidxshift0 = (is < 4u) ? scalesoffs : (scalesoffs + 4u);
+    const uint sc_word     = (is < 4u) ? hdr.y : hdr.w;
+    const uint mb_word     = (is < 4u) ? hdr.z : hdr.w;
+    const uint sc          = ((sc_word >> scalesoffs) & 0xFu) | ((hdr.y >> scidxshift1) & 0x30u);
+    const uint mbyte       = ((mb_word >> mbidxshift0) & 0xFu) | ((hdr.z >> scidxshift1) & 0x30u);
+    const uint q_base  = ((sb_u4 + REPACK_QS_OFF_U4 + w_lo) << 2u) + sub;
+    const uint qh_base = (sb_u4 << 2u) + REPACK_Q5_K_QH_OFF_U32 + w_lo;
     const uint ql0 = use_u ? u_u32.data[q_base +  0u] : a_u32.data[q_base +  0u];
     const uint ql1 = use_u ? u_u32.data[q_base +  4u] : a_u32.data[q_base +  4u];
     const uint ql2 = use_u ? u_u32.data[q_base +  8u] : a_u32.data[q_base +  8u];
@@ -568,8 +580,8 @@ void dequant16(bool use_u, uint row_unit_base, uint ci, out MMA_FVEC4 w0, out MM
     const bool qh_left = (is <= 4u);
     const uint qh_sh   = qh_left ? (4u - is) : (is - 4u);
     const uint sh_13   = is + 4u;
-    const f16vec4 d = f16vec4(dm_eff.x);
-    const f16vec4 m = f16vec4(dm_eff.y);
+    const f16vec4 d = f16vec4(loadd.x * float(sc));
+    const f16vec4 m = f16vec4(-loadd.y * float(mbyte));
     w0 = fma(d, repack_magic_u5_h(((ql0 >> shift) & 0x000F000Fu) | ((qh_left ? (qh0 << qh_sh) : (qh0 >> qh_sh)) & 0x00100010u), ((ql0 >> (shift + 8u)) & 0x000F000Fu) | ((qh0 >> sh_13) & 0x00100010u)), m);
     w1 = fma(d, repack_magic_u5_h(((ql1 >> shift) & 0x000F000Fu) | ((qh_left ? (qh1 << qh_sh) : (qh1 >> qh_sh)) & 0x00100010u), ((ql1 >> (shift + 8u)) & 0x000F000Fu) | ((qh1 >> sh_13) & 0x00100010u)), m);
     w2 = fma(d, repack_magic_u5_h(((ql2 >> shift) & 0x000F000Fu) | ((qh_left ? (qh2 << qh_sh) : (qh2 >> qh_sh)) & 0x00100010u), ((ql2 >> (shift + 8u)) & 0x000F000Fu) | ((qh2 >> sh_13) & 0x00100010u)), m);
@@ -623,18 +635,19 @@ void dequant16(bool use_u, uint row_unit_base, uint ci, out MMA_FVEC4 w0, out MM
 #endif
 #elif defined(DATA_A_Q6_K)
 #ifdef REPACK_PLANAR
-    const uint sb_idx  = ci >> 4u;
-    const uint tile_u4 = (row_unit_base + (sb_idx >> 2u)) * REPACK_Q6_K_TILE_U4;
-    const uint k       = sb_idx & 3u;
+    const uint sb_u4   = (row_unit_base + (ci >> 4u)) * REPACK_Q6_K_SB_U4;
+    const uint sb_u32  = sb_u4 << 2u;
     const uint il      = ci & 15u;
     const uint h       = il >> 3u;
     const uint sh_n    = ((il >> 2u) & 1u) * 4u;
     const uint qhshift = ((il >> 1u) & 3u) * 2u;
     const uint q_comp  = (h << 1u) | ((il >> 1u) & 1u);
     const uint w_lo    = (il & 1u) << 2u;
-    const float16_t sc = unpackFloat2x16(use_u ? u_u32.data[(tile_u4 << 2u) + k * 8u + (il >> 1u)] : a_u32.data[(tile_u4 << 2u) + k * 8u + (il >> 1u)])[il & 1u];
-    const uint q_base  = ((tile_u4 + REPACK_QS_OFF_U4 + k * 8u + w_lo) << 2u) + q_comp;
-    const uint qh_base = (tile_u4 << 2u) + REPACK_QH_OFF_U32 + (k * 8u + w_lo) * 2u + h;
+    const float d_f    = unpackHalf2x16(use_u ? u_u32.data[sb_u32 + REPACK_Q6_K_D_OFF_U32] : a_u32.data[sb_u32 + REPACK_Q6_K_D_OFF_U32]).x;
+    const uint sc_word = use_u ? u_u32.data[sb_u32 + REPACK_Q6_K_SC_OFF_U32 + (il >> 2u)] : a_u32.data[sb_u32 + REPACK_Q6_K_SC_OFF_U32 + (il >> 2u)];
+    const float16_t sc = float16_t(d_f * float(bitfieldExtract(int(sc_word), int((il & 3u) * 8u), 8)));
+    const uint q_base  = ((sb_u4 + REPACK_Q6_K_QL_OFF_U4 + w_lo) << 2u) + q_comp;
+    const uint qh_base = sb_u32 + REPACK_Q6_K_QH_OFF_U32 + w_lo * 2u + h;
     const uint ql0 = use_u ? u_u32.data[q_base +  0u] : a_u32.data[q_base +  0u];
     const uint ql1 = use_u ? u_u32.data[q_base +  4u] : a_u32.data[q_base +  4u];
     const uint ql2 = use_u ? u_u32.data[q_base +  8u] : a_u32.data[q_base +  8u];
@@ -915,10 +928,6 @@ void main() {
 
     uint a_row_base[NT];
     bool tile_second[NT];
-#ifdef REPACK_PLANAR
-    const uint n_tiles_row  = (stride_a_u + 3u) >> 2u;
-    const uint a_batch_rows = a_batch_base / stride_a_u;
-#endif
     [[unroll]] for (uint t = 0u; t < NT; ++t) {
         const uint tile_r = sg_m0 + 8u * t;
 #ifndef MUL_MAT_ID
@@ -926,29 +935,17 @@ void main() {
             tile_second[t] = true;
             const uint m1 = p.M - p.pair_m0;
             const uint r1 = min(tile_r - p.pair_m0 + fm, m1 - 1u);
-#ifdef REPACK_PLANAR
-            a_row_base[t] = (a_batch_rows + r1) * n_tiles_row;
-#else
             a_row_base[t] = a_batch_base + r1 * stride_a_u;
-#endif
         } else if (FUSE_MODE == 2u) {
             tile_second[t] = false;
             const uint r0 = min(tile_r + fm, p.pair_m0 - 1u);
-#ifdef REPACK_PLANAR
-            a_row_base[t] = (a_batch_rows + r0) * n_tiles_row;
-#else
             a_row_base[t] = a_batch_base + r0 * stride_a_u;
-#endif
         } else
 #endif
         {
             tile_second[t] = false;
             const uint r0 = min(tile_r + fm, p.M - 1u);
-#ifdef REPACK_PLANAR
-            a_row_base[t] = (a_batch_rows + r0) * n_tiles_row;
-#else
             a_row_base[t] = a_batch_base + r0 * stride_a_u;
-#endif
         }
     }
 
