@@ -255,7 +255,10 @@ void compute_outputs(const uint first_row, const uint num_rows) {
     }
 
 #ifdef REPACK_PLANAR
-    if ((num_blocks_per_row & 3u) == 0u) {
+#ifndef REPACK_FAST_KQ
+#define REPACK_FAST_KQ GEN_FAST_KQ
+#endif
+    if (REPACK_FAST_KQ >= 2) {
         const uint it_size8 = gl_WorkGroupSize.x >> 3u;
         const uint itid8 = tid & 7u;
         const uint ix8 = tid >> 3u;
@@ -430,7 +433,14 @@ void compute_outputs(const uint first_row, const uint num_rows) {
                         const vec4 q2 = repack_magic_q6(((ql0 >> 4u) & 0x000F000Fu) | (qh & 0x00300030u),  ((ql0  >> 12u) & 0x000F000Fu) | ((qh & 0x30003000u) >> 8u));
                         const vec4 q3 = repack_magic_q6(((ql32>> 4u) & 0x000F000Fu) | ((qh & 0x00C000C0u) >> 2u), ((ql32 >> 12u) & 0x000F000Fu) | ((qh & 0xC000C000u) >> 10u));
                         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-                            temp[j][n] = fma(fma(dot(by0_a[j], q0), sc0, fma(dot(by1_a[j], q1), sc1, fma(dot(by2_a[j], q2), sc2, dot(by3_a[j], q3) * sc3))), d, temp[j][n]);
+                            FLOAT_TYPE sum[4] = {0, 0, 0, 0};
+                            [[unroll]] for (uint l = 0; l < 4; ++l) {
+                                sum[0] = fma(FLOAT_TYPE(by0_a[j][l]), q0[l], sum[0]);
+                                sum[1] = fma(FLOAT_TYPE(by1_a[j][l]), q1[l], sum[1]);
+                                sum[2] = fma(FLOAT_TYPE(by2_a[j][l]), q2[l], sum[2]);
+                                sum[3] = fma(FLOAT_TYPE(by3_a[j][l]), q3[l], sum[3]);
+                            }
+                            temp[j][n] = fma(fma(sum[0], sc0, fma(sum[1], sc1, fma(sum[2], sc2, sum[3] * sc3))), d, temp[j][n]);
                         }
                     }
                     if (GEN_GLU == 3) {
@@ -449,7 +459,14 @@ void compute_outputs(const uint first_row, const uint num_rows) {
                         const vec4 q2 = repack_magic_q6(((ql0 >> 4u) & 0x000F000Fu) | (qh & 0x00300030u),  ((ql0  >> 12u) & 0x000F000Fu) | ((qh & 0x30003000u) >> 8u));
                         const vec4 q3 = repack_magic_q6(((ql32>> 4u) & 0x000F000Fu) | ((qh & 0x00C000C0u) >> 2u), ((ql32 >> 12u) & 0x000F000Fu) | ((qh & 0xC000C000u) >> 10u));
                         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-                            temp2[j][n] = fma(fma(dot(by0_a[j], q0), sc0, fma(dot(by1_a[j], q1), sc1, fma(dot(by2_a[j], q2), sc2, dot(by3_a[j], q3) * sc3))), d, temp2[j][n]);
+                            FLOAT_TYPE sum[4] = {0, 0, 0, 0};
+                            [[unroll]] for (uint l = 0; l < 4; ++l) {
+                                sum[0] = fma(FLOAT_TYPE(by0_a[j][l]), q0[l], sum[0]);
+                                sum[1] = fma(FLOAT_TYPE(by1_a[j][l]), q1[l], sum[1]);
+                                sum[2] = fma(FLOAT_TYPE(by2_a[j][l]), q2[l], sum[2]);
+                                sum[3] = fma(FLOAT_TYPE(by3_a[j][l]), q3[l], sum[3]);
+                            }
+                            temp2[j][n] = fma(fma(sum[0], sc0, fma(sum[1], sc1, fma(sum[2], sc2, sum[3] * sc3))), d, temp2[j][n]);
                         }
                     }
                 }
@@ -478,7 +495,14 @@ void compute_outputs(const uint first_row, const uint num_rows) {
                             const uint b4 = (j * p.batch_stride_b + b_offset + y_idx) >> 2u;
                             const vec4 by0 = vec4(data_b_v4[b4      ]), by1 = vec4(data_b_v4[b4 +  8u]);
                             const vec4 by2 = vec4(data_b_v4[b4 + 16u]), by3 = vec4(data_b_v4[b4 + 24u]);
-                            temp[j][n] = fma(fma(dot(by0, q0), sc0, fma(dot(by1, q1), sc1, fma(dot(by2, q2), sc2, dot(by3, q3) * sc3))), d, temp[j][n]);
+                            FLOAT_TYPE sum[4] = {0, 0, 0, 0};
+                            [[unroll]] for (uint l = 0; l < 4; ++l) {
+                                sum[0] = fma(FLOAT_TYPE(by0[l]), q0[l], sum[0]);
+                                sum[1] = fma(FLOAT_TYPE(by1[l]), q1[l], sum[1]);
+                                sum[2] = fma(FLOAT_TYPE(by2[l]), q2[l], sum[2]);
+                                sum[3] = fma(FLOAT_TYPE(by3[l]), q3[l], sum[3]);
+                            }
+                            temp[j][n] = fma(fma(sum[0], sc0, fma(sum[1], sc1, fma(sum[2], sc2, sum[3] * sc3))), d, temp[j][n]);
                         }
                     }
                     if (GEN_GLU == 3) {
@@ -500,7 +524,14 @@ void compute_outputs(const uint first_row, const uint num_rows) {
                             const uint b4 = (j * p.batch_stride_b + b_offset + y_idx) >> 2u;
                             const vec4 by0 = vec4(data_b_v4[b4      ]), by1 = vec4(data_b_v4[b4 +  8u]);
                             const vec4 by2 = vec4(data_b_v4[b4 + 16u]), by3 = vec4(data_b_v4[b4 + 24u]);
-                            temp2[j][n] = fma(fma(dot(by0, q0), sc0, fma(dot(by1, q1), sc1, fma(dot(by2, q2), sc2, dot(by3, q3) * sc3))), d, temp2[j][n]);
+                            FLOAT_TYPE sum[4] = {0, 0, 0, 0};
+                            [[unroll]] for (uint l = 0; l < 4; ++l) {
+                                sum[0] = fma(FLOAT_TYPE(by0[l]), q0[l], sum[0]);
+                                sum[1] = fma(FLOAT_TYPE(by1[l]), q1[l], sum[1]);
+                                sum[2] = fma(FLOAT_TYPE(by2[l]), q2[l], sum[2]);
+                                sum[3] = fma(FLOAT_TYPE(by3[l]), q3[l], sum[3]);
+                            }
+                            temp2[j][n] = fma(fma(sum[0], sc0, fma(sum[1], sc1, fma(sum[2], sc2, sum[3] * sc3))), d, temp2[j][n]);
                         }
                     }
                 }

@@ -454,7 +454,10 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     }
 
 #ifdef REPACK_PLANAR
-    if ((num_blocks_per_row & 3u) == 0u) {
+#ifndef REPACK_FAST_KQ
+#define REPACK_FAST_KQ GEN_FAST_KQ
+#endif
+    if (REPACK_FAST_KQ >= 2) {
         const uint it_size8 = gl_WorkGroupSize.x >> 3u;
         const uint itid8 = tid & 7u;
         const uint ix8 = tid >> 3u;
@@ -631,67 +634,83 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
         const uint it_size16 = gl_WorkGroupSize.x >> 4u;
         const uint itid16 = tid & 15u;
         const uint ix16 = tid >> 4u;
-        const uint itid8 = itid16 & 7u;
-        const uint half16 = itid16 >> 3u;
+        const uint il = itid16 >> 2u;
+        const uint ir = itid16 & 3u;
+        const uint v_im = il >> 1u;
+        const uint v_in = il & 1u;
+        const uint q_lane = 2u * ir + v_in;
+        const uint y_offset = 64u * v_im + 4u * q_lane;
         for (uint i = ix16; i < num_blocks_per_row; i += it_size16) {
-            const uint y_idx = i * QUANT_K + 128u * half16 + 4u * itid8;
-            if (NUM_COLS <= 2) {
-                vec4 by0_a[NUM_COLS], by1_a[NUM_COLS], by2_a[NUM_COLS], by3_a[NUM_COLS];
-                FLOAT_TYPE sy0_a[NUM_COLS], sy1_a[NUM_COLS], sy2_a[NUM_COLS], sy3_a[NUM_COLS];
+            const uint y1_idx = i * QUANT_K + y_offset;
+            const uint y2_idx = y1_idx + 128u;
+            if (NUM_COLS <= 4) {
+                vec4 by10_a[NUM_COLS], by132_a[NUM_COLS], by20_a[NUM_COLS], by232_a[NUM_COLS];
+                FLOAT_TYPE sy10_a[NUM_COLS], sy132_a[NUM_COLS], sy20_a[NUM_COLS], sy232_a[NUM_COLS];
                 [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-                    const uint b4 = (j * p.batch_stride_b + b_offset + y_idx) >> 2u;
-                    by0_a[j] = vec4(data_b_v4[b4      ]); by1_a[j] = vec4(data_b_v4[b4 +  8u]);
-                    by2_a[j] = vec4(data_b_v4[b4 + 16u]); by3_a[j] = vec4(data_b_v4[b4 + 24u]);
-                    sy0_a[j] = (FLOAT_TYPE(by0_a[j].x) + FLOAT_TYPE(by0_a[j].y)) + (FLOAT_TYPE(by0_a[j].z) + FLOAT_TYPE(by0_a[j].w));
-                    sy1_a[j] = (FLOAT_TYPE(by1_a[j].x) + FLOAT_TYPE(by1_a[j].y)) + (FLOAT_TYPE(by1_a[j].z) + FLOAT_TYPE(by1_a[j].w));
-                    sy2_a[j] = (FLOAT_TYPE(by2_a[j].x) + FLOAT_TYPE(by2_a[j].y)) + (FLOAT_TYPE(by2_a[j].z) + FLOAT_TYPE(by2_a[j].w));
-                    sy3_a[j] = (FLOAT_TYPE(by3_a[j].x) + FLOAT_TYPE(by3_a[j].y)) + (FLOAT_TYPE(by3_a[j].z) + FLOAT_TYPE(by3_a[j].w));
+                    const uint b4_1 = (j * p.batch_stride_b + b_offset + y1_idx) >> 2u;
+                    const uint b4_2 = (j * p.batch_stride_b + b_offset + y2_idx) >> 2u;
+                    by10_a[j]  = vec4(data_b_v4[b4_1     ]); by132_a[j] = vec4(data_b_v4[b4_1 + 8u]);
+                    by20_a[j]  = vec4(data_b_v4[b4_2     ]); by232_a[j] = vec4(data_b_v4[b4_2 + 8u]);
+                    sy10_a[j]  = (FLOAT_TYPE(by10_a[j].x)  + FLOAT_TYPE(by10_a[j].y))  + (FLOAT_TYPE(by10_a[j].z)  + FLOAT_TYPE(by10_a[j].w));
+                    sy132_a[j] = (FLOAT_TYPE(by132_a[j].x) + FLOAT_TYPE(by132_a[j].y)) + (FLOAT_TYPE(by132_a[j].z) + FLOAT_TYPE(by132_a[j].w));
+                    sy20_a[j]  = (FLOAT_TYPE(by20_a[j].x)  + FLOAT_TYPE(by20_a[j].y))  + (FLOAT_TYPE(by20_a[j].z)  + FLOAT_TYPE(by20_a[j].w));
+                    sy232_a[j] = (FLOAT_TYPE(by232_a[j].x) + FLOAT_TYPE(by232_a[j].y)) + (FLOAT_TYPE(by232_a[j].z) + FLOAT_TYPE(by232_a[j].w));
                 }
                 [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
                     const uint rn = (n == 0 || n < eff_rows) ? n : 0;
                     const uint sb_u4  = (a_offset + (row_base + rn) * num_blocks_per_row + i) * REPACK_Q5_K_SB_U4;
                     const uint sb_u32 = sb_u4 << 2u;
-                    const uint q_u32_base = ((sb_u4 + REPACK_QS_OFF_U4 + itid8) << 2u) + half16 * 2u;
+                    const uint q_u32_base = ((sb_u4 + REPACK_QS_OFF_U4 + q_lane) << 2u) + v_im;
                     {
                         const uvec4 hdr = use_a2 ? data_a2_u4[sb_u4 + REPACK_HDR_OFF_U4] : data_a_u4[sb_u4 + REPACK_HDR_OFF_U4];
                         const vec2 dm = unpackHalf2x16(hdr.x);
-                        const vec4 sc_v = (half16 == 0u) ? vec4(unpack8(hdr.y & 0x3F3F3F3Fu))
-                                                         : vec4(unpack8((hdr.w & 0x0F0F0F0Fu) | ((hdr.y >> 2u) & 0x30303030u)));
-                        const vec4 m_v  = (half16 == 0u) ? vec4(unpack8(hdr.z & 0x3F3F3F3Fu))
-                                                         : vec4(unpack8(((hdr.w >> 4u) & 0x0F0F0F0Fu) | ((hdr.z >> 2u) & 0x30303030u)));
-                        const uint qa = use_a2 ? data_a2_u32[q_u32_base + 0u] : data_a_u32[q_u32_base + 0u];
-                        const uint qb = use_a2 ? data_a2_u32[q_u32_base + 1u] : data_a_u32[q_u32_base + 1u];
-                        const uint qh_h = (use_a2 ? data_a2_u32[sb_u32 + REPACK_Q5_K_QH_OFF_U32 + itid8] : data_a_u32[sb_u32 + REPACK_Q5_K_QH_OFF_U32 + itid8]) >> (half16 * 4u);
-                        const vec4 qa_lo = repack_magic_u5((qa         & 0x000F000Fu) | ((qh_h << 4u) & 0x00100010u), ((qa >>  8u) & 0x000F000Fu) | ((qh_h >> 4u) & 0x00100010u));
-                        const vec4 qa_hi = repack_magic_u5(((qa >> 4u) & 0x000F000Fu) | ((qh_h << 3u) & 0x00100010u), ((qa >> 12u) & 0x000F000Fu) | ((qh_h >> 5u) & 0x00100010u));
-                        const vec4 qb_lo = repack_magic_u5((qb         & 0x000F000Fu) | ((qh_h << 2u) & 0x00100010u), ((qb >>  8u) & 0x000F000Fu) | ((qh_h >> 6u) & 0x00100010u));
-                        const vec4 qb_hi = repack_magic_u5(((qb >> 4u) & 0x000F000Fu) | ((qh_h << 1u) & 0x00100010u), ((qb >> 12u) & 0x000F000Fu) | ((qh_h >> 7u) & 0x00100010u));
+                        const uint s01_u16 = (hdr.y >> (v_im * 16u)) & 0xFFFFu;
+                        const uint s45_u16 = (hdr.z >> (v_im * 16u)) & 0xFFFFu;
+                        const uint s89_u16 = (hdr.w >> (v_im * 16u)) & 0xFFFFu;
+                        const uint scale_0_4_l = (s45_u16 << 16u) | s01_u16;
+                        const uint scale_0_4_h = (scale_0_4_l & 0xC0C0C0C0u) >> 2u;
+                        const vec4 sc03 = vec4(unpack8(scale_0_4_l & 0x3F3F3F3Fu));
+                        const vec4 sc47 = vec4(unpack8((((s89_u16 << 12u) | s89_u16) & 0x0F0F0F0Fu) | scale_0_4_h));
+                        const uint qs0_u32  = use_a2 ? data_a2_u32[q_u32_base + 0u] : data_a_u32[q_u32_base + 0u];
+                        const uint qs64_u32 = use_a2 ? data_a2_u32[q_u32_base + 2u] : data_a_u32[q_u32_base + 2u];
+                        const uint qh_s     = (use_a2 ? data_a2_u32[sb_u32 + REPACK_Q5_K_QH_OFF_U32 + q_lane] : data_a_u32[sb_u32 + REPACK_Q5_K_QH_OFF_U32 + q_lane]) >> (2u * v_im);
+                        const vec4 q0_lo = repack_magic_u5((qs0_u32  & 0x000F000Fu) | ((qh_s << 4u) & 0x00100010u), ((qs0_u32  >>  8u) & 0x000F000Fu) | ((qh_s >> 4u) & 0x00100010u));
+                        const vec4 q0_hi = repack_magic_u5(((qs0_u32 >> 4u) & 0x000F000Fu) | ((qh_s << 3u) & 0x00100010u), ((qs0_u32  >> 12u) & 0x000F000Fu) | ((qh_s >> 5u) & 0x00100010u));
+                        const vec4 q2_lo = repack_magic_u5((qs64_u32 & 0x000F000Fu) | ((qh_s      ) & 0x00100010u), ((qs64_u32 >>  8u) & 0x000F000Fu) | ((qh_s >> 8u) & 0x00100010u));
+                        const vec4 q2_hi = repack_magic_u5(((qs64_u32 >> 4u) & 0x000F000Fu) | ((qh_s >> 1u) & 0x00100010u), ((qs64_u32 >> 12u) & 0x000F000Fu) | ((qh_s >> 9u) & 0x00100010u));
                         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-                            const FLOAT_TYPE d0 = dot(by0_a[j], qa_lo) * sc_v.x + dot(by1_a[j], qa_hi) * sc_v.y;
-                            const FLOAT_TYPE d1 = dot(by2_a[j], qb_lo) * sc_v.z + dot(by3_a[j], qb_hi) * sc_v.w;
-                            const FLOAT_TYPE sm = (sy0_a[j] * m_v.x + sy1_a[j] * m_v.y) + (sy2_a[j] * m_v.z + sy3_a[j] * m_v.w);
-                            temp[j][n] = fma(dm.x, d0 + d1, fma(-dm.y, sm, temp[j][n]));
+                            const FLOAT_TYPE sx = dot(by10_a[j],  q0_lo);
+                            const FLOAT_TYPE sy = dot(by132_a[j], q0_hi);
+                            const FLOAT_TYPE sz = dot(by20_a[j],  q2_lo);
+                            const FLOAT_TYPE sw = dot(by232_a[j], q2_hi);
+                            const FLOAT_TYPE smin = fma(sy10_a[j], sc03.z, fma(sy132_a[j], sc03.w, fma(sy20_a[j], sc47.z, sy232_a[j] * sc47.w)));
+                            temp[j][n] = fma(dm.x, fma(sx, sc03.x, fma(sy, sc03.y, fma(sz, sc47.x, sw * sc47.y))), fma(-dm.y, smin, temp[j][n]));
                         }
                     }
                     if (GEN_GLU == 3) {
                         const uvec4 hdr = data_a2_u4[sb_u4 + REPACK_HDR_OFF_U4];
                         const vec2 dm = unpackHalf2x16(hdr.x);
-                        const vec4 sc_v = (half16 == 0u) ? vec4(unpack8(hdr.y & 0x3F3F3F3Fu))
-                                                         : vec4(unpack8((hdr.w & 0x0F0F0F0Fu) | ((hdr.y >> 2u) & 0x30303030u)));
-                        const vec4 m_v  = (half16 == 0u) ? vec4(unpack8(hdr.z & 0x3F3F3F3Fu))
-                                                         : vec4(unpack8(((hdr.w >> 4u) & 0x0F0F0F0Fu) | ((hdr.z >> 2u) & 0x30303030u)));
-                        const uint qa = data_a2_u32[q_u32_base + 0u];
-                        const uint qb = data_a2_u32[q_u32_base + 1u];
-                        const uint qh_h = data_a2_u32[sb_u32 + REPACK_Q5_K_QH_OFF_U32 + itid8] >> (half16 * 4u);
-                        const vec4 qa_lo = repack_magic_u5((qa         & 0x000F000Fu) | ((qh_h << 4u) & 0x00100010u), ((qa >>  8u) & 0x000F000Fu) | ((qh_h >> 4u) & 0x00100010u));
-                        const vec4 qa_hi = repack_magic_u5(((qa >> 4u) & 0x000F000Fu) | ((qh_h << 3u) & 0x00100010u), ((qa >> 12u) & 0x000F000Fu) | ((qh_h >> 5u) & 0x00100010u));
-                        const vec4 qb_lo = repack_magic_u5((qb         & 0x000F000Fu) | ((qh_h << 2u) & 0x00100010u), ((qb >>  8u) & 0x000F000Fu) | ((qh_h >> 6u) & 0x00100010u));
-                        const vec4 qb_hi = repack_magic_u5(((qb >> 4u) & 0x000F000Fu) | ((qh_h << 1u) & 0x00100010u), ((qb >> 12u) & 0x000F000Fu) | ((qh_h >> 7u) & 0x00100010u));
+                        const uint s01_u16 = (hdr.y >> (v_im * 16u)) & 0xFFFFu;
+                        const uint s45_u16 = (hdr.z >> (v_im * 16u)) & 0xFFFFu;
+                        const uint s89_u16 = (hdr.w >> (v_im * 16u)) & 0xFFFFu;
+                        const uint scale_0_4_l = (s45_u16 << 16u) | s01_u16;
+                        const uint scale_0_4_h = (scale_0_4_l & 0xC0C0C0C0u) >> 2u;
+                        const vec4 sc03 = vec4(unpack8(scale_0_4_l & 0x3F3F3F3Fu));
+                        const vec4 sc47 = vec4(unpack8((((s89_u16 << 12u) | s89_u16) & 0x0F0F0F0Fu) | scale_0_4_h));
+                        const uint qs0_u32  = data_a2_u32[q_u32_base + 0u];
+                        const uint qs64_u32 = data_a2_u32[q_u32_base + 2u];
+                        const uint qh_s     = data_a2_u32[sb_u32 + REPACK_Q5_K_QH_OFF_U32 + q_lane] >> (2u * v_im);
+                        const vec4 q0_lo = repack_magic_u5((qs0_u32  & 0x000F000Fu) | ((qh_s << 4u) & 0x00100010u), ((qs0_u32  >>  8u) & 0x000F000Fu) | ((qh_s >> 4u) & 0x00100010u));
+                        const vec4 q0_hi = repack_magic_u5(((qs0_u32 >> 4u) & 0x000F000Fu) | ((qh_s << 3u) & 0x00100010u), ((qs0_u32  >> 12u) & 0x000F000Fu) | ((qh_s >> 5u) & 0x00100010u));
+                        const vec4 q2_lo = repack_magic_u5((qs64_u32 & 0x000F000Fu) | ((qh_s      ) & 0x00100010u), ((qs64_u32 >>  8u) & 0x000F000Fu) | ((qh_s >> 8u) & 0x00100010u));
+                        const vec4 q2_hi = repack_magic_u5(((qs64_u32 >> 4u) & 0x000F000Fu) | ((qh_s >> 1u) & 0x00100010u), ((qs64_u32 >> 12u) & 0x000F000Fu) | ((qh_s >> 9u) & 0x00100010u));
                         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-                            const FLOAT_TYPE d0 = dot(by0_a[j], qa_lo) * sc_v.x + dot(by1_a[j], qa_hi) * sc_v.y;
-                            const FLOAT_TYPE d1 = dot(by2_a[j], qb_lo) * sc_v.z + dot(by3_a[j], qb_hi) * sc_v.w;
-                            const FLOAT_TYPE sm = (sy0_a[j] * m_v.x + sy1_a[j] * m_v.y) + (sy2_a[j] * m_v.z + sy3_a[j] * m_v.w);
-                            temp2[j][n] = fma(dm.x, d0 + d1, fma(-dm.y, sm, temp2[j][n]));
+                            const FLOAT_TYPE sx = dot(by10_a[j],  q0_lo);
+                            const FLOAT_TYPE sy = dot(by132_a[j], q0_hi);
+                            const FLOAT_TYPE sz = dot(by20_a[j],  q2_lo);
+                            const FLOAT_TYPE sw = dot(by232_a[j], q2_hi);
+                            const FLOAT_TYPE smin = fma(sy10_a[j], sc03.z, fma(sy132_a[j], sc03.w, fma(sy20_a[j], sc47.z, sy232_a[j] * sc47.w)));
+                            temp2[j][n] = fma(dm.x, fma(sx, sc03.x, fma(sy, sc03.y, fma(sz, sc47.x, sw * sc47.y))), fma(-dm.y, smin, temp2[j][n]));
                         }
                     }
                 }
@@ -700,61 +719,73 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
                     const uint rn = (n == 0 || n < eff_rows) ? n : 0;
                     const uint sb_u4  = (a_offset + (row_base + rn) * num_blocks_per_row + i) * REPACK_Q5_K_SB_U4;
                     const uint sb_u32 = sb_u4 << 2u;
-                    const uint q_u32_base = ((sb_u4 + REPACK_QS_OFF_U4 + itid8) << 2u) + half16 * 2u;
+                    const uint q_u32_base = ((sb_u4 + REPACK_QS_OFF_U4 + q_lane) << 2u) + v_im;
                     {
                         const uvec4 hdr = use_a2 ? data_a2_u4[sb_u4 + REPACK_HDR_OFF_U4] : data_a_u4[sb_u4 + REPACK_HDR_OFF_U4];
                         const vec2 dm = unpackHalf2x16(hdr.x);
-                        const vec4 sc_v = (half16 == 0u) ? vec4(unpack8(hdr.y & 0x3F3F3F3Fu))
-                                                         : vec4(unpack8((hdr.w & 0x0F0F0F0Fu) | ((hdr.y >> 2u) & 0x30303030u)));
-                        const vec4 m_v  = (half16 == 0u) ? vec4(unpack8(hdr.z & 0x3F3F3F3Fu))
-                                                         : vec4(unpack8(((hdr.w >> 4u) & 0x0F0F0F0Fu) | ((hdr.z >> 2u) & 0x30303030u)));
-                        const uint qa = use_a2 ? data_a2_u32[q_u32_base + 0u] : data_a_u32[q_u32_base + 0u];
-                        const uint qb = use_a2 ? data_a2_u32[q_u32_base + 1u] : data_a_u32[q_u32_base + 1u];
-                        const uint qh_h = (use_a2 ? data_a2_u32[sb_u32 + REPACK_Q5_K_QH_OFF_U32 + itid8] : data_a_u32[sb_u32 + REPACK_Q5_K_QH_OFF_U32 + itid8]) >> (half16 * 4u);
-                        const vec4 qa_lo = repack_magic_u5((qa         & 0x000F000Fu) | ((qh_h << 4u) & 0x00100010u), ((qa >>  8u) & 0x000F000Fu) | ((qh_h >> 4u) & 0x00100010u));
-                        const vec4 qa_hi = repack_magic_u5(((qa >> 4u) & 0x000F000Fu) | ((qh_h << 3u) & 0x00100010u), ((qa >> 12u) & 0x000F000Fu) | ((qh_h >> 5u) & 0x00100010u));
-                        const vec4 qb_lo = repack_magic_u5((qb         & 0x000F000Fu) | ((qh_h << 2u) & 0x00100010u), ((qb >>  8u) & 0x000F000Fu) | ((qh_h >> 6u) & 0x00100010u));
-                        const vec4 qb_hi = repack_magic_u5(((qb >> 4u) & 0x000F000Fu) | ((qh_h << 1u) & 0x00100010u), ((qb >> 12u) & 0x000F000Fu) | ((qh_h >> 7u) & 0x00100010u));
+                        const uint s01_u16 = (hdr.y >> (v_im * 16u)) & 0xFFFFu;
+                        const uint s45_u16 = (hdr.z >> (v_im * 16u)) & 0xFFFFu;
+                        const uint s89_u16 = (hdr.w >> (v_im * 16u)) & 0xFFFFu;
+                        const uint scale_0_4_l = (s45_u16 << 16u) | s01_u16;
+                        const uint scale_0_4_h = (scale_0_4_l & 0xC0C0C0C0u) >> 2u;
+                        const vec4 sc03 = vec4(unpack8(scale_0_4_l & 0x3F3F3F3Fu));
+                        const vec4 sc47 = vec4(unpack8((((s89_u16 << 12u) | s89_u16) & 0x0F0F0F0Fu) | scale_0_4_h));
+                        const uint qs0_u32  = use_a2 ? data_a2_u32[q_u32_base + 0u] : data_a_u32[q_u32_base + 0u];
+                        const uint qs64_u32 = use_a2 ? data_a2_u32[q_u32_base + 2u] : data_a_u32[q_u32_base + 2u];
+                        const uint qh_s     = (use_a2 ? data_a2_u32[sb_u32 + REPACK_Q5_K_QH_OFF_U32 + q_lane] : data_a_u32[sb_u32 + REPACK_Q5_K_QH_OFF_U32 + q_lane]) >> (2u * v_im);
+                        const vec4 q0_lo = repack_magic_u5((qs0_u32  & 0x000F000Fu) | ((qh_s << 4u) & 0x00100010u), ((qs0_u32  >>  8u) & 0x000F000Fu) | ((qh_s >> 4u) & 0x00100010u));
+                        const vec4 q0_hi = repack_magic_u5(((qs0_u32 >> 4u) & 0x000F000Fu) | ((qh_s << 3u) & 0x00100010u), ((qs0_u32  >> 12u) & 0x000F000Fu) | ((qh_s >> 5u) & 0x00100010u));
+                        const vec4 q2_lo = repack_magic_u5((qs64_u32 & 0x000F000Fu) | ((qh_s      ) & 0x00100010u), ((qs64_u32 >>  8u) & 0x000F000Fu) | ((qh_s >> 8u) & 0x00100010u));
+                        const vec4 q2_hi = repack_magic_u5(((qs64_u32 >> 4u) & 0x000F000Fu) | ((qh_s >> 1u) & 0x00100010u), ((qs64_u32 >> 12u) & 0x000F000Fu) | ((qh_s >> 9u) & 0x00100010u));
                         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-                            const uint b4 = (j * p.batch_stride_b + b_offset + y_idx) >> 2u;
-                            const vec4 by0 = vec4(data_b_v4[b4      ]), by1 = vec4(data_b_v4[b4 +  8u]);
-                            const vec4 by2 = vec4(data_b_v4[b4 + 16u]), by3 = vec4(data_b_v4[b4 + 24u]);
-                            const FLOAT_TYPE sy0 = (FLOAT_TYPE(by0.x) + FLOAT_TYPE(by0.y)) + (FLOAT_TYPE(by0.z) + FLOAT_TYPE(by0.w));
-                            const FLOAT_TYPE sy1 = (FLOAT_TYPE(by1.x) + FLOAT_TYPE(by1.y)) + (FLOAT_TYPE(by1.z) + FLOAT_TYPE(by1.w));
-                            const FLOAT_TYPE sy2 = (FLOAT_TYPE(by2.x) + FLOAT_TYPE(by2.y)) + (FLOAT_TYPE(by2.z) + FLOAT_TYPE(by2.w));
-                            const FLOAT_TYPE sy3 = (FLOAT_TYPE(by3.x) + FLOAT_TYPE(by3.y)) + (FLOAT_TYPE(by3.z) + FLOAT_TYPE(by3.w));
-                            const FLOAT_TYPE d0 = dot(by0, qa_lo) * sc_v.x + dot(by1, qa_hi) * sc_v.y;
-                            const FLOAT_TYPE d1 = dot(by2, qb_lo) * sc_v.z + dot(by3, qb_hi) * sc_v.w;
-                            const FLOAT_TYPE sm = (sy0 * m_v.x + sy1 * m_v.y) + (sy2 * m_v.z + sy3 * m_v.w);
-                            temp[j][n] = fma(dm.x, d0 + d1, fma(-dm.y, sm, temp[j][n]));
+                            const uint b4_1 = (j * p.batch_stride_b + b_offset + y1_idx) >> 2u;
+                            const uint b4_2 = (j * p.batch_stride_b + b_offset + y2_idx) >> 2u;
+                            const vec4 by10  = vec4(data_b_v4[b4_1     ]), by132 = vec4(data_b_v4[b4_1 + 8u]);
+                            const vec4 by20  = vec4(data_b_v4[b4_2     ]), by232 = vec4(data_b_v4[b4_2 + 8u]);
+                            const FLOAT_TYPE sumy10  = (FLOAT_TYPE(by10.x)  + FLOAT_TYPE(by10.y))  + (FLOAT_TYPE(by10.z)  + FLOAT_TYPE(by10.w));
+                            const FLOAT_TYPE sumy132 = (FLOAT_TYPE(by132.x) + FLOAT_TYPE(by132.y)) + (FLOAT_TYPE(by132.z) + FLOAT_TYPE(by132.w));
+                            const FLOAT_TYPE sumy20  = (FLOAT_TYPE(by20.x)  + FLOAT_TYPE(by20.y))  + (FLOAT_TYPE(by20.z)  + FLOAT_TYPE(by20.w));
+                            const FLOAT_TYPE sumy232 = (FLOAT_TYPE(by232.x) + FLOAT_TYPE(by232.y)) + (FLOAT_TYPE(by232.z) + FLOAT_TYPE(by232.w));
+                            const FLOAT_TYPE sx = dot(by10,  q0_lo);
+                            const FLOAT_TYPE sy = dot(by132, q0_hi);
+                            const FLOAT_TYPE sz = dot(by20,  q2_lo);
+                            const FLOAT_TYPE sw = dot(by232, q2_hi);
+                            const FLOAT_TYPE smin = fma(sumy10, sc03.z, fma(sumy132, sc03.w, fma(sumy20, sc47.z, sumy232 * sc47.w)));
+                            temp[j][n] = fma(dm.x, fma(sx, sc03.x, fma(sy, sc03.y, fma(sz, sc47.x, sw * sc47.y))), fma(-dm.y, smin, temp[j][n]));
                         }
                     }
                     if (GEN_GLU == 3) {
                         const uvec4 hdr = data_a2_u4[sb_u4 + REPACK_HDR_OFF_U4];
                         const vec2 dm = unpackHalf2x16(hdr.x);
-                        const vec4 sc_v = (half16 == 0u) ? vec4(unpack8(hdr.y & 0x3F3F3F3Fu))
-                                                         : vec4(unpack8((hdr.w & 0x0F0F0F0Fu) | ((hdr.y >> 2u) & 0x30303030u)));
-                        const vec4 m_v  = (half16 == 0u) ? vec4(unpack8(hdr.z & 0x3F3F3F3Fu))
-                                                         : vec4(unpack8(((hdr.w >> 4u) & 0x0F0F0F0Fu) | ((hdr.z >> 2u) & 0x30303030u)));
-                        const uint qa = data_a2_u32[q_u32_base + 0u];
-                        const uint qb = data_a2_u32[q_u32_base + 1u];
-                        const uint qh_h = data_a2_u32[sb_u32 + REPACK_Q5_K_QH_OFF_U32 + itid8] >> (half16 * 4u);
-                        const vec4 qa_lo = repack_magic_u5((qa         & 0x000F000Fu) | ((qh_h << 4u) & 0x00100010u), ((qa >>  8u) & 0x000F000Fu) | ((qh_h >> 4u) & 0x00100010u));
-                        const vec4 qa_hi = repack_magic_u5(((qa >> 4u) & 0x000F000Fu) | ((qh_h << 3u) & 0x00100010u), ((qa >> 12u) & 0x000F000Fu) | ((qh_h >> 5u) & 0x00100010u));
-                        const vec4 qb_lo = repack_magic_u5((qb         & 0x000F000Fu) | ((qh_h << 2u) & 0x00100010u), ((qb >>  8u) & 0x000F000Fu) | ((qh_h >> 6u) & 0x00100010u));
-                        const vec4 qb_hi = repack_magic_u5(((qb >> 4u) & 0x000F000Fu) | ((qh_h << 1u) & 0x00100010u), ((qb >> 12u) & 0x000F000Fu) | ((qh_h >> 7u) & 0x00100010u));
+                        const uint s01_u16 = (hdr.y >> (v_im * 16u)) & 0xFFFFu;
+                        const uint s45_u16 = (hdr.z >> (v_im * 16u)) & 0xFFFFu;
+                        const uint s89_u16 = (hdr.w >> (v_im * 16u)) & 0xFFFFu;
+                        const uint scale_0_4_l = (s45_u16 << 16u) | s01_u16;
+                        const uint scale_0_4_h = (scale_0_4_l & 0xC0C0C0C0u) >> 2u;
+                        const vec4 sc03 = vec4(unpack8(scale_0_4_l & 0x3F3F3F3Fu));
+                        const vec4 sc47 = vec4(unpack8((((s89_u16 << 12u) | s89_u16) & 0x0F0F0F0Fu) | scale_0_4_h));
+                        const uint qs0_u32  = data_a2_u32[q_u32_base + 0u];
+                        const uint qs64_u32 = data_a2_u32[q_u32_base + 2u];
+                        const uint qh_s     = data_a2_u32[sb_u32 + REPACK_Q5_K_QH_OFF_U32 + q_lane] >> (2u * v_im);
+                        const vec4 q0_lo = repack_magic_u5((qs0_u32  & 0x000F000Fu) | ((qh_s << 4u) & 0x00100010u), ((qs0_u32  >>  8u) & 0x000F000Fu) | ((qh_s >> 4u) & 0x00100010u));
+                        const vec4 q0_hi = repack_magic_u5(((qs0_u32 >> 4u) & 0x000F000Fu) | ((qh_s << 3u) & 0x00100010u), ((qs0_u32  >> 12u) & 0x000F000Fu) | ((qh_s >> 5u) & 0x00100010u));
+                        const vec4 q2_lo = repack_magic_u5((qs64_u32 & 0x000F000Fu) | ((qh_s      ) & 0x00100010u), ((qs64_u32 >>  8u) & 0x000F000Fu) | ((qh_s >> 8u) & 0x00100010u));
+                        const vec4 q2_hi = repack_magic_u5(((qs64_u32 >> 4u) & 0x000F000Fu) | ((qh_s >> 1u) & 0x00100010u), ((qs64_u32 >> 12u) & 0x000F000Fu) | ((qh_s >> 9u) & 0x00100010u));
                         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-                            const uint b4 = (j * p.batch_stride_b + b_offset + y_idx) >> 2u;
-                            const vec4 by0 = vec4(data_b_v4[b4      ]), by1 = vec4(data_b_v4[b4 +  8u]);
-                            const vec4 by2 = vec4(data_b_v4[b4 + 16u]), by3 = vec4(data_b_v4[b4 + 24u]);
-                            const FLOAT_TYPE sy0 = (FLOAT_TYPE(by0.x) + FLOAT_TYPE(by0.y)) + (FLOAT_TYPE(by0.z) + FLOAT_TYPE(by0.w));
-                            const FLOAT_TYPE sy1 = (FLOAT_TYPE(by1.x) + FLOAT_TYPE(by1.y)) + (FLOAT_TYPE(by1.z) + FLOAT_TYPE(by1.w));
-                            const FLOAT_TYPE sy2 = (FLOAT_TYPE(by2.x) + FLOAT_TYPE(by2.y)) + (FLOAT_TYPE(by2.z) + FLOAT_TYPE(by2.w));
-                            const FLOAT_TYPE sy3 = (FLOAT_TYPE(by3.x) + FLOAT_TYPE(by3.y)) + (FLOAT_TYPE(by3.z) + FLOAT_TYPE(by3.w));
-                            const FLOAT_TYPE d0 = dot(by0, qa_lo) * sc_v.x + dot(by1, qa_hi) * sc_v.y;
-                            const FLOAT_TYPE d1 = dot(by2, qb_lo) * sc_v.z + dot(by3, qb_hi) * sc_v.w;
-                            const FLOAT_TYPE sm = (sy0 * m_v.x + sy1 * m_v.y) + (sy2 * m_v.z + sy3 * m_v.w);
-                            temp2[j][n] = fma(dm.x, d0 + d1, fma(-dm.y, sm, temp2[j][n]));
+                            const uint b4_1 = (j * p.batch_stride_b + b_offset + y1_idx) >> 2u;
+                            const uint b4_2 = (j * p.batch_stride_b + b_offset + y2_idx) >> 2u;
+                            const vec4 by10  = vec4(data_b_v4[b4_1     ]), by132 = vec4(data_b_v4[b4_1 + 8u]);
+                            const vec4 by20  = vec4(data_b_v4[b4_2     ]), by232 = vec4(data_b_v4[b4_2 + 8u]);
+                            const FLOAT_TYPE sumy10  = (FLOAT_TYPE(by10.x)  + FLOAT_TYPE(by10.y))  + (FLOAT_TYPE(by10.z)  + FLOAT_TYPE(by10.w));
+                            const FLOAT_TYPE sumy132 = (FLOAT_TYPE(by132.x) + FLOAT_TYPE(by132.y)) + (FLOAT_TYPE(by132.z) + FLOAT_TYPE(by132.w));
+                            const FLOAT_TYPE sumy20  = (FLOAT_TYPE(by20.x)  + FLOAT_TYPE(by20.y))  + (FLOAT_TYPE(by20.z)  + FLOAT_TYPE(by20.w));
+                            const FLOAT_TYPE sumy232 = (FLOAT_TYPE(by232.x) + FLOAT_TYPE(by232.y)) + (FLOAT_TYPE(by232.z) + FLOAT_TYPE(by232.w));
+                            const FLOAT_TYPE sx = dot(by10,  q0_lo);
+                            const FLOAT_TYPE sy = dot(by132, q0_hi);
+                            const FLOAT_TYPE sz = dot(by20,  q2_lo);
+                            const FLOAT_TYPE sw = dot(by232, q2_hi);
+                            const FLOAT_TYPE smin = fma(sumy10, sc03.z, fma(sumy132, sc03.w, fma(sumy20, sc47.z, sumy232 * sc47.w)));
+                            temp2[j][n] = fma(dm.x, fma(sx, sc03.x, fma(sy, sc03.y, fma(sz, sc47.x, sw * sc47.y))), fma(-dm.y, smin, temp2[j][n]));
                         }
                     }
                 }
