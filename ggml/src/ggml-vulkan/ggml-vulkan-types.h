@@ -879,6 +879,13 @@ struct vk_device_struct {
     vk_pipeline pipeline_mul_mv_mma_f32_f16[5][8][2];
     vk_pipeline pipeline_mul_mv_mma_id[GGML_TYPE_COUNT][7][5][2];
 
+    vk_pipeline pipeline_dequant_repack[3];
+    vk_pipeline pipeline_dequant_mul_mat_vec_repack_f32_f32[3][mul_mat_vec_max_cols_limit];
+    vk_pipeline pipeline_dequant_mul_mat_vec_repack_f16_f32[3][mul_mat_vec_max_cols_limit];
+    vk_pipeline pipeline_dequant_mul_mat_vec_id_repack_f32[3];
+    vk_pipeline pipeline_mul_mv_mma_repack[3][5][8][2];
+    vk_pipeline pipeline_mul_mv_mma_id_repack[3][7][5][2];
+
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols_limit];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
 
@@ -1087,6 +1094,8 @@ struct vk_device_struct {
     vk_buffer sync_staging;
 
     ggml_backend_buffer_type buffer_type;
+    ggml_backend_buffer_type repack_buffer_type {};
+    std::array<ggml_backend_buffer_type_t, 2> extra_bufts {};
 
     bool disable_fusion;
     std::atomic<bool> fusion_stats_enabled {false};

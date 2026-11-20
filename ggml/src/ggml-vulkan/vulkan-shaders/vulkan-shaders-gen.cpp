@@ -818,6 +818,10 @@ void process_shaders() {
         const std::string mma_def = "DATA_A_" + to_uppercase(mma_t);
         string_to_spv("mul_mv_mma_" + mma_t,    "mul_mv_mma.comp", {{"FLOAT16", "1"}, {mma_def, "1"}}, true, true, false, false);
         string_to_spv("mul_mv_mma_id_" + mma_t, "mul_mv_mma.comp", {{"FLOAT16", "1"}, {"MUL_MAT_ID", "1"}, {mma_def, "1"}}, true, true, false, false);
+        if (mma_t == "q4_k" || mma_t == "q5_k" || mma_t == "q6_k") {
+            string_to_spv("mul_mv_mma_" + mma_t + "_repack",    "mul_mv_mma.comp", {{"FLOAT16", "1"}, {mma_def, "1"}, {"REPACK_PLANAR", "1"}}, true, true, false, false);
+            string_to_spv("mul_mv_mma_id_" + mma_t + "_repack", "mul_mv_mma.comp", {{"FLOAT16", "1"}, {"MUL_MAT_ID", "1"}, {mma_def, "1"}, {"REPACK_PLANAR", "1"}}, true, true, false, false);
+        }
     }
 #endif
 
@@ -842,6 +846,10 @@ void process_shaders() {
 
         string_to_spv("mul_mat_vec_" + tname + "_f32_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
         string_to_spv("mul_mat_vec_" + tname + "_f16_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPEV2", "f16vec2"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+        if (tname == "q8_0") {
+            string_to_spv("mul_mat_vec_q8_0_f32_f32_subgroup_no_shmem_shb", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}, {"USE_SH_B", "1"}}));
+            string_to_spv("mul_mat_vec_q8_0_f16_f32_subgroup_no_shmem_shb", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPEV2", "f16vec2"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}, {"USE_SH_B", "1"}}));
+        }
 
 #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
         if (tname == "mxfp4" || tname == "nvfp4") {
@@ -860,6 +868,11 @@ void process_shaders() {
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}));
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32_subgroup", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+        if (tname == "q4_k" || tname == "q5_k" || tname == "q6_k") {
+            string_to_spv("mul_mat_vec_" + tname + "_repack_f32_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"REPACK_PLANAR", "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+            string_to_spv("mul_mat_vec_" + tname + "_repack_f16_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"REPACK_PLANAR", "1"}, {"B_TYPE", "float16_t"}, {"B_TYPEV2", "f16vec2"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+            string_to_spv("mul_mat_vec_id_" + tname + "_repack_f32_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"REPACK_PLANAR", "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+        }
 
         // mul mat vec with integer dot product
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
@@ -877,6 +890,9 @@ void process_shaders() {
         // Dequant shaders
         if (tname != "f16" && tname != "bf16") {
             string_to_spv("dequant_" + tname, "dequant_" + tname + ".comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float16_t"}}));
+        }
+        if (tname == "q4_k" || tname == "q5_k" || tname == "q6_k") {
+            string_to_spv("dequant_" + tname + "_repack", "dequant_repack.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float16_t"}}));
         }
         // Fused dequant+transpose variant for FA quant-KV (per-head-contiguous f16 scratch).
         if (tname == "q8_0") {

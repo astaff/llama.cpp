@@ -1475,13 +1475,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     // The values are unchanged, so the matrix-vector product gives the same result with half the bytes.
     bool gen_to_bf16 = false;
     {
-        static const bool gen_bf16_exact = getenv("GGML_GEN_BF16_EXACT") != nullptr && atoi(getenv("GGML_GEN_BF16_EXACT")) != 0;
+        static const bool gen_bf16_exact = getenv("GGML_GEN_BF16_EXACT") == nullptr || atoi(getenv("GGML_GEN_BF16_EXACT")) != 0;
         const std::string name = tn.str();
         auto ends_with = [&](const char * suf) {
             const size_t n = strlen(suf);
             return name.size() >= n && name.compare(name.size() - n, n, suf) == 0;
         };
-        if (gen_bf16_exact && !use_mmap && !is_lazy && !(flags & TENSOR_DUPLICATED) && t_meta.type == GGML_TYPE_F32 &&
+        if (gen_bf16_exact && !is_lazy && !(flags & TENSOR_DUPLICATED) && t_meta.type == GGML_TYPE_F32 &&
             t_meta.ne[0] % 2 == 0 &&
             (ends_with(".ffn_gate_inp.weight") || ends_with(".ffn_gate_inp_shexp.weight") ||
              ends_with(".ssm_alpha.weight") || ends_with(".ssm_beta.weight") ||
@@ -1514,6 +1514,34 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
     if (buft == nullptr) {
         return nullptr;
+    }
+
+    // Under mmap, only keep BF16 compaction when the target buffer type is NOT
+    // mmap-aliased directly from the file via buffer_from_host_ptr (e.g. Vulkan0).
+    if (gen_to_bf16 && use_mmap) {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        if (!dev) {
+            dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        }
+        bool may_mmap_alias = false;
+        if (dev) {
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(dev, &props);
+            may_mmap_alias = props.caps.buffer_from_host_ptr && (buft == ggml_backend_dev_buffer_type(dev));
+        }
+        if (may_mmap_alias) {
+            t_meta.type = GGML_TYPE_F32;
+            t_meta.nb[0] = ggml_type_size(GGML_TYPE_F32);
+            t_meta.nb[1] = ggml_row_size(GGML_TYPE_F32, t_meta.ne[0]);
+            for (int dim = 2; dim < GGML_MAX_DIMS; dim++) {
+                t_meta.nb[dim] = t_meta.ne[dim-1]*t_meta.nb[dim-1];
+            }
+            gen_to_bf16 = false;
+            buft = buft_for_tensor(&t_meta);
+            if (buft == nullptr) {
+                return nullptr;
+            }
+        }
     }
 
     ggml_context * ctx = ctx_for_buft(buft);

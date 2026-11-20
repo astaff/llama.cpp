@@ -1,0 +1,111 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+#include "dequant_head.glsl"
+#include "repack_planar.glsl"
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A_U32 { uint data_a_u32[]; };
+layout (binding = 0) readonly buffer A_U4  { uvec4 data_a_u4[]; };
+layout (binding = 1) writeonly buffer D { D_TYPE data_b[]; };
+
+void main() {
+    const uint n_sb = p.K >> 8u;
+    const uint n_tiles = (n_sb + 3u) >> 2u;
+#if defined(DATA_A_Q4_K)
+    const uint tile_u4 = REPACK_Q4_K_TILE_U4;
+#elif defined(DATA_A_Q5_K)
+    const uint tile_u4 = REPACK_Q5_K_TILE_U4;
+#else
+    const uint tile_u4 = REPACK_Q6_K_TILE_U4;
+#endif
+
+    [[unroll]] for (uint wgy = 0u; wgy < 256u; ++wgy) {
+        const uint ib = gl_WorkGroupID.x * 256u + wgy;
+        if (ib >= p.nel / 256u) {
+            return;
+        }
+
+        const uint row_idx = ib / n_sb;
+        const uint sb_in_row = ib - row_idx * n_sb;
+        const uint t_idx = sb_in_row >> 2u;
+        const uint k = sb_in_row & 3u;
+        const uint base_u4 = (row_idx * n_tiles + t_idx) * tile_u4;
+        const uint base_u32 = base_u4 << 2u;
+
+        const uint tid = gl_LocalInvocationID.x; // 0..31: sub_pair (0..3) * 8 + itid8 (0..7)
+        const uint sub_pair = tid >> 3u;
+        const uint itid8 = tid & 7u;
+        const uint qs_word = data_a_u32[((base_u4 + REPACK_QS_OFF_U4 + k * 8u + itid8) << 2u) + sub_pair];
+        const uint y_idx = ib * 256u + sub_pair * 64u + 4u * itid8;
+
+#if defined(DATA_A_Q4_K)
+        const f16vec2 dm_lo = unpackFloat2x16(data_a_u32[base_u32 + k * 8u + (sub_pair * 2u + 0u)]);
+        const f16vec2 dm_hi = unpackFloat2x16(data_a_u32[base_u32 + k * 8u + (sub_pair * 2u + 1u)]);
+        const f16vec4 q_lo = repack_magic_u4_h(qs_word);
+        const f16vec4 q_hi = repack_magic_u4_h(qs_word >> 4u);
+        const f16vec4 r_lo = fma(f16vec4(dm_lo.x), q_lo, f16vec4(dm_lo.y));
+        const f16vec4 r_hi = fma(f16vec4(dm_hi.x), q_hi, f16vec4(dm_hi.y));
+        data_b[y_idx +  0u] = D_TYPE(r_lo.x); data_b[y_idx +  1u] = D_TYPE(r_lo.y);
+        data_b[y_idx +  2u] = D_TYPE(r_lo.z); data_b[y_idx +  3u] = D_TYPE(r_lo.w);
+        data_b[y_idx + 32u] = D_TYPE(r_hi.x); data_b[y_idx + 33u] = D_TYPE(r_hi.y);
+        data_b[y_idx + 34u] = D_TYPE(r_hi.z); data_b[y_idx + 35u] = D_TYPE(r_hi.w);
+#elif defined(DATA_A_Q5_K)
+        const uint is0 = sub_pair * 2u + 0u;
+        const uint is1 = sub_pair * 2u + 1u;
+        const f16vec2 dm_lo = unpackFloat2x16(data_a_u32[base_u32 + k * 8u + is0]);
+        const f16vec2 dm_hi = unpackFloat2x16(data_a_u32[base_u32 + k * 8u + is1]);
+        const uint qh_u32 = data_a_u32[base_u32 + REPACK_QH_OFF_U32 + k * 8u + itid8];
+        const uint hb0_02 = (is0 <= 4u ? (qh_u32 << (4u - is0)) : (qh_u32 >> (is0 - 4u))) & 0x00100010u;
+        const uint hb0_13 = (qh_u32 >> (is0 + 4u)) & 0x00100010u;
+        const uint hb1_02 = (is1 <= 4u ? (qh_u32 << (4u - is1)) : (qh_u32 >> (is1 - 4u))) & 0x00100010u;
+        const uint hb1_13 = (qh_u32 >> (is1 + 4u)) & 0x00100010u;
+        const f16vec4 q_lo = repack_magic_u5_h((qs_word & 0x000F000Fu) | hb0_02, ((qs_word >> 8u) & 0x000F000Fu) | hb0_13);
+        const f16vec4 q_hi = repack_magic_u5_h(((qs_word >> 4u) & 0x000F000Fu) | hb1_02, ((qs_word >> 12u) & 0x000F000Fu) | hb1_13);
+        const f16vec4 r_lo = fma(f16vec4(dm_lo.x), q_lo, f16vec4(dm_lo.y));
+        const f16vec4 r_hi = fma(f16vec4(dm_hi.x), q_hi, f16vec4(dm_hi.y));
+        data_b[y_idx +  0u] = D_TYPE(r_lo.x); data_b[y_idx +  1u] = D_TYPE(r_lo.y);
+        data_b[y_idx +  2u] = D_TYPE(r_lo.z); data_b[y_idx +  3u] = D_TYPE(r_lo.w);
+        data_b[y_idx + 32u] = D_TYPE(r_hi.x); data_b[y_idx + 33u] = D_TYPE(r_hi.y);
+        data_b[y_idx + 34u] = D_TYPE(r_hi.z); data_b[y_idx + 35u] = D_TYPE(r_hi.w);
+#else
+        // Q6_K: sub_pair 0 -> h=0, b=0 (ql0, lo nibble, subs 0/1, 2/3 -> actually il = 0..15)
+        // Wait: in Q6_K tile_qs_u4, .x=ql[0..7], .y=ql[8..15], .z=ql[16..23], .w=ql[24..31]!
+        // Let h = sub_pair >> 1u (0 or 1), sub_b = sub_pair & 1u (0=lo nibble, 1=hi nibble):
+        // h=0 uses .x (0..31) & .y (32..63); h=1 uses .z (128..159) & .w (160..191).
+        const uint h = sub_pair >> 1u;
+        const uint sb_b = sub_pair & 1u; // 0 = lo nibble (q0/q1), 1 = hi nibble (q2/q3)
+        const uvec4 q_all = data_a_u4[base_u4 + REPACK_QS_OFF_U4 + k * 8u + itid8];
+        const uint ql_a = (h == 0u) ? q_all.x : q_all.z;
+        const uint ql_b = (h == 0u) ? q_all.y : q_all.w;
+        const uint qh   = data_a_u32[base_u32 + REPACK_QH_OFF_U32 + (k * 8u + itid8) * 2u + h];
+        const uint sh_n = sb_b * 4u;
+        const uint qh_a_02 = (sb_b == 0u) ? ((qh & 0x00030003u) << 4u) : (qh & 0x00300030u);
+        const uint qh_a_13 = (sb_b == 0u) ? ((qh & 0x03000300u) >> 4u) : ((qh & 0x30003000u) >> 8u);
+        const uint qh_b_02 = (sb_b == 0u) ? ((qh & 0x000C000Cu) << 2u) : ((qh & 0x00C000C0u) >> 2u);
+        const uint qh_b_13 = (sb_b == 0u) ? ((qh & 0x0C000C00u) >> 6u) : ((qh & 0xC000C000u) >> 10u);
+        const f16vec4 q_a = repack_magic_q6_h(((ql_a >> sh_n) & 0x000F000Fu) | qh_a_02, ((ql_a >> (sh_n + 8u)) & 0x000F000Fu) | qh_a_13);
+        const f16vec4 q_b = repack_magic_q6_h(((ql_b >> sh_n) & 0x000F000Fu) | qh_b_02, ((ql_b >> (sh_n + 8u)) & 0x000F000Fu) | qh_b_13);
+        const uint s_pair = (h * 8u + sb_b * 4u + (itid8 >> 2u));
+        // sc0 at sub s_pair+0, sc1 at sub s_pair+2 (in Q6_K, pairs in scale plane are (0,1), (2,3), ...)
+        // Actually word = h*4 + sb_b*2 + (itid8 >> 2u)? Let's verify:
+        //   scales[0]..scales[15] stored as pairs (2p, 2p+1) in word p=0..7!
+        //   For s_h = 8*h + (itid8>>2):
+        //     sb_b=0 uses scales[s_h + 0] (ql_a) and scales[s_h + 2] (ql_b)
+        //     sb_b=1 uses scales[s_h + 4] (ql_a) and scales[s_h + 6] (ql_b)
+        //   Notice s_h has bit0 = itid8>>2! And (s_h + 2*c) keeps the SAME bit0 = itid8>>2, while word idx = (s_h + 2*c) >> 1 = 4*h + 2*sb_b + c!
+        const uint sc_sel = itid8 >> 2u;
+        const float16_t sc_a = unpackFloat2x16(data_a_u32[base_u32 + k * 8u + 4u * h + 2u * sb_b + 0u])[sc_sel];
+        const float16_t sc_b = unpackFloat2x16(data_a_u32[base_u32 + k * 8u + 4u * h + 2u * sb_b + 1u])[sc_sel];
+        const f16vec4 r_a = q_a * f16vec4(sc_a);
+        const f16vec4 r_b = q_b * f16vec4(sc_b);
+        const uint y6_idx = ib * 256u + 128u * h + 64u * sb_b + 4u * itid8;
+        data_b[y6_idx +  0u] = D_TYPE(r_a.x); data_b[y6_idx +  1u] = D_TYPE(r_a.y);
+        data_b[y6_idx +  2u] = D_TYPE(r_a.z); data_b[y6_idx +  3u] = D_TYPE(r_a.w);
+        data_b[y6_idx + 32u] = D_TYPE(r_b.x); data_b[y6_idx + 33u] = D_TYPE(r_b.y);
+        data_b[y6_idx + 34u] = D_TYPE(r_b.z); data_b[y6_idx + 35u] = D_TYPE(r_b.w);
+#endif
+    }
+}

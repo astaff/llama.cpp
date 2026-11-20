@@ -133,6 +133,13 @@ layout(binding = MMA_BIND_U) readonly buffer BUF_U_IQ4XSP32 { block_iq4_xs_packe
 layout(binding = 0)          readonly buffer BUF_A_IQ4_NL { block_iq4_nl_packed16 data[]; } a_iq4_nl;
 layout(binding = MMA_BIND_U) readonly buffer BUF_U_IQ4_NL { block_iq4_nl_packed16 data[]; } u_iq4_nl;
 #endif
+#ifdef REPACK_PLANAR
+#include "repack_planar.glsl"
+layout(binding = 0)          readonly buffer BUF_A_REPACK_U32 { uint  data[]; } a_u32;
+layout(binding = 0)          readonly buffer BUF_A_REPACK_U4  { uvec4 data[]; } a_u4;
+layout(binding = MMA_BIND_U) readonly buffer BUF_U_REPACK_U32 { uint  data[]; } u_u32;
+layout(binding = MMA_BIND_U) readonly buffer BUF_U_REPACK_U4  { uvec4 data[]; } u_u4;
+#endif
 
 // B bindings (binding = 1)
 layout(binding = 1) readonly buffer BUF_B_F32   { float     data_b[];       };
@@ -479,6 +486,28 @@ void dequant16(bool use_u, uint row_unit_base, uint ci, out MMA_FVEC4 w0, out MM
     w2 = f16vec4(fma(d, vec4(unpack8((q2 >> shift) & 0x0F0F0F0Fu)) + h2, m));
     w3 = f16vec4(fma(d, vec4(unpack8((q3 >> shift) & 0x0F0F0F0Fu)) + h3, m));
 #elif defined(DATA_A_Q4_K)
+#ifdef REPACK_PLANAR
+    const uint sb_idx  = ci >> 4u;
+    const uint tile_u4 = (row_unit_base + (sb_idx >> 2u)) * REPACK_Q4_K_TILE_U4;
+    const uint k       = sb_idx & 3u;
+    const uint il      = ci & 15u;
+    const uint is      = il >> 1u;
+    const uint shift   = (is & 1u) * 4u;
+    const uint sub     = il >> 2u;
+    const uint w_lo    = (il & 1u) << 2u;
+    const f16vec2 dm_eff = unpackFloat2x16((use_u ? u_u32.data[(tile_u4 << 2u) + k * 8u + is] : a_u32.data[(tile_u4 << 2u) + k * 8u + is]));
+    const uint q_base  = ((tile_u4 + REPACK_QS_OFF_U4 + k * 8u + w_lo) << 2u) + sub;
+    const uint q0 = use_u ? u_u32.data[q_base +  0u] : a_u32.data[q_base +  0u];
+    const uint q1 = use_u ? u_u32.data[q_base +  4u] : a_u32.data[q_base +  4u];
+    const uint q2 = use_u ? u_u32.data[q_base +  8u] : a_u32.data[q_base +  8u];
+    const uint q3 = use_u ? u_u32.data[q_base + 12u] : a_u32.data[q_base + 12u];
+    const f16vec4 d = f16vec4(dm_eff.x);
+    const f16vec4 m = f16vec4(dm_eff.y);
+    w0 = fma(d, repack_magic_u4_h(q0 >> shift), m);
+    w1 = fma(d, repack_magic_u4_h(q1 >> shift), m);
+    w2 = fma(d, repack_magic_u4_h(q2 >> shift), m);
+    w3 = fma(d, repack_magic_u4_h(q3 >> shift), m);
+#else
     const uint ib    = row_unit_base + (ci >> 4u);
     const uint il    = ci & 15u;
     const uint is    = il >> 1u;
@@ -514,7 +543,38 @@ void dequant16(bool use_u, uint row_unit_base, uint ci, out MMA_FVEC4 w0, out MM
     w1 = fma(d, f16vec4(unpack8(q1 & q_mk)), m);
     w2 = fma(d, f16vec4(unpack8(q2 & q_mk)), m);
     w3 = fma(d, f16vec4(unpack8(q3 & q_mk)), m);
+#endif
 #elif defined(DATA_A_Q5_K)
+#ifdef REPACK_PLANAR
+    const uint sb_idx  = ci >> 4u;
+    const uint tile_u4 = (row_unit_base + (sb_idx >> 2u)) * REPACK_Q5_K_TILE_U4;
+    const uint k       = sb_idx & 3u;
+    const uint il      = ci & 15u;
+    const uint is      = il >> 1u;
+    const uint shift   = (is & 1u) * 4u;
+    const uint sub     = il >> 2u;
+    const uint w_lo    = (il & 1u) << 2u;
+    const f16vec2 dm_eff = unpackFloat2x16((use_u ? u_u32.data[(tile_u4 << 2u) + k * 8u + is] : a_u32.data[(tile_u4 << 2u) + k * 8u + is]));
+    const uint q_base  = ((tile_u4 + REPACK_QS_OFF_U4 + k * 8u + w_lo) << 2u) + sub;
+    const uint qh_base = (tile_u4 << 2u) + REPACK_QH_OFF_U32 + k * 8u + w_lo;
+    const uint ql0 = use_u ? u_u32.data[q_base +  0u] : a_u32.data[q_base +  0u];
+    const uint ql1 = use_u ? u_u32.data[q_base +  4u] : a_u32.data[q_base +  4u];
+    const uint ql2 = use_u ? u_u32.data[q_base +  8u] : a_u32.data[q_base +  8u];
+    const uint ql3 = use_u ? u_u32.data[q_base + 12u] : a_u32.data[q_base + 12u];
+    const uint qh0 = use_u ? u_u32.data[qh_base + 0u] : a_u32.data[qh_base + 0u];
+    const uint qh1 = use_u ? u_u32.data[qh_base + 1u] : a_u32.data[qh_base + 1u];
+    const uint qh2 = use_u ? u_u32.data[qh_base + 2u] : a_u32.data[qh_base + 2u];
+    const uint qh3 = use_u ? u_u32.data[qh_base + 3u] : a_u32.data[qh_base + 3u];
+    const bool qh_left = (is <= 4u);
+    const uint qh_sh   = qh_left ? (4u - is) : (is - 4u);
+    const uint sh_13   = is + 4u;
+    const f16vec4 d = f16vec4(dm_eff.x);
+    const f16vec4 m = f16vec4(dm_eff.y);
+    w0 = fma(d, repack_magic_u5_h(((ql0 >> shift) & 0x000F000Fu) | ((qh_left ? (qh0 << qh_sh) : (qh0 >> qh_sh)) & 0x00100010u), ((ql0 >> (shift + 8u)) & 0x000F000Fu) | ((qh0 >> sh_13) & 0x00100010u)), m);
+    w1 = fma(d, repack_magic_u5_h(((ql1 >> shift) & 0x000F000Fu) | ((qh_left ? (qh1 << qh_sh) : (qh1 >> qh_sh)) & 0x00100010u), ((ql1 >> (shift + 8u)) & 0x000F000Fu) | ((qh1 >> sh_13) & 0x00100010u)), m);
+    w2 = fma(d, repack_magic_u5_h(((ql2 >> shift) & 0x000F000Fu) | ((qh_left ? (qh2 << qh_sh) : (qh2 >> qh_sh)) & 0x00100010u), ((ql2 >> (shift + 8u)) & 0x000F000Fu) | ((qh2 >> sh_13) & 0x00100010u)), m);
+    w3 = fma(d, repack_magic_u5_h(((ql3 >> shift) & 0x000F000Fu) | ((qh_left ? (qh3 << qh_sh) : (qh3 >> qh_sh)) & 0x00100010u), ((ql3 >> (shift + 8u)) & 0x000F000Fu) | ((qh3 >> sh_13) & 0x00100010u)), m);
+#else
     const uint ib     = row_unit_base + (ci >> 4u);
     const uint il     = ci & 15u;
     const uint is     = il >> 1u;
@@ -560,7 +620,35 @@ void dequant16(bool use_u, uint row_unit_base, uint ci, out MMA_FVEC4 w0, out MM
     w1 = fma(d, f16vec4(unpack8(((ql1 >> shift) & 0x0F0F0F0Fu) | qhb1)), m);
     w2 = fma(d, f16vec4(unpack8(((ql2 >> shift) & 0x0F0F0F0Fu) | qhb2)), m);
     w3 = fma(d, f16vec4(unpack8(((ql3 >> shift) & 0x0F0F0F0Fu) | qhb3)), m);
+#endif
 #elif defined(DATA_A_Q6_K)
+#ifdef REPACK_PLANAR
+    const uint sb_idx  = ci >> 4u;
+    const uint tile_u4 = (row_unit_base + (sb_idx >> 2u)) * REPACK_Q6_K_TILE_U4;
+    const uint k       = sb_idx & 3u;
+    const uint il      = ci & 15u;
+    const uint h       = il >> 3u;
+    const uint sh_n    = ((il >> 2u) & 1u) * 4u;
+    const uint qhshift = ((il >> 1u) & 3u) * 2u;
+    const uint q_comp  = (h << 1u) | ((il >> 1u) & 1u);
+    const uint w_lo    = (il & 1u) << 2u;
+    const float16_t sc = unpackFloat2x16(use_u ? u_u32.data[(tile_u4 << 2u) + k * 8u + (il >> 1u)] : a_u32.data[(tile_u4 << 2u) + k * 8u + (il >> 1u)])[il & 1u];
+    const uint q_base  = ((tile_u4 + REPACK_QS_OFF_U4 + k * 8u + w_lo) << 2u) + q_comp;
+    const uint qh_base = (tile_u4 << 2u) + REPACK_QH_OFF_U32 + (k * 8u + w_lo) * 2u + h;
+    const uint ql0 = use_u ? u_u32.data[q_base +  0u] : a_u32.data[q_base +  0u];
+    const uint ql1 = use_u ? u_u32.data[q_base +  4u] : a_u32.data[q_base +  4u];
+    const uint ql2 = use_u ? u_u32.data[q_base +  8u] : a_u32.data[q_base +  8u];
+    const uint ql3 = use_u ? u_u32.data[q_base + 12u] : a_u32.data[q_base + 12u];
+    const uint qh0 = (use_u ? u_u32.data[qh_base + 0u] : a_u32.data[qh_base + 0u]) >> qhshift;
+    const uint qh1 = (use_u ? u_u32.data[qh_base + 2u] : a_u32.data[qh_base + 2u]) >> qhshift;
+    const uint qh2 = (use_u ? u_u32.data[qh_base + 4u] : a_u32.data[qh_base + 4u]) >> qhshift;
+    const uint qh3 = (use_u ? u_u32.data[qh_base + 6u] : a_u32.data[qh_base + 6u]) >> qhshift;
+    const f16vec4 dv = f16vec4(sc);
+    w0 = repack_magic_q6_h(((ql0 >> sh_n) & 0x000F000Fu) | ((qh0 & 0x00030003u) << 4u), ((ql0 >> (sh_n + 8u)) & 0x000F000Fu) | ((qh0 >> 4u) & 0x00300030u)) * dv;
+    w1 = repack_magic_q6_h(((ql1 >> sh_n) & 0x000F000Fu) | ((qh1 & 0x00030003u) << 4u), ((ql1 >> (sh_n + 8u)) & 0x000F000Fu) | ((qh1 >> 4u) & 0x00300030u)) * dv;
+    w2 = repack_magic_q6_h(((ql2 >> sh_n) & 0x000F000Fu) | ((qh2 & 0x00030003u) << 4u), ((ql2 >> (sh_n + 8u)) & 0x000F000Fu) | ((qh2 >> 4u) & 0x00300030u)) * dv;
+    w3 = repack_magic_q6_h(((ql3 >> sh_n) & 0x000F000Fu) | ((qh3 & 0x00030003u) << 4u), ((ql3 >> (sh_n + 8u)) & 0x000F000Fu) | ((qh3 >> 4u) & 0x00300030u)) * dv;
+#else
     const uint ib      = row_unit_base + (ci >> 4u);
     const uint il      = ci & 15u;
     const uint b       = ((il >> 2u) & 1u) * 4u;
@@ -596,6 +684,7 @@ void dequant16(bool use_u, uint row_unit_base, uint ci, out MMA_FVEC4 w0, out MM
     w1 = fma(f16vec4(unpack8(ql23 | (qh23 << 4u))), dv, mv);
     w2 = fma(f16vec4(unpack8(ql45 | (qh45 << 4u))), dv, mv);
     w3 = fma(f16vec4(unpack8(ql67 | (qh67 << 4u))), dv, mv);
+#endif
 #elif defined(DATA_A_IQ4_XS)
     const uint ib    = row_unit_base + (ci >> 4u);
     const uint il    = ci & 15u;
@@ -826,6 +915,10 @@ void main() {
 
     uint a_row_base[NT];
     bool tile_second[NT];
+#ifdef REPACK_PLANAR
+    const uint n_tiles_row  = (stride_a_u + 3u) >> 2u;
+    const uint a_batch_rows = a_batch_base / stride_a_u;
+#endif
     [[unroll]] for (uint t = 0u; t < NT; ++t) {
         const uint tile_r = sg_m0 + 8u * t;
 #ifndef MUL_MAT_ID
@@ -833,17 +926,29 @@ void main() {
             tile_second[t] = true;
             const uint m1 = p.M - p.pair_m0;
             const uint r1 = min(tile_r - p.pair_m0 + fm, m1 - 1u);
+#ifdef REPACK_PLANAR
+            a_row_base[t] = (a_batch_rows + r1) * n_tiles_row;
+#else
             a_row_base[t] = a_batch_base + r1 * stride_a_u;
+#endif
         } else if (FUSE_MODE == 2u) {
             tile_second[t] = false;
             const uint r0 = min(tile_r + fm, p.pair_m0 - 1u);
+#ifdef REPACK_PLANAR
+            a_row_base[t] = (a_batch_rows + r0) * n_tiles_row;
+#else
             a_row_base[t] = a_batch_base + r0 * stride_a_u;
+#endif
         } else
 #endif
         {
             tile_second[t] = false;
             const uint r0 = min(tile_r + fm, p.M - 1u);
+#ifdef REPACK_PLANAR
+            a_row_base[t] = (a_batch_rows + r0) * n_tiles_row;
+#else
             a_row_base[t] = a_batch_base + r0 * stride_a_u;
+#endif
         }
     }
 
@@ -915,7 +1020,7 @@ void main() {
         }                                                                                    \
     } while (false)
 
-#if defined(DATA_A_Q4_K)
+#if defined(DATA_A_Q4_K) && !defined(REPACK_PLANAR)
 #define MMA_ACCUM_KPAIRS_GEN(LOOP_ATTR, FENCE_MACRO, TARGET_MACRO, TARGET_ARR, USE_U, ROW_BASE)                          \
     do {                                                                                                                 \
         FENCE_MACRO();                                                                                                   \
@@ -966,7 +1071,7 @@ void main() {
             TARGET_MACRO(TARGET_ARR, (s_kp << 4u), w0, w1, w2, w3);                                                      \
         }                                                                                                                \
     } while (false)
-#elif defined(DATA_A_Q5_K)
+#elif defined(DATA_A_Q5_K) && !defined(REPACK_PLANAR)
 #define MMA_ACCUM_KPAIRS_GEN(LOOP_ATTR, FENCE_MACRO, TARGET_MACRO, TARGET_ARR, USE_U, ROW_BASE)                          \
     do {                                                                                                                 \
         FENCE_MACRO();                                                                                                   \
@@ -1025,7 +1130,7 @@ void main() {
             TARGET_MACRO(TARGET_ARR, (s_kp << 4u), w0, w1, w2, w3);                                                      \
         }                                                                                                                \
     } while (false)
-#elif defined(DATA_A_Q6_K)
+#elif defined(DATA_A_Q6_K) && !defined(REPACK_PLANAR)
 #define MMA_ACCUM_KPAIRS_GEN(LOOP_ATTR, FENCE_MACRO, TARGET_MACRO, TARGET_ARR, USE_U, ROW_BASE)                          \
     do {                                                                                                                 \
         FENCE_MACRO();                                                                                                   \
