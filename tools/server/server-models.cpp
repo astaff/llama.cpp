@@ -1252,7 +1252,7 @@ void server_models::load(const std::string & name, const load_options & opts) {
         if (std::getenv("GGML_VK_FORCE_BATCH_INVARIANT") == nullptr) {
             bool uses_spec = false;
             for (size_t ai = 0; ai + 1 < child_args.size(); ++ai) {
-                if (child_args[ai] == "--spec-type" && !child_args[ai + 1].empty() && child_args[ai + 1] != "none") {
+                if (child_args[ai] == "--spec-type" && child_args[ai + 1] == "draft-mtp") {
                     uses_spec = true;
                     break;
                 }
