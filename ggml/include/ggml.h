@@ -2445,6 +2445,16 @@ extern "C" {
             struct ggml_tensor * table,
             struct ggml_tensor * indices);
 
+    GGML_API bool ggml_flash_attn_ext_has_banded_rel_bias(const struct ggml_tensor * a);
+
+    // Add table[q_pos - cell_pos, head, query] for 0 <= q_pos - cell_pos < extent inside FlashAttention.
+    // pos_info is 1D I32 packing [cell_pos (n_stream*n_kv), q_pos (n_tokens), tile64_minmax (n_stream*ceil(n_kv/64)*2)].
+    GGML_API void ggml_flash_attn_ext_add_banded_rel_bias(
+            struct ggml_tensor * a,
+            struct ggml_tensor * table,
+            struct ggml_tensor * pos_info,
+            int32_t              extent);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
             struct ggml_context * ctx,

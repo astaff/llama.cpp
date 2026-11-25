@@ -32,6 +32,7 @@ const bool FLIP            = (Flags & 64) != 0;
 const bool FLIP_DIRECT     = (Flags & 128) != 0;
 const bool USE_LPT_GQA_SWIZZLE = (Flags & 256) != 0;
 const bool GQA_VROW_PACK       = (Flags & 512) != 0;
+const bool REL_BIAS_ENABLE     = (Flags & 2048) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -80,9 +81,15 @@ layout (push_constant) uniform parameter {
     uint32_t k_num;
 } p;
 
+// When REL_BIAS_ENABLE is set, ALiBi (max_bias > 0) and LOGIT_SOFTCAP are unused, so max_bias/logit_softcap
+// carry packed rel_params & rel_offsets while preserving m0/m1 for ACTIVE_SPAN_BIT / CONST_PREFIX_BIT.
+#define FA_REL_PARAMS  floatBitsToUint(p.max_bias)
+#define FA_REL_OFFSETS floatBitsToUint(p.logit_softcap)
+
 #define SINK_ENABLE_BIT (1<<24)
 #define ACTIVE_SPAN_BIT (1u<<25)
 #define CONST_PREFIX_BIT (1u<<26)
+#define SINK_2D_BIT (1u<<27)
 #define N_LOG2_MASK 0xFFFF
 
 layout (binding = 4) readonly buffer S {float data_s[];};
@@ -93,6 +100,10 @@ layout (binding = 5) writeonly buffer OV4 {D_TYPEV4 data_ov4[];};
 layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 
 layout (binding = 7) readonly buffer SP {int32_t data_sparse[];};
+
+layout (binding = 8) readonly buffer RT {float data_rel_table[];};
+
+layout (binding = 9) readonly buffer RP {int32_t data_rel_pos[];};
 
 // Use -FLT_MAX/2 rather than -inf to reduce the possibility of NaNs, e.g. when computing Mold-M.
 #define NEG_FLT_MAX_OVER_2 uintBitsToFloat(0xFEFFFFFF)
@@ -151,20 +162,36 @@ ACC_TYPE perElemOpComputeSlope(const in uint32_t r, const in uint32_t c, const i
     return ACC_TYPE(pow(base, ACC_TYPE(exph)));
 }
 
-// Load the sink value, indexed by Q's dimension 2.
-ACC_TYPE perElemOpGetSink(const in uint32_t r, const in uint32_t c, const in ACC_TYPE elem, const in uint32_t iq2)
-{
-    const uint32_t h = iq2 + (r % p.gqa_ratio);
-
-    return ACC_TYPE(data_s[h]);
-}
-
 uint32_t i, N, KV, split_k_index, Tr, start_j, end_j,
 #if defined(COOPMAT_8X8)
          j_const_min, j_const_end,
 #endif
          gqa_iq1, iq2, iq3, rk2, rk3, rv2, rv3, ik2, ik3, iv2, iv3,
          q_stride, k_stride, v_stride, m_stride, sparse_base;
+
+// Load the sink value, indexed by Q's dimension 2 (or 2D [n_head, n_tokens] when SINK_2D_BIT is set).
+ACC_TYPE perElemOpGetSink(const in uint32_t r, const in uint32_t c, const in ACC_TYPE elem, const in uint32_t iq2)
+{
+    if ((p.mask_n_head_log2 & SINK_2D_BIT) != 0u) {
+        uint32_t q_tok, h;
+        if (GQA_VROW_PACK) {
+            q_tok = r / p.gqa_ratio;
+            h     = iq2 + (r - q_tok * p.gqa_ratio);
+        } else if (p.gqa_ratio > 1u) {
+            q_tok = gqa_iq1;
+            h     = iq2 + r;
+        } else {
+            q_tok = i * Br + r;
+            h     = iq2;
+        }
+        q_tok = min(q_tok, p.ne2 - 1u);
+        h     = min(h,     p.ne1 - 1u);
+        return ACC_TYPE(data_s[(iq3 * p.ne2 + q_tok) * p.ne1 + h]);
+    }
+    const uint32_t h = iq2 + (r % p.gqa_ratio);
+
+    return ACC_TYPE(data_s[h]);
+}
 
 void init_indices()
 {

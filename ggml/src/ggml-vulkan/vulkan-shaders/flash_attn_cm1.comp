@@ -69,6 +69,8 @@ const uint32_t sfsh_elems = (Bc * sfshstride >= Br * osh_stride) ? (Bc * sfshstr
 shared ACC_TYPEV4 sfsh[sfsh_elems];
 const uint32_t need_kvsh_u = SHMEM_STAGING | (Flags & 16u) | Clamp | (HSK & 15u) | (HSV % (MatBc * num_sg));
 shared FLOAT_TYPEV4 kvsh[(need_kvsh_u != 0u) ? 128u : 1u];
+shared int32_t sh_q_pos[REL_BIAS_ENABLE ? Br : 1u];
+shared int32_t sh_q_mm[REL_BIAS_ENABLE ? 2u : 1u];
 
 void main() {
     init_indices();
@@ -150,7 +152,37 @@ void main() {
             slope[tid] = cm;
         } else {
             const uint32_t slope_r = GQA_VROW_PACK ? (i * Br + tid) : tid;
-            slope[tid] = (p.max_bias > 0.0f) ? perElemOpComputeSlope(slope_r, col_tid, ACC_TYPE(0), iq2) : ACC_TYPE(1.0);
+            slope[tid] = (!REL_BIAS_ENABLE && p.max_bias > 0.0f) ? perElemOpComputeSlope(slope_r, col_tid, ACC_TYPE(0), iq2) : ACC_TYPE(1.0);
+        }
+    }
+    const uint32_t rel_t_len  = FA_REL_PARAMS & 0xFFFFu;
+    const uint32_t rel_ext    = FA_REL_PARAMS >> 16;
+    const uint32_t rel_t_off  = FA_REL_OFFSETS & 0xFFFFu;
+    const uint32_t rel_p_off  = FA_REL_OFFSETS >> 16;
+    const uint32_t rel_cp_off = rel_p_off + iq3 * KV;
+    const uint32_t rel_qp_off = rel_p_off + p.ne3 * KV + iq3 * p.ne2;
+    const uint32_t rel_tm_off = rel_p_off + p.ne3 * KV + p.ne3 * p.ne2 + iq3 * CEIL_DIV(KV, 64u) * 2u;
+    if (REL_BIAS_ENABLE && gl_SubgroupID == 0u) {
+        int32_t lmin =  1073741824;
+        int32_t lmax = -1073741824;
+        for (uint32_t r = gl_SubgroupInvocationID; r < Br; r += SubGroupSize) {
+            const uint32_t vrow = i * Br + r;
+            int32_t qp = -1073741824;
+            if (vrow < N) {
+                const uint32_t q_tok = GQA_VROW_PACK ? (vrow / p.gqa_ratio) : ((p.gqa_ratio > 1u) ? gqa_iq1 : vrow);
+                if (q_tok < p.ne2) {
+                    qp = data_rel_pos[rel_qp_off + q_tok];
+                    lmin = min(lmin, qp);
+                    lmax = max(lmax, qp);
+                }
+            }
+            sh_q_pos[r] = qp;
+        }
+        lmin = subgroupMin(lmin);
+        lmax = subgroupMax(lmax);
+        if (gl_SubgroupInvocationID == 0u) {
+            sh_q_mm[0] = lmin;
+            sh_q_mm[1] = lmax;
         }
     }
     barrier();
@@ -325,7 +357,15 @@ void main() {
             barrier();
         }
 
-        if (MASK_ENABLE && !is_const_mask_blk && mask_opt_bits != MASK_OPT_ALL_ZERO) {
+        bool tile_has_rel = false;
+        if (REL_BIAS_ENABLE) {
+            const uint32_t b64  = (j * Bc) >> 6u;
+            const int32_t  tmin = data_rel_pos[rel_tm_off + b64 * 2u + 0u];
+            const int32_t  tmax = data_rel_pos[rel_tm_off + b64 * 2u + 1u];
+            tile_has_rel = (sh_q_mm[1] >= tmin) && (sh_q_mm[0] < tmax + int32_t(rel_ext));
+        }
+        const bool need_mask_add = MASK_ENABLE && !is_const_mask_blk && mask_opt_bits != MASK_OPT_ALL_ZERO;
+        if (need_mask_add || tile_has_rel) {
             const bool nem1_bounds_check = !(p.gqa_ratio > 1u) && (p.nem1 % Br) != 0u;
             [[unroll]] for (uint32_t idx = 0u; idx < Bc * Br / 4u; idx += WorkGroupSize) {
                 const uint32_t idx0 = idx + tid;
@@ -335,37 +375,67 @@ void main() {
                     uint32_t kcol;
                     const bool kv_active = fa_kv_index(j * Bc + c, kcol);
                     if (!KV_bounds_check || j * Bc + c < KV) {
-                        ACC_TYPEV4 masks = ACC_TYPEV4(0.0);
-                        if (kv_active) {
-                            if (USE_SPARSE) {
-                                masks = ACC_TYPEV4(float(data_m[m_offset + kcol]));
-                            } else if (GQA_VROW_PACK) {
-                                const uint32_t m_b3 = (iq3 % p.nem3) * p.nem2;
-                                [[unroll]] for (uint32_t rr = 0u; rr < 4u; ++rr) {
-                                    const uint32_t vrow = i * Br + r * 4u + rr;
-                                    if (vrow < N) {
-                                        const uint32_t q_tok  = vrow / p.gqa_ratio;
-                                        const uint32_t q_head = iq2 + (vrow - q_tok * p.gqa_ratio);
-                                        if (q_tok < p.nem1) {
-                                            const uint32_t m_idx = ((m_b3 + (q_head % p.nem2)) * p.nem1 + q_tok) * KV + kcol;
-                                            masks[rr] = ACC_TYPE(data_m[m_idx]);
+                        ACC_TYPEV4 add_v = ACC_TYPEV4(0.0);
+                        if (need_mask_add) {
+                            ACC_TYPEV4 masks = ACC_TYPEV4(0.0);
+                            if (kv_active) {
+                                if (USE_SPARSE) {
+                                    masks = ACC_TYPEV4(float(data_m[m_offset + kcol]));
+                                } else if (GQA_VROW_PACK) {
+                                    const uint32_t m_b3 = (iq3 % p.nem3) * p.nem2;
+                                    [[unroll]] for (uint32_t rr = 0u; rr < 4u; ++rr) {
+                                        const uint32_t vrow = i * Br + r * 4u + rr;
+                                        if (vrow < N) {
+                                            const uint32_t q_tok  = vrow / p.gqa_ratio;
+                                            const uint32_t q_head = iq2 + (vrow - q_tok * p.gqa_ratio);
+                                            if (q_tok < p.nem1) {
+                                                const uint32_t m_idx = ((m_b3 + (q_head % p.nem2)) * p.nem1 + q_tok) * KV + kcol;
+                                                masks[rr] = ACC_TYPE(data_m[m_idx]);
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    [[unroll]] for (uint32_t rr = 0u; rr < 4u; ++rr) {
+                                        if (!nem1_bounds_check || i * Br + r * 4u + rr < p.nem1) {
+                                            masks[rr] = ACC_TYPE(data_m[m_offset + (i * Br + r * 4u + rr) * m_stride + kcol]);
                                         }
                                     }
                                 }
-                            } else {
-                                [[unroll]] for (uint32_t rr = 0u; rr < 4u; ++rr) {
-                                    if (!nem1_bounds_check || i * Br + r * 4u + rr < p.nem1) {
-                                        masks[rr] = ACC_TYPE(data_m[m_offset + (i * Br + r * 4u + rr) * m_stride + kcol]);
+                            } else if (USE_SPARSE) {
+                                masks = ACC_TYPEV4(NEG_FLT_MAX_OVER_2);
+                            }
+                            const ACC_TYPEV4 slopes = has_const_prefix
+                                ? ACC_TYPEV4(1.0)
+                                : ACC_TYPEV4(slope[r * 4u], slope[r * 4u + 1u], slope[r * 4u + 2u], slope[r * 4u + 3u]);
+                            add_v = slopes * masks;
+                        }
+                        if (tile_has_rel && kv_active) {
+                            const int32_t k_p = data_rel_pos[rel_cp_off + kcol];
+                            [[unroll]] for (uint32_t rr = 0u; rr < 4u; ++rr) {
+                                const uint32_t r_loc = r * 4u + rr;
+                                const uint32_t vrow  = i * Br + r_loc;
+                                if (vrow < N) {
+                                    uint32_t q_tok, q_head;
+                                    if (GQA_VROW_PACK) {
+                                        q_tok  = vrow / p.gqa_ratio;
+                                        q_head = iq2 + (vrow - q_tok * p.gqa_ratio);
+                                    } else if (p.gqa_ratio > 1u) {
+                                        q_tok  = gqa_iq1;
+                                        q_head = iq2 + r_loc;
+                                    } else {
+                                        q_tok  = vrow;
+                                        q_head = iq2;
+                                    }
+                                    if (q_tok < p.ne2 && q_head < p.ne1) {
+                                        const int32_t d = sh_q_pos[r_loc] - k_p;
+                                        if (d >= 0 && uint32_t(d) < rel_ext && uint32_t(d) < rel_t_len) {
+                                            add_v[rr] += ACC_TYPE(data_rel_table[rel_t_off + ((iq3 * p.ne2 + q_tok) * p.ne1 + q_head) * rel_t_len + uint32_t(d)]);
+                                        }
                                     }
                                 }
                             }
-                        } else if (USE_SPARSE) {
-                            masks = ACC_TYPEV4(NEG_FLT_MAX_OVER_2);
                         }
-                        const ACC_TYPEV4 slopes = has_const_prefix
-                            ? ACC_TYPEV4(1.0)
-                            : ACC_TYPEV4(slope[r * 4u], slope[r * 4u + 1u], slope[r * 4u + 2u], slope[r * 4u + 3u]);
-                        sfsh[c * sfshstride + r] += slopes * masks;
+                        sfsh[c * sfshstride + r] += add_v;
                     }
                 }
             }

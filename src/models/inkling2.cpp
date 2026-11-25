@@ -578,32 +578,22 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         cb(Vcur, "Vcur", il);
         cb(Rcur, "Rcur", il);
 
-        ggml_tensor * rel_pos = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
+        ggml_tensor * rel_pos      = is_swa ? inp->self_rel_pos_swa      : inp->self_rel_pos;
+        ggml_tensor * rel_pos_pack = is_swa ? inp->self_rel_pos_pack_swa : inp->self_rel_pos_pack;
 
-        const int64_t n_stream = (is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw)->ne[3];
-        const int64_t n_kv     = rel_pos->ne[0];
+        const ggml_tensor * raw_mask = is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
+        const int64_t n_stream = raw_mask->ne[3];
+        const int64_t n_kv     = raw_mask->ne[0];
 
         const int64_t n_extent = layer.attn_rel_bias->ne[1];
         const int64_t n_seq_tokens = n_tokens/n_stream;
-        const int64_t n_kv_max = std::max<int64_t>(n_kv, (is_swa ? attn->mctx->get_swa() : attn->mctx->get_base())->get_size());
-        int64_t n_rows_max = std::max({ int64_t(1), n_kq_bias_max/(n_kv_max*n_head*n_stream),
-                (n_seq_tokens + n_kq_chunk_max - 1)/n_kq_chunk_max });
-        if (n_rows_max < n_seq_tokens) {
-            const int64_t n_chunks = (n_seq_tokens + n_rows_max - 1)/n_rows_max;
-            n_rows_max = std::min(n_seq_tokens, GGML_PAD((n_seq_tokens + n_chunks - 1)/n_chunks, 64));
-        }
-        auto rows = [&](ggml_tensor * t, int d, int64_t r0, int64_t nr) {
-            int64_t ne[4] = { t->ne[0], t->ne[1], t->ne[2], t->ne[3] };
-            ne[d] = nr;
-            return ggml_cont(ctx0, ggml_view_4d(ctx0, t, ne[0], ne[1], ne[2], ne[3], t->nb[1], t->nb[2], t->nb[3], r0*t->nb[d]));
-        };
+        const bool fuse_rel      = !getenv("GGML_INKLING_NO_FUSE");
+        const bool use_banded_fa = cparams.flash_attn && fuse_rel && rel_pos_pack != nullptr && !getenv("GGML_INKLING_LEGACY_KQB");
 
         ggml_tensor * sinks_raw  = sinks;
         ggml_tensor * table      = nullptr;
-        const bool fuse_rel      = !getenv("GGML_INKLING_NO_FUSE");
         int64_t eff_rows         = n_extent;
         ggml_tensor * rel_bias_v = layer.attn_rel_bias;
-        bool chunk_table         = false;
         if (fuse_rel) {
             if (!is_swa && ubatch.pos != nullptr && ubatch.n_tokens > 0) {
                 llama_pos max_p = 0;
@@ -619,96 +609,120 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             rel_bias_v = eff_rows < n_extent
                 ? ggml_view_2d(ctx0, layer.attn_rel_bias, layer.attn_rel_bias->ne[0], eff_rows, layer.attn_rel_bias->nb[1], 0)
                 : layer.attn_rel_bias;
-            chunk_table = (n_rows_max < n_seq_tokens) &&
-                          (eff_rows * n_head * n_tokens * (int64_t)sizeof(float) > (256LL << 20));
-            if (!chunk_table) {
-                table = ggml_mul_mat(ctx0, rel_bias_v, Rcur);
-            }
+        }
+
+        if (use_banded_fa) {
+            table = ggml_mul_mat(ctx0, rel_bias_v, Rcur);
+            cur = build_attn(inp,
+                    nullptr, nullptr, nullptr,
+                    Qcur, Kcur, Vcur, nullptr, sinks_raw, 1.0f/sqrtf(n_embd_head), il, 0,
+                    table, rel_pos_pack, (int32_t) n_extent);
         } else {
-            table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
-            table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks_raw, 1, n_head, n_tokens));
-            table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
-        }
+            const int64_t n_kv_max = std::max<int64_t>(n_kv, (is_swa ? attn->mctx->get_swa() : attn->mctx->get_base())->get_size());
+            int64_t n_rows_max = std::max({ int64_t(1), n_kq_bias_max/(n_kv_max*n_head*n_stream),
+                    (n_seq_tokens + n_kq_chunk_max - 1)/n_kq_chunk_max });
+            if (n_rows_max < n_seq_tokens) {
+                const int64_t n_chunks = (n_seq_tokens + n_rows_max - 1)/n_rows_max;
+                n_rows_max = std::min(n_seq_tokens, GGML_PAD((n_seq_tokens + n_chunks - 1)/n_chunks, 64));
+            }
+            auto rows = [&](ggml_tensor * t, int d, int64_t r0, int64_t nr) {
+                int64_t ne[4] = { t->ne[0], t->ne[1], t->ne[2], t->ne[3] };
+                ne[d] = nr;
+                return ggml_cont(ctx0, ggml_view_4d(ctx0, t, ne[0], ne[1], ne[2], ne[3], t->nb[1], t->nb[2], t->nb[3], r0*t->nb[d]));
+            };
 
-        // one zero tensor per head count for the whole graph
-        ggml_tensor *& zero = zero_sinks[n_head];
-        if (!zero) {
-            zero = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
-        }
-        sinks = zero;
-
-        std::vector<ggml_tensor *> outs;
-        for (int64_t r0 = 0; r0 < n_seq_tokens; r0 += n_rows_max) {
-            const int64_t nr = std::min(n_rows_max, n_seq_tokens - r0);
-            const bool all = nr == n_seq_tokens;
-            ggml_tensor * q_c = Qcur;
-            ggml_tensor * kq_b = nullptr;
+            const bool chunk_table = fuse_rel && (n_rows_max < n_seq_tokens) &&
+                                     (eff_rows * n_head * n_tokens * (int64_t)sizeof(float) > (256LL << 20));
             if (fuse_rel) {
-                ggml_tensor *& rel_pos_dev = inp->self_rel_pos_dev[is_swa];
-                if (!rel_pos_dev) {
-                    rel_pos_dev = ggml_cont(ctx0, rel_pos);
+                if (!chunk_table) {
+                    table = ggml_mul_mat(ctx0, rel_bias_v, Rcur);
                 }
-                if (!all) {
+            } else {
+                table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
+                table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks_raw, 1, n_head, n_tokens));
+                table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
+            }
+
+            // one zero tensor per head count for the whole graph
+            ggml_tensor *& zero = zero_sinks[n_head];
+            if (!zero) {
+                zero = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+            }
+            sinks = zero;
+
+            std::vector<ggml_tensor *> outs;
+            for (int64_t r0 = 0; r0 < n_seq_tokens; r0 += n_rows_max) {
+                const int64_t nr = std::min(n_rows_max, n_seq_tokens - r0);
+                const bool all = nr == n_seq_tokens;
+                ggml_tensor * q_c = Qcur;
+                ggml_tensor * kq_b = nullptr;
+                if (fuse_rel) {
+                    ggml_tensor *& rel_pos_dev = inp->self_rel_pos_dev[is_swa];
+                    if (!rel_pos_dev) {
+                        rel_pos_dev = ggml_cont(ctx0, rel_pos);
+                    }
+                    if (!all) {
+                        q_c = ggml_reshape_3d(ctx0, rows(ggml_reshape_4d(ctx0, Qcur, n_embd_head, n_head, n_seq_tokens, n_stream), 2, r0, nr),
+                                n_embd_head, n_head, nr*n_stream);
+                    }
+                    if (chunk_table) {
+                        ggml_tensor * Rcur_c = n_stream == 1
+                            ? ggml_view_3d(ctx0, Rcur, hparams.n_relative, n_head, nr, Rcur->nb[1], Rcur->nb[2], r0 * Rcur->nb[2])
+                            : ggml_reshape_3d(ctx0, rows(ggml_reshape_4d(ctx0, Rcur, hparams.n_relative, n_head, n_seq_tokens, n_stream), 2, r0, nr),
+                                    hparams.n_relative, n_head, nr*n_stream);
+                        ggml_tensor * table_c = ggml_mul_mat(ctx0, rel_bias_v, Rcur_c);
+                        ggml_tensor * sinks_c = n_stream == 1
+                            ? ggml_view_2d(ctx0, sinks_raw, n_head, nr, sinks_raw->nb[1], r0 * sinks_raw->nb[1])
+                            : ggml_reshape_2d(ctx0, rows(ggml_reshape_4d(ctx0, sinks_raw, n_head, 1, n_seq_tokens, n_stream), 2, r0, nr),
+                                    n_head, nr*n_stream);
+                        ggml_tensor * rel_pos_c = n_stream == 1
+                            ? ggml_view_2d(ctx0, rel_pos_dev, n_kv, nr, rel_pos_dev->nb[1], r0 * rel_pos_dev->nb[1])
+                            : ggml_reshape_2d(ctx0, rows(ggml_reshape_4d(ctx0, rel_pos_dev, n_kv, 1, n_seq_tokens, n_stream), 2, r0, nr),
+                                    n_kv, nr*n_stream);
+                        kq_b = ggml_inkling_rel_gather(ctx0, table_c, sinks_c, rel_pos_c, n_kv, nr, n_head, n_stream,
+                                                       (int32_t)nr, 0, (int32_t)n_extent);
+                    } else {
+                        kq_b = ggml_inkling_rel_gather(ctx0, table, sinks_raw, rel_pos_dev, n_kv, nr, n_head, n_stream,
+                                                       (int32_t)n_seq_tokens, (int32_t)r0, (int32_t)n_extent);
+                    }
+                } else if (all) {
+                    kq_b = ggml_get_rows(ctx0, table, rel_pos);
+                    kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, nr, n_stream);
+                    kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
+                } else {
                     q_c = ggml_reshape_3d(ctx0, rows(ggml_reshape_4d(ctx0, Qcur, n_embd_head, n_head, n_seq_tokens, n_stream), 2, r0, nr),
                             n_embd_head, n_head, nr*n_stream);
+                    ggml_tensor * table_c = ggml_reshape_4d(ctx0, table, table->ne[0], table->ne[1], n_seq_tokens, n_stream);
+                    table_c = ggml_view_4d(ctx0, table_c, table_c->ne[0], table_c->ne[1], nr, n_stream,
+                            table_c->nb[1], table_c->nb[2], table_c->nb[3], r0*table_c->nb[2]);
+                    ggml_tensor *& rel_pos_dev = inp->self_rel_pos_dev[is_swa];
+                    if (!rel_pos_dev) {
+                        rel_pos_dev = ggml_cont(ctx0, rel_pos);
+                    }
+                    ggml_tensor * rel_pos_c = ggml_view_3d(ctx0, rel_pos_dev, n_kv, nr, n_stream,
+                            rel_pos_dev->nb[1], n_seq_tokens*rel_pos_dev->nb[1], r0*rel_pos_dev->nb[1]);
+                    kq_b = ggml_cont(ctx0, ggml_permute(ctx0, ggml_get_rows(ctx0, table_c, rel_pos_c), 2, 0, 1, 3));
                 }
-                if (chunk_table) {
-                    ggml_tensor * Rcur_c = n_stream == 1
-                        ? ggml_view_3d(ctx0, Rcur, hparams.n_relative, n_head, nr, Rcur->nb[1], Rcur->nb[2], r0 * Rcur->nb[2])
-                        : ggml_reshape_3d(ctx0, rows(ggml_reshape_4d(ctx0, Rcur, hparams.n_relative, n_head, n_seq_tokens, n_stream), 2, r0, nr),
-                                hparams.n_relative, n_head, nr*n_stream);
-                    ggml_tensor * table_c = ggml_mul_mat(ctx0, rel_bias_v, Rcur_c);
-                    ggml_tensor * sinks_c = n_stream == 1
-                        ? ggml_view_2d(ctx0, sinks_raw, n_head, nr, sinks_raw->nb[1], r0 * sinks_raw->nb[1])
-                        : ggml_reshape_2d(ctx0, rows(ggml_reshape_4d(ctx0, sinks_raw, n_head, 1, n_seq_tokens, n_stream), 2, r0, nr),
-                                n_head, nr*n_stream);
-                    ggml_tensor * rel_pos_c = n_stream == 1
-                        ? ggml_view_2d(ctx0, rel_pos_dev, n_kv, nr, rel_pos_dev->nb[1], r0 * rel_pos_dev->nb[1])
-                        : ggml_reshape_2d(ctx0, rows(ggml_reshape_4d(ctx0, rel_pos_dev, n_kv, 1, n_seq_tokens, n_stream), 2, r0, nr),
-                                n_kv, nr*n_stream);
-                    kq_b = ggml_inkling_rel_gather(ctx0, table_c, sinks_c, rel_pos_c, n_kv, nr, n_head, n_stream,
-                                                   (int32_t)nr, 0, (int32_t)n_extent);
-                } else {
-                    kq_b = ggml_inkling_rel_gather(ctx0, table, sinks_raw, rel_pos_dev, n_kv, nr, n_head, n_stream,
-                                                   (int32_t)n_seq_tokens, (int32_t)r0, (int32_t)n_extent);
-                }
-            } else if (all) {
-                kq_b = ggml_get_rows(ctx0, table, rel_pos);
-                kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, nr, n_stream);
-                kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
-            } else {
-                q_c = ggml_reshape_3d(ctx0, rows(ggml_reshape_4d(ctx0, Qcur, n_embd_head, n_head, n_seq_tokens, n_stream), 2, r0, nr),
-                        n_embd_head, n_head, nr*n_stream);
-                ggml_tensor * table_c = ggml_reshape_4d(ctx0, table, table->ne[0], table->ne[1], n_seq_tokens, n_stream);
-                table_c = ggml_view_4d(ctx0, table_c, table_c->ne[0], table_c->ne[1], nr, n_stream,
-                        table_c->nb[1], table_c->nb[2], table_c->nb[3], r0*table_c->nb[2]);
-                ggml_tensor *& rel_pos_dev = inp->self_rel_pos_dev[is_swa];
-                if (!rel_pos_dev) {
-                    rel_pos_dev = ggml_cont(ctx0, rel_pos);
-                }
-                ggml_tensor * rel_pos_c = ggml_view_3d(ctx0, rel_pos_dev, n_kv, nr, n_stream,
-                        rel_pos_dev->nb[1], n_seq_tokens*rel_pos_dev->nb[1], r0*rel_pos_dev->nb[1]);
-                kq_b = ggml_cont(ctx0, ggml_permute(ctx0, ggml_get_rows(ctx0, table_c, rel_pos_c), 2, 0, 1, 3));
-            }
-            cb(kq_b, "kq_b", il);
+                cb(kq_b, "kq_b", il);
 
-            // only the first chunk stores K and V
-            ggml_tensor * out = build_attn(inp,
-                    nullptr, nullptr, nullptr,
-                    q_c, r0 == 0 ? Kcur : nullptr, r0 == 0 ? Vcur : nullptr, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il, r0);
-            outs.push_back(all ? out : ggml_reshape_3d(ctx0, out, out->ne[0], nr, n_stream));
-        }
-        while (outs.size() > 1) {
-            std::vector<ggml_tensor *> next;
-            for (size_t c = 0; c + 1 < outs.size(); c += 2) {
-                next.push_back(ggml_concat(ctx0, outs[c], outs[c + 1], 1));
+                // only the first chunk stores K and V
+                ggml_tensor * out = build_attn(inp,
+                        nullptr, nullptr, nullptr,
+                        q_c, r0 == 0 ? Kcur : nullptr, r0 == 0 ? Vcur : nullptr, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il, r0);
+                outs.push_back(all ? out : ggml_reshape_3d(ctx0, out, out->ne[0], nr, n_stream));
             }
-            if (outs.size() % 2) {
-                next.push_back(outs.back());
+            while (outs.size() > 1) {
+                std::vector<ggml_tensor *> next;
+                for (size_t c = 0; c + 1 < outs.size(); c += 2) {
+                    next.push_back(ggml_concat(ctx0, outs[c], outs[c + 1], 1));
+                }
+                if (outs.size() % 2) {
+                    next.push_back(outs.back());
+                }
+                outs = std::move(next);
             }
-            outs = std::move(next);
+            cur = n_rows_max >= n_seq_tokens ? outs[0] : ggml_reshape_2d(ctx0, outs[0], outs[0]->ne[0], n_tokens);
         }
-        cur = n_rows_max >= n_seq_tokens ? outs[0] : ggml_reshape_2d(ctx0, outs[0], outs[0]->ne[0], n_tokens);
 
         cur = ggml_mul(ctx0, cur, Qgate);
         cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);

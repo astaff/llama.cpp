@@ -77,6 +77,15 @@ void main() {
     const uint32_t k_stride4 = k_stride >> 2u;
     const uint32_t v_stride4 = v_stride >> 2u;
 
+    const int32_t q_pos_val = REL_BIAS_ENABLE ? data_rel_pos[p.ne3 * KV + iq3 * p.ne2 + gqa_iq1 + (FA_REL_OFFSETS >> 16)] : 0;
+    const uint32_t rel_t_len  = FA_REL_PARAMS & 0xFFFFu;
+    const uint32_t rel_ext    = FA_REL_PARAMS >> 16;
+    const uint32_t rel_t_off  = FA_REL_OFFSETS & 0xFFFFu;
+    const uint32_t rel_p_off  = FA_REL_OFFSETS >> 16;
+    const uint32_t rel_cp_off = rel_p_off + iq3 * KV;
+    const uint32_t rel_tm_off = rel_p_off + p.ne3 * KV + p.ne3 * p.ne2 + iq3 * CEIL_DIV(KV, 64u) * 2u;
+    const uint32_t rel_tb_row = rel_t_off + ((iq3 * p.ne2 + gqa_iq1) * p.ne1 + iq2) * rel_t_len;
+
     [[dont_unroll]]
     for (uint32_t j = start_j; j < end_j; ++j) {
         const uint32_t j_col = j * 64u;
@@ -84,14 +93,23 @@ void main() {
             float sub_max = NEG_FLT_MAX_OVER_2;
             const uint32_t kc0 = j_col + lane;
             const uint32_t kc1 = kc0 + 32u;
-            if (!KV_bounds_check || kc0 < KV) {
-                [[unroll]] for (uint32_t r = 0u; r < 3u; ++r) {
-                    sub_max = max(sub_max, float(data_m[m_row_off[r] + kc0]));
+            if (p.nem2 == 1u) {
+                if (!KV_bounds_check || kc0 < KV) {
+                    sub_max = max(sub_max, float(data_m[m_row_off[0] + kc0]));
                 }
-            }
-            if (!KV_bounds_check || kc1 < KV) {
-                [[unroll]] for (uint32_t r = 0u; r < 3u; ++r) {
-                    sub_max = max(sub_max, float(data_m[m_row_off[r] + kc1]));
+                if (!KV_bounds_check || kc1 < KV) {
+                    sub_max = max(sub_max, float(data_m[m_row_off[0] + kc1]));
+                }
+            } else {
+                if (!KV_bounds_check || kc0 < KV) {
+                    [[unroll]] for (uint32_t r = 0u; r < 3u; ++r) {
+                        sub_max = max(sub_max, float(data_m[m_row_off[r] + kc0]));
+                    }
+                }
+                if (!KV_bounds_check || kc1 < KV) {
+                    [[unroll]] for (uint32_t r = 0u; r < 3u; ++r) {
+                        sub_max = max(sub_max, float(data_m[m_row_off[r] + kc1]));
+                    }
                 }
             }
             if (subgroupAll(sub_max <= NEG_FLT_MAX_OVER_2)) {
@@ -147,9 +165,36 @@ void main() {
             [[unroll]] for (uint32_t c = 0u; c < 4u; ++c) {
                 const uint32_t kcol = j_col + c * 16u + col_tid;
                 const bool ok = !KV_bounds_check || kcol < KV;
-                [[unroll]] for (uint32_t r = 0u; r < 3u; ++r) {
-                    const FLOAT_TYPE mvf = ok ? FLOAT_TYPE(data_m[m_row_off[r] + kcol]) : FLOAT_TYPE(0.0);
-                    Sf[r][c] += ACC_TYPE(mvf);
+                if (p.nem2 == 1u) {
+                    const ACC_TYPE mvf = ok ? ACC_TYPE(data_m[m_row_off[0] + kcol]) : ACC_TYPE(0.0);
+                    Sf[0][c] += mvf;
+                    Sf[1][c] += mvf;
+                    Sf[2][c] += mvf;
+                } else {
+                    [[unroll]] for (uint32_t r = 0u; r < 3u; ++r) {
+                        const FLOAT_TYPE mvf = ok ? FLOAT_TYPE(data_m[m_row_off[r] + kcol]) : FLOAT_TYPE(0.0);
+                        Sf[r][c] += ACC_TYPE(mvf);
+                    }
+                }
+            }
+        }
+
+        if (REL_BIAS_ENABLE) {
+            const uint32_t b64  = j_col >> 6u;
+            const int32_t  tmin = data_rel_pos[rel_tm_off + b64 * 2u + 0u];
+            const int32_t  tmax = data_rel_pos[rel_tm_off + b64 * 2u + 1u];
+            if (q_pos_val >= tmin && q_pos_val < tmax + int32_t(rel_ext)) {
+                [[unroll]] for (uint32_t c = 0u; c < 4u; ++c) {
+                    const uint32_t kcol = j_col + c * 16u + col_tid;
+                    if (!KV_bounds_check || kcol < KV) {
+                        const int32_t d = q_pos_val - data_rel_pos[rel_cp_off + kcol];
+                        if (d >= 0 && uint32_t(d) < rel_ext && uint32_t(d) < rel_t_len) {
+                            const uint32_t ud = uint32_t(d);
+                            Sf[0][c] += ACC_TYPE(data_rel_table[rel_tb_row + 0u * rel_t_len + ud]);
+                            Sf[1][c] += ACC_TYPE(data_rel_table[rel_tb_row + 1u * rel_t_len + ud]);
+                            Sf[2][c] += ACC_TYPE(data_rel_table[rel_tb_row + 2u * rel_t_len + ud]);
+                        }
+                    }
                 }
             }
         }

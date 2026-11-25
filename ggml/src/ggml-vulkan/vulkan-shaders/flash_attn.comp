@@ -166,7 +166,7 @@ void main() {
     }
 
     // ALiBi
-    if (p.max_bias > 0.0f) {
+    if (!REL_BIAS_ENABLE && p.max_bias > 0.0f) {
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
             slope[r] = perElemOpComputeSlope(tile_row(r), col_tid, ACC_TYPE(0), iq2);
         }
@@ -188,6 +188,31 @@ void main() {
     uint32_t mask_opt = 0;
     uint32_t mask_opt_idx = ~0;
     uint32_t mask_opt_bits = 0;
+
+    const uint32_t rel_t_len  = FA_REL_PARAMS & 0xFFFFu;
+    const uint32_t rel_ext    = FA_REL_PARAMS >> 16;
+    const uint32_t rel_t_off  = FA_REL_OFFSETS & 0xFFFFu;
+    const uint32_t rel_p_off  = FA_REL_OFFSETS >> 16;
+    const uint32_t rel_cp_off = rel_p_off + iq3 * KV;
+    const uint32_t rel_qp_off = rel_p_off + p.ne3 * KV + iq3 * p.ne2;
+    const uint32_t rel_tm_off = rel_p_off + p.ne3 * KV + p.ne3 * p.ne2 + iq3 * CEIL_DIV(KV, 64u) * 2u;
+    int32_t wg_q_min =  1073741824;
+    int32_t wg_q_max = -1073741824;
+    if (REL_BIAS_ENABLE) {
+        if (p.gqa_ratio > 1u) {
+            wg_q_min = data_rel_pos[rel_qp_off + gqa_iq1];
+            wg_q_max = wg_q_min;
+        } else {
+            for (uint32_t rr = 0u; rr < Br; ++rr) {
+                const uint32_t qr = i * Br + rr;
+                if (qr < N && qr < p.ne2) {
+                    const int32_t qp = data_rel_pos[rel_qp_off + qr];
+                    wg_q_min = min(wg_q_min, qp);
+                    wg_q_max = max(wg_q_max, qp);
+                }
+            }
+        }
+    }
 
     [[dont_unroll]]
     for (uint32_t j = start_j; j < end_j; ++j) {
@@ -458,6 +483,32 @@ void main() {
                     FLOAT_TYPE mvf = masksh[(c * cols_per_iter + col_tid) * masksh_stride + tile_row(r)];
 
                     Sf[r][c] += slope[r]*mvf;
+                }
+            }
+        }
+
+        if (REL_BIAS_ENABLE) {
+            const uint32_t b64  = (j * Bc) >> 6u;
+            const int32_t  tmin = data_rel_pos[rel_tm_off + b64 * 2u + 0u];
+            const int32_t  tmax = data_rel_pos[rel_tm_off + b64 * 2u + 1u];
+            if (wg_q_max >= tmin && wg_q_min < tmax + int32_t(rel_ext)) {
+                [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
+                    uint32_t kcol;
+                    if (fa_kv_index(j * Bc + c * cols_per_iter + col_tid, kcol)) {
+                        const int32_t k_p = data_rel_pos[rel_cp_off + kcol];
+                        [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                            const uint32_t row    = tile_row(r);
+                            const uint32_t q_tok  = (p.gqa_ratio > 1u) ? gqa_iq1 : (i * Br + row);
+                            const uint32_t q_head = (p.gqa_ratio > 1u) ? (iq2 + row) : iq2;
+                            if (((p.gqa_ratio > 1u) ? (row < N) : (q_tok < N)) && q_tok < p.ne2 && q_head < p.ne1) {
+                                const int32_t q_p = (p.gqa_ratio > 1u) ? wg_q_min : data_rel_pos[rel_qp_off + q_tok];
+                                const int32_t d   = q_p - k_p;
+                                if (d >= 0 && uint32_t(d) < rel_ext && uint32_t(d) < rel_t_len) {
+                                    Sf[r][c] += ACC_TYPE(data_rel_table[rel_t_off + ((iq3 * p.ne2 + q_tok) * p.ne1 + q_head) * rel_t_len + uint32_t(d)]);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
