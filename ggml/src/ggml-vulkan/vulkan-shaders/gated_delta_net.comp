@@ -146,7 +146,8 @@ void main() {
     const uint eff_K               = K & 0x7FFFFFFFu;
 
 #if USE_SUBGROUP_ADD
-    if (CONTIG_VEC4 != 0u && KDA == 0u && ROWS_PER_LANE == 4u && LANES_PER_COLUMN == 32u && (COLS_PER_SUB == 4u || COLS_PER_SUB == 2u)) {
+    if (REPLAY == 0u && CONTIG_VEC4 != 0u && KDA == 0u && ROWS_PER_LANE == 4u && LANES_PER_COLUMN == 32u && (COLS_PER_SUB == 4u || COLS_PER_SUB == 2u) &&
+        sq1 == sk1 && sq2 == sk2 && sq3 == sk3) {
         const bool qk_v4_ok = ((sq1 & 3u) == 0u) && ((sq2 & 3u) == 0u) && ((sq3 & 3u) == 0u);
         const bool v_v4_ok  = (COLS_PER_SUB == 4u) && (COLS_PER_WG == 1u) && ((sv1 & 3u) == 0u) && ((sv2 & 3u) == 0u) && ((sv3 & 3u) == 0u) && ((col_base & 3u) == 0u);
         const bool st_v4_ok = ((sout_nb2 & 3u) == 0u) && ((s_off & 3u) == 0u);

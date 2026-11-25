@@ -2331,7 +2331,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     std::unique_ptr<llama_batch_ext> s19_dspark_warmup_padded;
     const llama_batch_ext * s19_batch_ptr = &batch_inp;
-    if (model.hparams.dspark_f_rnn &&
+    if (model.hparams.dspark_f_rnn && batch_inp.state.empty() &&
         batch_inp.n_embd == 0 && batch_inp.tokens[0].embd_row < 0 &&
         batch_inp.tokens.size() < model.hparams.dflash_block_size) {
         s19_dspark_warmup_padded = std::make_unique<llama_batch_ext>(batch_inp);
