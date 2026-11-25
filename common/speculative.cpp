@@ -1181,6 +1181,9 @@ public:
         }
     }
 
+    const int32_t * s19_row_map   = nullptr;
+    int32_t         s19_row_map_n = 0;
+
     bool process(const common_batch & batch_in) override {
         if (batch_in.size() <= 0) {
             return true;
@@ -1238,9 +1241,10 @@ public:
                     batch_inject.clear();
                     for (int32_t i = 0; i < n_chunk; ++i) {
                         const int32_t   row        = i_batch_beg[seq_id] + offset + i;
+                        const int32_t   tgt_row    = (s19_row_map && row < s19_row_map_n) ? s19_row_map[row] : row;
                         const llama_pos p          = batch_in.tokens[row].pos[0];
                         const llama_pos pos_arr[4] = { p, p, p, 0 };
-                        batch_inject.add_embd_row(row, pos_arr, seq_id, false);
+                        batch_inject.add_embd_row(tgt_row, pos_arr, seq_id, false);
                     }
 
                     const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
@@ -1262,8 +1266,10 @@ public:
                         GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
                     }
                     for (int32_t i = 0; i < n_chunk; ++i) {
-                        float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                        const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
+                        const int32_t row     = i_batch_beg[seq_id] + offset + i;
+                        const int32_t tgt_row = (s19_row_map && row < s19_row_map_n) ? s19_row_map[row] : row;
+                        float       * dst     = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                        const float * src     = layer + (size_t) tgt_row * n_embd_tgt;
                         std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
                     }
                 }
@@ -3580,6 +3586,39 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
         result = result && impl->process(batch);
     }
 
+    return result;
+}
+
+bool common_speculative_process_rows(
+        common_speculative * spec,
+        const common_batch & batch_full,
+        const int32_t      * rows,
+        int32_t              n_rows) {
+    if (spec == nullptr || n_rows <= 0) {
+        return true;
+    }
+
+    common_batch sub;
+    for (int32_t i = 0; i < n_rows; ++i) {
+        const int32_t r = rows[i];
+        GGML_ASSERT(r >= 0 && r < batch_full.size());
+        const auto & t = batch_full.tokens[r];
+        sub.add(t.id, t.pos[0], t.seq_id, t.output);
+    }
+
+    bool result = true;
+    for (auto & impl : spec->impls) {
+        auto * dflash = dynamic_cast<common_speculative_impl_draft_dflash *>(impl.get());
+        if (dflash) {
+            dflash->s19_row_map   = rows;
+            dflash->s19_row_map_n = n_rows;
+            result = result && dflash->process(sub);
+            dflash->s19_row_map   = nullptr;
+            dflash->s19_row_map_n = 0;
+        } else {
+            result = result && impl->process(sub);
+        }
+    }
     return result;
 }
 

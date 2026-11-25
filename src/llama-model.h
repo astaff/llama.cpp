@@ -676,6 +676,9 @@ struct llama_layer {
     // gemma4 layer output scale, reused for talkie embedding skip scale
     struct ggml_tensor * out_scale = nullptr;
 
+    // S19_WAVE3: stacked FullAttn [attn_q_inp_norm; attn_k_inp_norm; attn_v_inp_norm] [n_embd, 3]
+    struct ggml_tensor * s19_attn_qkv_inp_norm = nullptr;
+
     // metis16 per-pass hyper-connection mixes, attention pass LoRA, expert route embeddings
     struct ggml_tensor * hc_attn_mix         = nullptr;
     struct ggml_tensor * hc_attn_read        = nullptr;
@@ -961,6 +964,12 @@ struct llama_model {
     struct ggml_tensor * dspark_markov_ctx_mix   = nullptr; // rnn markov head: f_rnn from target features
     struct ggml_tensor * dspark_markov_ctx_norm  = nullptr;
 
+    // Series 19 (W1.2): Persistent GPU-resident f_rnn context ring ([n_embd, 64 * n_seq] F32)
+    mutable ggml_context_ptr        dspark_ring_ctx;
+    mutable ggml_backend_buffer_ptr dspark_ring_buf;
+    mutable struct ggml_tensor *    dspark_f_rnn_ring    = nullptr;
+    mutable uint32_t                dspark_ring_n_seq    = 0;
+
     // zaya1
     struct ggml_tensor * res_scale_in   = nullptr;
     struct ggml_tensor * res_scale_in_b = nullptr;
@@ -1003,6 +1012,18 @@ struct llama_model {
     std::vector<int32_t> target_layer_ids;
 
     std::vector<llama_layer> layers;
+
+    // S19_WAVE3: lazily materialized coalesced F32 weights for Inkling-2 looped-core & FullAttn norms
+    struct s19_loop_coalesced {
+        struct ggml_tensor * ctrl_down_qkv = nullptr; // [2*n_embd, rank, 3]
+        struct ggml_tensor * ctrl_up_qkv   = nullptr; // [rank, 2*n_embd, 3] ([gain; forget])
+        struct ggml_tensor * ctrl_up_ffn   = nullptr; // [rank, 2*n_embd]    ([gain; forget])
+    };
+    mutable ggml_context_ptr                s19_inkling_ctx;
+    mutable ggml_backend_buffer_ptr         s19_inkling_buf;
+    mutable struct ggml_tensor *            s19_pass_msg_query = nullptr;
+    mutable std::vector<s19_loop_coalesced> s19_loop_layers;
+    mutable bool                            s19_inkling_ready = false;
 
     //Dense linear projections for SentenceTransformers models like embeddinggemma
     // For Sentence Transformers models structure see

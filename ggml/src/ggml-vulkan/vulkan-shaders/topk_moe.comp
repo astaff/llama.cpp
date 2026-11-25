@@ -24,13 +24,24 @@ layout (push_constant) uniform parameter
     uint with_norm;
     float output_scale;
     float output_bias;
+#ifdef TOPK_EMIT_COUNTS
+    uint count_bn;
+    uint row_ids_offset;
+#endif
 };
 
+#ifdef TOPK_EMIT_COUNTS
+layout(local_size_x_id = 0, local_size_y_id = 3, local_size_z = 1) in;
+#else
 layout(local_size_x_id = 0, local_size_y = 4, local_size_z = 1) in;
+#endif
 
 layout(constant_id = 0) const uint WARP_SIZE = 32;
 layout(constant_id = 1) const uint n_experts_spec = 512;
 layout(constant_id = 2) const bool nexperts_use_push = false;
+#ifdef TOPK_EMIT_COUNTS
+layout(constant_id = 3) const uint ROWS_PER_WG = 8;
+#endif
 
 uint n_experts = nexperts_use_push ? n_experts_push : n_experts_spec;
 
@@ -42,6 +53,13 @@ layout (binding = 0, std430) readonly buffer Logits {float logits[];};
 layout (binding = 1, std430) readonly buffer BiasProbs {float bias[];};
 layout (binding = 2, std430) writeonly buffer Weights {float weights[];};
 layout (binding = 3, std430) writeonly buffer Ids {uint ids[];};
+#ifdef TOPK_EMIT_COUNTS
+layout (binding = 4, std430) writeonly buffer ExpertCounts {uint data_exp_d[];};
+shared uint sh_sel_ids[16 * 32];
+shared uint sh_vals[256];
+shared uint sh_offsets[256];
+shared uint sh_cursors[256];
+#endif
 
 const float INFINITY = 1.0 / 0.0;
 
@@ -91,9 +109,13 @@ void softmax_warp_inplace(inout float vals[experts_per_thread], const uint limit
 
 void main() {
     const uint row = gl_WorkGroupID.x * gl_WorkGroupSize.y + gl_SubgroupID;
+#ifdef TOPK_EMIT_COUNTS
+    if (row < n_rows) {
+#else
     if (row >= n_rows) {
         return;
     }
+#endif
 
     const uint logits_offset = n_experts * row;
     const uint bias_offset = 0; // 1D
@@ -193,6 +215,11 @@ void main() {
             ids[ids_offset + k] = max_expert;
             wt_sum += max_val;
         }
+#ifdef TOPK_EMIT_COUNTS
+        if (lane == 0u) {
+            sh_sel_ids[row * n_expert_used + uint(k)] = max_expert;
+        }
+#endif
     }
 
     if (with_norm != 0) {
@@ -230,4 +257,60 @@ void main() {
             weights[weights_offset + idx] = wo;
         }
     }
+#ifdef TOPK_EMIT_COUNTS
+    } // end if (row < n_rows)
+
+    const uint lane_e     = gl_SubgroupInvocationID;
+    const uint tid        = gl_SubgroupID * WARP_SIZE + lane_e;
+    const uint wg_threads = ROWS_PER_WG * WARP_SIZE;
+
+    for (uint e = tid; e < n_experts; e += wg_threads) {
+        sh_vals[e] = 0u;
+    }
+    barrier();
+
+    const uint num_sel = n_rows * n_expert_used;
+    for (uint idx = tid; idx < num_sel; idx += wg_threads) {
+        const uint exp_id = sh_sel_ids[idx];
+        if (exp_id < n_experts) {
+            atomicAdd(sh_vals[exp_id], 1u);
+        }
+    }
+    barrier();
+
+    if (gl_SubgroupID == 0u) {
+        const uint n_experts_padded = (n_experts + WARP_SIZE - 1u) & ~(WARP_SIZE - 1u);
+        uint base = 0u;
+        for (uint e = lane_e; e < n_experts_padded; e += WARP_SIZE) {
+            const bool in_range = e < n_experts;
+            const uint count = in_range ? sh_vals[e] : 0u;
+            const uint n_tiles = (count + count_bn - 1u) / count_bn;
+            const uint tile_begin = base + subgroupExclusiveAdd(n_tiles);
+            if (in_range) {
+                sh_offsets[e] = tile_begin * count_bn;
+                sh_cursors[e] = 0u;
+                for (uint t = 0u; t < n_tiles; ++t) {
+                    const uint desc = 1u + 2u * (tile_begin + t);
+                    data_exp_d[desc]      = e;
+                    data_exp_d[desc + 1u] = min(count_bn, count - t * count_bn);
+                }
+            }
+            base += subgroupAdd(n_tiles);
+        }
+        if (lane_e == 0u) {
+            data_exp_d[0] = base;
+        }
+    }
+    barrier();
+
+    for (uint idx = tid; idx < num_sel; idx += wg_threads) {
+        const uint i01 = idx / n_expert_used;
+        const uint i00 = idx - i01 * n_expert_used;
+        const uint exp_id = sh_sel_ids[idx];
+        if (exp_id < n_experts) {
+            const uint r = atomicAdd(sh_cursors[exp_id], 1u);
+            data_exp_d[row_ids_offset + sh_offsets[exp_id] + r] = (i01 << 16u) | i00;
+        }
+    }
+#endif
 }

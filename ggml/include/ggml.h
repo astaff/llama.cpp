@@ -1266,12 +1266,22 @@ extern "C" {
             struct ggml_tensor  * kq_mask,
             int32_t               mask_r0);
 
+    // S19_WAVE3: Inkling-2 depth-mix with optional 0-ULP 512-tree RMS_NORM_MUL epilogue
     GGML_API struct ggml_tensor * ggml_inkling_depth_mix(
             struct ggml_context       * ctx,
             struct ggml_tensor * const * states,
             int                         n_states,
             struct ggml_tensor        * query,
             float                       eps);
+
+    GGML_API struct ggml_tensor * ggml_inkling_depth_mix_rms(
+            struct ggml_context       * ctx,
+            struct ggml_tensor * const * states,
+            int                         n_states,
+            struct ggml_tensor        * query,
+            struct ggml_tensor        * rms_w,
+            float                       eps,
+            float                       rms_eps);
 
     GGML_API struct ggml_tensor * ggml_inkling_rms2_concat(
             struct ggml_context * ctx,
@@ -1286,6 +1296,25 @@ extern "C" {
             struct ggml_tensor  * raw_gain,
             struct ggml_tensor  * raw_forget);
 
+    GGML_API struct ggml_tensor * ggml_inkling_ctrl_apply_rms_mul(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * message,
+            struct ggml_tensor  * up_gf,
+            struct ggml_tensor  * rms_w,
+            float                 eps);
+
+    GGML_API struct ggml_tensor * ggml_inkling_l2_clip_qr(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q_cur,
+            struct ggml_tensor  * r_cur,
+            struct ggml_tensor  * q_scale,
+            struct ggml_tensor  * r_scale,
+            struct ggml_tensor  * mul_tau,
+            float                 q_threshold,
+            float                 r_threshold,
+            float                 eps);
+
     GGML_API struct ggml_tensor * ggml_inkling_dspark_concat4(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -1297,6 +1326,36 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * joint,
             struct ggml_tensor  * state_in);
+
+    GGML_API struct ggml_tensor * ggml_inkling_softcap(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            float                 inv_cap,
+            float                 cap);
+
+    GGML_API struct ggml_tensor * ggml_inkling_dspark_joint_gru(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * prev,
+            struct ggml_tensor  * markov_w1,
+            struct ggml_tensor  * state_in,
+            struct ggml_tensor  * hidden,
+            struct ggml_tensor  * context,
+            struct ggml_tensor  * joint_proj,
+            struct ggml_tensor  * joint_proj_b);
+
+    GGML_API struct ggml_tensor * ggml_inkling_dspark_inject_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * features,
+            struct ggml_tensor  * fuse_w,
+            struct ggml_tensor  * norm0,
+            struct ggml_tensor  * norm1,
+            struct ggml_tensor  * norm2,
+            struct ggml_tensor  * norm3,
+            struct ggml_tensor  * positions,
+            struct ggml_tensor  * ring_dst,
+            int32_t               ring_seq_offset,
+            int32_t               ring_rows,
+            float                 eps);
 
     // normalize along rows
     GGML_API struct ggml_tensor * ggml_norm(

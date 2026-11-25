@@ -276,6 +276,7 @@ struct vk_pipeline_struct {
     vk_pipeline gen_pair_mm;
     vk_pipeline gen_pair_glu;
     vk_pipeline gen_fast_ep;
+    vk_pipeline gen_fast_ep_kp2;
     vk_pipeline gen_lora_twin;
 };
 
@@ -885,12 +886,12 @@ struct vk_device_struct {
     vk_pipeline pipeline_mul_mv_mma_f32_f16[5][8][2];
     vk_pipeline pipeline_mul_mv_mma_id[GGML_TYPE_COUNT][7][5][2];
 
-    vk_pipeline pipeline_dequant_repack[3];
-    vk_pipeline pipeline_dequant_mul_mat_vec_repack_f32_f32[3][mul_mat_vec_max_cols_limit];
-    vk_pipeline pipeline_dequant_mul_mat_vec_repack_f16_f32[3][mul_mat_vec_max_cols_limit];
-    vk_pipeline pipeline_dequant_mul_mat_vec_id_repack_f32[3];
-    vk_pipeline pipeline_mul_mv_mma_repack[3][5][8][2];
-    vk_pipeline pipeline_mul_mv_mma_id_repack[3][7][5][2];
+    vk_pipeline pipeline_dequant_repack[4];
+    vk_pipeline pipeline_dequant_mul_mat_vec_repack_f32_f32[4][mul_mat_vec_max_cols_limit];
+    vk_pipeline pipeline_dequant_mul_mat_vec_repack_f16_f32[4][mul_mat_vec_max_cols_limit];
+    vk_pipeline pipeline_dequant_mul_mat_vec_id_repack_f32[4];
+    vk_pipeline pipeline_mul_mv_mma_repack[4][5][8][2];
+    vk_pipeline pipeline_mul_mv_mma_id_repack[4][7][5][2];
 
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols_limit];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
@@ -992,7 +993,7 @@ struct vk_device_struct {
 
     // [src/dst 0=fp32,1=fp16,2=bf16]
     vk_pipeline pipeline_glu[GGML_GLU_OP_COUNT][3];
-    vk_pipeline pipeline_inkling_fused[8];
+    vk_pipeline pipeline_inkling_fused[16];
 
     vk_pipeline pipeline_silu_back_f32;
     vk_pipeline pipeline_soft_max_f32, pipeline_soft_max_f32_f16;
@@ -1096,6 +1097,7 @@ struct vk_device_struct {
 
     // [2] is for whether to take n_experts from spec constant (0) or push constant (1)
     vk_pipeline pipeline_topk_moe[num_topk_moe_pipelines][2];
+    vk_pipeline pipeline_topk_moe_count[9][2][2];
 
     std::vector<vk_pipeline_ref> all_pipelines;
 
@@ -1227,6 +1229,7 @@ typedef std::vector<vk_submission> vk_sequence;
 #define MAT_VEC_FUSION_FLAGS_LORA0 0x80000 // fused dynamic LoRA0 epilogue
 #define MAT_VEC_FUSION_FLAGS_LORA1 0x100000 // fused dynamic LoRA1 epilogue (up in PAIR_GLU, second mm in PAIR_MM)
 #define MAT_VEC_FUSION_FLAGS_EXP_SCALE0 0x200000 // per-expert .scale indexed by expert_idx
+#define MAT_VEC_FUSION_FLAGS_SITU_MERGED 0x400000 // S19: unsplit MoE gate_up + SITU in mul_mv_mma_id
 
 struct vk_staging_memcpy {
     vk_staging_memcpy(void * _dst, const void * _src, size_t _n) : dst(_dst), src(_src), n(_n) {}
@@ -1429,9 +1432,16 @@ struct ggml_backend_vk_context {
     const ggml_tensor * gen_rms_scale_dst2 {};
     const ggml_tensor * gen_rms_scale_rsrc2 {};
     // gen: dense MUL_MAT forward-elision epilogue target and auxiliary inputs (GGML_GEN_FUSE=mmgate,shexp)
+    // S19_WAVE3: MAT_VEC_FUSION_FLAGS_SRC1_SCALE (0x4000000) + gen_mm_src1_override
+#ifndef MAT_VEC_FUSION_FLAGS_SRC1_SCALE
+#define MAT_VEC_FUSION_FLAGS_SRC1_SCALE 0x4000000
+#endif
     const ggml_tensor * gen_mm_dst {};
     const ggml_tensor * gen_mm_f0 {};
     const ggml_tensor * gen_mm_f1 {};
+    const ggml_tensor * gen_mm_src1_override {};
+    float gen_glu_alpha {};
+    float gen_glu_limit {};
     uint32_t gen_mm_flags {};
     // gen: paired dense MUL_MAT sharing src1 (GGML_GEN_FUSE=pairmm)
     const ggml_tensor * gen_pair_mm1 {};
@@ -1510,6 +1520,15 @@ struct ggml_backend_vk_context {
     bool                last_mask_opt_valid {};
     bool                prealloc_mask_opt_need_sync {};
 
+    struct {
+        const ggml_tensor * mask {};
+        uint32_t            mask_r0 {};
+        uint32_t            nr {};
+        uint32_t            kv_min {};
+        uint32_t            kv_max {};
+        bool                valid {};
+    } mask_span_cache[4];
+
     // Series 9: Single-Front reusable command buffer LRU cache + zero-submit UMA async readbacks
     std::vector<vk_graph_replay_entry> replay_cache;
     uint64_t replay_lru_clock {};
@@ -1566,6 +1585,7 @@ struct ggml_backend_vk_context {
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
     bool fused_softcap_argmax {};
+    bool fused_add_softcap_argmax {};
     bool fused_inkling_clip_set_rows {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 

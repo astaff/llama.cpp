@@ -31,6 +31,7 @@ const bool Q_IN_REGS       = (Flags & 32) != 0;
 const bool FLIP            = (Flags & 64) != 0;
 const bool FLIP_DIRECT     = (Flags & 128) != 0;
 const bool USE_LPT_GQA_SWIZZLE = (Flags & 256) != 0;
+const bool GQA_VROW_PACK       = (Flags & 512) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -80,6 +81,7 @@ layout (push_constant) uniform parameter {
 } p;
 
 #define SINK_ENABLE_BIT (1<<24)
+#define ACTIVE_SPAN_BIT (1u<<25)
 #define N_LOG2_MASK 0xFFFF
 
 layout (binding = 4) readonly buffer S {float data_s[];};
@@ -166,7 +168,7 @@ void init_indices()
     KV = p.KV;
 
     if (p.k_num > 1) {
-        if (p.gqa_ratio > 1) {
+        if (p.gqa_ratio > 1 && !GQA_VROW_PACK) {
             i = 0;
             // batch and split_k share gl_WorkGroupID.x
             gqa_iq1 = gl_WorkGroupID.x / p.k_num;
@@ -176,7 +178,7 @@ void init_indices()
             split_k_index = gl_WorkGroupID.x % p.k_num;
             i = gl_WorkGroupID.x / p.k_num;
         }
-    } else if (p.gqa_ratio > 1) {
+    } else if (p.gqa_ratio > 1 && !GQA_VROW_PACK) {
         i = 0;
         gqa_iq1 = gl_WorkGroupID.x;
         split_k_index = 0;
@@ -190,6 +192,10 @@ void init_indices()
 
     start_j = split_k_index * p.split_kv / Bc;
     end_j = CEIL_DIV(min(KV, (split_k_index + 1) * p.split_kv), Bc);
+    if (!USE_SPARSE && (p.mask_n_head_log2 & ACTIVE_SPAN_BIT) != 0u) {
+        start_j = max(start_j, floatBitsToUint(p.m0));
+        end_j   = min(end_j,   floatBitsToUint(p.m1));
+    }
 
     // When not using grouped query attention, all rows share the same iq2, equal to gl_WorkGroupID.y.
     // When using grouped query attention, each workgroup does gqa_ratio consecutive values of iq2.
@@ -214,7 +220,7 @@ void init_indices()
     // nb?1 are already divided by the type size and are in units of elements.
     // When using grouped query attention, Q is indexed by iq2, so the stride
     // should be nb02 (which is in bytes).
-    q_stride = p.gqa_ratio > 1 ? (p.nb02 / 4) : p.nb01;
+    q_stride = (p.gqa_ratio > 1 && !GQA_VROW_PACK) ? (p.nb02 / 4) : p.nb01;
     k_stride = p.nb11;
     v_stride = p.nb21;
     // When using grouped query attention, all rows use the same mask (stride 0).

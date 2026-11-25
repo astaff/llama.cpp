@@ -88,6 +88,7 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const common_batch & batch);
+bool common_speculative_process_rows(common_speculative * spec, const common_batch & batch_full, const int32_t * rows, int32_t n_rows);
 
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);

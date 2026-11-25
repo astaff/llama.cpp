@@ -371,7 +371,22 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
             ggml_tensor * hidden_i = ggml_view_2d(ctx0, hidden, hidden->ne[0], n_blocks,
                                                   (size_t) block_drafts * hidden->nb[1], i*hidden->nb[1]);
             ggml_tensor * hidden_c = ggml_is_contiguous(hidden_i) ? hidden_i : ggml_cont(ctx0, hidden_i);
-            if (f_rnn != nullptr && !getenv("GGML_INKLING_NO_FUSE") &&
+            const bool can_fuse_joint_gru =
+                f_rnn != nullptr &&
+                !getenv("GGML_INKLING_NO_FUSE") &&
+                (!g.loras || g.loras->empty()) &&
+                (!g.hdmd || g.hdmd->rot.find(model.dspark_joint_proj) == g.hdmd->rot.end()) &&
+                (model.dspark_markov_w1->type == GGML_TYPE_BF16 || model.dspark_markov_w1->type == GGML_TYPE_F32) &&
+                (model.dspark_joint_proj->type == GGML_TYPE_BF16 || model.dspark_joint_proj->type == GGML_TYPE_F32) &&
+                ggml_is_contiguous(prev) && ggml_is_contiguous(state) &&
+                ggml_is_contiguous(hidden_c) && ggml_is_contiguous(f_rnn);
+            if (can_fuse_joint_gru) {
+                ggml_tensor * st_lat = ggml_inkling_dspark_joint_gru(
+                    ctx0, prev, model.dspark_markov_w1, state, hidden_c, f_rnn,
+                    model.dspark_joint_proj, model.dspark_joint_proj_b);
+                state  = ggml_view_2d(ctx0, st_lat, rank, st_lat->ne[1], st_lat->nb[1], 0);
+                markov = ggml_view_2d(ctx0, st_lat, rank, st_lat->ne[1], st_lat->nb[1], st_lat->nb[2]);
+            } else if (f_rnn != nullptr && !getenv("GGML_INKLING_NO_FUSE") &&
                 ggml_is_contiguous(state) && ggml_is_contiguous(hidden_c) && ggml_is_contiguous(f_rnn)) {
                 ggml_tensor * joint = ggml_inkling_dspark_concat4(ctx0, state, w1_prev, hidden_c, f_rnn);
                 joint = ggml_add(ctx0, ggml_mul_mat(ctx0, model.dspark_joint_proj, joint), model.dspark_joint_proj_b);
@@ -415,7 +430,11 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         ggml_tensor * base_i = ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, i*base->nb[1]);
         ggml_tensor * col    = ggml_add(ctx0, base_i, bias);
         if (softcap > 0.0f) {
-            col = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, col, 1.0f/softcap)), softcap);
+            if (!getenv("GGML_INKLING_NO_FUSE") && ggml_is_contiguous(col)) {
+                col = ggml_inkling_softcap(ctx0, col, 1.0f/softcap, softcap);
+            } else {
+                col = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, col, 1.0f/softcap)), softcap);
+            }
         }
 
         if (!ids_only) {

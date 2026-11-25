@@ -1,0 +1,329 @@
+#version 450
+
+// S19.D W4.2: 0-ULP 88-GPR N=1 GQA=3 multi-head-mask FlashAttention kernel for Apple AGX (Borealis)
+// Specializes HSK = HSV = 128, Br = 3, Bc = 64, WorkGroupSize = 128, SubGroupSize = 32, D_split = 8, row_split = 1:
+// - Qf[3 * 33] staged in 1,584 B bank-conflict-free shared memory (-48 FP32 GPRs -> 88 GPRs total, 0 spills!)
+// - Per-subhead mask indexing (q_head = iq2 + r) with 0 masksh shared memory and 0 inner-loop barriers
+// - 2-column K/V register-paced [[dont_unroll]] inner loops keeping live GPRs <= 88 (0 dynamic array indexing)
+// - Batched 2-barrier epilogue preserving exact D_split=8 & s=0..3 FP32/FP16 reduction order (100% 0-ULP)
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+#ifdef FLOAT16
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_subgroup_extended_types_float16 : require
+#endif
+
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_KHR_shader_subgroup_vote : enable
+
+#include "types.glsl"
+#include "dot_product_funcs.glsl"
+#include "flash_attn_base.glsl"
+
+layout (binding = 0) readonly buffer Q   { float     data_q[];   };
+layout (binding = 0) readonly buffer QV4 { vec4      data_qv4[]; };
+layout (binding = 1) readonly buffer KV4 { f16vec4   data_kv4[]; };
+layout (binding = 2) readonly buffer VV4 { f16vec4   data_vv4[]; };
+layout (binding = 3) readonly buffer M   { float16_t data_m[];   };
+
+shared FLOAT_TYPEV4 Qf[3u * 33u];
+shared float        tmpsh_m[3u * 32u];
+shared float        tmpsh_l[3u * 32u];
+shared FLOAT_TYPEV4 tmpshv4[3u * 4u * 32u];
+
+void main() {
+    init_indices();
+
+    const uint32_t tid     = gl_LocalInvocationIndex;
+    const uint32_t d_tid   = tid & 7u;
+    const uint32_t col_tid = tid >> 3u;
+    const uint32_t lane    = gl_SubgroupInvocationID;
+    const uint32_t sg_id   = gl_SubgroupID;
+
+    const uint32_t q_base_elem = gqa_iq1 * p.nb01 + (iq2 * p.nb02 + iq3 * p.nb03) / 4u;
+    if (tid < 96u) {
+        const uint32_t qr   = tid >> 5u;
+        const uint32_t qc   = tid & 31u;
+        const uint32_t elem = q_base_elem + qr * q_stride + qc * 4u;
+        vec4 qv;
+        if ((elem & 3u) == 0u) {
+            qv = data_qv4[elem >> 2u];
+        } else {
+            qv = vec4(data_q[elem + 0u], data_q[elem + 1u], data_q[elem + 2u], data_q[elem + 3u]);
+        }
+        Qf[qr * 33u + qc] = FLOAT_TYPEV4(qv * p.scale);
+    }
+
+    FLOAT_TYPEV4 Of[3][4];
+    float Lf[3], Mf[3];
+    uint32_t m_row_off[3];
+    const uint32_t m_b3 = (iq3 % p.nem3) * p.nem2;
+    [[unroll]] for (uint32_t r = 0u; r < 3u; ++r) {
+        [[unroll]] for (uint32_t d = 0u; d < 4u; ++d) {
+            Of[r][d] = FLOAT_TYPEV4(0.0);
+        }
+        Lf[r] = 0.0f;
+        Mf[r] = NEG_FLT_MAX_OVER_2;
+        const uint32_t q_head = iq2 + r;
+        m_row_off[r] = ((m_b3 + (q_head % p.nem2)) * p.nem1 + gqa_iq1) * KV;
+    }
+    barrier();
+
+    const uint32_t k_offset4 = ((ik2 * p.nb12 + ik3 * p.nb13) / 2u) >> 2u;
+    const uint32_t v_offset4 = ((iv2 * p.nb22 + iv3 * p.nb23) / 2u) >> 2u;
+    const uint32_t k_stride4 = k_stride >> 2u;
+    const uint32_t v_stride4 = v_stride >> 2u;
+
+    [[dont_unroll]]
+    for (uint32_t j = start_j; j < end_j; ++j) {
+        const uint32_t j_col = j * 64u;
+        if (MASK_ENABLE) {
+            float sub_max = NEG_FLT_MAX_OVER_2;
+            const uint32_t kc0 = j_col + lane;
+            const uint32_t kc1 = kc0 + 32u;
+            if (!KV_bounds_check || kc0 < KV) {
+                [[unroll]] for (uint32_t r = 0u; r < 3u; ++r) {
+                    sub_max = max(sub_max, float(data_m[m_row_off[r] + kc0]));
+                }
+            }
+            if (!KV_bounds_check || kc1 < KV) {
+                [[unroll]] for (uint32_t r = 0u; r < 3u; ++r) {
+                    sub_max = max(sub_max, float(data_m[m_row_off[r] + kc1]));
+                }
+            }
+            if (subgroupAll(sub_max <= NEG_FLT_MAX_OVER_2)) {
+                continue;
+            }
+        }
+
+        ACC_TYPE Sf[3][4];
+        [[dont_unroll]]
+        for (uint32_t c2 = 0u; c2 < 2u; ++c2) {
+            const uint32_t kcol0 = j_col + (c2 * 2u + 0u) * 16u + col_tid;
+            const uint32_t kcol1 = kcol0 + 16u;
+            ACC_TYPE s0_0 = ACC_TYPE(0.0), s1_0 = ACC_TYPE(0.0), s2_0 = ACC_TYPE(0.0);
+            ACC_TYPE s0_1 = ACC_TYPE(0.0), s1_1 = ACC_TYPE(0.0), s2_1 = ACC_TYPE(0.0);
+            if (!KV_bounds_check || kcol0 < KV) {
+                const uint32_t kb0 = k_offset4 + kcol0 * k_stride4 + d_tid;
+                [[unroll]] for (uint32_t d = 0u; d < 4u; ++d) {
+                    const uint32_t qc = d * 8u + d_tid;
+                    const FLOAT_TYPEV4 K_Tf = FLOAT_TYPEV4(data_kv4[kb0 + d * 8u]);
+                    s0_0 = dot_product(Qf[0u * 33u + qc], K_Tf, s0_0);
+                    s1_0 = dot_product(Qf[1u * 33u + qc], K_Tf, s1_0);
+                    s2_0 = dot_product(Qf[2u * 33u + qc], K_Tf, s2_0);
+                }
+            }
+            if (!KV_bounds_check || kcol1 < KV) {
+                const uint32_t kb1 = k_offset4 + kcol1 * k_stride4 + d_tid;
+                [[unroll]] for (uint32_t d = 0u; d < 4u; ++d) {
+                    const uint32_t qc = d * 8u + d_tid;
+                    const FLOAT_TYPEV4 K_Tf = FLOAT_TYPEV4(data_kv4[kb1 + d * 8u]);
+                    s0_1 = dot_product(Qf[0u * 33u + qc], K_Tf, s0_1);
+                    s1_1 = dot_product(Qf[1u * 33u + qc], K_Tf, s1_1);
+                    s2_1 = dot_product(Qf[2u * 33u + qc], K_Tf, s2_1);
+                }
+            }
+            if (c2 == 0u) {
+                Sf[0][0] = s0_0; Sf[1][0] = s1_0; Sf[2][0] = s2_0;
+                Sf[0][1] = s0_1; Sf[1][1] = s1_1; Sf[2][1] = s2_1;
+            } else {
+                Sf[0][2] = s0_0; Sf[1][2] = s1_0; Sf[2][2] = s2_0;
+                Sf[0][3] = s0_1; Sf[1][3] = s1_1; Sf[2][3] = s2_1;
+            }
+        }
+
+        [[unroll]] for (uint32_t c = 0u; c < 4u; ++c) {
+            [[unroll]] for (uint s = 4u; s > 0u; s >>= 1u) {
+                [[unroll]] for (uint32_t r = 0u; r < 3u; ++r) {
+                    Sf[r][c] += subgroupShuffleXor(Sf[r][c], s);
+                }
+            }
+        }
+
+        if (MASK_ENABLE) {
+            [[unroll]] for (uint32_t c = 0u; c < 4u; ++c) {
+                const uint32_t kcol = j_col + c * 16u + col_tid;
+                const bool ok = !KV_bounds_check || kcol < KV;
+                [[unroll]] for (uint32_t r = 0u; r < 3u; ++r) {
+                    const FLOAT_TYPE mvf = ok ? FLOAT_TYPE(data_m[m_row_off[r] + kcol]) : FLOAT_TYPE(0.0);
+                    Sf[r][c] += ACC_TYPE(mvf);
+                }
+            }
+        }
+
+        float eMf[3];
+        [[unroll]] for (uint32_t r = 0u; r < 3u; ++r) {
+            float rowmaxf = NEG_FLT_MAX_OVER_2;
+            [[unroll]] for (uint32_t c = 0u; c < 4u; ++c) {
+                if (KV_bounds_check && j_col + c * 16u + col_tid >= KV) {
+                    continue;
+                }
+                rowmaxf = max(rowmaxf, float(Sf[r][c]));
+            }
+            rowmaxf += FATTN_KQ_MAX_OFFSET;
+            const float Moldf = Mf[r];
+            Mf[r] = max(rowmaxf, Moldf);
+            eMf[r] = exp(Moldf - Mf[r]);
+            Lf[r] = eMf[r] * Lf[r];
+        }
+
+        [[unroll]] for (uint32_t d = 0u; d < 4u; ++d) {
+            [[unroll]] for (uint32_t r = 0u; r < 3u; ++r) {
+                Of[r][d] = FLOAT_TYPE(eMf[r]) * Of[r][d];
+            }
+        }
+
+        [[dont_unroll]]
+        for (uint32_t c2 = 0u; c2 < 2u; ++c2) {
+            const uint32_t vcol0 = j_col + (c2 * 2u + 0u) * 16u + col_tid;
+            const uint32_t vcol1 = vcol0 + 16u;
+            const ACC_TYPE s0_0 = (c2 == 0u) ? Sf[0][0] : Sf[0][2];
+            const ACC_TYPE s1_0 = (c2 == 0u) ? Sf[1][0] : Sf[1][2];
+            const ACC_TYPE s2_0 = (c2 == 0u) ? Sf[2][0] : Sf[2][2];
+            const ACC_TYPE s0_1 = (c2 == 0u) ? Sf[0][1] : Sf[0][3];
+            const ACC_TYPE s1_1 = (c2 == 0u) ? Sf[1][1] : Sf[1][3];
+            const ACC_TYPE s2_1 = (c2 == 0u) ? Sf[2][1] : Sf[2][3];
+
+            if (!KV_bounds_check || vcol0 < KV) {
+                const FLOAT_TYPE p0 = FLOAT_TYPE(exp(float(s0_0) - Mf[0]));
+                const FLOAT_TYPE p1 = FLOAT_TYPE(exp(float(s1_0) - Mf[1]));
+                const FLOAT_TYPE p2 = FLOAT_TYPE(exp(float(s2_0) - Mf[2]));
+                Lf[0] += float(p0);
+                Lf[1] += float(p1);
+                Lf[2] += float(p2);
+                const uint32_t vb0 = v_offset4 + vcol0 * v_stride4 + d_tid;
+                [[unroll]] for (uint32_t d = 0u; d < 4u; ++d) {
+                    const FLOAT_TYPEV4 Vf = FLOAT_TYPEV4(data_vv4[vb0 + d * 8u]);
+                    Of[0][d] += FLOAT_TYPEV4(p0 * Vf);
+                    Of[1][d] += FLOAT_TYPEV4(p1 * Vf);
+                    Of[2][d] += FLOAT_TYPEV4(p2 * Vf);
+                }
+            }
+            if (!KV_bounds_check || vcol1 < KV) {
+                const FLOAT_TYPE p0 = FLOAT_TYPE(exp(float(s0_1) - Mf[0]));
+                const FLOAT_TYPE p1 = FLOAT_TYPE(exp(float(s1_1) - Mf[1]));
+                const FLOAT_TYPE p2 = FLOAT_TYPE(exp(float(s2_1) - Mf[2]));
+                Lf[0] += float(p0);
+                Lf[1] += float(p1);
+                Lf[2] += float(p2);
+                const uint32_t vb1 = v_offset4 + vcol1 * v_stride4 + d_tid;
+                [[unroll]] for (uint32_t d = 0u; d < 4u; ++d) {
+                    const FLOAT_TYPEV4 Vf = FLOAT_TYPEV4(data_vv4[vb1 + d * 8u]);
+                    Of[0][d] += FLOAT_TYPEV4(p0 * Vf);
+                    Of[1][d] += FLOAT_TYPEV4(p1 * Vf);
+                    Of[2][d] += FLOAT_TYPEV4(p2 * Vf);
+                }
+            }
+        }
+    }
+
+    // Batched 2-barrier workgroup reduction across all 3 sub-heads (exact D_split=8 & s=0..3 order)
+    [[unroll]] for (uint32_t r = 0u; r < 3u; ++r) {
+        float rowmaxf = Mf[r];
+        rowmaxf = max(rowmaxf, subgroupShuffleXor(rowmaxf, 8u));
+        rowmaxf = max(rowmaxf, subgroupShuffleXor(rowmaxf, 16u));
+        if (lane == d_tid) {
+            tmpsh_m[(r * 4u + sg_id) * 8u + d_tid] = rowmaxf;
+        }
+    }
+    barrier();
+
+    [[unroll]] for (uint32_t r = 0u; r < 3u; ++r) {
+        float rowmaxf = tmpsh_m[r * 32u + d_tid];
+        [[unroll]] for (uint32_t s = 1u; s < 4u; ++s) {
+            rowmaxf = max(rowmaxf, tmpsh_m[(r * 4u + s) * 8u + d_tid]);
+        }
+        const float Moldf = Mf[r];
+        Mf[r] = max(rowmaxf, Moldf);
+        const float eMf = exp(Moldf - Mf[r]);
+
+        Lf[r] = eMf * Lf[r];
+        Lf[r] += subgroupShuffleXor(Lf[r], 8u);
+        Lf[r] += subgroupShuffleXor(Lf[r], 16u);
+        if (lane == d_tid) {
+            tmpsh_l[(r * 4u + sg_id) * 8u + d_tid] = Lf[r];
+        }
+
+        [[unroll]] for (uint32_t d = 0u; d < 4u; ++d) {
+            Of[r][d] = FLOAT_TYPE(eMf) * Of[r][d];
+            Of[r][d] += subgroupShuffleXor(Of[r][d], 8u);
+            Of[r][d] += subgroupShuffleXor(Of[r][d], 16u);
+            if (lane == d_tid) {
+                tmpshv4[((r * 4u + d) * 4u + sg_id) * 8u + d_tid] = Of[r][d];
+            }
+        }
+    }
+    barrier();
+
+    [[unroll]] for (uint32_t r = 0u; r < 3u; ++r) {
+        Lf[r] = tmpsh_l[r * 32u + d_tid];
+        [[unroll]] for (uint32_t s = 1u; s < 4u; ++s) {
+            Lf[r] += tmpsh_l[(r * 4u + s) * 8u + d_tid];
+        }
+        [[unroll]] for (uint32_t d = 0u; d < 4u; ++d) {
+            Of[r][d] = tmpshv4[(r * 4u + d) * 32u + d_tid];
+            [[unroll]] for (uint32_t s = 1u; s < 4u; ++s) {
+                Of[r][d] += tmpshv4[((r * 4u + d) * 4u + s) * 8u + d_tid];
+            }
+        }
+    }
+
+    if (p.k_num > 1u) {
+        if (col_tid == 0u) {
+            const uint32_t o_offset = HSV * p.ne1 * (split_k_index + p.k_num * (gqa_iq1 + p.ne2 * iq3)) / 4u;
+            [[unroll]] for (uint32_t r = 0u; r < 3u; ++r) {
+                if (r < N) {
+                    [[unroll]] for (uint32_t d = 0u; d < 4u; ++d) {
+                        gqaStore(r, d * 8u + d_tid, Of[r][d], o_offset, iq2, N);
+                    }
+                }
+            }
+            if (d_tid == 0u) {
+                const uint32_t lm_offset = HSV * p.ne1 * p.k_num * p.ne2 * p.ne3 + p.ne1 * 2u * (split_k_index + p.k_num * (gqa_iq1 + p.ne2 * iq3));
+                [[unroll]] for (uint32_t r = 0u; r < 3u; ++r) {
+                    if (r < N) {
+                        data_o[lm_offset + iq2 + r]         = D_TYPE(Lf[r]);
+                        data_o[lm_offset + p.ne1 + iq2 + r] = D_TYPE(Mf[r]);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    if ((p.mask_n_head_log2 & SINK_ENABLE_BIT) != 0u) {
+        [[unroll]] for (uint32_t r = 0u; r < 3u; ++r) {
+            const float sink = perElemOpGetSink(r, 0u, ACC_TYPE(0), iq2);
+            float ms = 1.0f;
+            float vs = 1.0f;
+            if (sink > Mf[r]) {
+                ms = exp(Mf[r] - sink);
+                [[unroll]] for (uint32_t d = 0u; d < 4u; ++d) {
+                    Of[r][d] *= FLOAT_TYPE(ms);
+                }
+            } else {
+                vs = exp(sink - Mf[r]);
+            }
+            Lf[r] = Lf[r] * ms + vs;
+        }
+    }
+
+    if (col_tid == 0u) {
+        const uint32_t o_offset = (gqa_iq1 * p.ne1 * HSV + iq3 * p.ne2 * p.ne1 * HSV) / 4u;
+        [[unroll]] for (uint32_t r = 0u; r < 3u; ++r) {
+            if (r < N) {
+                const float lrcp = (Lf[r] == 0.0f) ? 0.0f : (1.0f / Lf[r]);
+                [[unroll]] for (uint32_t d = 0u; d < 4u; ++d) {
+                    FLOAT_TYPEV4 out_v = Of[r][d] * FLOAT_TYPE(lrcp);
+#if defined(FLOAT_TYPE_MAX)
+                    out_v = clamp(out_v, -FLOAT_TYPE_MAX, FLOAT_TYPE_MAX);
+#endif
+                    gqaStore(r, d * 8u + d_tid, out_v, o_offset, iq2, N);
+                }
+            }
+        }
+    }
+}

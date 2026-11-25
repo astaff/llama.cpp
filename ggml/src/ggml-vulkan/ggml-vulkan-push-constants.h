@@ -147,6 +147,8 @@ struct vk_mat_mat_id_fused_push_constants {
     uint32_t n_experts;
     uint32_t row_ids_offset;
     uint32_t fusion_flags;
+    float    glu_alpha;
+    float    glu_limit;
 };
 
 struct vk_mat_vec_id_push_constants {

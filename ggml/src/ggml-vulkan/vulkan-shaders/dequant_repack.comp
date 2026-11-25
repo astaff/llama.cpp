@@ -12,6 +12,30 @@ layout (binding = 0) readonly buffer A_U4  { uvec4 data_a_u4[]; };
 layout (binding = 1) writeonly buffer D { D_TYPE data_b[]; };
 
 void main() {
+#if defined(DATA_A_NVFP4)
+    const uint s_blks = (p.K >> 6u) * p.M;
+    const uint n_blks = p.nel >> 6u;
+    const uint tid    = gl_LocalInvocationID.x;
+    const uint sub    = tid >> 3u;
+    const uint l      = tid & 7u;
+    for (uint wgy = 0u; wgy < 1024u; ++wgy) {
+        const uint ib = gl_WorkGroupID.x * 1024u + wgy;
+        if (ib >= n_blks) {
+            return;
+        }
+        const uint e          = ib / s_blks;
+        const uint b_in_slice = ib - e * s_blks;
+        const uint slice_u32  = e * s_blks * 9u;
+        const uint d_u32      = data_a_u32[slice_u32 + s_blks * 8u + b_in_slice];
+        const float d         = ue4m3_to_fp32(uint8_t((d_u32 >> (sub * 8u)) & 0xFFu));
+        const uint q_word     = data_a_u32[slice_u32 + b_in_slice * 8u + sub * 2u + (l >> 2u)];
+        const uint q_byte     = (q_word >> ((l & 3u) * 8u)) & 0xFFu;
+        const uint b_idx      = ib * 64u + sub * 16u + l;
+        data_b[b_idx + 0u]    = D_TYPE(d * 0.5f * float(mxfp4_kval(q_byte & 0xFu)));
+        data_b[b_idx + 8u]    = D_TYPE(d * 0.5f * float(mxfp4_kval(q_byte >> 4u)));
+    }
+    return;
+#endif
 #if defined(DATA_A_Q4_K)
     const uint sb_u4 = REPACK_Q4_K_SB_U4;
 #elif defined(DATA_A_Q5_K)

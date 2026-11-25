@@ -2778,6 +2778,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // the large-add-nodes issue for uniform arches; for Puzzle the per-layer
     // value is correct). ref: https://github.com/ggml-org/llama.cpp/pull/14753
     const uint32_t n_expert_used_il = hparams.n_expert_used(il);
+    if ((arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) &&
+        hparams.n_shortconv_l_cache == 4 && ubatch.n_seq_tokens <= 8 && n_tokens <= 8 &&
+        n_expert_used_il > 1 && ggml_is_contiguous(experts) &&
+        !getenv("GGML_INKLING_NO_FUSE") && !getenv("GGML_VK_DISABLE_S19_CONV_SUM")) {
+        cb(experts, "ffn_moe_out", il);
+        return experts;
+    }
     for (uint32_t i = 0; i < n_expert_used_il; ++i) {
         cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
 

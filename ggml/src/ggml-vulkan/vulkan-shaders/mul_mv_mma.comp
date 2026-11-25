@@ -144,9 +144,12 @@ layout(binding = MMA_BIND_U) readonly buffer BUF_U_NVFP4  { block_nvfp4_packed32
 #ifdef REPACK_PLANAR
 #include "repack_planar.glsl"
 layout(binding = 0)          readonly buffer BUF_A_REPACK_U32 { uint  data[]; } a_u32;
+layout(binding = 0)          readonly buffer BUF_A_REPACK_U2  { uvec2 data[]; } a_u2;
 layout(binding = 0)          readonly buffer BUF_A_REPACK_U4  { uvec4 data[]; } a_u4;
 layout(binding = MMA_BIND_U) readonly buffer BUF_U_REPACK_U32 { uint  data[]; } u_u32;
+layout(binding = MMA_BIND_U) readonly buffer BUF_U_REPACK_U2  { uvec2 data[]; } u_u2;
 layout(binding = MMA_BIND_U) readonly buffer BUF_U_REPACK_U4  { uvec4 data[]; } u_u4;
+uint g_mma_slice_blk_base;
 #endif
 
 // B bindings (binding = 1)
@@ -217,8 +220,10 @@ layout(push_constant) uniform parameter {
     uint nbi1;
     uint ne11;
     uint n_experts;
-    uint row_ids_offset;
-    uint fusion_flags;
+    uint  row_ids_offset;
+    uint  fusion_flags;
+    float glu_alpha;
+    float glu_limit;
 #else
     uint M;
     uint N;
@@ -763,9 +768,31 @@ void dequant16(bool use_u, uint row_unit_base, uint ci, out MMA_FVEC4 w0, out MM
     w2 = f16vec4(d * vec4(iq4nl_lut(q2.x), iq4nl_lut(q2.y), iq4nl_lut(q2.z), iq4nl_lut(q2.w)));
     w3 = f16vec4(d * vec4(iq4nl_lut(q3.x), iq4nl_lut(q3.y), iq4nl_lut(q3.z), iq4nl_lut(q3.w)));
 #elif defined(DATA_A_NVFP4)
-    const uint ib  = row_unit_base + (ci >> 2u);
     const uint sub = ci & 3u;
     uint d_u32, q0, q1;
+#ifdef REPACK_PLANAR
+    const uint b_in_slice = (row_unit_base - g_mma_slice_blk_base) + (ci >> 2u);
+    uint s_blks = p.batch_stride_a >> 6u;
+#ifndef MUL_MAT_ID
+    if (FUSE_MODE == 2u && use_u) {
+        s_blks = (p.K >> 6u) * (p.M - p.pair_m0);
+    } else if (FUSE_MODE == 2u) {
+        s_blks = (p.K >> 6u) * p.pair_m0;
+    }
+#endif
+    const uint slice_u32 = g_mma_slice_blk_base * 9u;
+    const uint slice_u2  = slice_u32 >> 1u;
+    if (use_u) {
+        d_u32           = u_u32.data[slice_u32 + s_blks * 8u + b_in_slice];
+        const uvec2 q01 = u_u2.data[slice_u2 + b_in_slice * 4u + sub];
+        q0 = q01.x; q1 = q01.y;
+    } else {
+        d_u32           = a_u32.data[slice_u32 + s_blks * 8u + b_in_slice];
+        const uvec2 q01 = a_u2.data[slice_u2 + b_in_slice * 4u + sub];
+        q0 = q01.x; q1 = q01.y;
+    }
+#else
+    const uint ib  = row_unit_base + (ci >> 2u);
     if (use_u) {
         d_u32 = u_nvfp4.data[ib].d[0];
         q0    = u_nvfp4.data[ib].qs[2u * sub + 0u];
@@ -775,6 +802,7 @@ void dequant16(bool use_u, uint row_unit_base, uint ci, out MMA_FVEC4 w0, out MM
         q0    = a_nvfp4.data[ib].qs[2u * sub + 0u];
         q1    = a_nvfp4.data[ib].qs[2u * sub + 1u];
     }
+#endif
     const uint du = (d_u32 >> (sub * 8u)) & 0xFFu;
     const f16vec4 dv = f16vec4(float16_t(ue4m3_to_fp32_build(du)));
     const f16vec2 e0_lo = unpackFloat2x16(nvfp4_e2m1_pair_fp16_bits(q0));
@@ -932,6 +960,9 @@ void main() {
     }
     const uint n_valid = tile_ne1;
     const uint a_batch_base = expert_idx * (p.batch_stride_a >> MMA_ELEM_SHIFT);
+#ifdef REPACK_PLANAR
+    g_mma_slice_blk_base = a_batch_base;
+#endif
     if (USE_SH_IDS) {
         for (uint c_it = tid; c_it < BN_COLS; c_it += WG_THREADS) {
             const uint c = min(c_it, tile_ne1 - 1u);
@@ -968,6 +999,9 @@ void main() {
     const uint i02         = i12 / p.broadcast2;
     const uint batch_idx_a = i03 * p.ne02 + i02;
     const uint a_batch_base = batch_idx_a * (p.batch_stride_a >> MMA_ELEM_SHIFT);
+#ifdef REPACK_PLANAR
+    g_mma_slice_blk_base = a_batch_base;
+#endif
     const uint b_batch_base = batch_idx * p.batch_stride_b;
 #endif
 

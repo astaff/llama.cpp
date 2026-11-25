@@ -83,7 +83,15 @@ void main() {
             const uint32_t r  = idx0 / (HSK_pad / 4u);
             vec4 qv = vec4(0.0);
             if (i * Br + r < N && d4 * 4u < HSK) {
-                const uint32_t q_elem = q_offset + (i * Br + r) * q_stride + d4 * 4u;
+                const uint32_t vrow = i * Br + r;
+                uint32_t q_elem;
+                if (GQA_VROW_PACK) {
+                    const uint32_t q_tok  = vrow / p.gqa_ratio;
+                    const uint32_t q_head = iq2 + (vrow - q_tok * p.gqa_ratio);
+                    q_elem = q_tok * p.nb01 + (q_head * p.nb02 + iq3 * p.nb03) / 4u + d4 * 4u;
+                } else {
+                    q_elem = q_offset + vrow * q_stride + d4 * 4u;
+                }
                 if (!KV_bounds_check || (q_elem & 3u) == 0u) {
                     qv = data_qv4[q_elem >> 2u] * p.scale;
                 } else {
@@ -103,7 +111,8 @@ void main() {
     }
 
     if (tid < Br) {
-        slope[tid] = (p.max_bias > 0.0f) ? perElemOpComputeSlope(tid, col_tid, ACC_TYPE(0), iq2) : ACC_TYPE(1.0);
+        const uint32_t slope_r = GQA_VROW_PACK ? (i * Br + tid) : tid;
+        slope[tid] = (p.max_bias > 0.0f) ? perElemOpComputeSlope(slope_r, col_tid, ACC_TYPE(0), iq2) : ACC_TYPE(1.0);
     }
     barrier();
 
@@ -169,6 +178,19 @@ void main() {
                         if (fa_kv_index(j * Bc + c, kcol)) {
                             if (USE_SPARSE) {
                                 max_mask = max(max_mask, float(data_m[m_offset + kcol]));
+                            } else if (GQA_VROW_PACK) {
+                                const uint32_t m_b3 = (iq3 % p.nem3) * p.nem2;
+                                [[unroll]] for (uint32_t rr = 0u; rr < 4u; ++rr) {
+                                    const uint32_t vrow = i * Br + r * 4u + rr;
+                                    if (vrow < N) {
+                                        const uint32_t q_tok  = vrow / p.gqa_ratio;
+                                        const uint32_t q_head = iq2 + (vrow - q_tok * p.gqa_ratio);
+                                        if (q_tok < p.nem1) {
+                                            const uint32_t m_idx = ((m_b3 + (q_head % p.nem2)) * p.nem1 + q_tok) * KV + kcol;
+                                            max_mask = max(max_mask, float(data_m[m_idx]));
+                                        }
+                                    }
+                                }
                             } else {
                                 [[unroll]] for (uint32_t rr = 0u; rr < 4u; ++rr) {
                                     if (!nem1_bounds_check || i * Br + r * 4u + rr < p.nem1) {
@@ -287,6 +309,19 @@ void main() {
                         if (kv_active) {
                             if (USE_SPARSE) {
                                 masks = ACC_TYPEV4(float(data_m[m_offset + kcol]));
+                            } else if (GQA_VROW_PACK) {
+                                const uint32_t m_b3 = (iq3 % p.nem3) * p.nem2;
+                                [[unroll]] for (uint32_t rr = 0u; rr < 4u; ++rr) {
+                                    const uint32_t vrow = i * Br + r * 4u + rr;
+                                    if (vrow < N) {
+                                        const uint32_t q_tok  = vrow / p.gqa_ratio;
+                                        const uint32_t q_head = iq2 + (vrow - q_tok * p.gqa_ratio);
+                                        if (q_tok < p.nem1) {
+                                            const uint32_t m_idx = ((m_b3 + (q_head % p.nem2)) * p.nem1 + q_tok) * KV + kcol;
+                                            masks[rr] = ACC_TYPE(data_m[m_idx]);
+                                        }
+                                    }
+                                }
                             } else {
                                 [[unroll]] for (uint32_t rr = 0u; rr < 4u; ++rr) {
                                     if (!nem1_bounds_check || i * Br + r * 4u + rr < p.nem1) {
@@ -441,7 +476,18 @@ void main() {
                     sh_eMf[tile_row(r)] = 1.0f;
                 }
             }
-            if (p.gqa_ratio > 1u) {
+            if (GQA_VROW_PACK) {
+                [[unroll]] for (uint32_t r = 0u; r < sm_rows_per_th; ++r) {
+                    const uint32_t vrow = i * Br + tile_row(r);
+                    if (vrow < N && col_tid == 0u) {
+                        const uint32_t q_tok  = vrow / p.gqa_ratio;
+                        const uint32_t q_head = iq2 + (vrow - q_tok * p.gqa_ratio);
+                        const uint32_t lm_offset = HSV * p.ne1 * p.k_num * p.ne2 * p.ne3 + p.ne1 * 2u * (split_k_index + p.k_num * (q_tok + p.ne2 * iq3));
+                        data_o[lm_offset + q_head]         = D_TYPE(Lf[r]);
+                        data_o[lm_offset + p.ne1 + q_head] = D_TYPE(Mf[r]);
+                    }
+                }
+            } else if (p.gqa_ratio > 1u) {
                 const uint32_t lm_offset = HSV * p.ne1 * p.k_num * p.ne2 * p.ne3 + p.ne1 * 2u * (split_k_index + p.k_num * (gqa_iq1 + p.ne2 * iq3));
                 [[unroll]] for (uint32_t r = 0u; r < sm_rows_per_th; ++r) {
                     if (tile_row(r) < N) {
@@ -463,7 +509,8 @@ void main() {
             [[unroll]] for (uint32_t r = 0u; r < sm_rows_per_th; ++r) {
                 float ms = 1.0f;
                 if ((p.mask_n_head_log2 & SINK_ENABLE_BIT) != 0u) {
-                    const float sink = perElemOpGetSink(tile_row(r), 0u, ACC_TYPE(0), iq2);
+                    const uint32_t sink_r = GQA_VROW_PACK ? (i * Br + tile_row(r)) : tile_row(r);
+                    const float sink = perElemOpGetSink(sink_r, 0u, ACC_TYPE(0), iq2);
                     float vs = 1.0f;
                     if (sink > Mf[r]) {
                         ms = exp(Mf[r] - sink);
@@ -507,7 +554,19 @@ void main() {
                             out_v = clamp(out_v, -O_TYPE(FLOAT_TYPE_MAX), O_TYPE(FLOAT_TYPE_MAX));
                         }
 #endif
-                        if (p.k_num > 1u) {
+                        if (GQA_VROW_PACK) {
+                            const uint32_t vrow = i * Br + row;
+                            if (vrow < N) {
+                                const uint32_t q_tok  = vrow / p.gqa_ratio;
+                                const uint32_t q_head = iq2 + (vrow - q_tok * p.gqa_ratio);
+                                if (p.k_num > 1u) {
+                                    const uint32_t o_off = HSV * p.ne1 * (split_k_index + p.k_num * (q_tok + p.ne2 * iq3)) / 4u;
+                                    data_ov4[o_off + q_head * (HSV / 4u) + d] = D_TYPEV4(out_v);
+                                } else {
+                                    data_ov4[o_base_dense + (q_head * HSV + q_tok * p.ne1 * HSV) / 4u + d] = D_TYPEV4(out_v);
+                                }
+                            }
+                        } else if (p.k_num > 1u) {
                             if (p.gqa_ratio > 1u) {
                                 if (row < N) {
                                     gqaStore(row, d, out_v, o_base_sk_gqa, iq2, N);

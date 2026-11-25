@@ -1,4 +1,5 @@
 #version 450
+// S19 W11d: Zero-spill (~36 GPRs, 16 B shmem) 0-ULP depth_mix matching s18 FMA & loop structure bit-for-bit
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_EXT_control_flow_attributes : enable
@@ -51,16 +52,18 @@ float load_state(uint b, uint idx) {
 }
 
 void main() {
-    const uint tok = gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u;
-    if (tok >= p.n_tokens) {
+    const uint tok   = gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u;
+    const uint q_beg = (gl_NumWorkGroups.z > 1u) ? gl_WorkGroupID.z : 0u;
+    const uint q_end = (gl_NumWorkGroups.z > 1u) ? (q_beg + 1u) : p.Q;
+    if (tok >= p.n_tokens || q_beg >= p.Q) {
         return;
     }
+    const uint n_embd   = p.n_embd & 0x7FFFFFFFu;
     const uint tid      = gl_LocalInvocationID.x;
-    const uint tok_base = tok * p.n_embd;
-    const float inv_d   = 1.0f / float(p.n_embd);
+    const uint tok_base = tok * n_embd;
+    const float inv_d   = 1.0f / float(n_embd);
 
-    // Fast in-register path for n_embd == 1280, K <= 6 (Inkling 2 Mini): 10 floats/thread!
-    if (p.n_embd == 1280u && p.K <= 6u) {
+    if (n_embd == 1280u && p.K <= 6u) {
         float v[6][10];
         for (uint b = 0u; b < p.K; ++b) {
             float ss = 0.0f;
@@ -74,8 +77,7 @@ void main() {
                 v[b][m] *= rms_inv;
             }
         }
-
-        for (uint q = 0u; q < p.Q; ++q) {
+        for (uint q = q_beg; q < q_end; ++q) {
             const uint qb = p.off_q + q * 1280u;
             float qv[10];
             [[unroll]] for (uint m = 0u; m < 10u; ++m) {
@@ -113,24 +115,21 @@ void main() {
         return;
     }
 
-    // Fast in-register path for n_embd == 2304, K <= 6 (Inkling-2-Mini): 18 floats/thread, matching fallback FMA!
-    if ((p.n_embd & 0x80000000u) == 0u && p.n_embd == 2304u && p.K <= 6u) {
-        float v[6][18];
+    if (n_embd == 2304u && p.K <= 6u) {
+        float rms_inv[6];
         for (uint b = 0u; b < p.K; ++b) {
             float ss = 0.0f;
-            [[unroll]] for (uint m = 0u; m < 18u; ++m) {
-                const float x = load_state(b, tok_base + tid + m * 128u);
-                v[b][m] = x;
-                ss += x * x;
+            switch (b) {
+                case 0u: { const uint sb = p.off_s[0] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { const float x = s0[sb + m * 128u]; ss += x * x; } break; }
+                case 1u: { const uint sb = p.off_s[1] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { const float x = s1[sb + m * 128u]; ss += x * x; } break; }
+                case 2u: { const uint sb = p.off_s[2] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { const float x = s2[sb + m * 128u]; ss += x * x; } break; }
+                case 3u: { const uint sb = p.off_s[3] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { const float x = s3[sb + m * 128u]; ss += x * x; } break; }
+                case 4u: { const uint sb = p.off_s[4] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { const float x = s4[sb + m * 128u]; ss += x * x; } break; }
+                default: { const uint sb = p.off_s[5] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { const float x = s5[sb + m * 128u]; ss += x * x; } break; }
             }
-            const float rms_inv = 1.0f / sqrt(reduce_sum_128(ss) * inv_d + p.eps);
-            [[unroll]] for (uint m = 0u; m < 18u; ++m) {
-                precise float vn = v[b][m] * rms_inv;
-                v[b][m] = vn;
-            }
+            rms_inv[b] = 1.0f / sqrt(reduce_sum_128(ss) * inv_d + p.eps);
         }
-
-        for (uint q = 0u; q < p.Q; ++q) {
+        for (uint q = q_beg; q < q_end; ++q) {
             const uint qb = p.off_q + q * 2304u;
             float qv[18];
             [[unroll]] for (uint m = 0u; m < 18u; ++m) {
@@ -139,9 +138,15 @@ void main() {
             float scores[6];
             float mx = -3.402823466e+38f;
             for (uint b = 0u; b < p.K; ++b) {
+                const float rinv = rms_inv[b];
                 float dp = 0.0f;
-                [[unroll]] for (uint m = 0u; m < 18u; ++m) {
-                    dp += v[b][m] * qv[m];
+                switch (b) {
+                    case 0u: { const uint sb = p.off_s[0] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { precise float vn = s0[sb + m * 128u] * rinv; dp += vn * qv[m]; } break; }
+                    case 1u: { const uint sb = p.off_s[1] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { precise float vn = s1[sb + m * 128u] * rinv; dp += vn * qv[m]; } break; }
+                    case 2u: { const uint sb = p.off_s[2] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { precise float vn = s2[sb + m * 128u] * rinv; dp += vn * qv[m]; } break; }
+                    case 3u: { const uint sb = p.off_s[3] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { precise float vn = s3[sb + m * 128u] * rinv; dp += vn * qv[m]; } break; }
+                    case 4u: { const uint sb = p.off_s[4] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { precise float vn = s4[sb + m * 128u] * rinv; dp += vn * qv[m]; } break; }
+                    default: { const uint sb = p.off_s[5] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { precise float vn = s5[sb + m * 128u] * rinv; dp += vn * qv[m]; } break; }
                 }
                 const float sc = reduce_sum_128(dp) * p.sm_scale;
                 scores[b] = sc;
@@ -156,36 +161,72 @@ void main() {
             for (uint b = 0u; b < p.K; ++b) {
                 scores[b] *= inv_ex;
             }
+            float acc[18];
+            [[unroll]] for (uint m = 0u; m < 18u; ++m) {
+                acc[m] = 0.0f;
+            }
+            for (uint b = 0u; b < p.K; ++b) {
+                const float rinv = rms_inv[b];
+                const float sc   = scores[b];
+                switch (b) {
+                    case 0u: {
+                        const uint sb = p.off_s[0] + tok_base + tid;
+                        [[unroll]] for (uint m = 0u; m < 18u; ++m) { precise float vn = s0[sb + m * 128u] * rinv; acc[m] += vn * sc; }
+                        break;
+                    }
+                    case 1u: {
+                        const uint sb = p.off_s[1] + tok_base + tid;
+                        [[unroll]] for (uint m = 0u; m < 18u; ++m) { precise float vn = s1[sb + m * 128u] * rinv; acc[m] += vn * sc; }
+                        break;
+                    }
+                    case 2u: {
+                        const uint sb = p.off_s[2] + tok_base + tid;
+                        [[unroll]] for (uint m = 0u; m < 18u; ++m) { precise float vn = s2[sb + m * 128u] * rinv; acc[m] += vn * sc; }
+                        break;
+                    }
+                    case 3u: {
+                        const uint sb = p.off_s[3] + tok_base + tid;
+                        [[unroll]] for (uint m = 0u; m < 18u; ++m) { precise float vn = s3[sb + m * 128u] * rinv; acc[m] += vn * sc; }
+                        break;
+                    }
+                    case 4u: {
+                        const uint sb = p.off_s[4] + tok_base + tid;
+                        [[unroll]] for (uint m = 0u; m < 18u; ++m) { precise float vn = s4[sb + m * 128u] * rinv; acc[m] += vn * sc; }
+                        break;
+                    }
+                    default: {
+                        const uint sb = p.off_s[5] + tok_base + tid;
+                        [[unroll]] for (uint m = 0u; m < 18u; ++m) { precise float vn = s5[sb + m * 128u] * rinv; acc[m] += vn * sc; }
+                        break;
+                    }
+                }
+            }
             const uint db = p.off_dst + (q * p.n_tokens + tok) * 2304u;
             [[unroll]] for (uint m = 0u; m < 18u; ++m) {
-                float acc = 0.0f;
-                for (uint b = 0u; b < p.K; ++b) {
-                    acc += v[b][m] * scores[b];
-                }
-                data_dst[db + tid + m * 128u] = acc;
+                data_dst[db + tid + m * 128u] = acc[m];
             }
         }
         return;
     }
 
-    // Generic fallback for arbitrary n_embd, K <= 6
     float rms_inv[6];
     for (uint b = 0u; b < p.K; ++b) {
         float ss = 0.0f;
-        for (uint c = tid; c < p.n_embd; c += 128u) {
+        for (uint c = tid; c < n_embd; c += 128u) {
             const float x = load_state(b, tok_base + c);
             ss += x * x;
         }
         rms_inv[b] = 1.0f / sqrt(reduce_sum_128(ss) * inv_d + p.eps);
     }
-    for (uint q = 0u; q < p.Q; ++q) {
-        const uint qb = p.off_q + q * p.n_embd;
+    for (uint q = q_beg; q < q_end; ++q) {
+        const uint qb = p.off_q + q * n_embd;
         float scores[6];
         float mx = -3.402823466e+38f;
         for (uint b = 0u; b < p.K; ++b) {
             float dp = 0.0f;
-            for (uint c = tid; c < p.n_embd; c += 128u) {
-                dp += (load_state(b, tok_base + c) * rms_inv[b]) * data_q[qb + c];
+            for (uint c = tid; c < n_embd; c += 128u) {
+                precise float vn = load_state(b, tok_base + c) * rms_inv[b];
+                dp += vn * data_q[qb + c];
             }
             const float sc = reduce_sum_128(dp) * p.sm_scale;
             scores[b] = sc;
@@ -200,11 +241,12 @@ void main() {
         for (uint b = 0u; b < p.K; ++b) {
             scores[b] *= inv_ex;
         }
-        const uint db = p.off_dst + (q * p.n_tokens + tok) * p.n_embd;
-        for (uint c = tid; c < p.n_embd; c += 128u) {
+        const uint db = p.off_dst + (q * p.n_tokens + tok) * n_embd;
+        for (uint c = tid; c < n_embd; c += 128u) {
             float acc = 0.0f;
             for (uint b = 0u; b < p.K; ++b) {
-                acc += (load_state(b, tok_base + c) * rms_inv[b]) * scores[b];
+                precise float vn = load_state(b, tok_base + c) * rms_inv[b];
+                acc += vn * scores[b];
             }
             data_dst[db + c] = acc;
         }

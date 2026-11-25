@@ -197,7 +197,9 @@ layout (push_constant) uniform parameter
     uint n_experts;
     uint row_ids_offset;
 #ifdef MM_FUSED
-    uint fusion_flags;
+    uint  fusion_flags;
+    float glu_alpha;
+    float glu_limit;
 #endif
 #else
     uint base_work_group_z;

@@ -1,5 +1,8 @@
 #include "parsers.h"
 
+#include <algorithm>
+#include "log.h"
+
 bool is_inkling_template(const std::string & src) {
     return src.find("<|message_user|>") != std::string::npos &&
            src.find("<|content_image|>") != std::string::npos;
@@ -122,9 +125,9 @@ common_chat_params common_chat_params_init_inkling(const common_chat_template & 
 
         // the call takes the name in the JSON
         auto tool_json = p.token(TOOL_JSON);
-        auto tool_body = [&](const common_peg_parser & json_name) {
+        auto tool_body = [&](const common_peg_parser & json_name, const common_peg_parser & args_parser) {
             return p.tool_open(p.literal("{")) << p.json_member("name", p.literal("\"") + p.tool_name(json_name) + p.literal("\"")) << p.literal(",")
-                                               << p.json_member("args", p.tool_args(p.json())) << p.tool_close(p.literal("}")) + end;
+                                               << p.json_member("args", p.tool_args(args_parser)) << p.tool_close(p.literal("}")) + end;
         };
 
         if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
@@ -134,9 +137,67 @@ common_chat_params common_chat_params_init_inkling(const common_chat_template & 
                 std::string  name     = function.at("name");
                 std::string  quoted   = json(name).dump();
 
+                auto args_inner = p.json();
+                try {
+                    auto params = common_chat_tool_parameters(function);
+                    auto doc    = std::make_shared<const common_chat_schema_document>(common_chat_schema_from_json(params));
+                    const auto * obj = dynamic_cast<const common_chat_schema_object *>(doc->root.get());
+                    if (obj && !obj->additional_properties) {
+                        if (obj->properties.empty()) {
+                            args_inner = p.literal("{") + p.optional(p.space()) + p.literal("}");
+                        } else {
+                            std::vector<const common_chat_schema_property *> sorted;
+                            sorted.reserve(obj->properties.size());
+                            for (const auto & prop : obj->properties) {
+                                sorted.push_back(&prop);
+                            }
+                            std::sort(sorted.begin(), sorted.end(), [](const auto * a, const auto * b) {
+                                return a->name < b->name;
+                            });
+                            size_t first_req = sorted.size();
+                            for (size_t j = 0; j < sorted.size(); ++j) {
+                                if (sorted[j]->required) {
+                                    first_req = j;
+                                    break;
+                                }
+                            }
+                            if (first_req < sorted.size()) {
+                                std::vector<common_peg_parser> kv_rules;
+                                kv_rules.reserve(sorted.size());
+                                for (size_t j = 0; j < sorted.size(); ++j) {
+                                    const std::string base = "tool-" + std::to_string(tool_index) + "-p" + std::to_string(j);
+                                    auto val = p.schema(p.json(), base + "-val", doc, *sorted[j]->schema);
+                                    kv_rules.push_back(p.rule(base + "-kv",
+                                        p.literal(json(sorted[j]->name).dump()) + p.optional(p.space()) +
+                                        p.literal(":") + p.optional(p.space()) + val));
+                                }
+                                auto comma = p.optional(p.space()) + p.literal(",") + p.optional(p.space());
+                                auto chain = kv_rules[first_req];
+                                for (size_t j = first_req + 1; j < sorted.size(); ++j) {
+                                    chain = sorted[j]->required ? (chain + comma + kv_rules[j])
+                                                                : (chain + p.optional(comma + kv_rules[j]));
+                                }
+                                for (size_t j = first_req; j > 0; --j) {
+                                    chain = p.optional(kv_rules[j - 1] + comma) + chain;
+                                }
+                                args_inner = p.literal("{") + p.optional(p.space()) + chain + p.optional(p.space()) + p.literal("}");
+                            } else if (params.contains("properties") && params.at("properties").is_object()) {
+                                json sorted_props = json::object();
+                                for (const auto * sp : sorted) {
+                                    sorted_props[sp->name] = params.at("properties").at(sp->name);
+                                }
+                                params["properties"] = sorted_props;
+                                args_inner = p.schema(p.json(), "tool-" + std::to_string(tool_index) + "-schema", params);
+                            }
+                        }
+                    }
+                } catch (const std::exception & e) {
+                    LOG_WRN("%s: tool %s uses generic JSON args: %s\n", __func__, name.c_str(), e.what());
+                }
+
                 // The research model does not generate a tool name before the tool call token
                 auto json_name = p.literal(quoted.substr(1, quoted.size() - 2));
-                tool_choice |= p.rule("tool-" + std::to_string(tool_index), p.tool(p.optional(p.literal(name)) + tool_json + tool_body(json_name)));
+                tool_choice |= p.rule("tool-" + std::to_string(tool_index), p.tool(p.optional(p.literal(name)) + tool_json + tool_body(json_name, args_inner)));
             });
 
             auto calls = inputs.parallel_tool_calls ? tool_choice + p.zero_or_more(header + tool_choice) : tool_choice;
@@ -144,7 +205,7 @@ common_chat_params common_chat_params_init_inkling(const common_chat_template & 
         }
 
         auto name  = p.until(tool_json);
-        auto body  = tool_body(p.string_content('"'));
+        auto body  = tool_body(p.string_content('"'), p.json());
         auto next  = p.rule("tool-call", header + p.tool(name + tool_json + body));
         auto more  = inputs.parallel_tool_calls ? p.zero_or_more(next) : p.eps();
         auto calls = header + name + p.trigger_rule("tool-calls", tool_json, body + more);

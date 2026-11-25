@@ -3195,7 +3195,7 @@ struct ggml_tensor * ggml_inkling_conv(
         int32_t               st_slot_stride,
         int32_t               st_kw,
         float                 scale_out) {
-    struct ggml_tensor * result = ggml_dup_tensor(ctx, cur);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cur->ne[0], (int64_t)n_seq_tokens * n_seqs);
     result->op     = GGML_OP_INKLING_FUSED;
     result->src[0] = cur;
     result->src[1] = history;
@@ -3260,26 +3260,41 @@ struct ggml_tensor * ggml_inkling_rel_gather_f16(
     return result;
 }
 
+// S19_WAVE3: mode = 3, 4 extensions + mode = 11, 12 constructors
+struct ggml_tensor * ggml_inkling_depth_mix_rms(
+        struct ggml_context       * ctx,
+        struct ggml_tensor * const * states,
+        int                         n_states,
+        struct ggml_tensor        * query,
+        struct ggml_tensor        * rms_w,
+        float                       eps,
+        float                       rms_eps) {
+    GGML_ASSERT(n_states >= 1 && n_states <= 6);
+    const int64_t n_embd   = states[0]->ne[0];
+    const int64_t n_tokens = states[0]->ne[1] * states[0]->ne[2];
+    const int64_t Q        = query->ne[1];
+    GGML_ASSERT(!rms_w || (rms_w->ne[0] == n_embd && (rms_w->ne[1] == 1 || rms_w->ne[1] == Q)));
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_tokens, Q);
+    result->op = GGML_OP_INKLING_FUSED;
+    for (int i = 0; i < n_states; ++i) {
+        result->src[i] = states[i];
+    }
+    result->src[n_states]     = query;
+    result->src[n_states + 1] = rms_w;
+    ggml_set_op_params_i32(result, 0, 3);
+    ggml_set_op_params_i32(result, 1, n_states);
+    ggml_set_op_params_f32(result, 2, eps);
+    ggml_set_op_params_f32(result, 3, rms_eps);
+    return result;
+}
+
 struct ggml_tensor * ggml_inkling_depth_mix(
         struct ggml_context       * ctx,
         struct ggml_tensor * const * states,
         int                         n_states,
         struct ggml_tensor        * query,
         float                       eps) {
-    GGML_ASSERT(n_states >= 1 && n_states <= 6);
-    const int64_t n_embd   = states[0]->ne[0];
-    const int64_t n_tokens = states[0]->ne[1] * states[0]->ne[2];
-    const int64_t Q        = query->ne[1];
-    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_tokens, Q);
-    result->op = GGML_OP_INKLING_FUSED;
-    for (int i = 0; i < n_states; ++i) {
-        result->src[i] = states[i];
-    }
-    result->src[n_states] = query;
-    ggml_set_op_params_i32(result, 0, 3);
-    ggml_set_op_params_i32(result, 1, n_states);
-    ggml_set_op_params_f32(result, 2, eps);
-    return result;
+    return ggml_inkling_depth_mix_rms(ctx, states, n_states, query, NULL, eps, 0.0f);
 }
 
 struct ggml_tensor * ggml_inkling_rms2_concat(
@@ -3287,7 +3302,12 @@ struct ggml_tensor * ggml_inkling_rms2_concat(
         struct ggml_tensor  * cur,
         struct ggml_tensor  * message,
         float                 eps) {
-    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * cur->ne[0], cur->ne[1]);
+    GGML_ASSERT(cur->ne[0] == message->ne[0] && cur->ne[1] == message->ne[1]);
+    GGML_ASSERT(cur->ne[2] == 1 || cur->ne[2] == message->ne[2]);
+    const int64_t C = message->ne[2];
+    struct ggml_tensor * result = C > 1
+        ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2 * cur->ne[0], cur->ne[1], C)
+        : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * cur->ne[0], cur->ne[1]);
     result->op     = GGML_OP_INKLING_FUSED;
     result->src[0] = cur;
     result->src[1] = message;
@@ -3309,6 +3329,61 @@ struct ggml_tensor * ggml_inkling_ctrl_apply(
     result->src[2] = raw_gain;
     result->src[3] = raw_forget;
     ggml_set_op_params_i32(result, 0, 5);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_ctrl_apply_rms_mul(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * message,
+        struct ggml_tensor  * up_gf,
+        struct ggml_tensor  * rms_w,
+        float                 eps) {
+    const int64_t n_embd   = message->ne[0];
+    const int64_t n_tokens = message->ne[1];
+    const int64_t C        = message->ne[2];
+    GGML_ASSERT(cur->ne[0] == n_embd && cur->ne[1] == n_tokens && (cur->ne[2] == 1 || cur->ne[2] == C));
+    GGML_ASSERT(up_gf->ne[0] == 2 * n_embd && up_gf->ne[1] == n_tokens && up_gf->ne[2] == C);
+    GGML_ASSERT(rms_w->ne[0] == n_embd && (rms_w->ne[1] == 1 || rms_w->ne[1] == C));
+    struct ggml_tensor * result = C > 1
+        ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_tokens, C)
+        : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    result->op     = GGML_OP_INKLING_FUSED;
+    result->src[0] = cur;
+    result->src[1] = message;
+    result->src[2] = up_gf;
+    result->src[3] = rms_w;
+    ggml_set_op_params_i32(result, 0, 11);
+    ggml_set_op_params_f32(result, 1, eps);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_l2_clip_qr(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q_cur,
+        struct ggml_tensor  * r_cur,
+        struct ggml_tensor  * q_scale,
+        struct ggml_tensor  * r_scale,
+        struct ggml_tensor  * mul_tau,
+        float                 q_threshold,
+        float                 r_threshold,
+        float                 eps) {
+    GGML_ASSERT(q_cur->ne[1] == r_cur->ne[1] && q_cur->ne[2] == r_cur->ne[2]);
+    const int64_t q_dim    = q_cur->ne[0];
+    const int64_t r_dim    = r_cur->ne[0];
+    const int64_t n_head   = q_cur->ne[1];
+    const int64_t n_tokens = q_cur->ne[2];
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (q_dim + r_dim) * n_head, n_tokens);
+    result->op     = GGML_OP_INKLING_FUSED;
+    result->src[0] = q_cur;
+    result->src[1] = r_cur;
+    result->src[2] = q_scale;
+    result->src[3] = r_scale;
+    result->src[4] = mul_tau;
+    ggml_set_op_params_i32(result, 0, 12);
+    ggml_set_op_params_f32(result, 1, q_threshold);
+    ggml_set_op_params_f32(result, 2, r_threshold);
+    ggml_set_op_params_f32(result, 3, eps);
     return result;
 }
 
@@ -3339,6 +3414,81 @@ struct ggml_tensor * ggml_inkling_dspark_gru(
     result->src[0] = joint;
     result->src[1] = state_in;
     ggml_set_op_params_i32(result, 0, 7); // MODE_DSPARK_GRU
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_softcap(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        float                 inv_cap,
+        float                 cap) {
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+    result->op     = GGML_OP_INKLING_FUSED;
+    result->src[0] = a;
+    ggml_set_op_params_i32(result, 0, 8); // MODE_SOFTCAP
+    ggml_set_op_params_f32(result, 1, inv_cap);
+    ggml_set_op_params_f32(result, 2, cap);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_dspark_joint_gru(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * prev,
+        struct ggml_tensor  * markov_w1,
+        struct ggml_tensor  * state_in,
+        struct ggml_tensor  * hidden,
+        struct ggml_tensor  * context,
+        struct ggml_tensor  * joint_proj,
+        struct ggml_tensor  * joint_proj_b) {
+    const int64_t rank   = state_in->ne[0];
+    const int64_t nb     = state_in->ne[1];
+    const int64_t n_embd = hidden->ne[0];
+    GGML_ASSERT(markov_w1->ne[0] == rank && prev->ne[0] == nb);
+    GGML_ASSERT(hidden->ne[1] == nb && context->ne[0] == n_embd && context->ne[1] == nb);
+    GGML_ASSERT(joint_proj->ne[0] == 2 * rank + 2 * n_embd && joint_proj->ne[1] == 3 * rank);
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, rank, nb, 2);
+    result->op     = GGML_OP_INKLING_FUSED;
+    result->src[0] = prev;
+    result->src[1] = markov_w1;
+    result->src[2] = state_in;
+    result->src[3] = hidden;
+    result->src[4] = context;
+    result->src[5] = joint_proj;
+    result->src[6] = joint_proj_b;
+    ggml_set_op_params_i32(result, 0, 9); // MODE_DSPARK_JOINT_GRU
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_dspark_inject_mix(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * features,
+        struct ggml_tensor  * fuse_w,
+        struct ggml_tensor  * norm0,
+        struct ggml_tensor  * norm1,
+        struct ggml_tensor  * norm2,
+        struct ggml_tensor  * norm3,
+        struct ggml_tensor  * positions,
+        struct ggml_tensor  * ring_dst,
+        int32_t               ring_seq_offset,
+        int32_t               ring_rows,
+        float                 eps) {
+    const int64_t n_embd   = norm0->ne[0];
+    const int64_t n_tokens = features->ne[1];
+    GGML_ASSERT(features->ne[0] == 4 * n_embd && fuse_w->ne[0] == 4 && fuse_w->ne[1] == 4);
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_tokens, 4);
+    result->op     = GGML_OP_INKLING_FUSED;
+    result->src[0] = features;
+    result->src[1] = fuse_w;
+    result->src[2] = norm0;
+    result->src[3] = norm1;
+    result->src[4] = norm2;
+    result->src[5] = norm3;
+    result->src[6] = positions;
+    result->src[7] = ring_dst;
+    ggml_set_op_params_i32(result, 0, 10); // MODE_DSPARK_INJECT_MIX
+    ggml_set_op_params_i32(result, 1, ring_seq_offset);
+    ggml_set_op_params_i32(result, 2, ring_rows);
+    ggml_set_op_params_f32(result, 3, eps);
     return result;
 }
 

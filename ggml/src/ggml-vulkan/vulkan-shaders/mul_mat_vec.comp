@@ -239,6 +239,36 @@ float nvfp4_decode_scale(const uint d_u32, const uint sub) {
     return ue4m3_to_fp32_build(du);
 }
 
+#ifdef REPACK_PLANAR
+void nvfp4_load_planar_a(const uint b_in_slice, const uint sub, const uint shift, out float da, out vec4 v0, out vec4 v1) {
+#ifdef MUL_MAT_ID
+    const uint s_blks = (p.ncols >> 6u) * p.stride_d;
+#else
+    const uint s_blks = (p.ncols >> 6u) * ((GEN_GLU == 2u) ? p.pair_m0 : p.stride_d);
+#endif
+    const uint slice_u32 = a_offset * 9u;
+    const uint slice_u2  = slice_u32 >> 1u;
+    da = nvfp4_decode_scale(data_a_repack_u32[slice_u32 + s_blks * 8u + b_in_slice], sub);
+    const uvec2 q01 = data_a_repack_u2[slice_u2 + b_in_slice * 4u + sub];
+    v0 = nvfp4_decode_nibs(q01.x >> shift);
+    v1 = nvfp4_decode_nibs(q01.y >> shift);
+}
+
+void nvfp4_load_planar_a2(const uint b_in_slice, const uint sub, const uint shift, out float da, out vec4 v0, out vec4 v1) {
+#ifdef MUL_MAT_ID
+    const uint s_blks = (p.ncols >> 6u) * p.stride_d;
+#else
+    const uint s_blks = (p.ncols >> 6u) * ((GEN_GLU == 2u) ? p.stride_d2 : p.stride_d);
+#endif
+    const uint slice_u32 = a_offset * 9u;
+    const uint slice_u2  = slice_u32 >> 1u;
+    da = nvfp4_decode_scale(data_a2_repack_u32[slice_u32 + s_blks * 8u + b_in_slice], sub);
+    const uvec2 q01 = data_a2_repack_u2[slice_u2 + b_in_slice * 4u + sub];
+    v0 = nvfp4_decode_nibs(q01.x >> shift);
+    v1 = nvfp4_decode_nibs(q01.y >> shift);
+}
+#endif
+
 void iter_aligned_nvfp4_a(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_TYPE temp2[NUM_COLS][NUM_ROWS], const uint row_base, const uint num_rows, const uint tid, const uint iter_idx) {
     const uint b_col4 = iter_idx * (2u * BLOCK_SIZE) + 2u * tid;
     const uint lane8  = tid & 7u;
@@ -257,16 +287,26 @@ void iter_aligned_nvfp4_a(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT
         }
         [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
             const uint rn = (n == 0u || n < num_rows) ? n : 0u;
+#ifdef REPACK_PLANAR
+            const uint b_in_slice = (row_base + rn) * blocks_per_row + ib_col;
+            float da; vec4 v0, v1;
+            nvfp4_load_planar_a(b_in_slice, sub, shift, da, v0, v1);
+#else
             const uint ib = a_offset + (row_base + rn) * blocks_per_row + ib_col;
             const float da = nvfp4_decode_scale(data_a_packed32[ib].d[0], sub);
             const vec4  v0 = nvfp4_decode_nibs(data_a_packed32[ib].qs[2u * sub + 0u] >> shift);
             const vec4  v1 = nvfp4_decode_nibs(data_a_packed32[ib].qs[2u * sub + 1u] >> shift);
+#endif
             vec4 u0 = vec4(0.0), u1 = vec4(0.0);
             float da2 = 0.0f;
             if (GEN_GLU == 3) {
+#ifdef REPACK_PLANAR
+                nvfp4_load_planar_a2(b_in_slice, sub, shift, da2, u0, u1);
+#else
                 da2 = nvfp4_decode_scale(data_a2_packed32[ib].d[0], sub);
                 u0  = nvfp4_decode_nibs(data_a2_packed32[ib].qs[2u * sub + 0u] >> shift);
                 u1  = nvfp4_decode_nibs(data_a2_packed32[ib].qs[2u * sub + 1u] >> shift);
+#endif
             }
             [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
                 temp[j][n] += FLOAT_TYPE((dot(bv0_arr[j], v0) + dot(bv1_arr[j], v1)) * da);
@@ -278,16 +318,26 @@ void iter_aligned_nvfp4_a(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT
     } else {
         [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
             const uint rn = (n == 0u || n < num_rows) ? n : 0u;
+#ifdef REPACK_PLANAR
+            const uint b_in_slice = (row_base + rn) * blocks_per_row + ib_col;
+            float da; vec4 v0, v1;
+            nvfp4_load_planar_a(b_in_slice, sub, shift, da, v0, v1);
+#else
             const uint ib = a_offset + (row_base + rn) * blocks_per_row + ib_col;
             const float da = nvfp4_decode_scale(data_a_packed32[ib].d[0], sub);
             const vec4  v0 = nvfp4_decode_nibs(data_a_packed32[ib].qs[2u * sub + 0u] >> shift);
             const vec4  v1 = nvfp4_decode_nibs(data_a_packed32[ib].qs[2u * sub + 1u] >> shift);
+#endif
             vec4 u0 = vec4(0.0), u1 = vec4(0.0);
             float da2 = 0.0f;
             if (GEN_GLU == 3) {
+#ifdef REPACK_PLANAR
+                nvfp4_load_planar_a2(b_in_slice, sub, shift, da2, u0, u1);
+#else
                 da2 = nvfp4_decode_scale(data_a2_packed32[ib].d[0], sub);
                 u0  = nvfp4_decode_nibs(data_a2_packed32[ib].qs[2u * sub + 0u] >> shift);
                 u1  = nvfp4_decode_nibs(data_a2_packed32[ib].qs[2u * sub + 1u] >> shift);
+#endif
             }
             [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
                 const uint b4 = (j * p.batch_stride_b + b_offset) >> 2u;
@@ -311,10 +361,16 @@ void iter_aligned_nvfp4_a2(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint
     const uint blocks_per_row = p.ncols >> 6u;
     [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
         const uint rn = (n == 0u || n < num_rows) ? n : 0u;
+#ifdef REPACK_PLANAR
+        const uint b_in_slice = (row_base + rn) * blocks_per_row + ib_col;
+        float da; vec4 v0, v1;
+        nvfp4_load_planar_a2(b_in_slice, sub, shift, da, v0, v1);
+#else
         const uint ib = a_offset + (row_base + rn) * blocks_per_row + ib_col;
         const float da = nvfp4_decode_scale(data_a2_packed32[ib].d[0], sub);
         const vec4  v0 = nvfp4_decode_nibs(data_a2_packed32[ib].qs[2u * sub + 0u] >> shift);
         const vec4  v1 = nvfp4_decode_nibs(data_a2_packed32[ib].qs[2u * sub + 1u] >> shift);
+#endif
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
             const uint b4 = (j * p.batch_stride_b + b_offset) >> 2u;
             const vec4 bv0 = vec4(data_b_v4[b4 + b_col4]);

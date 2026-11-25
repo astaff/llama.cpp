@@ -1,0 +1,215 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer BufPrev    { int   data_prev[];  };
+layout(binding = 1) readonly  buffer BufW1U32   { uint  w1_u32[];     };
+layout(binding = 1) readonly  buffer BufW1F32   { float w1_f32[];     };
+layout(binding = 2) readonly  buffer BufState   { float data_state[]; };
+layout(binding = 3) readonly  buffer BufHidden  { float data_hid[];   };
+layout(binding = 4) readonly  buffer BufCtx     { float data_ctx[];   };
+layout(binding = 5) readonly  buffer BufJpU32   { uint  jp_u32[];     };
+layout(binding = 5) readonly  buffer BufJpF32   { float jp_f32[];     };
+layout(binding = 6) readonly  buffer BufBias    { float data_bias[];  };
+layout(binding = 7) writeonly buffer BufDst     { float data_dst[];   };
+
+layout(push_constant) uniform PushConstants {
+    uint rank;
+    uint n_embd;
+    uint nb;
+    uint flags; // bit0: w1_is_bf16, bit1: jp_is_bf16, bit2: has_bias
+    uint off_prev;
+    uint off_w1;   // in elements (BF16 or F32)
+    uint off_state;
+    uint off_hid;
+    uint off_ctx;
+    uint off_jp;   // in elements (BF16 or F32)
+    uint off_bias;
+    uint off_dst;
+} p;
+
+float unpack_bf16_elem(uint u32_word, uint hi) {
+    return (hi == 0u)
+        ? uintBitsToFloat((u32_word & 0x0000FFFFu) << 16u)
+        : uintBitsToFloat( u32_word & 0xFFFF0000u);
+}
+
+float load_w1_1(uint idx) {
+    if ((p.flags & 1u) != 0u) {
+        const uint pos = p.off_w1 + idx;
+        return unpack_bf16_elem(w1_u32[pos >> 1u], pos & 1u);
+    }
+    return w1_f32[p.off_w1 + idx];
+}
+
+vec4 load_w1_4(uint idx) {
+    if ((p.flags & 1u) != 0u) {
+        const uint pos = p.off_w1 + idx;
+        if ((pos & 1u) == 0u) {
+            const uint a = w1_u32[pos >> 1u];
+            const uint b = w1_u32[(pos >> 1u) + 1u];
+            return vec4(
+                uintBitsToFloat((a & 0x0000FFFFu) << 16u),
+                uintBitsToFloat( a & 0xFFFF0000u),
+                uintBitsToFloat((b & 0x0000FFFFu) << 16u),
+                uintBitsToFloat( b & 0xFFFF0000u)
+            );
+        }
+    }
+    return vec4(load_w1_1(idx), load_w1_1(idx + 1u), load_w1_1(idx + 2u), load_w1_1(idx + 3u));
+}
+
+float load_jp_1(uint idx) {
+    if ((p.flags & 2u) != 0u) {
+        const uint pos = p.off_jp + idx;
+        return unpack_bf16_elem(jp_u32[pos >> 1u], pos & 1u);
+    }
+    return jp_f32[p.off_jp + idx];
+}
+
+vec4 load_jp_4(uint idx) {
+    if ((p.flags & 2u) != 0u) {
+        const uint pos = p.off_jp + idx;
+        if ((pos & 1u) == 0u) {
+            const uint a = jp_u32[pos >> 1u];
+            const uint b = jp_u32[(pos >> 1u) + 1u];
+            return vec4(
+                uintBitsToFloat((a & 0x0000FFFFu) << 16u),
+                uintBitsToFloat( a & 0xFFFF0000u),
+                uintBitsToFloat((b & 0x0000FFFFu) << 16u),
+                uintBitsToFloat( b & 0xFFFF0000u)
+            );
+        }
+    }
+    return vec4(load_jp_1(idx), load_jp_1(idx + 1u), load_jp_1(idx + 2u), load_jp_1(idx + 3u));
+}
+
+float load_x_1(uint b_idx, uint prev_id, uint k) {
+    if (k < p.rank) {
+        return data_state[p.off_state + b_idx * p.rank + k];
+    }
+    const uint k1 = k - p.rank;
+    if (k1 < p.rank) {
+        return load_w1_1(prev_id * p.rank + k1);
+    }
+    const uint k2 = k1 - p.rank;
+    if (k2 < p.n_embd) {
+        return data_hid[p.off_hid + b_idx * p.n_embd + k2];
+    }
+    const uint k3 = k2 - p.n_embd;
+    return data_ctx[p.off_ctx + b_idx * p.n_embd + k3];
+}
+
+vec4 load_x_4(uint b_idx, uint prev_id, uint k) {
+    if ((p.rank & 3u) == 0u && (p.n_embd & 3u) == 0u) {
+        if (k < p.rank) {
+            const uint base = p.off_state + b_idx * p.rank + k;
+            return vec4(data_state[base], data_state[base + 1u], data_state[base + 2u], data_state[base + 3u]);
+        }
+        const uint k1 = k - p.rank;
+        if (k1 < p.rank) {
+            return load_w1_4(prev_id * p.rank + k1);
+        }
+        const uint k2 = k1 - p.rank;
+        if (k2 < p.n_embd) {
+            const uint base = p.off_hid + b_idx * p.n_embd + k2;
+            return vec4(data_hid[base], data_hid[base + 1u], data_hid[base + 2u], data_hid[base + 3u]);
+        }
+        const uint k3   = k2 - p.n_embd;
+        const uint base = p.off_ctx + b_idx * p.n_embd + k3;
+        return vec4(data_ctx[base], data_ctx[base + 1u], data_ctx[base + 2u], data_ctx[base + 3u]);
+    }
+    return vec4(
+        load_x_1(b_idx, prev_id, k + 0u),
+        load_x_1(b_idx, prev_id, k + 1u),
+        load_x_1(b_idx, prev_id, k + 2u),
+        load_x_1(b_idx, prev_id, k + 3u)
+    );
+}
+
+void main() {
+    const uint sg    = gl_SubgroupID;
+    const uint lane  = gl_SubgroupInvocationID;
+    const uint col   = gl_WorkGroupID.x * 4u + sg;
+    const uint b_idx = gl_WorkGroupID.y;
+    if (col >= p.rank || b_idx >= p.nb) {
+        return;
+    }
+
+    const uint prev_id = uint(data_prev[p.off_prev + b_idx]);
+    const uint K       = 2u * p.rank + 2u * p.n_embd;
+    const uint r0      = col;
+    const uint r1      = p.rank + col;
+    const uint r2      = 2u * p.rank + col;
+
+    // Exact BLOCK_SIZE=32, K_PER_ITER=4 accumulation matching mul_mat_vec.comp (0-ULP)
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+
+    const uint full_iters = K / 128u;
+    for (uint it = 0u; it < full_iters; ++it) {
+        const uint k  = it * 128u + 4u * lane;
+        const vec4 xv = load_x_4(b_idx, prev_id, k);
+        acc0 += dot(load_jp_4(r0 * K + k), xv);
+        acc1 += dot(load_jp_4(r1 * K + k), xv);
+        acc2 += dot(load_jp_4(r2 * K + k), xv);
+    }
+    const uint tail_k = full_iters * 128u + 4u * lane;
+    if (tail_k < K) {
+        const uint rem = K - tail_k;
+        if (rem >= 4u) {
+            const vec4 xv = load_x_4(b_idx, prev_id, tail_k);
+            acc0 += dot(load_jp_4(r0 * K + tail_k), xv);
+            acc1 += dot(load_jp_4(r1 * K + tail_k), xv);
+            acc2 += dot(load_jp_4(r2 * K + tail_k), xv);
+        } else if (rem == 3u) {
+            const vec3 xv = vec3(load_x_1(b_idx, prev_id, tail_k), load_x_1(b_idx, prev_id, tail_k + 1u), load_x_1(b_idx, prev_id, tail_k + 2u));
+            acc0 += dot(vec3(load_jp_1(r0 * K + tail_k), load_jp_1(r0 * K + tail_k + 1u), load_jp_1(r0 * K + tail_k + 2u)), xv);
+            acc1 += dot(vec3(load_jp_1(r1 * K + tail_k), load_jp_1(r1 * K + tail_k + 1u), load_jp_1(r1 * K + tail_k + 2u)), xv);
+            acc2 += dot(vec3(load_jp_1(r2 * K + tail_k), load_jp_1(r2 * K + tail_k + 1u), load_jp_1(r2 * K + tail_k + 2u)), xv);
+        } else if (rem == 2u) {
+            const vec2 xv = vec2(load_x_1(b_idx, prev_id, tail_k), load_x_1(b_idx, prev_id, tail_k + 1u));
+            acc0 += dot(vec2(load_jp_1(r0 * K + tail_k), load_jp_1(r0 * K + tail_k + 1u)), xv);
+            acc1 += dot(vec2(load_jp_1(r1 * K + tail_k), load_jp_1(r1 * K + tail_k + 1u)), xv);
+            acc2 += dot(vec2(load_jp_1(r2 * K + tail_k), load_jp_1(r2 * K + tail_k + 1u)), xv);
+        } else {
+            const float xv = load_x_1(b_idx, prev_id, tail_k);
+            acc0 = fma(load_jp_1(r0 * K + tail_k), xv, acc0);
+            acc1 = fma(load_jp_1(r1 * K + tail_k), xv, acc1);
+            acc2 = fma(load_jp_1(r2 * K + tail_k), xv, acc2);
+        }
+    }
+
+    acc0 = subgroupAdd(acc0);
+    acc1 = subgroupAdd(acc1);
+    acc2 = subgroupAdd(acc2);
+
+    if (lane == 0u) {
+        const bool has_b = (p.flags & 4u) != 0u;
+        precise float j0 = has_b ? (acc0 + data_bias[p.off_bias + r0]) : acc0;
+        precise float j1 = has_b ? (acc1 + data_bias[p.off_bias + r1]) : acc1;
+        precise float j2 = has_b ? (acc2 + data_bias[p.off_bias + r2]) : acc2;
+
+        const uint idx   = b_idx * p.rank + col;
+        const float st   = data_state[p.off_state + idx];
+
+        // Exact IEEE-754 rounding sequence matching inkling_dspark_gru.comp (0-ULP)
+        precise float neg_j0 = -j0;
+        precise float exp_j0 = exp(neg_j0);
+        precise float den_j0 = 1.0f + exp_j0;
+        precise float gate   = 1.0f / den_j0;
+        precise float cand   = tanh(j1);
+        precise float diff   = st - cand;
+        precise float prod   = gate * diff;
+        precise float st_new = cand + prod;
+        precise float latent = tanh(j2);
+
+        const uint slice_elems = p.rank * p.nb;
+        data_dst[p.off_dst + idx]               = st_new;
+        data_dst[p.off_dst + slice_elems + idx] = latent;
+    }
+}

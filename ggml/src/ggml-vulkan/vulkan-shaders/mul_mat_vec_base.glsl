@@ -35,6 +35,10 @@ layout (binding = 3) readonly buffer A2_PACKED32 {A_TYPE_PACKED32 data_a2_packed
 #if defined(A_TYPE_PACKED64)
 layout (binding = 3) readonly buffer A2_PACKED64 {A_TYPE_PACKED64 data_a2_packed64[];};
 #endif
+#if defined(DATA_A_NVFP4) && defined(REPACK_PLANAR)
+layout (binding = 3) readonly buffer A2_REPACK_U32 {uint  data_a2_repack_u32[];};
+layout (binding = 3) readonly buffer A2_REPACK_U2  {uvec2 data_a2_repack_u2[];};
+#endif
 
 #ifndef MUL_MAT_ID
 layout (binding = 5) writeonly buffer D2 {D_TYPE data_d2[];};
@@ -135,17 +139,18 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 #else
             batch_idx_a * (p.batch_stride_a / QUANT_K);
 #endif
+    // S19_WAVE3: support NUM_COLS > 1 with ne12 > 1 (batched F32 dmmv at N <= 8, C = 3)
     b_offset =
 #ifdef MUL_MAT_ID
             (expert_i0 % p.ne11) * p.stride_b + expert_i1 * p.batch_stride_b;
 #else
-            batch_idx * p.batch_stride_b;
+            (col_split ? batch_idx : batch_idx * NUM_COLS) * p.batch_stride_b;
 #endif
     d_offset =
 #ifdef MUL_MAT_ID
             expert_i0 * p.stride_d + expert_i1 * p.batch_stride_d;
 #else
-            batch_idx * p.batch_stride_d;
+            (col_split ? batch_idx : batch_idx * NUM_COLS) * p.batch_stride_d;
 #endif
 }
 

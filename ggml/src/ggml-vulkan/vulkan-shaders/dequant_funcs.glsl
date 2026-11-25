@@ -512,6 +512,45 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 #endif
 
 #if defined(DATA_A_NVFP4)
+#if defined(REPACK_PLANAR)
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    const uint sub = iqs >> 4u;
+    const uint j = iqs & 7u;
+    const uint shift = (iqs & 8u) >> 1u;
+#ifdef MUL_MAT_ID
+    const uint s_blks = (p.ncols >> 6u) * p.stride_d;
+#else
+    const uint s_blks = (p.ncols >> 6u) * ((GEN_GLU == 2u) ? p.pair_m0 : p.stride_d);
+#endif
+    const uint slice_u32 = a_offset * 9u;
+    const uint d_u32 = data_a_repack_u32[slice_u32 + s_blks * 8u + ib];
+    const float d = ue4m3_to_fp32(uint8_t((d_u32 >> (sub * 8u)) & 0xFFu));
+    const uint q_word = data_a_repack_u32[slice_u32 + ib * 8u + sub * 2u + (j >> 2u)];
+    const uint bsh = (j & 3u) * 8u;
+    const uint vui0 = (q_word >> bsh) & 0xFFu;
+    const uint vui1 = (q_word >> (bsh + 8u)) & 0xFFu;
+    const uint qs0 = (vui0 >> shift) & 0xFu;
+    const uint qs1 = (vui1 >> shift) & 0xFu;
+    return vec2(float(mxfp4_kval(qs0)), float(mxfp4_kval(qs1))) * (d * 0.5f);
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    const uint sub = iqs >> 4u;
+    const uint j = iqs & 7u;
+    const uint shift = (iqs & 8u) >> 1u;
+#ifdef MUL_MAT_ID
+    const uint s_blks = (p.ncols >> 6u) * p.stride_d;
+#else
+    const uint s_blks = (p.ncols >> 6u) * ((GEN_GLU == 2u) ? p.pair_m0 : p.stride_d);
+#endif
+    const uint slice_u32 = a_offset * 9u;
+    const uint d_u32 = data_a_repack_u32[slice_u32 + s_blks * 8u + ib];
+    const float d = ue4m3_to_fp32(uint8_t((d_u32 >> (sub * 8u)) & 0xFFu));
+    const uint vui = data_a_repack_u32[slice_u32 + ib * 8u + (sub * 8u + j) / 4u];
+    const u8vec4 qv = unpack8((vui >> shift) & 0x0F0F0F0Fu);
+    return vec4(float(mxfp4_kval(uint(qv.x))), float(mxfp4_kval(uint(qv.y))),
+                float(mxfp4_kval(uint(qv.z))), float(mxfp4_kval(uint(qv.w)))) * (d * 0.5f);
+}
+#else
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     const uint sub = iqs >> 4u;
     const float d = ue4m3_to_fp32(data_a[a_offset + ib].d[sub]);
@@ -542,6 +581,7 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
                 float(mxfp4_kval(uint(qv.z))), float(mxfp4_kval(uint(qv.w)))) * (d * 0.5f);
 #endif
 }
+#endif
 #endif
 
 #if defined(DATA_A_F32) || defined(DATA_A_F16) || defined(DATA_A_BF16)

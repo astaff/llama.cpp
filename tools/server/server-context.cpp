@@ -147,6 +147,8 @@ enum slot_state {
     SLOT_STATE_GENERATING,
 };
 
+extern "C" void llama_s19_set_greedy_argmax_only(llama_context * ctx, bool enabled);
+
 struct server_slot; // forward declaration
 
 struct server_batch {
@@ -4652,9 +4654,27 @@ private:
         }
 
         bool has_output = false;
+        bool all_outputs_pure_greedy = true;
         for (int i = off; i < off + batch.view.size(); ++i) {
-            has_output |= batch.tokens[i].output;
+            if (batch.tokens[i].output) {
+                has_output = true;
+                const int32_t sid = batch.tokens[i].id_slot;
+                if (sid >= 0 && sid < (int32_t) slots.size()) {
+                    const auto & sl = slots[sid];
+                    const bool slot_greedy =
+                        sl.task != nullptr &&
+                        sl.task->need_sampling() &&
+                        sl.task->params.sampling.n_probs == 0 &&
+                        common_sampler_is_pure_argmax(sl.smpl.get());
+                    if (!slot_greedy) {
+                        all_outputs_pure_greedy = false;
+                    }
+                } else {
+                    all_outputs_pure_greedy = false;
+                }
+            }
         }
+        llama_s19_set_greedy_argmax_only(ctx_tgt, has_output && all_outputs_pure_greedy);
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
@@ -4722,17 +4742,57 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (spec) {
+        // Series 19 (W1.2): Defer speculative injection of draft-verification slots into post_decode()
+        // so ONLY the k + 1 accepted committed rows are injected (eliminating rejected-token ctx_dft work).
+        const bool s19_defer_dft = !getenv("S19_NO_DEFER_DFT");
+        if (spec && !s19_defer_dft) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch.view);
             });
-
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
-
-                // TODO: handle error
                 throw std::runtime_error("failed to process speculative batch");
+            }
+        } else if (spec) {
+            bool any_spec_verify = false;
+            bool any_non_spec    = false;
+            std::vector<int32_t> non_spec_rows;
+            for (int32_t vr = 0; vr < batch.view.size(); ++vr) {
+                const int32_t sid = batch.tokens[off + vr].id_slot;
+                const bool is_spec_slot = sid >= 0 && sid < (int32_t) slots.size() &&
+                                          slots[sid].state == SLOT_STATE_GENERATING &&
+                                          slots[sid].can_speculate() &&
+                                          !slots[sid].spec_draft.empty() &&
+                                          !slots[sid].spec_i_batch.empty() &&
+                                          ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+                if (is_spec_slot) {
+                    any_spec_verify = true;
+                } else {
+                    any_non_spec = true;
+                    non_spec_rows.push_back(vr);
+                }
+            }
+
+            if (!any_spec_verify) {
+                bool ok = true;
+                queue_tasks.yield_to_queue([&]() {
+                    ok = common_speculative_process(spec.get(), batch.view);
+                });
+                if (!ok) {
+                    SRV_ERR("%s", "failed to process speculative batch\n");
+                    throw std::runtime_error("failed to process speculative batch");
+                }
+            } else if (any_non_spec && !non_spec_rows.empty()) {
+                bool ok = true;
+                queue_tasks.yield_to_queue([&]() {
+                    ok = common_speculative_process_rows(
+                        spec.get(), batch.view, non_spec_rows.data(), (int32_t) non_spec_rows.size());
+                });
+                if (!ok) {
+                    SRV_ERR("%s", "failed to process non-speculative rows\n");
+                    throw std::runtime_error("failed to process non-speculative rows");
+                }
             }
         }
 
@@ -4901,7 +4961,10 @@ private:
 
             // verify and try to accept the draft
             {
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                const bool s19_need_smpl_ckpt =
+                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
+                common_sampler_ptr smpl_save(s19_need_smpl_ckpt ? common_sampler_clone(slot.smpl.get()) : nullptr);
 
                 GGML_ASSERT(spec_i_batch.size() == n_draft + 1);
                 GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
@@ -5023,6 +5086,22 @@ private:
                     slot.release();
 
                     return;
+                }
+            }
+
+            if (spec && !getenv("S19_NO_DEFER_DFT") && ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+                std::vector<int32_t> acc_view_rows(ids.size());
+                for (size_t r = 0; r < ids.size(); ++r) {
+                    acc_view_rows[r] = spec_i_batch[r] - off;
+                }
+                bool ok = true;
+                queue_tasks.yield_to_queue([&]() {
+                    ok = common_speculative_process_rows(
+                        spec.get(), batch.view, acc_view_rows.data(), (int32_t) acc_view_rows.size());
+                });
+                if (!ok) {
+                    SRV_ERR("%s", "failed to process accepted speculative rows\n");
+                    throw std::runtime_error("failed to process accepted speculative rows");
                 }
             }
 

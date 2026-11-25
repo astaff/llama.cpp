@@ -17,7 +17,7 @@ layout(push_constant) uniform PushConstants {
     uint  n_seqs;
     uint  hist_sconv_ch;
     uint  ch_offset;
-    uint  n_heads; // 0 if !has_dynamic
+    uint  n_heads;
     uint  st_base_f32;
     uint  st_seq_stride;
     uint  st_slot_stride;
@@ -60,7 +60,6 @@ void main() {
         const uint head_dim = p.n_channels / p.n_heads;
         const uint head     = c / head_dim;
         const uint db       = p.off_dyn + (tok_global * p.n_heads + head) * 4u;
-        // Exact sequential lag=0..3 accumulation matching inkling2.cpp:226-237
         sum += x3 * data_dyn[db + 0u];
         sum += x2 * data_dyn[db + 1u];
         sum += x1 * data_dyn[db + 2u];
