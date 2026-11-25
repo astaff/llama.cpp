@@ -5066,8 +5066,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     CREATE_GLU(situ, SITU)
     if (device->subgroup_arithmetic && device->subgroup_require_full_support && device->subgroup_size == 32) {
         ggml_vk_create_pipeline(device, device->pipeline_inkling_fused[0],  "inkling_l2_clip",           inkling_l2_clip_len,           inkling_l2_clip_data,           "main", 5, 48, {1, 1, 1}, {}, 1, true, true, 32);
-        ggml_vk_create_pipeline(device, device->pipeline_inkling_fused[1],  "inkling_conv",               inkling_conv_len,               inkling_conv_data,               "main", 7, 72, {1, 1, 1}, {}, 1, true);
-        ggml_vk_create_pipeline(device, device->pipeline_inkling_fused[14], "inkling_conv_scopy",         inkling_conv_scopy_len,         inkling_conv_scopy_data,         "main", 8, 88, {1, 1, 1}, {}, 1, true);
+        ggml_vk_create_pipeline(device, device->pipeline_inkling_fused[1],  "inkling_conv",               inkling_conv_len,               inkling_conv_data,               "main", 7, 76, {1, 1, 1}, {}, 1, true);
+        ggml_vk_create_pipeline(device, device->pipeline_inkling_fused[14], "inkling_conv_scopy",         inkling_conv_scopy_len,         inkling_conv_scopy_data,         "main", 8, 92, {1, 1, 1}, {}, 1, true);
         ggml_vk_create_pipeline(device, device->pipeline_inkling_fused[2],  "inkling_rel_gather",         inkling_rel_gather_len,         inkling_rel_gather_data,         "main", 5, 84, {1, 1, 1}, {}, 1, true);
         // S19_WAVE3/4: pure 16B [3] depth_mix, [13] depth_mix_rms, [4] rms2_concat, [11] ctrl_apply_rms_mul, [12] l2_clip_qr
         ggml_vk_create_pipeline(device, device->pipeline_inkling_fused[3],  "inkling_depth_mix",          inkling_depth_mix_len,          inkling_depth_mix_data,          "main", 8, 56, {1, 1, 1}, {}, 1, true, true, 32);
@@ -5075,7 +5075,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_inkling_fused[4],  "inkling_rms2_concat",        inkling_rms2_concat_len,        inkling_rms2_concat_data,        "main", 3, 36, {1, 1, 1}, {}, 1, true, true, 32);
         ggml_vk_create_pipeline(device, device->pipeline_inkling_fused[5],  "inkling_ctrl_apply",         inkling_ctrl_apply_len,         inkling_ctrl_apply_data,         "main", 5, 24, {1, 1, 1}, {}, 1, true);
         ggml_vk_create_pipeline(device, device->pipeline_inkling_fused[11], "inkling_ctrl_apply_rms_mul", inkling_ctrl_apply_rms_mul_len, inkling_ctrl_apply_rms_mul_data, "main", 5, 44, {1, 1, 1}, {}, 1, true, true, 32);
-        ggml_vk_create_pipeline(device, device->pipeline_inkling_fused[12], "inkling_l2_clip_qr",         inkling_l2_clip_qr_len,         inkling_l2_clip_qr_data,         "main", 6, 56, {1, 1, 1}, {}, 1, true, true, 32);
+        ggml_vk_create_pipeline(device, device->pipeline_inkling_fused[12], "inkling_l2_clip_qr",         inkling_l2_clip_qr_len,         inkling_l2_clip_qr_data,         "main", 6, 64, {1, 1, 1}, {}, 1, true, true, 32);
         ggml_vk_create_pipeline(device, device->pipeline_inkling_fused[6],  "inkling_dspark_concat4",    inkling_dspark_concat4_len,    inkling_dspark_concat4_data,    "main", 5, 40, {256, 1, 1}, {}, 1, true);
         ggml_vk_create_pipeline(device, device->pipeline_inkling_fused[7],  "inkling_dspark_gru",        inkling_dspark_gru_len,        inkling_dspark_gru_data,        "main", 3, 20, {256, 1, 1}, {}, 1, true);
         ggml_vk_create_pipeline(device, device->pipeline_inkling_fused[8],  "inkling_softcap",           inkling_softcap_len,           inkling_softcap_data,           "main", 2, 24, {1, 1, 1}, {}, 1, agx_no_robust);
@@ -7766,6 +7766,19 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
     return ctx->device->pipeline_dequant_mul_mat_vec_id_f32[dmmv_wg][a_type];
 }
 
+static size_t ggml_vk_tensor_byte_span(const ggml_tensor * t) {
+    if (!t || ggml_nelements(t) == 0) {
+        return 0;
+    }
+    size_t span = ggml_row_size(t->type, t->ne[0]);
+    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+        if (t->ne[d] > 1) {
+            span += (size_t)(t->ne[d] - 1) * t->nb[d];
+        }
+    }
+    return span;
+}
+
 vk_subbuffer ggml_vk_tensor_subbuffer(
     const ggml_backend_vk_context * ctx, const ggml_tensor * tensor, bool allow_misalign) {
 
@@ -7781,7 +7794,9 @@ vk_subbuffer ggml_vk_tensor_subbuffer(
     }
     GGML_ASSERT(buffer != nullptr);
 
-    size_t size = ggml_vk_tensor_is_repack(tensor) ? ggml_vk_repack_alloc_bytes(tensor) : ggml_nbytes(tensor);
+    size_t size = ggml_vk_tensor_is_repack(tensor)
+        ? ggml_vk_repack_alloc_bytes(tensor)
+        : std::max(ggml_nbytes(tensor), ggml_vk_tensor_byte_span(tensor));
 
     const size_t descriptor_offset = ggml_vk_descriptor_offset(
         offset, ctx->device->properties.limits.minStorageBufferOffsetAlignment, ggml_type_size(tensor->type));
@@ -7790,21 +7805,11 @@ vk_subbuffer ggml_vk_tensor_subbuffer(
     GGML_ASSERT(allow_misalign || misalign_bytes == 0);
     offset = descriptor_offset;
     size += misalign_bytes;
+    if (offset < buffer->size && size > buffer->size - offset) {
+        size = buffer->size - offset;
+    }
 
     return vk_subbuffer{buffer, offset, size};
-}
-
-static size_t ggml_vk_tensor_byte_span(const ggml_tensor * t) {
-    if (!t || ggml_nelements(t) == 0) {
-        return 0;
-    }
-    size_t span = ggml_row_size(t->type, t->ne[0]);
-    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
-        if (t->ne[d] > 1) {
-            span += (size_t)(t->ne[d] - 1) * t->nb[d];
-        }
-    }
-    return span;
 }
 
 static vk_subbuffer ggml_vk_strided_subbuffer(
@@ -10622,13 +10627,14 @@ static void ggml_vk_inkling_fused(ggml_backend_vk_context * ctx, vk_context & su
         ggml_tensor       * state    = dst->src[4];
         const ggml_tensor * residual = dst->src[5];
         const ggml_tensor * scopy    = dst->src[6];
-        const vk_subbuffer c_buf     = ggml_vk_tensor_subbuffer(ctx, cur,     true);
+        const vk_subbuffer c_buf     = ggml_vk_strided_subbuffer(ctx, cur, true);
         const vk_subbuffer h_buf     = ggml_vk_tensor_subbuffer(ctx, history, true);
         const vk_subbuffer w_buf     = ggml_vk_tensor_subbuffer(ctx, weight,  true);
         const vk_subbuffer dyn_buf   = dynamic  ? ggml_vk_tensor_subbuffer(ctx, dynamic,  true) : c_buf;
         const vk_subbuffer st_buf    = ggml_vk_tensor_subbuffer(ctx, state,   true);
         const vk_subbuffer res_buf   = residual ? ggml_vk_tensor_subbuffer(ctx, residual, true) : c_buf;
         const uint32_t n_channels    = (uint32_t)cur->ne[0];
+        const uint32_t cur_s1        = (uint32_t)(cur->nb[1] / sizeof(float));
         const uint32_t n_seq_tokens  = (uint32_t)ggml_get_op_params_i32(dst, 2);
         const uint32_t n_seqs        = (uint32_t)ggml_get_op_params_i32(dst, 3);
         const uint32_t off_st        = f32_off(state);
@@ -10644,6 +10650,7 @@ static void ggml_vk_inkling_fused(ggml_backend_vk_context * ctx, vk_context & su
                 uint32_t has_res, off_res;
                 uint32_t off_state, off_scopy;
                 uint32_t use_hist, off_hist, hist_sconv_ch;
+                uint32_t cur_s1;
             } pc_sc = {
                 n_channels, n_seq_tokens, n_seqs, n_exp,
                 (uint32_t)ggml_get_op_params_i32(dst, 1),
@@ -10661,8 +10668,9 @@ static void ggml_vk_inkling_fused(ggml_backend_vk_context * ctx, vk_context & su
                 scopy ? 0u : 1u,
                 f32_off(history),
                 (uint32_t)history->ne[1],
+                cur_s1,
             };
-            static_assert(sizeof(pc_sc) == 88, "inkling_conv_scopy pc size");
+            static_assert(sizeof(pc_sc) == 92, "inkling_conv_scopy pc size");
             ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
                                       { c_buf, h_buf, w_buf, dyn_buf, st_buf, d_buf, res_buf, sc_buf }, pc_sc,
                                       { CEIL_DIV(n_channels, 64u), 1u, n_seqs });
@@ -10674,6 +10682,7 @@ static void ggml_vk_inkling_fused(ggml_backend_vk_context * ctx, vk_context & su
                 uint32_t off_cur, off_hist, off_w, off_dyn, off_dst;
                 float    scale_out;
                 uint32_t has_res, off_res;
+                uint32_t cur_s1;
             } pc_c = {
                 n_channels, n_seq_tokens, n_seqs, (uint32_t)history->ne[1],
                 (uint32_t)ggml_get_op_params_i32(dst, 1),
@@ -10686,8 +10695,9 @@ static void ggml_vk_inkling_fused(ggml_backend_vk_context * ctx, vk_context & su
                 ggml_get_op_params_f32(dst, 9),
                 residual ? 1u : 0u,
                 f32_off(residual),
+                cur_s1,
             };
-            static_assert(sizeof(pc_c) == 72, "inkling_conv pc size");
+            static_assert(sizeof(pc_c) == 76, "inkling_conv pc size");
             ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
                                       { c_buf, h_buf, w_buf, dyn_buf, st_buf, d_buf, res_buf }, pc_c,
                                       { CEIL_DIV(n_channels, 64u), n_seq_tokens, n_seqs });
@@ -10910,8 +10920,8 @@ static void ggml_vk_inkling_fused(ggml_backend_vk_context * ctx, vk_context & su
         const ggml_tensor * q_sc  = dst->src[2];
         const ggml_tensor * r_sc  = dst->src[3];
         const ggml_tensor * tau   = dst->src[4];
-        const vk_subbuffer q_buf  = ggml_vk_tensor_subbuffer(ctx, q_cur, true);
-        const vk_subbuffer r_buf  = ggml_vk_tensor_subbuffer(ctx, r_cur, true);
+        const vk_subbuffer q_buf  = ggml_vk_strided_subbuffer(ctx, q_cur, true);
+        const vk_subbuffer r_buf  = ggml_vk_strided_subbuffer(ctx, r_cur, true);
         const vk_subbuffer qs_buf = q_sc ? ggml_vk_tensor_subbuffer(ctx, q_sc, true) : q_buf;
         const vk_subbuffer rs_buf = r_sc ? ggml_vk_tensor_subbuffer(ctx, r_sc, true) : r_buf;
         const vk_subbuffer t_buf  = tau  ? ggml_vk_tensor_subbuffer(ctx, tau,  true) : q_buf;
@@ -10920,12 +10930,14 @@ static void ggml_vk_inkling_fused(ggml_backend_vk_context * ctx, vk_context & su
             uint32_t q_ne0, r_ne0, n_head, n_tokens, flags;
             uint32_t off_q, off_r, off_qs, off_rs, off_tau, off_dst;
             float    q_threshold, r_threshold, eps;
+            uint32_t q_tok_s, r_tok_s;
         } pc = {
             (uint32_t)q_cur->ne[0], (uint32_t)r_cur->ne[0], (uint32_t)q_cur->ne[1], (uint32_t)q_cur->ne[2], flags,
             f32_off(q_cur), f32_off(r_cur), f32_off(q_sc), f32_off(r_sc), f32_off(tau), off_d,
             ggml_get_op_params_f32(dst, 1), ggml_get_op_params_f32(dst, 2), ggml_get_op_params_f32(dst, 3),
+            (uint32_t)(q_cur->nb[2] / sizeof(float)), (uint32_t)(r_cur->nb[2] / sizeof(float)),
         };
-        static_assert(sizeof(pc) == 56, "inkling_l2_clip_qr pc size");
+        static_assert(sizeof(pc) == 64, "inkling_l2_clip_qr pc size");
         const uint32_t rows = 2u * (uint32_t)(q_cur->ne[1] * q_cur->ne[2]);
         const uint32_t wg_y = CEIL_DIV(rows, 65535u);
         const uint32_t wg_x = wg_y > 1u ? 65535u : rows;
@@ -27162,7 +27174,18 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 for (int s = 0; s < GGML_MAX_SRC; ++s) {
                     if (op->src[s] == nullptr) continue;
-                    if (!ggml_is_contiguous(op->src[s])) return false;
+                    const ggml_tensor * st_t = op->src[s];
+                    const bool allow_strided =
+                        (m == 1 && s == 0 && st_t->ne[2] == 1 && st_t->ne[3] == 1 &&
+                         st_t->nb[0] == sizeof(float) && (st_t->nb[1] % sizeof(float) == 0)) ||
+                        (m == 12 && (s == 0 || s == 1) && st_t->ne[3] == 1 &&
+                         st_t->nb[0] == sizeof(float) && st_t->nb[1] == (size_t)st_t->ne[0] * sizeof(float) &&
+                         (st_t->nb[2] % sizeof(float) == 0));
+                    if (allow_strided) {
+                        if (!tensor_size_supported(ggml_vk_tensor_byte_span(st_t))) return false;
+                    } else if (!ggml_is_contiguous(st_t)) {
+                        return false;
+                    }
                     const ggml_type st = op->src[s]->type;
                     if ((m == 2 && s == 2) || (m == 1 && s == 6) || (m == 9 && s == 0) || (m == 10 && s == 6)) {
                         if (st != GGML_TYPE_I32) return false;

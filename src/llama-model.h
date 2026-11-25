@@ -678,6 +678,8 @@ struct llama_layer {
 
     // S19_WAVE3: stacked FullAttn [attn_q_inp_norm; attn_k_inp_norm; attn_v_inp_norm] [n_embd, 3]
     struct ggml_tensor * s19_attn_qkv_inp_norm = nullptr;
+    // Coalesced Q8_0 attention projections [wq | wqkv_gate | attn_rel (| wk | wv on SWA)]
+    struct ggml_tensor * s19_attn_in_proj_q8   = nullptr;
 
     // metis16 per-pass hyper-connection mixes, attention pass LoRA, expert route embeddings
     struct ggml_tensor * hc_attn_mix         = nullptr;
@@ -1013,10 +1015,11 @@ struct llama_model {
 
     std::vector<llama_layer> layers;
 
-    // S19_WAVE3: lazily materialized coalesced F32 weights for Inkling-2 looped-core & FullAttn norms
+    // S19_WAVE3: lazily materialized coalesced BF16/F32 weights for Inkling-2 looped-core & FullAttn norms
     struct s19_loop_coalesced {
         struct ggml_tensor * ctrl_down_qkv = nullptr; // [2*n_embd, rank, 3]
         struct ggml_tensor * ctrl_up_qkv   = nullptr; // [rank, 2*n_embd, 3] ([gain; forget])
+        struct ggml_tensor * ctrl_down_ffn = nullptr; // [2*n_embd, rank]
         struct ggml_tensor * ctrl_up_ffn   = nullptr; // [rank, 2*n_embd]    ([gain; forget])
     };
     mutable ggml_context_ptr                s19_inkling_ctx;

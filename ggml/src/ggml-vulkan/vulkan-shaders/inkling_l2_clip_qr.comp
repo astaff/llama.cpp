@@ -27,6 +27,8 @@ layout(push_constant) uniform PushConstants {
     float q_threshold;
     float r_threshold;
     float eps;
+    uint  q_tok_s;
+    uint  r_tok_s;
 } p;
 
 void main() {
@@ -44,7 +46,8 @@ void main() {
     const bool has_sc  = is_r ? ((p.flags & 2u) != 0u) : ((p.flags & 1u) != 0u);
     const bool has_tau = (p.flags & 4u) != 0u;
     const float thresh = is_r ? p.r_threshold : p.q_threshold;
-    const uint cur_b   = (is_r ? p.off_r : p.off_q) + sub_row * ne0;
+    const uint cur_b   = is_r ? (p.off_r + tok * p.r_tok_s + head * p.r_ne0)
+                              : (p.off_q + tok * p.q_tok_s + head * p.q_ne0);
     const uint sc_b    = (is_r ? p.off_rs : p.off_qs) + head * ne0;
     const uint dst_b   = p.off_dst + (is_r ? (q_rows * p.q_ne0 + sub_row * p.r_ne0) : (sub_row * p.q_ne0));
 

@@ -7,9 +7,10 @@
 #include <algorithm>
 #include <cstring>
 #include <mutex>
+#include <tuple>
 #include <vector>
 
-// S19_WAVE3: lazily materialize stacked FullAttn Q/K/V input norms for standalone inkling2
+// S19_WAVE3: lazily materialize stacked FullAttn Q/K/V input norms & coalesced Q8_0 attention weights for standalone inkling2
 static void s19_ensure_inkling2_norms(const llama_model & model) {
     if (model.s19_inkling_ready || getenv("GGML_INKLING_NO_FUSE") || model.layers.empty()) {
         return;
@@ -25,24 +26,37 @@ static void s19_ensure_inkling2_norms(const llama_model & model) {
     }
     const int n_all  = (int)model.layers.size();
     const int64_t ne = model.hparams.n_embd;
+    const bool coal_attn_q8 = !getenv("GGML_INKLING_NO_COAL_ATTN") && model.loras.empty();
+    auto can_coal_q8_w = [&](const ggml_tensor * w) -> bool {
+        return w && w->type == GGML_TYPE_Q8_0 && w->ne[0] == ne && (ne % 32) == 0 &&
+               w->ne[2] == 1 && w->ne[3] == 1 && ggml_is_contiguous(w) &&
+               model.w_scales.find(w) == model.w_scales.end() && model.hdmd.rot.find(w) == model.hdmd.rot.end();
+    };
     int n_full = 0;
+    int n_coal = 0;
     for (int i = 0; i < n_all; ++i) {
         if (!model.hparams.is_swa(i) && model.layers[i].attn_q_inp_norm) {
             ++n_full;
         }
+        if (coal_attn_q8 && can_coal_q8_w(model.layers[i].wq) &&
+            can_coal_q8_w(model.layers[i].wqkv_gate) && can_coal_q8_w(model.layers[i].attn_rel)) {
+            ++n_coal;
+        }
     }
-    if (n_full == 0) {
+    if (n_full == 0 && n_coal == 0) {
         model.s19_inkling_ready = true;
         return;
     }
-    ggml_init_params params = { ggml_tensor_overhead() * (size_t)(n_full + 4), nullptr, true };
+    ggml_init_params params = { ggml_tensor_overhead() * (size_t)(n_full + n_coal + 4), nullptr, true };
     ggml_context_ptr ctx(ggml_init(params));
     std::vector<std::pair<int, ggml_tensor *>> created;
+    std::vector<std::tuple<int, ggml_tensor *, bool>> created_coal;
     for (int i = 0; i < n_all; ++i) {
-        if (!model.hparams.is_swa(i) && model.layers[i].attn_q_inp_norm) {
+        const auto & li = model.layers[i];
+        if (!model.hparams.is_swa(i) && li.attn_q_inp_norm) {
             bool dup = false;
             for (const auto & pr : created) {
-                if (model.layers[pr.first].attn_q_inp_norm == model.layers[i].attn_q_inp_norm) {
+                if (model.layers[pr.first].attn_q_inp_norm == li.attn_q_inp_norm) {
                     const_cast<llama_layer &>(model.layers[i]).s19_attn_qkv_inp_norm = pr.second;
                     dup = true;
                     break;
@@ -54,12 +68,31 @@ static void s19_ensure_inkling2_norms(const llama_model & model) {
                 created.push_back({ i, t });
             }
         }
+        if (coal_attn_q8 && can_coal_q8_w(li.wq) && can_coal_q8_w(li.wqkv_gate) && can_coal_q8_w(li.attn_rel)) {
+            bool dup = false;
+            for (const auto & ap : created_coal) {
+                if (model.layers[std::get<0>(ap)].wq == li.wq) {
+                    const_cast<llama_layer &>(model.layers[i]).s19_attn_in_proj_q8 = std::get<1>(ap);
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) {
+                const bool inc_kv = model.hparams.is_swa(i) && can_coal_q8_w(li.wk) && can_coal_q8_w(li.wv);
+                const int64_t m_rows = li.wq->ne[1] + li.wqkv_gate->ne[1] + li.attn_rel->ne[1] +
+                                       (inc_kv ? (li.wk->ne[1] + li.wv->ne[1]) : 0);
+                ggml_tensor * t = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_Q8_0, ne, m_rows);
+                const_cast<llama_layer &>(model.layers[i]).s19_attn_in_proj_q8 = t;
+                created_coal.emplace_back(i, t, inc_kv);
+            }
+        }
     }
     ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(ref->buffer);
     ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
     if (!buf) {
         for (int i = 0; i < n_all; ++i) {
             const_cast<llama_layer &>(model.layers[i]).s19_attn_qkv_inp_norm = nullptr;
+            const_cast<llama_layer &>(model.layers[i]).s19_attn_in_proj_q8   = nullptr;
         }
         return;
     }
@@ -72,6 +105,23 @@ static void s19_ensure_inkling2_norms(const llama_model & model) {
         ggml_backend_tensor_get(l.attn_k_inp_norm, stage.data() + 1 * row_bytes, 0, row_bytes);
         ggml_backend_tensor_get(l.attn_v_inp_norm, stage.data() + 2 * row_bytes, 0, row_bytes);
         ggml_backend_tensor_set(pr.second, stage.data(), 0, 3 * row_bytes);
+    }
+    for (const auto & ap : created_coal) {
+        const auto & l    = model.layers[std::get<0>(ap)];
+        ggml_tensor * dst = std::get<1>(ap);
+        const bool inc_kv = std::get<2>(ap);
+        const ggml_tensor * srcs[5] = { l.wq, l.wqkv_gate, l.attn_rel, l.wk, l.wv };
+        const int n_srcs = inc_kv ? 5 : 3;
+        size_t dst_off = 0;
+        for (int si = 0; si < n_srcs; ++si) {
+            const size_t nb = ggml_nbytes(srcs[si]);
+            if (stage.size() < nb) {
+                stage.resize(nb);
+            }
+            ggml_backend_tensor_get(srcs[si], stage.data(), 0, nb);
+            ggml_backend_tensor_set(dst, stage.data(), dst_off, nb);
+            dst_off += nb;
+        }
     }
     model.s19_inkling_ctx   = std::move(ctx);
     model.s19_inkling_buf   = std::move(buf);
@@ -465,9 +515,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
     ggml_tensor * inpSA = cur;
 
-    const bool fuse_s19 = n_tokens <= 512 && !getenv("GGML_INKLING_NO_FUSE") && !getenv("S19_NO_INK_W3") && blocks.size() + 1 <= 6 && model.s19_inkling_ready;
+    const bool fuse_s19 = n_tokens <= 4096 && !getenv("GGML_INKLING_NO_FUSE") && !getenv("S19_NO_INK_W3") && blocks.size() + 1 <= 6 && model.s19_inkling_ready;
     const bool fuse_mix_rms = fuse_s19 && !getenv("S19_NO_MIX_RMS");
-    const bool has_s19_loop = fuse_s19 && !getenv("S19_NO_CTRL_RMS") && messages && n_tokens <= 8 && model.loras.empty() &&
+    const bool has_s19_loop = fuse_s19 && !getenv("S19_NO_CTRL_RMS") && messages && n_tokens <= 4096 && model.loras.empty() &&
                               ip >= 0 && (size_t)ip < model.s19_loop_layers.size() &&
                               model.s19_loop_layers[ip].ctrl_down_qkv != nullptr;
 
@@ -526,38 +576,81 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
     // self-attention
     {
-        ggml_tensor * Qcur      = build_lora_mm(layer.wq,             inputs[0]);
-        ggml_tensor * Qgate_raw = build_lora_mm(layer.wqkv_gate,      inputs[0]);
-        ggml_tensor * Qgate     = ggml_sigmoid(ctx0, Qgate_raw);
-        ggml_tensor * Rcur      = nullptr;
-        ggml_tensor * sinks     = nullptr;
-        ggml_tensor * Kraw      = nullptr;
-        ggml_tensor * Kdyn      = nullptr;
-        ggml_tensor * Vraw      = nullptr;
-        ggml_tensor * Vdyn      = nullptr;
-        if (n_tokens <= 8 && !getenv("S19_NO_WKV_REORDER")) {
-            Kraw  = build_lora_mm(layer.wk,             inputs[1]);
-            Vraw  = build_lora_mm(layer.wv,             inputs[2]);
-            Rcur  = build_lora_mm(layer.attn_rel,       inputs[0]);
+        const int64_t m_q   = layer.wq->ne[1];
+        const int64_t m_qg  = layer.wqkv_gate->ne[1];
+        const int64_t m_rel = layer.attn_rel->ne[1];
+        const int64_t m_qgr = m_q + m_qg + m_rel;
+        const int64_t m_k   = layer.wk->ne[1];
+        const int64_t m_v   = layer.wv->ne[1];
+        const bool use_coal_q8 = layer.s19_attn_in_proj_q8 != nullptr && model.loras.empty() &&
+                                 !getenv("GGML_INKLING_NO_FUSE") && !getenv("GGML_INKLING_NO_COAL_ATTN");
+
+        ggml_tensor * Qcur         = nullptr;
+        ggml_tensor * Q3           = nullptr;
+        ggml_tensor * Qgate        = nullptr;
+        ggml_tensor * Qgate_raw_2d = nullptr;
+        ggml_tensor * Rcur         = nullptr;
+        ggml_tensor * R3           = nullptr;
+        ggml_tensor * sinks        = nullptr;
+        ggml_tensor * Kraw         = nullptr;
+        ggml_tensor * Kdyn         = nullptr;
+        ggml_tensor * Vraw         = nullptr;
+        ggml_tensor * Vdyn         = nullptr;
+
+        if (use_coal_q8) {
+            const bool coal_has_kv = (inputs[0] == inputs[1] && inputs[0] == inputs[2]) &&
+                                     (layer.s19_attn_in_proj_q8->ne[1] == m_qgr + m_k + m_v);
+            ggml_tensor * w_in = coal_has_kv
+                ? layer.s19_attn_in_proj_q8
+                : (layer.s19_attn_in_proj_q8->ne[1] == m_qgr
+                    ? layer.s19_attn_in_proj_q8
+                    : ggml_view_2d(ctx0, layer.s19_attn_in_proj_q8, n_embd, m_qgr, layer.s19_attn_in_proj_q8->nb[1], 0));
+            ggml_tensor * mm_in = ggml_mul_mat(ctx0, w_in, inputs[0]);
+            Q3           = ggml_view_3d(ctx0, mm_in, n_embd_head, n_head, n_tokens,
+                                        n_embd_head * sizeof(float), mm_in->nb[1], 0);
+            Qgate_raw_2d = ggml_view_2d(ctx0, mm_in, m_qg, n_tokens,
+                                        n_tokens == 1 ? (size_t)m_qg * sizeof(float) : mm_in->nb[1],
+                                        (size_t)m_q * sizeof(float));
+            R3           = ggml_view_3d(ctx0, mm_in, hparams.n_relative, n_head, n_tokens,
+                                        hparams.n_relative * sizeof(float), mm_in->nb[1], (size_t)(m_q + m_qg) * sizeof(float));
+            if (coal_has_kv) {
+                Kraw = ggml_view_2d(ctx0, mm_in, m_k, n_tokens, mm_in->nb[1], (size_t)m_qgr * sizeof(float));
+                Vraw = ggml_view_2d(ctx0, mm_in, m_v, n_tokens, mm_in->nb[1], (size_t)(m_qgr + m_k) * sizeof(float));
+            } else {
+                Kraw = build_lora_mm(layer.wk, inputs[1]);
+                Vraw = build_lora_mm(layer.wv, inputs[2]);
+            }
             sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
             Kdyn  = is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]);
             Vdyn  = is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]);
         } else {
-            Rcur  = build_lora_mm(layer.attn_rel,       inputs[0]);
-            sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
-            Kraw  = build_lora_mm(layer.wk,             inputs[1]);
-            Kdyn  = is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]);
-            Vraw  = build_lora_mm(layer.wv,             inputs[2]);
-            Vdyn  = is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]);
+            Qcur = build_lora_mm(layer.wq, inputs[0]);
+            ggml_tensor * Qgate_raw = build_lora_mm(layer.wqkv_gate, inputs[0]);
+            Qgate = ggml_sigmoid(ctx0, Qgate_raw);
+            if (n_tokens <= 8 && !getenv("S19_NO_WKV_REORDER")) {
+                Kraw  = build_lora_mm(layer.wk,             inputs[1]);
+                Vraw  = build_lora_mm(layer.wv,             inputs[2]);
+                Rcur  = build_lora_mm(layer.attn_rel,       inputs[0]);
+                sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
+                Kdyn  = is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]);
+                Vdyn  = is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]);
+            } else {
+                Rcur  = build_lora_mm(layer.attn_rel,       inputs[0]);
+                sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
+                Kraw  = build_lora_mm(layer.wk,             inputs[1]);
+                Kdyn  = is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]);
+                Vraw  = build_lora_mm(layer.wv,             inputs[2]);
+                Vdyn  = is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]);
+            }
+            Q3 = ggml_reshape_3d(ctx0, Qcur, n_embd_head,        n_head, n_tokens);
+            R3 = ggml_reshape_3d(ctx0, Rcur, hparams.n_relative, n_head, n_tokens);
         }
 
         ggml_tensor * Kcur      = convolve(Kraw, layer.attn_k_conv, Kdyn, state, history, recr, 0);
         ggml_tensor * Vcur      = convolve(Vraw, layer.attn_v_conv, Vdyn, state, history, recr, n_embd_k_gqa);
 
         ggml_tensor * opt_tau = is_swa ? nullptr : tau;
-        if (n_tokens <= 8 && getenv("GGML_VK_ENABLE_S19_CLIP_QR") && !getenv("GGML_INKLING_NO_FUSE") && !getenv("S19_NO_INK_W3")) {
-            ggml_tensor * Q3      = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
-            ggml_tensor * R3      = ggml_reshape_3d(ctx0, Rcur, hparams.n_relative, n_head, n_tokens);
+        if (!getenv("GGML_VK_DISABLE_S19_CLIP_QR") && !getenv("GGML_INKLING_NO_FUSE") && !getenv("S19_NO_INK_W3")) {
             ggml_tensor * qr_clip = ggml_inkling_l2_clip_qr(
                     ctx0, Q3, R3, layer.attn_q_clip, layer.attn_rel_clip, opt_tau,
                     hparams.f_qk_clip, hparams.f_relative_clip, 1e-6f);
@@ -567,8 +660,14 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                                 hparams.n_relative * sizeof(float), hparams.n_relative * n_head * sizeof(float),
                                 (size_t)(n_embd_head * n_head * n_tokens) * sizeof(float));
         } else {
-            Qcur = clip(ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), layer.attn_q_clip,   hparams.f_qk_clip,       opt_tau);
-            Rcur = clip(ggml_reshape_3d(ctx0, Rcur, hparams.n_relative, n_head, n_tokens), layer.attn_rel_clip, hparams.f_relative_clip, opt_tau);
+            if (!ggml_is_contiguous(Q3)) {
+                Q3 = ggml_cont(ctx0, Q3);
+            }
+            if (!ggml_is_contiguous(R3)) {
+                R3 = ggml_cont(ctx0, R3);
+            }
+            Qcur = clip(Q3, layer.attn_q_clip,   hparams.f_qk_clip,       opt_tau);
+            Rcur = clip(R3, layer.attn_rel_clip, hparams.f_relative_clip, opt_tau);
         }
         Kcur = clip(ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), nullptr,             hparams.f_qk_clip,       nullptr);
         Vcur = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens), hparams.f_norm_rms_eps);
@@ -724,6 +823,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             cur = n_rows_max >= n_seq_tokens ? outs[0] : ggml_reshape_2d(ctx0, outs[0], outs[0]->ne[0], n_tokens);
         }
 
+        if (Qgate_raw_2d) {
+            Qgate = ggml_sigmoid(ctx0, Qgate_raw_2d);
+        }
         cur = ggml_mul(ctx0, cur, Qgate);
         cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
         cb(cur, "attn_out", il);
@@ -750,7 +852,8 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         cur = ggml_reshape_2d(ctx0, mix(blocks, cur, layer.ffn_res_query), n_embd, n_tokens);
         ggml_tensor * msg_ffn = message(LOOP_CTRL_FFN);
         ggml_tensor * gate_in = ggml_inkling_rms2_concat(ctx0, cur, msg_ffn, 1e-6f);
-        ggml_tensor * gate    = ggml_mul_mat(ctx0, loop->ctrl_down[LOOP_CTRL_FFN], gate_in);
+        ggml_tensor * w_down  = s19_l.ctrl_down_ffn ? s19_l.ctrl_down_ffn : loop->ctrl_down[LOOP_CTRL_FFN];
+        ggml_tensor * gate    = ggml_mul_mat(ctx0, w_down, gate_in);
         ggml_tensor * up_gf   = ggml_mul_mat(ctx0, s19_l.ctrl_up_ffn, gate);
         cur = ggml_inkling_ctrl_apply_rms_mul(ctx0, cur, msg_ffn, up_gf, layer.ffn_norm, hparams.f_norm_rms_eps);
     } else {

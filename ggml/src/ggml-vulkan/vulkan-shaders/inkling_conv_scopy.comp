@@ -36,6 +36,7 @@ layout(push_constant) uniform PushConstants {
     uint  use_hist;
     uint  off_hist;
     uint  hist_sconv_ch;
+    uint  cur_s1;
 } p;
 
 void main() {
@@ -71,7 +72,7 @@ void main() {
         const uint elem       = tok_global * p.n_channels + c;
         float x3;
         if (p.n_exp <= 1u) {
-            x3 = data_cur[p.off_cur + elem];
+            x3 = data_cur[p.off_cur + tok_global * p.cur_s1 + c];
         } else {
             const uint base = p.off_cur + tok_global * (p.n_exp * p.n_channels) + c;
             float s = data_cur[base];

@@ -3895,7 +3895,7 @@ void ggml_compute_forward_inkling_fused(const ggml_compute_params * params, ggml
             }
             const int64_t tok = seq * n_seq_tokens + pos;
             if (n_exp <= 1) {
-                return pc[tok * n_channels + c];
+                return *(const float *)((const char *)cur->data + tok * cur->nb[1] + c * sizeof(float));
             }
             float s = 0.0f;
             const float * pbase = pc + tok * (n_exp * n_channels) + c;
@@ -4147,8 +4147,6 @@ void ggml_compute_forward_inkling_fused(const ggml_compute_params * params, ggml
         const int64_t n_head      = q_cur->ne[1];
         const int64_t n_tokens    = q_cur->ne[2];
         const int64_t q_rows      = n_head * n_tokens;
-        const float * pq          = (const float *)q_cur->data;
-        const float * pr          = (const float *)r_cur->data;
         const float * pqs         = q_sc ? (const float *)q_sc->data : nullptr;
         const float * prs         = r_sc ? (const float *)r_sc->data : nullptr;
         const float * ptau        = tau  ? (const float *)tau->data  : nullptr;
@@ -4160,7 +4158,8 @@ void ggml_compute_forward_inkling_fused(const ggml_compute_params * params, ggml
             const int64_t tok     = sub_row / n_head;
             const int64_t ne0     = is_r ? r_ne0 : q_ne0;
             const float   thresh  = is_r ? r_thresh : q_thresh;
-            const float * pcur    = (is_r ? pr : pq) + sub_row * ne0;
+            const ggml_tensor * ct = is_r ? r_cur : q_cur;
+            const float * pcur    = (const float *)((const char *)ct->data + tok * ct->nb[2] + head * ct->nb[1]);
             const float * psc     = is_r ? (prs ? prs + head * ne0 : nullptr) : (pqs ? pqs + head * ne0 : nullptr);
             float       * pout    = pd + (is_r ? (q_rows * q_ne0 + sub_row * r_ne0) : (sub_row * q_ne0));
             float ss = 0.0f;

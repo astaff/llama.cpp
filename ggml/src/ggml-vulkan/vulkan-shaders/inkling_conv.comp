@@ -30,13 +30,14 @@ layout(push_constant) uniform PushConstants {
     float scale_out;
     uint  has_res;
     uint  off_res;
+    uint  cur_s1;
 } p;
 
 float load_conv_x(uint seq, uint c, int pos) {
     if (pos < 0) {
         return data_hist[p.off_hist + (seq * p.hist_sconv_ch + (p.ch_offset + c)) * 3u + uint(pos + 3)];
     }
-    return data_cur[p.off_cur + (seq * p.n_seq_tokens + uint(pos)) * p.n_channels + c];
+    return data_cur[p.off_cur + (seq * p.n_seq_tokens + uint(pos)) * p.cur_s1 + c];
 }
 
 void main() {
