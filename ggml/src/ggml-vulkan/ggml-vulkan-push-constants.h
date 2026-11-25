@@ -164,6 +164,8 @@ struct vk_mat_vec_id_push_constants {
     uint32_t ne11;
     uint32_t expert_i1;
     uint32_t nbi1;
+    float    glu_alpha;
+    float    glu_limit;
 };
 
 struct vk_flash_attn_push_constants {

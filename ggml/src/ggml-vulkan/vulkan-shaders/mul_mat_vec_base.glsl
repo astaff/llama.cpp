@@ -21,6 +21,7 @@
 #define MAT_VEC_FUSION_FLAGS_COL_SPLIT 0x8000
 #define MAT_VEC_FUSION_FLAGS_LORA0 0x80000
 #define MAT_VEC_FUSION_FLAGS_LORA1 0x100000
+#define MAT_VEC_FUSION_FLAGS_SITU_MERGED 0x400000
 
 layout (binding = 3) readonly buffer A2 {A_TYPE data_a2[];};
 #if defined(A_TYPEV4)
@@ -67,6 +68,8 @@ layout (push_constant) uniform parameter
     uint ne11;
     uint expert_i1;
     uint nbi1;
+    float glu_alpha;
+    float glu_limit;
 #else
     uint base_work_group_y;
     uint ne02;
@@ -154,7 +157,25 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 #endif
 }
 
-#ifndef MUL_MAT_ID
+#ifdef MUL_MAT_ID
+float mmv_apply_id_pair_glu(float g, float u) {
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_EXP_SCALE0) != 0) {
+        const float esc = float(data_fuse0[expert_id]);
+        precise float g_s = g * esc;
+        precise float u_s = u * esc;
+        g = g_s;
+        u = u_s;
+    }
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SITU_MERGED) != 0) {
+        const float beta = p.glu_alpha;
+        const float lb   = p.glu_limit;
+        const float act  = (tanh(g * (1.0f / beta)) * beta) * (1.0f / (1.0f + exp(-g)));
+        const float u_c  = (lb > 0.0f) ? (tanh(u * (1.0f / lb)) * lb) : u;
+        return act * u_c;
+    }
+    return (g / (1.0f + exp(-g))) * u;
+}
+#else
 FLOAT_TYPE gen_apply_mm_epilogue(FLOAT_TYPE val, const uint j, const uint first_row, const uint n) {
     if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SIGMOID) != 0) {
         precise float gen_x = float(D_TYPE(val));
@@ -350,10 +371,12 @@ void reduce_pair_glu(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_TYPE
                     data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(0);
                     continue;
                 }
-#endif
+                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(FLOAT_TYPE(mmv_apply_id_pair_glu(float(D_TYPE(temp[j][n])), float(D_TYPE(temp2[j][n])))));
+#else
                 const float glu_g = float(D_TYPE(temp[j][n]));
                 const float glu_u = float(D_TYPE(temp2[j][n]));
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(FLOAT_TYPE(glu_g / (1.0f + exp(-glu_g)) * glu_u));
+#endif
             }
         }
     }
@@ -619,6 +642,7 @@ void reduce_pair_glu(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_TYPE
                     data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(0);
                     continue;
                 }
+                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(FLOAT_TYPE(mmv_apply_id_pair_glu(float(D_TYPE(acc)), float(D_TYPE(acc2)))));
 #else
                 if (MMV_HAS_LORA0) {
                     acc += lora0_acc[j][n];
@@ -626,10 +650,10 @@ void reduce_pair_glu(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_TYPE
                 if (MMV_HAS_LORA1) {
                     acc2 += lora1_acc[j][n];
                 }
-#endif
                 const float glu_g = float(D_TYPE(acc));
                 const float glu_u = float(D_TYPE(acc2));
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(FLOAT_TYPE(glu_g / (1.0f + exp(-glu_g)) * glu_u));
+#endif
             }
         }
     }
@@ -685,6 +709,7 @@ void reduce_pair_glu(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_TYPE
                     data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(0);
                     continue;
                 }
+                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(FLOAT_TYPE(mmv_apply_id_pair_glu(float(D_TYPE(temp[j][n])), float(D_TYPE(tmpsh[j][n][0])))));
 #else
                 if (MMV_HAS_LORA0) {
                     temp[j][n] += FLOAT_TYPE(mmv_eval_lora0_scalar(first_row + n, mmv_tok_j(j)));
@@ -692,10 +717,10 @@ void reduce_pair_glu(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_TYPE
                 if (MMV_HAS_LORA1) {
                     tmpsh[j][n][0] += FLOAT_TYPE(mmv_eval_lora1_scalar(first_row + n, mmv_tok_j(j)));
                 }
-#endif
                 const float glu_g = float(D_TYPE(temp[j][n]));
                 const float glu_u = float(D_TYPE(tmpsh[j][n][0]));
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(FLOAT_TYPE(glu_g / (1.0f + exp(-glu_g)) * glu_u));
+#endif
             }
         }
     }

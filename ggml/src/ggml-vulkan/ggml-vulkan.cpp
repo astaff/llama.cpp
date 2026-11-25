@@ -11339,26 +11339,27 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     static const int env_mma_id_f16_b       = getenv("GGML_VK_MMA_ID_F16_B")        ? atoi(getenv("GGML_VK_MMA_ID_F16_B") )       : 1;
     static const uint32_t env_mma_id_kp     = getenv("GGML_VK_MMA_ID_KP")           ? (uint32_t)atoi(getenv("GGML_VK_MMA_ID_KP")) : 1u;
     const bool has_pglu_twin  = has_pair_glu || has_situ_merged;
+    const uint32_t eff_m_rows = has_situ_merged ? (uint32_t)(ne01 / 2) : (uint32_t)ne01;
     const bool is_fastep_cand = !has_pglu_twin && use_mmid_fused &&
                                 ((fusion_flags & ~(MAT_VEC_FUSION_FLAGS_SCALE0 | MAT_VEC_FUSION_FLAGS_SCALE0_TOK)) == 0u ||
                                  (ggml_vk_is_apple_agx_coopmat(ctx->device) && !mma_id_disabled &&
                                   (fusion_flags & ~(MAT_VEC_FUSION_FLAGS_EXP_SCALE0 | MAT_VEC_FUSION_FLAGS_SCALE1 | MAT_VEC_FUSION_FLAGS_SCALE1_TOK)) == 0u));
-    const int eff_mma_id_max_n = has_pair_glu   ? (env_mma_id_pglu_max_n >= 0 ? env_mma_id_pglu_max_n : env_mma_id_max_n)
+    const int eff_mma_id_max_n = has_pglu_twin  ? (env_mma_id_pglu_max_n >= 0 ? env_mma_id_pglu_max_n : env_mma_id_max_n)
                                : is_fastep_cand ? (env_mma_id_fep_max_n  >= 0 ? env_mma_id_fep_max_n  : env_mma_id_max_n)
                                : env_mma_id_max_n;
     const uint32_t mma_id_k_step = (src0->type == GGML_TYPE_Q4_0) ? 32u : 64u;
     const uint32_t avg_tok_per_exp = (uint32_t)CEIL_DIV(nei0 * nei1, n_as);
     const int def_mma_id_msg = env_mma_id_msg >= 0 ? env_mma_id_msg : ((nei1 >= 1024) ? 8 : -1);
-    const int req_msg = has_pair_glu   ? (env_mma_id_pglu_msg > 0 ? env_mma_id_pglu_msg : def_mma_id_msg)
+    const int req_msg = has_pglu_twin  ? (env_mma_id_pglu_msg > 0 ? env_mma_id_pglu_msg : def_mma_id_msg)
                       : is_fastep_cand ? (env_mma_id_fep_msg  > 0 ? env_mma_id_fep_msg  : def_mma_id_msg)
                       : def_mma_id_msg;
-    const bool want_msg8  = (req_msg == 8 || req_msg == 81) && ne01 >= (req_msg == 81 ? 64u : 128u) && (ne10 % 128u == 0);
-    const bool want_msg8_pglu = (req_msg == 8 || req_msg == 81) && has_pair_glu && ne01 >= 64 && (ne10 % 128u == 0);
+    const bool want_msg8  = (req_msg == 8 || req_msg == 81) && eff_m_rows >= (req_msg == 81 ? 64u : 128u) && (ne10 % 128u == 0);
+    const bool want_msg8_pglu = (req_msg == 8 || req_msg == 81) && has_pglu_twin && eff_m_rows >= 64u && (ne10 % 128u == 0);
     const bool use_msg8_cfg = want_msg8 || want_msg8_pglu;
-    const int req_rt = has_pair_glu   ? (env_mma_id_pglu_rt > 0 ? env_mma_id_pglu_rt : env_mma_id_rt)
+    const int req_rt = has_pglu_twin  ? (env_mma_id_pglu_rt > 0 ? env_mma_id_pglu_rt : env_mma_id_rt)
                      : is_fastep_cand ? (env_mma_id_fep_rt  > 0 ? env_mma_id_fep_rt  : env_mma_id_rt)
                      : env_mma_id_rt;
-    const bool can_wide_rt = src0->type != GGML_TYPE_F32 && (ne10 % 64u == 0) && ne01 >= 32;
+    const bool can_wide_rt = src0->type != GGML_TYPE_F32 && (ne10 % 64u == 0) && eff_m_rows >= 32u;
     const uint32_t id_rt_i = (req_rt == 8 && can_wide_rt) ? 6u
                            : (req_rt == 6 && can_wide_rt) ? 5u
                            : (req_rt == 5 && can_wide_rt) ? 4u
@@ -11396,9 +11397,24 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                   (is_repack
                                       ? (repack_ri >= 0 && ctx->device->pipeline_mul_mv_mma_id_repack[repack_ri][id_rt_i][0][0] != nullptr)
                                       : (ctx->device->pipeline_mul_mv_mma_id[src0->type][id_rt_i][0][0] != nullptr));
+    auto has_cached_y_f16 = [&]() -> bool {
+        if (!ggml_is_contiguous(src1) || ctx->device->pipeline_contig_cpy_f32_f16 == nullptr) {
+            return false;
+        }
+        vk_pipeline_struct * cpy_p = ctx->device->pipeline_contig_cpy_f32_f16.get();
+        const ggml_tensor * key_s1 = ggml_vk_prealloc_y_equiv_root(src1);
+        for (uint32_t s = 0; s < ctx->prealloc_y_ring_count; ++s) {
+            if (ctx->prealloc_y_last_pipeline_ring[s] == cpy_p &&
+                ctx->prealloc_y_last_tensor_ring[s] == key_s1 &&
+                !ctx->prealloc_y_last_k_padded_ring[s]) {
+                return true;
+            }
+        }
+        return false;
+    };
     const bool mma_id_f16_b = mma_id_candidate && src0->type != GGML_TYPE_F32 &&
-                              ((env_mma_id_f16_b == 1 && nei1 >= 32) ||
-                               (env_mma_id_f16_b == 2 && has_pair_glu && nei1 >= 32) ||
+                              ((env_mma_id_f16_b == 1 && (nei1 >= 32 || has_cached_y_f16())) ||
+                               (env_mma_id_f16_b == 2 && has_pglu_twin && nei1 >= 32) ||
                                (env_mma_id_f16_b >= 3));
 
     // Intel coopmat1 prefers f16 activations; for large batches on Apple AGX, pre-staged FP16 B (cached for _pairglu!) halves scattered MoE B bandwidth.
@@ -11471,11 +11487,11 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                             !y_needs_k_padding;
     vk_pipeline pipeline = nullptr;
     if (use_mma_id) {
-        const uint32_t id_ci = (req_msg == 1 || (ne10 % (64u * eff_shb_kp) != 0) || ne01 < 32)
+        const uint32_t id_ci = (req_msg == 1 || (ne10 % (64u * eff_shb_kp) != 0) || eff_m_rows < 32u)
                                ? 1u
-                               : ((req_msg == 2 || (req_msg < 0 && ne01 < 64))
+                               : ((req_msg == 2 || (req_msg < 0 && eff_m_rows < 64u))
                                    ? 2u
-                                   : (use_msg8_cfg ? ((req_msg == 81 && !has_pair_glu) ? 4u : 3u) : 0u));
+                                   : (use_msg8_cfg ? ((req_msg == 81 && !has_pglu_twin) ? 4u : 3u) : 0u));
         const uint32_t bf16_i = y_f32_kernel ? 0u : 1u;
         pipeline = is_repack
             ? ctx->device->pipeline_mul_mv_mma_id_repack[repack_ri][id_rt_i][id_ci][bf16_i]
@@ -11566,15 +11582,16 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
     static const bool disable_pglu_f16_out = getenv("GGML_VK_DISABLE_PGLU_F16_OUT") != nullptr;
     static const bool keep_pglu_f32        = getenv("GGML_VK_KEEP_PGLU_F32") != nullptr;
-    const bool next_mmid_wants_f16 = cgraph != nullptr && has_pair_glu &&
-        (node_idx + 3 < cgraph->n_nodes) &&
-        cgraph->nodes[node_idx + 3]->op == GGML_OP_MUL_MAT_ID &&
-        cgraph->nodes[node_idx + 3]->src[1] == out_dst &&
-        cgraph->nodes[node_idx + 3]->src[0]->type != GGML_TYPE_F32 &&
-        cgraph->nodes[node_idx + 3]->src[0]->ne[1] >= 32 &&
-        (out_dst->ne[0] % ((cgraph->nodes[node_idx + 3]->src[0]->type == GGML_TYPE_Q4_0) ? 32 : 64) == 0);
-    const bool want_pglu_f16_out = !disable_pglu_f16_out && has_pair_glu && use_mma_id &&
-        mma_id_f16_b && next_mmid_wants_f16 && ggml_is_contiguous(out_dst) &&
+    const bool next_mmid_wants_f16 = ctx->gen_pair_glu_sole_mmid_next ||
+        (cgraph != nullptr && has_pair_glu &&
+         (node_idx + 3 < cgraph->n_nodes) &&
+         cgraph->nodes[node_idx + 3]->op == GGML_OP_MUL_MAT_ID &&
+         cgraph->nodes[node_idx + 3]->src[1] == out_dst &&
+         cgraph->nodes[node_idx + 3]->src[0]->type != GGML_TYPE_F32 &&
+         cgraph->nodes[node_idx + 3]->src[0]->ne[1] >= 32 &&
+         (out_dst->ne[0] % ((cgraph->nodes[node_idx + 3]->src[0]->type == GGML_TYPE_Q4_0) ? 32 : 64) == 0));
+    const bool want_pglu_f16_out = !disable_pglu_f16_out && has_pglu_twin && use_mma_id &&
+        (mma_id_f16_b || env_mma_id_f16_b == 1) && next_mmid_wants_f16 && ggml_is_contiguous(out_dst) &&
         get_misalign_bytes(ctx, out_dst) == 0;
     const size_t pglu_f16_bytes = sizeof(ggml_fp16_t) * d_ne;
 
@@ -11778,7 +11795,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         const vk_subbuffer aux0_sub = aux0_t ? ggml_vk_tensor_subbuffer(ctx, aux0_t) : d_sub;
         vk_subbuffer aux1_sub       = aux1_t ? ggml_vk_tensor_subbuffer(ctx, aux1_t) : d_sub;
         if (do_pglu_f16_out) {
-            aux1_sub = ggml_vk_produce_prealloc_y_f16(ctx, subctx, out_dst, pglu_f16_bytes, false, in_y_slot);
+            aux1_sub = ggml_vk_produce_prealloc_y_f16(ctx, subctx, out_dst, pglu_f16_bytes, true, in_y_slot);
             GGML_ASSERT(in_y_slot < 0 || aux1_sub.offset != y_buf_offset);
             mma_fusion_flags |= MAT_VEC_FUSION_FLAGS_D_F16_AUX1;
             if (ctx->gen_pair_glu_sole_mmid_next && ids_non_negative && !keep_pglu_f32) {
@@ -11819,7 +11836,9 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
 static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
-    const bool has_pair_glu = ctx->num_additional_fused_ops == 2 && cgraph->nodes[node_idx + 2]->op == GGML_OP_GLU;
+    const bool has_pair_glu    = ctx->num_additional_fused_ops == 2 && cgraph->nodes[node_idx + 2]->op == GGML_OP_GLU;
+    const bool has_situ_merged = ctx->gen_mm_dst != nullptr && (ctx->gen_mm_flags & MAT_VEC_FUSION_FLAGS_SITU_MERGED) != 0u;
+    const ggml_tensor * out_dst = ctx->gen_mm_dst ? ctx->gen_mm_dst : cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * src1 = dst->src[1];
     ggml_tensor * ids = dst->src[2];
@@ -11852,8 +11871,9 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     const uint64_t nei1 = ids->ne[1];
     const uint32_t nbi1 = (uint32_t)(ids->nb[1] / sizeof(int));
 
-    const uint64_t ne20 = dst->ne[0];
-    const uint64_t ne21 = dst->ne[1];
+    const uint64_t ne20 = out_dst->ne[0];
+    const uint64_t ne21 = out_dst->ne[1];
+    const uint64_t eff_m_id = has_situ_merged ? (ne01 / 2) : ne01;
     // const uint64_t ne22 = dst->ne[2];
     // const uint64_t ne23 = dst->ne[3];
 
@@ -11862,7 +11882,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     const bool y_non_contig = !ggml_vk_dim01_contiguous(src1);
 
     const bool f16_f32_kernel = src1->type == GGML_TYPE_F32;
-    bool quantize_y = !is_repack && !has_pair_glu && ctx->device->integer_dot_signed && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_src1_prec_allows_q8(dst) && ggml_vk_should_use_mmvq(ctx->device, ne01, ne12, ne10, src0->type);
+    bool quantize_y = !is_repack && !has_pair_glu && !has_situ_merged && ctx->device->integer_dot_signed && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_src1_prec_allows_q8(dst) && ggml_vk_should_use_mmvq(ctx->device, eff_m_id, ne12, ne10, src0->type);
 
     vk_pipeline to_fp16_vk_0 = nullptr;
     vk_pipeline to_fp16_vk_1 = nullptr;
@@ -11898,7 +11918,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     if (max_a_nbytes > ctx->device->properties.limits.maxStorageBufferRange) {
         dmmv = ggml_vk_get_64b_indexing_pipeline(ctx, dmmv);
     }
-    if (has_pair_glu) {
+    if (has_pair_glu || has_situ_merged) {
         GGML_ASSERT(dmmv && dmmv->gen_pair_glu);
         dmmv = dmmv->gen_pair_glu;
     } else if ((ctx->num_additional_fused_ops == 1 && cgraph->nodes[node_idx + 1]->op == GGML_OP_GLU) ||
@@ -12013,10 +12033,10 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
 
     const uint32_t max_groups_x = ctx->device->properties.limits.maxComputeWorkGroupCount[0];
 
-    uint32_t groups_x = ne01;
+    uint32_t groups_x = (uint32_t)eff_m_id;
     uint32_t groups_z = 1;
 
-    if (ne01 > max_groups_x) {
+    if (eff_m_id > max_groups_x) {
         groups_z = 64;
         groups_x = CEIL_DIV(groups_x, groups_z);
     }
@@ -12067,12 +12087,15 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         }
     }
 
+    const float situ_alpha = has_situ_merged ? ctx->gen_glu_alpha : 0.0f;
+    const float situ_limit = has_situ_merged ? ctx->gen_glu_limit : 0.0f;
     if (use_toky) {
         const vk_mat_vec_id_push_constants pc = {
-            (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
+            (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)eff_m_id,
             stride_batch_x, stride_batch_y, (uint32_t)(ne20 * ne21),
             fusion_flags | MAT_VEC_FUSION_FLAGS_GEN_TOKY,
-            (uint32_t)nei0, (uint32_t)ne11, 0u, nbi1
+            (uint32_t)nei0, (uint32_t)ne11, 0u, nbi1,
+            situ_alpha, situ_limit
         };
         ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
             {
@@ -12088,10 +12111,11 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         // Loop over the batch dimension
         for (uint32_t expert_i1 = 0; expert_i1 < nei1; ++expert_i1) {
             const vk_mat_vec_id_push_constants pc = {
-                (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
+                (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)eff_m_id,
                 stride_batch_x, stride_batch_y, (uint32_t)(ne20 * ne21),
                 fusion_flags,
-                (uint32_t)nei0, (uint32_t)ne11, expert_i1, nbi1
+                (uint32_t)nei0, (uint32_t)ne11, expert_i1, nbi1,
+                situ_alpha, situ_limit
             };
             ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
                 {
@@ -23338,6 +23362,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         float    glu_alpha {};
         float    glu_limit {};
         int skip[5] { -1, -1, -1, -1, -1 };
+        int sole_down_idx { -1 };
     };
     std::vector<s17_mmid_exp_info> s17_mmid_exp;
     if (!ctx->device->disable_fusion && !getenv("GGML_VK_DISABLE_S17_EXP_SCALE")) {
@@ -23465,7 +23490,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             if (gen_skip.empty()) {
                 gen_skip.assign(cgraph->n_nodes, 0);
             }
-            s17_mmid_exp[idx] = { dst_out, s_cur, f1_t, flags, 0.0f, 0.0f, { rep_idx, gr_idx, mul0_idx, mul1_idx, -1 } };
+            s17_mmid_exp[idx] = { dst_out, s_cur, f1_t, flags, 0.0f, 0.0f, { rep_idx, gr_idx, mul0_idx, mul1_idx, -1 }, -1 };
             if (rep_idx  >= 0) gen_skip[rep_idx]  = 1;
             if (gr_idx   >= 0) gen_skip[gr_idx]   = 1;
             if (mul0_idx >= 0) gen_skip[mul0_idx] = 1;
@@ -23473,8 +23498,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
     }
 
-    // Series 19 (W4.5): Fuse unsplit GGML_GLU_OP_SITU (+ optional EXP_SCALE0) into mul_mv_mma_id FUSE_MODE=3 for 2 <= N <= 16
-    if (!ctx->device->disable_fusion && gen_fuse_enabled("glu") && getenv("GGML_VK_ENABLE_S19_MMID_SITU") != nullptr &&
+    // Series 19 (W4.5): Fuse unsplit GGML_GLU_OP_SITU (+ optional EXP_SCALE0) into mul_mv_mma_id FUSE_MODE=3 for 2 <= N <= 2048
+    static const int env_s19_situ_max_n = getenv("GGML_VK_S19_SITU_MAX_N") ? atoi(getenv("GGML_VK_S19_SITU_MAX_N")) : 2048;
+    if (!ctx->device->disable_fusion && gen_fuse_enabled("glu") && !getenv("GGML_VK_DISABLE_S19_MMID_SITU") &&
         ggml_vk_is_apple_agx_coopmat(ctx->device) && !ggml_vk_exact_s8_enabled() && !getenv("GGML_VK_DISABLE_MMA_ID")) {
         for (int idx = 0; idx < last_node; ++idx) {
             if (!gen_skip.empty() && gen_skip[idx]) {
@@ -23488,12 +23514,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             const ggml_tensor * w0 = mmid->src[0];
             const ggml_tensor * b1 = mmid->src[1];
             const ggml_tensor * ids = mmid->src[2];
+            const bool uses_mmv_id = ggml_vk_use_mul_mat_vec_id(ctx, cgraph, idx) || ids->ne[1] <= (int64_t)ctx->device->mmv_id_max_tokens;
             if (!w0 || !b1 || !ids || (w0->type != GGML_TYPE_NVFP4 && w0->type != GGML_TYPE_Q8_0) ||
+                (w0->type == GGML_TYPE_Q8_0 && uses_mmv_id && ggml_vk_tensor_is_repack(w0)) ||
+                (uses_mmv_id && getenv("GGML_VK_ENABLE_S19_MMVID_SITU") == nullptr) ||
                 !ggml_vk_dim01_contiguous(w0) || b1->type != GGML_TYPE_F32 || (get_misalign_bytes(ctx, b1) % 4 != 0) ||
                 (b1->ne[0] % 64 != 0) || (w0->ne[1] % 16 != 0) || (w0->ne[1] / 2) < 64 ||
                 !(b1->ne[1] == 1 || b1->ne[1] >= ids->ne[0]) ||
-                ggml_vk_use_mul_mat_vec_id(ctx, cgraph, idx) || ids->ne[1] <= (int64_t)ctx->device->mmv_id_max_tokens ||
-                ids->ne[1] > 16 || gen_batch_invariant_for_n(ids->ne[1])) {
+                ids->ne[1] > env_s19_situ_max_n || gen_batch_invariant_for_n(ids->ne[1])) {
                 continue;
             }
             const bool has_exp = !s17_mmid_exp.empty() && s17_mmid_exp[idx].dst != nullptr &&
@@ -23558,18 +23586,44 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 if (hazard) break;
             }
             if (hazard) continue;
+            int sole_down_idx = -1;
+            if (!uses_mmv_id && !(glu->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                for (int j = glu_idx + 1; j < std::min(cgraph->n_nodes, glu_idx + 8); ++j) {
+                    const ggml_tensor * nj = cgraph->nodes[j];
+                    if (is_sk(j) || (!gen_skip.empty() && gen_skip[j]) || ggml_op_is_empty(nj->op)) {
+                        continue;
+                    }
+                    if (nj->op == GGML_OP_MUL_MAT_ID && nj->src[1] == glu && nj->src[2] == ids &&
+                        nj->src[0] && nj->src[0]->type != GGML_TYPE_F32 && nj->src[0]->ne[1] >= 32 &&
+                        (glu->ne[0] % ((nj->src[0]->type == GGML_TYPE_Q4_0) ? 32 : 64) == 0) &&
+                        !use_idx.any_reader(glu, [&](int r) { return r != j; })) {
+                        bool mid_non_empty = false;
+                        for (int k = idx + 1; k < j; ++k) {
+                            if (!is_sk(k) && (gen_skip.empty() || !gen_skip[k]) && !ggml_op_is_empty(cgraph->nodes[k]->op)) {
+                                mid_non_empty = true;
+                                break;
+                            }
+                        }
+                        if (!mid_non_empty) {
+                            sole_down_idx = j;
+                        }
+                    }
+                    break;
+                }
+            }
             if (s17_mmid_exp.empty()) s17_mmid_exp.resize(cgraph->n_nodes);
             if (gen_skip.empty()) gen_skip.assign(cgraph->n_nodes, 0);
             if (has_exp) {
-                s17_mmid_exp[idx].dst       = glu;
-                s17_mmid_exp[idx].flags    |= MAT_VEC_FUSION_FLAGS_SITU_MERGED;
-                s17_mmid_exp[idx].glu_alpha = ggml_get_op_params_f32(glu, 2);
-                s17_mmid_exp[idx].glu_limit = ggml_get_op_params_f32(glu, 3);
-                s17_mmid_exp[idx].skip[4]   = glu_idx;
+                s17_mmid_exp[idx].dst           = glu;
+                s17_mmid_exp[idx].flags        |= MAT_VEC_FUSION_FLAGS_SITU_MERGED;
+                s17_mmid_exp[idx].glu_alpha     = ggml_get_op_params_f32(glu, 2);
+                s17_mmid_exp[idx].glu_limit     = ggml_get_op_params_f32(glu, 3);
+                s17_mmid_exp[idx].skip[4]       = glu_idx;
+                s17_mmid_exp[idx].sole_down_idx = sole_down_idx;
             } else {
                 s17_mmid_exp[idx] = { glu, nullptr, nullptr, MAT_VEC_FUSION_FLAGS_SITU_MERGED,
                                       ggml_get_op_params_f32(glu, 2), ggml_get_op_params_f32(glu, 3),
-                                      { -1, -1, -1, -1, glu_idx } };
+                                      { -1, -1, -1, -1, glu_idx }, sole_down_idx };
             }
             gen_skip[glu_idx] = 1;
         }
@@ -24363,6 +24417,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             ctx->gen_mm_flags  = mm_ep.flags;
             ctx->gen_glu_alpha = me.glu_alpha;
             ctx->gen_glu_limit = me.glu_limit;
+            ctx->gen_pair_glu_sole_mmid_next = me.sole_down_idx >= 0;
             fusion_string      = mm_ep.name;
         } else if (!s19_mm_src1.empty() && s19_mm_src1[i].src1 != nullptr && ctx->num_additional_fused_ops == 0) {
             const auto & ms = s19_mm_src1[i];

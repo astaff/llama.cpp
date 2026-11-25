@@ -242,7 +242,7 @@ float nvfp4_decode_scale(const uint d_u32, const uint sub) {
 #ifdef REPACK_PLANAR
 void nvfp4_load_planar_a(const uint b_in_slice, const uint sub, const uint shift, out float da, out vec4 v0, out vec4 v1) {
 #ifdef MUL_MAT_ID
-    const uint s_blks = (p.ncols >> 6u) * p.stride_d;
+    const uint s_blks = p.batch_stride_a >> 6u;
 #else
     const uint s_blks = (p.ncols >> 6u) * ((GEN_GLU == 2u) ? p.pair_m0 : p.stride_d);
 #endif
@@ -256,7 +256,7 @@ void nvfp4_load_planar_a(const uint b_in_slice, const uint sub, const uint shift
 
 void nvfp4_load_planar_a2(const uint b_in_slice, const uint sub, const uint shift, out float da, out vec4 v0, out vec4 v1) {
 #ifdef MUL_MAT_ID
-    const uint s_blks = (p.ncols >> 6u) * p.stride_d;
+    const uint s_blks = p.batch_stride_a >> 6u;
 #else
     const uint s_blks = (p.ncols >> 6u) * ((GEN_GLU == 2u) ? p.stride_d2 : p.stride_d);
 #endif
@@ -300,13 +300,27 @@ void iter_aligned_nvfp4_a(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT
             vec4 u0 = vec4(0.0), u1 = vec4(0.0);
             float da2 = 0.0f;
             if (GEN_GLU == 3) {
+#ifdef MUL_MAT_ID
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SITU_MERGED) != 0u) {
 #ifdef REPACK_PLANAR
-                nvfp4_load_planar_a2(b_in_slice, sub, shift, da2, u0, u1);
+                    nvfp4_load_planar_a(b_in_slice + p.stride_d * blocks_per_row, sub, shift, da2, u0, u1);
 #else
-                da2 = nvfp4_decode_scale(data_a2_packed32[ib].d[0], sub);
-                u0  = nvfp4_decode_nibs(data_a2_packed32[ib].qs[2u * sub + 0u] >> shift);
-                u1  = nvfp4_decode_nibs(data_a2_packed32[ib].qs[2u * sub + 1u] >> shift);
+                    const uint ib_u = ib + p.stride_d * blocks_per_row;
+                    da2 = nvfp4_decode_scale(data_a_packed32[ib_u].d[0], sub);
+                    u0  = nvfp4_decode_nibs(data_a_packed32[ib_u].qs[2u * sub + 0u] >> shift);
+                    u1  = nvfp4_decode_nibs(data_a_packed32[ib_u].qs[2u * sub + 1u] >> shift);
 #endif
+                } else
+#endif
+                {
+#ifdef REPACK_PLANAR
+                    nvfp4_load_planar_a2(b_in_slice, sub, shift, da2, u0, u1);
+#else
+                    da2 = nvfp4_decode_scale(data_a2_packed32[ib].d[0], sub);
+                    u0  = nvfp4_decode_nibs(data_a2_packed32[ib].qs[2u * sub + 0u] >> shift);
+                    u1  = nvfp4_decode_nibs(data_a2_packed32[ib].qs[2u * sub + 1u] >> shift);
+#endif
+                }
             }
             [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
                 temp[j][n] += FLOAT_TYPE((dot(bv0_arr[j], v0) + dot(bv1_arr[j], v1)) * da);
@@ -331,13 +345,27 @@ void iter_aligned_nvfp4_a(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT
             vec4 u0 = vec4(0.0), u1 = vec4(0.0);
             float da2 = 0.0f;
             if (GEN_GLU == 3) {
+#ifdef MUL_MAT_ID
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SITU_MERGED) != 0u) {
 #ifdef REPACK_PLANAR
-                nvfp4_load_planar_a2(b_in_slice, sub, shift, da2, u0, u1);
+                    nvfp4_load_planar_a(b_in_slice + p.stride_d * blocks_per_row, sub, shift, da2, u0, u1);
 #else
-                da2 = nvfp4_decode_scale(data_a2_packed32[ib].d[0], sub);
-                u0  = nvfp4_decode_nibs(data_a2_packed32[ib].qs[2u * sub + 0u] >> shift);
-                u1  = nvfp4_decode_nibs(data_a2_packed32[ib].qs[2u * sub + 1u] >> shift);
+                    const uint ib_u = ib + p.stride_d * blocks_per_row;
+                    da2 = nvfp4_decode_scale(data_a_packed32[ib_u].d[0], sub);
+                    u0  = nvfp4_decode_nibs(data_a_packed32[ib_u].qs[2u * sub + 0u] >> shift);
+                    u1  = nvfp4_decode_nibs(data_a_packed32[ib_u].qs[2u * sub + 1u] >> shift);
 #endif
+                } else
+#endif
+                {
+#ifdef REPACK_PLANAR
+                    nvfp4_load_planar_a2(b_in_slice, sub, shift, da2, u0, u1);
+#else
+                    da2 = nvfp4_decode_scale(data_a2_packed32[ib].d[0], sub);
+                    u0  = nvfp4_decode_nibs(data_a2_packed32[ib].qs[2u * sub + 0u] >> shift);
+                    u1  = nvfp4_decode_nibs(data_a2_packed32[ib].qs[2u * sub + 1u] >> shift);
+#endif
+                }
             }
             [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
                 const uint b4 = (j * p.batch_stride_b + b_offset) >> 2u;
@@ -414,9 +442,19 @@ void iter_aligned_q8_0_a(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_
             vec4 u = vec4(0.0), u2 = vec4(0.0);
             FLOAT_TYPE da2 = FLOAT_TYPE(0);
             if (GEN_GLU == 3) {
-                u   = q8_0_decode_magic(i16vec2(data_a2_packed16[ib].qs[iqs_h    ], data_a2_packed16[ib].qs[iqs_h + 1]));
-                u2  = q8_0_decode_magic(i16vec2(data_a2_packed16[ib].qs[iqs_h + 2], data_a2_packed16[ib].qs[iqs_h + 3]));
-                da2 = float(data_a2_packed16[ib].d);
+#ifdef MUL_MAT_ID
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SITU_MERGED) != 0u) {
+                    const uint ib_u = ib + p.stride_d * blocks_per_row;
+                    u   = q8_0_decode_magic(i16vec2(data_a_packed16[ib_u].qs[iqs_h    ], data_a_packed16[ib_u].qs[iqs_h + 1]));
+                    u2  = q8_0_decode_magic(i16vec2(data_a_packed16[ib_u].qs[iqs_h + 2], data_a_packed16[ib_u].qs[iqs_h + 3]));
+                    da2 = float(data_a_packed16[ib_u].d);
+                } else
+#endif
+                {
+                    u   = q8_0_decode_magic(i16vec2(data_a2_packed16[ib].qs[iqs_h    ], data_a2_packed16[ib].qs[iqs_h + 1]));
+                    u2  = q8_0_decode_magic(i16vec2(data_a2_packed16[ib].qs[iqs_h + 2], data_a2_packed16[ib].qs[iqs_h + 3]));
+                    da2 = float(data_a2_packed16[ib].d);
+                }
             }
             [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
                 const FLOAT_TYPE rowtmp = (dot(bv0_arr[j], v) + dot(bv1_arr[j], v2)) * da;
@@ -437,9 +475,19 @@ void iter_aligned_q8_0_a(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_
             vec4 u = vec4(0.0), u2 = vec4(0.0);
             FLOAT_TYPE da2 = FLOAT_TYPE(0);
             if (GEN_GLU == 3) {
-                u   = q8_0_decode_magic(i16vec2(data_a2_packed16[ib].qs[iqs_h    ], data_a2_packed16[ib].qs[iqs_h + 1]));
-                u2  = q8_0_decode_magic(i16vec2(data_a2_packed16[ib].qs[iqs_h + 2], data_a2_packed16[ib].qs[iqs_h + 3]));
-                da2 = float(data_a2_packed16[ib].d);
+#ifdef MUL_MAT_ID
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SITU_MERGED) != 0u) {
+                    const uint ib_u = ib + p.stride_d * blocks_per_row;
+                    u   = q8_0_decode_magic(i16vec2(data_a_packed16[ib_u].qs[iqs_h    ], data_a_packed16[ib_u].qs[iqs_h + 1]));
+                    u2  = q8_0_decode_magic(i16vec2(data_a_packed16[ib_u].qs[iqs_h + 2], data_a_packed16[ib_u].qs[iqs_h + 3]));
+                    da2 = float(data_a_packed16[ib_u].d);
+                } else
+#endif
+                {
+                    u   = q8_0_decode_magic(i16vec2(data_a2_packed16[ib].qs[iqs_h    ], data_a2_packed16[ib].qs[iqs_h + 1]));
+                    u2  = q8_0_decode_magic(i16vec2(data_a2_packed16[ib].qs[iqs_h + 2], data_a2_packed16[ib].qs[iqs_h + 3]));
+                    da2 = float(data_a2_packed16[ib].d);
+                }
             }
             [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
                 const uint b4 = (j * p.batch_stride_b + b_offset) >> 2;
@@ -518,9 +566,19 @@ void iter2_aligned_q8_0_a(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT
         vec4 w0_0 = vec4(0.0), w1_0 = vec4(0.0);
         FLOAT_TYPE du0 = FLOAT_TYPE(0);
         if (GEN_GLU == 3) {
-            w0_0 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib0].qs[iqs_h    ], data_a2_packed16[ib0].qs[iqs_h + 1]));
-            w1_0 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib0].qs[iqs_h + 2], data_a2_packed16[ib0].qs[iqs_h + 3]));
-            du0  = float(data_a2_packed16[ib0].d);
+#ifdef MUL_MAT_ID
+            if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SITU_MERGED) != 0u) {
+                const uint ib0_u = ib0 + p.stride_d * blocks_per_row;
+                w0_0 = q8_0_decode_magic(i16vec2(data_a_packed16[ib0_u].qs[iqs_h    ], data_a_packed16[ib0_u].qs[iqs_h + 1]));
+                w1_0 = q8_0_decode_magic(i16vec2(data_a_packed16[ib0_u].qs[iqs_h + 2], data_a_packed16[ib0_u].qs[iqs_h + 3]));
+                du0  = float(data_a_packed16[ib0_u].d);
+            } else
+#endif
+            {
+                w0_0 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib0].qs[iqs_h    ], data_a2_packed16[ib0].qs[iqs_h + 1]));
+                w1_0 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib0].qs[iqs_h + 2], data_a2_packed16[ib0].qs[iqs_h + 3]));
+                du0  = float(data_a2_packed16[ib0].d);
+            }
         }
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
             const uint b4 = (j * p.batch_stride_b + b_offset) >> 2;
@@ -539,9 +597,19 @@ void iter2_aligned_q8_0_a(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT
         vec4 w0_1 = vec4(0.0), w1_1 = vec4(0.0);
         FLOAT_TYPE du1 = FLOAT_TYPE(0);
         if (GEN_GLU == 3) {
-            w0_1 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib1].qs[iqs_h    ], data_a2_packed16[ib1].qs[iqs_h + 1]));
-            w1_1 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib1].qs[iqs_h + 2], data_a2_packed16[ib1].qs[iqs_h + 3]));
-            du1  = float(data_a2_packed16[ib1].d);
+#ifdef MUL_MAT_ID
+            if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SITU_MERGED) != 0u) {
+                const uint ib1_u = ib1 + p.stride_d * blocks_per_row;
+                w0_1 = q8_0_decode_magic(i16vec2(data_a_packed16[ib1_u].qs[iqs_h    ], data_a_packed16[ib1_u].qs[iqs_h + 1]));
+                w1_1 = q8_0_decode_magic(i16vec2(data_a_packed16[ib1_u].qs[iqs_h + 2], data_a_packed16[ib1_u].qs[iqs_h + 3]));
+                du1  = float(data_a_packed16[ib1_u].d);
+            } else
+#endif
+            {
+                w0_1 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib1].qs[iqs_h    ], data_a2_packed16[ib1].qs[iqs_h + 1]));
+                w1_1 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib1].qs[iqs_h + 2], data_a2_packed16[ib1].qs[iqs_h + 3]));
+                du1  = float(data_a2_packed16[ib1].d);
+            }
         }
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
             const uint b4 = (j * p.batch_stride_b + b_offset) >> 2;
@@ -577,12 +645,26 @@ void iter2_aligned_q8_0_a(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT
             vec4 w0_0 = vec4(0.0), w1_0 = vec4(0.0), w0_1 = vec4(0.0), w1_1 = vec4(0.0);
             FLOAT_TYPE du0 = FLOAT_TYPE(0), du1 = FLOAT_TYPE(0);
             if (GEN_GLU == 3) {
-                w0_0 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib0].qs[iqs_h    ], data_a2_packed16[ib0].qs[iqs_h + 1]));
-                w1_0 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib0].qs[iqs_h + 2], data_a2_packed16[ib0].qs[iqs_h + 3]));
-                du0  = float(data_a2_packed16[ib0].d);
-                w0_1 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib1].qs[iqs_h    ], data_a2_packed16[ib1].qs[iqs_h + 1]));
-                w1_1 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib1].qs[iqs_h + 2], data_a2_packed16[ib1].qs[iqs_h + 3]));
-                du1  = float(data_a2_packed16[ib1].d);
+#ifdef MUL_MAT_ID
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SITU_MERGED) != 0u) {
+                    const uint ib0_u = ib0 + p.stride_d * blocks_per_row;
+                    const uint ib1_u = ib1 + p.stride_d * blocks_per_row;
+                    w0_0 = q8_0_decode_magic(i16vec2(data_a_packed16[ib0_u].qs[iqs_h    ], data_a_packed16[ib0_u].qs[iqs_h + 1]));
+                    w1_0 = q8_0_decode_magic(i16vec2(data_a_packed16[ib0_u].qs[iqs_h + 2], data_a_packed16[ib0_u].qs[iqs_h + 3]));
+                    du0  = float(data_a_packed16[ib0_u].d);
+                    w0_1 = q8_0_decode_magic(i16vec2(data_a_packed16[ib1_u].qs[iqs_h    ], data_a_packed16[ib1_u].qs[iqs_h + 1]));
+                    w1_1 = q8_0_decode_magic(i16vec2(data_a_packed16[ib1_u].qs[iqs_h + 2], data_a_packed16[ib1_u].qs[iqs_h + 3]));
+                    du1  = float(data_a_packed16[ib1_u].d);
+                } else
+#endif
+                {
+                    w0_0 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib0].qs[iqs_h    ], data_a2_packed16[ib0].qs[iqs_h + 1]));
+                    w1_0 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib0].qs[iqs_h + 2], data_a2_packed16[ib0].qs[iqs_h + 3]));
+                    du0  = float(data_a2_packed16[ib0].d);
+                    w0_1 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib1].qs[iqs_h    ], data_a2_packed16[ib1].qs[iqs_h + 1]));
+                    w1_1 = q8_0_decode_magic(i16vec2(data_a2_packed16[ib1].qs[iqs_h + 2], data_a2_packed16[ib1].qs[iqs_h + 3]));
+                    du1  = float(data_a2_packed16[ib1].d);
+                }
             }
 
             [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
