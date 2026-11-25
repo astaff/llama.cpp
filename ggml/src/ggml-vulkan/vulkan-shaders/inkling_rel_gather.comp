@@ -24,7 +24,7 @@ layout(push_constant) uniform PushConstants {
     uint off_sinks;
     uint off_rel;
     uint off_dst;
-    uint flags;     // bit 0: out_f16, bit 1: has_mask, bit 2: span_compact, bit 3: span_neg_inf
+    uint flags;     // bit 0: out_f16, bit 1: has_mask, bit 2: span_compact, bit 3: span_neg_inf, bit 4: const_prefix
     uint off_mask;  // in f16 elements
     uint mask_r0;
     uint mask_ne1;
@@ -32,19 +32,24 @@ layout(push_constant) uniform PushConstants {
     uint mask_ne3;
     uint kv_min;
     uint kv_limit;
+    uint kv_const_end;
 } p;
 
 void main() {
-    const uint idx   = gl_GlobalInvocationID.x + gl_WorkGroupID.y * (65535u * 256u);
+    const uint idx          = gl_GlobalInvocationID.x + gl_WorkGroupID.y * (65535u * 256u);
     const bool span_compact = (p.flags & 4u) != 0u;
-    const uint span  = span_compact ? (p.kv_limit - p.kv_min) : p.n_kv;
-    const uint total = span * p.nr * p.n_head * p.n_stream;
+    const bool const_prefix = (p.flags & 16u) != 0u;
+    const uint span         = const_prefix ? (1u + (p.kv_limit - p.kv_const_end))
+                                           : (span_compact ? (p.kv_limit - p.kv_min) : p.n_kv);
+    const uint total        = span * p.nr * p.n_head * p.n_stream;
     if (idx >= total) {
         return;
     }
-    const uint kv_i  = span_compact ? (p.kv_min + (idx % span)) : (idx % p.n_kv);
+    const uint s_idx = idx % span;
+    const uint kv_i  = const_prefix ? ((s_idx == 0u) ? p.kv_min : (p.kv_const_end + (s_idx - 1u)))
+                                    : (span_compact ? (p.kv_min + s_idx) : s_idx);
     const uint t1    = idx / span;
-    const uint dst_i = span_compact ? (t1 * p.n_kv + kv_i) : idx;
+    const uint dst_i = (span_compact || const_prefix) ? (t1 * p.n_kv + kv_i) : idx;
 
     if ((p.flags & 8u) != 0u && (kv_i < p.kv_min || kv_i >= p.kv_limit)) {
         if ((p.flags & 1u) != 0u) {

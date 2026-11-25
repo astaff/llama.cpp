@@ -5246,7 +5246,9 @@ server_context::server_context() : impl(new server_context_impl()) {}
 server_context::~server_context() = default;
 
 bool server_context::load_model(common_params & params) {
-    return impl->load_model(params);
+    const bool ok = impl->load_model(params);
+    server_restore_init_thread_affinity();
+    return ok;
 }
 
 void server_context::start_loop() {

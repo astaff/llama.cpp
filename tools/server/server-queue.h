@@ -155,6 +155,8 @@ private:
     void worker_stop();
 };
 
+void server_restore_init_thread_affinity();
+
 // struct for managing server responses
 // in most cases, use server_response_reader to retrieve results
 struct server_response {

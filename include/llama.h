@@ -1676,6 +1676,8 @@ extern "C" {
     //    return token;
     // Returns the sampled token
     LLAMA_API llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_context * ctx, int32_t idx);
+    LLAMA_API bool        llama_sampler_grammar_is_dormant(const struct llama_sampler * smpl);
+    LLAMA_API bool        llama_sampler_chain_is_pure_greedy(const struct llama_sampler * chain);
     LLAMA_API bool        llama_sampler_chain_is_pure_temp_dist(const struct llama_sampler * chain, float * out_temp, struct llama_sampler ** out_dist);
     LLAMA_API llama_token llama_sampler_temp_dist_sample_raw_0ulp(struct llama_sampler * dist_smpl, const float * logits_row, int32_t n_vocab, float temp);
 

@@ -3470,6 +3470,19 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     bool disposable_threadpool = false;
 
+#if defined(__gnu_linux__)
+    cpu_set_t s20_prev_cpuset;
+    bool s20_restored_full = false;
+    if (n_threads > 1 && s20_has_init_cpuset) {
+        CPU_ZERO(&s20_prev_cpuset);
+        if (sched_getaffinity(0, sizeof(s20_prev_cpuset), &s20_prev_cpuset) == 0 &&
+            CPU_COUNT(&s20_prev_cpuset) < CPU_COUNT(&s20_init_cpuset)) {
+            (void) sched_setaffinity(0, sizeof(s20_init_cpuset), &s20_init_cpuset);
+            s20_restored_full = true;
+        }
+    }
+#endif
+
     if (threadpool == NULL) {
         //GGML_PRINT_DEBUG("Threadpool is not specified. Will create a disposable threadpool : n_threads %d\n", n_threads);
         disposable_threadpool = true;
@@ -3488,16 +3501,6 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
-#if defined(__gnu_linux__)
-        cpu_set_t s20_prev_cpuset;
-        bool s20_restored_full = false;
-        CPU_ZERO(&s20_prev_cpuset);
-        if (s20_has_init_cpuset && sched_getaffinity(0, sizeof(s20_prev_cpuset), &s20_prev_cpuset) == 0 &&
-            CPU_COUNT(&s20_prev_cpuset) < CPU_COUNT(&s20_init_cpuset)) {
-            (void) sched_setaffinity(0, sizeof(s20_init_cpuset), &s20_init_cpuset);
-            s20_restored_full = true;
-        }
-#endif
         #pragma omp parallel num_threads(n_threads)
         {
             #pragma omp single
@@ -3516,11 +3519,6 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
             }
             ggml_graph_compute_thread(&threadpool->workers[ith]);
         }
-#if defined(__gnu_linux__)
-        if (s20_restored_full) {
-            (void) sched_setaffinity(0, sizeof(s20_prev_cpuset), &s20_prev_cpuset);
-        }
-#endif
     } else {
         atomic_store_explicit(&threadpool->n_graph, 1, memory_order_relaxed);
         ggml_graph_compute_thread(&threadpool->workers[0]);
@@ -3546,6 +3544,12 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     if (n_threads > 1) {
         clear_numa_thread_affinity();
     }
+
+#if defined(__gnu_linux__)
+    if (s20_restored_full) {
+        (void) sched_setaffinity(0, sizeof(s20_prev_cpuset), &s20_prev_cpuset);
+    }
+#endif
 
     enum ggml_status ret = threadpool->ec;
 

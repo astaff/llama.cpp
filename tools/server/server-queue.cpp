@@ -21,6 +21,28 @@
 // server_queue
 //
 
+#if defined(__linux__)
+#include <sched.h>
+static cpu_set_t g_s21_srv_init_cpuset;
+static bool      g_s21_srv_has_init_cpuset = false;
+
+__attribute__((constructor)) static void s21_srv_capture_init_cpuset() {
+    CPU_ZERO(&g_s21_srv_init_cpuset);
+    if (sched_getaffinity(0, sizeof(g_s21_srv_init_cpuset), &g_s21_srv_init_cpuset) == 0 &&
+        CPU_COUNT(&g_s21_srv_init_cpuset) > 1) {
+        g_s21_srv_has_init_cpuset = true;
+    }
+}
+
+void server_restore_init_thread_affinity() {
+    if (g_s21_srv_has_init_cpuset) {
+        (void) sched_setaffinity(0, sizeof(g_s21_srv_init_cpuset), &g_s21_srv_init_cpuset);
+    }
+}
+#else
+void server_restore_init_thread_affinity() {}
+#endif
+
 static bool task_resets_idle_timer(server_task_type type) {
     return type != SERVER_TASK_TYPE_METRICS;
 }
@@ -176,6 +198,7 @@ bool server_queue::process_new_tasks(bool is_yielding) {
 }
 
 void server_queue::worker_loop() {
+    server_restore_init_thread_affinity();
     while (true) {
         {
             std::unique_lock<std::mutex> lock(mutex_tasks);
@@ -303,6 +326,7 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
 }
 
 void server_queue::start_loop(int64_t idle_sleep_ms) {
+    server_restore_init_thread_affinity();
     running = true;
     time_last_task = ggml_time_ms();
 
@@ -353,6 +377,7 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
             // no tasks, check for sleeping state
             if (should_sleep()) {
                 QUE_INF("%s", "entering sleeping state\n");
+                server_restore_init_thread_affinity();
                 sleeping = true;
                 // Call order cb0 -> cb1 -> cb{N}
                 for (auto & cb : callback_sleeping_state) {

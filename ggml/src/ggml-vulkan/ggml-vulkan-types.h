@@ -1527,10 +1527,13 @@ struct ggml_backend_vk_context {
 
     struct {
         const ggml_tensor * mask {};
+        const ggml_tensor * rel_pos {};
         uint32_t            mask_r0 {};
         uint32_t            nr {};
+        uint32_t            extent {};
         uint32_t            kv_min {};
         uint32_t            kv_max {};
+        uint32_t            kv_const_end {};
         bool                valid {};
     } mask_span_cache[4];
 

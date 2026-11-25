@@ -1526,13 +1526,41 @@ static void test_all(const std::string & title, std::function<void(const TestCas
         "regexp with unsupported shorthand",
         R"""({
             "type": "string",
-            "pattern": "^[0-9]{3}\\w$"
+            "pattern": "^[0-9]{3}\\b$"
         })""",
         R"""(
             char ::= [^"\\\x7F\x00-\x1F] | [\\] (["\\bfnrt] | "u" [0-9a-fA-F]{4})
             root ::= string
             space ::= | " " | "\n"{1,2} [ \t]{0,20}
             string ::= "\"" char* "\""
+        )"""
+    });
+
+    test({
+        SUCCESS,
+        "regexp with supported shorthands (\\d, \\w, \\s)",
+        R"""({
+            "type": "string",
+            "pattern": "^\\d{3}\\w\\s*$"
+        })""",
+        R"""(
+            root ::= "\"" (root-1{3,3} [0-9A-Za-z_] [ \t\n\r\x0B\x0C]*) "\""
+            root-1 ::= [0-9]
+            space ::= | " " | "\n"{1,2} [ \t]{0,20}
+        )"""
+    });
+
+    test({
+        SUCCESS,
+        "regexp omp session tool pattern",
+        R"""({
+            "type": "string",
+            "pattern": "^(?:\\s*|[A-Za-z0-9][A-Za-z0-9._-]{0,47})$"
+        })""",
+        R"""(
+            root ::= "\"" (([ \t\n\r\x0B\x0C]* | [A-Za-z0-9] root-1{0,47})) "\""
+            root-1 ::= [A-Za-z0-9._-]
+            space ::= | " " | "\n"{1,2} [ \t]{0,20}
         )"""
     });
 

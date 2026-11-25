@@ -82,6 +82,7 @@ layout (push_constant) uniform parameter {
 
 #define SINK_ENABLE_BIT (1<<24)
 #define ACTIVE_SPAN_BIT (1u<<25)
+#define CONST_PREFIX_BIT (1u<<26)
 #define N_LOG2_MASK 0xFFFF
 
 layout (binding = 4) readonly buffer S {float data_s[];};
@@ -159,6 +160,9 @@ ACC_TYPE perElemOpGetSink(const in uint32_t r, const in uint32_t c, const in ACC
 }
 
 uint32_t i, N, KV, split_k_index, Tr, start_j, end_j,
+#if defined(COOPMAT_8X8)
+         j_const_min, j_const_end,
+#endif
          gqa_iq1, iq2, iq3, rk2, rk3, rv2, rv3, ik2, ik3, iv2, iv3,
          q_stride, k_stride, v_stride, m_stride, sparse_base;
 
@@ -192,10 +196,26 @@ void init_indices()
 
     start_j = split_k_index * p.split_kv / Bc;
     end_j = CEIL_DIV(min(KV, (split_k_index + 1) * p.split_kv), Bc);
+#if defined(COOPMAT_8X8)
+    j_const_min = 0u;
+    j_const_end = 0u;
+    if (!USE_SPARSE && (p.mask_n_head_log2 & ACTIVE_SPAN_BIT) != 0u) {
+        const uint32_t m0_u = floatBitsToUint(p.m0);
+        if ((p.mask_n_head_log2 & CONST_PREFIX_BIT) != 0u) {
+            j_const_min = m0_u & 0xFFFFu;
+            j_const_end = m0_u >> 16;
+            start_j = max(start_j, j_const_min);
+        } else {
+            start_j = max(start_j, m0_u);
+        }
+        end_j = min(end_j, floatBitsToUint(p.m1));
+    }
+#else
     if (!USE_SPARSE && (p.mask_n_head_log2 & ACTIVE_SPAN_BIT) != 0u) {
         start_j = max(start_j, floatBitsToUint(p.m0));
         end_j   = min(end_j,   floatBitsToUint(p.m1));
     }
+#endif
 
     // When not using grouped query attention, all rows share the same iq2, equal to gl_WorkGroupID.y.
     // When using grouped query attention, each workgroup does gqa_ratio consecutive values of iq2.

@@ -402,14 +402,14 @@ struct llama_file::impl {
 #else
     impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) : fname(fname) {
 #ifdef __linux__
-        // Try unbuffered I/O for read only
         if (use_direct_io && std::strcmp(mode, "rb") == 0) {
+            drop_page_cache = true;
             if (init_fd()) {
                 LLAMA_LOG_INFO("%s: file '%s' opened with direct I/O (alignment: %zu bytes)\n",
                                __func__, fname, alignment);
                 return;
             }
-            LLAMA_LOG_WARN("Failed to open file '%s' with unbuffered I/O: %s. Falling back to buffered I/O\n",
+            LLAMA_LOG_WARN("Failed to open file '%s' with unbuffered I/O: %s. Falling back to buffered I/O + POSIX_FADV_DONTNEED\n",
                            fname, strerror(errno));
         }
 #endif
@@ -418,14 +418,44 @@ struct llama_file::impl {
 
 #ifdef __linux__
     bool init_fd() {
-        fd = open(fname.c_str(), O_RDONLY | O_DIRECT);
+        fd = open(fname.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
 
         if (fd != -1) {
             struct stat file_stats{};
-            fstat(fd, &file_stats);
+            if (fstat(fd, &file_stats) != 0) {
+                close(fd);
+                fd = -1;
+                return false;
+            }
 
-            size = file_stats.st_size;
-            alignment = file_stats.st_blksize;
+            size = (size_t) file_stats.st_size;
+            const long page_sz = sysconf(_SC_PAGESIZE);
+            size_t dio_mem_align = 4096;
+            size_t dio_off_align = 4096;
+#if defined(STATX_DIOALIGN) && defined(AT_EMPTY_PATH)
+            struct statx stx{};
+            if (statx(fd, "", AT_EMPTY_PATH, STATX_DIOALIGN, &stx) == 0 && (stx.stx_mask & STATX_DIOALIGN)) {
+                if (stx.stx_dio_mem_align > 0)    { dio_mem_align = stx.stx_dio_mem_align; }
+                if (stx.stx_dio_offset_align > 0) { dio_off_align = stx.stx_dio_offset_align; }
+            }
+#endif
+            alignment = std::max<size_t>({
+                (size_t) file_stats.st_blksize,
+                page_sz > 0 ? (size_t) page_sz : (size_t) 4096,
+                dio_mem_align,
+                dio_off_align,
+                (size_t) 4096
+            });
+            if ((alignment & (alignment - 1)) != 0) {
+                size_t p2 = 4096;
+                while (p2 < alignment) {
+                    p2 <<= 1;
+                }
+                alignment = p2;
+            }
+
+            // Evict any header/readahead pages cached earlier by gguf_init_from_file or prior runs
+            (void) posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
 
             off_t ret = lseek(fd, 0, SEEK_SET);
             if (ret == -1) {
@@ -435,7 +465,52 @@ struct llama_file::impl {
         }
         return false;
     }
+
+    void read_tail_nocache(size_t file_off, void * dst, size_t len) {
+        if (len == 0) {
+            return;
+        }
+        int tfd = open(fname.c_str(), O_RDONLY | O_CLOEXEC);
+        if (tfd == -1) {
+            throw std::runtime_error(format("failed to open tail fd for %s: %s", fname.c_str(), strerror(errno)));
+        }
+        size_t done = 0;
+        while (done < len) {
+            ssize_t r = ::pread(tfd, reinterpret_cast<char *>(dst) + done, len - done, (off_t) (file_off + done));
+            if (r == -1) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                int saved = errno;
+                close(tfd);
+                throw std::runtime_error(format("tail pread error: %s", strerror(saved)));
+            }
+            if (r == 0) {
+                close(tfd);
+                throw std::runtime_error("unexpectedly reached end of file in tail pread");
+            }
+            done += (size_t) r;
+        }
+        (void) posix_fadvise(tfd, (off_t) (file_off & ~(alignment - 1)), 0, POSIX_FADV_DONTNEED);
+        close(tfd);
+    }
 #endif
+
+    void * ensure_dio_buf(size_t need) {
+        if (dio_buf && dio_buf_cap >= need) {
+            return dio_buf;
+        }
+        free(dio_buf);
+        dio_buf     = nullptr;
+        dio_buf_cap = 0;
+        const size_t alloc_sz = (need + alignment - 1) & ~(alignment - 1);
+        if (posix_memalign(&dio_buf, alignment, alloc_sz) != 0) {
+            dio_buf = nullptr;
+            return nullptr;
+        }
+        dio_buf_cap = alloc_sz;
+        return dio_buf;
+    }
 
     void init_fp(const char * mode) {
         fp = ggml_fopen(fname.c_str(), mode);
@@ -490,96 +565,170 @@ struct llama_file::impl {
         errno = 0;
         if (fd == -1) {
             const size_t read_offset = tell();
-            const size_t to_read = std::min(len, size - read_offset);
-
-            std::size_t ret = std::fread(ptr, to_read, 1, fp);
-            if (ferror(fp)) {
-                throw std::runtime_error(format("read error: %s", strerror(errno)));
-            }
-            if (to_read > 0 && ret != 1) {
+            if (read_offset > size) {
                 throw std::runtime_error("unexpectedly reached end of file");
             }
+            const size_t to_read = std::min(len, size - read_offset);
+
+            if (to_read > 0) {
+                std::size_t ret = std::fread(ptr, to_read, 1, fp);
+                if (ferror(fp)) {
+                    throw std::runtime_error(format("read error: %s", strerror(errno)));
+                }
+                if (ret != 1) {
+                    throw std::runtime_error("unexpectedly reached end of file");
+                }
+#ifdef __linux__
+                if (drop_page_cache) {
+                    const long ps = sysconf(_SC_PAGESIZE);
+                    const size_t page_sz = ps > 0 ? (size_t) ps : (size_t) 4096;
+                    const size_t drop_beg = read_offset & ~(page_sz - 1);
+                    const size_t drop_end = (read_offset + to_read) & ~(page_sz - 1);
+                    if (drop_end > drop_beg) {
+                        (void) posix_fadvise(::fileno(fp), (off_t) drop_beg, (off_t) (drop_end - drop_beg), POSIX_FADV_DONTNEED);
+                    }
+                }
+#endif
+            }
+            if (len > to_read) {
+                std::memset(reinterpret_cast<char *>(ptr) + to_read, 0, len - to_read);
+            }
         } else {
-            size_t bytes_read = 0;
-            while (bytes_read < len) {
-                const size_t to_read = len - bytes_read;
-                ssize_t ret = ::read(fd, reinterpret_cast<char *>(ptr) + bytes_read, to_read);
+            const size_t start_offset = tell();
+            if (start_offset > size) {
+                throw std::runtime_error("unexpectedly reached end of file");
+            }
+            const size_t avail = std::min(len, size - start_offset);
+            if (avail == 0) {
+                std::memset(ptr, 0, len);
+                return;
+            }
+
+            const bool is_aligned =
+                ((start_offset & (alignment - 1)) == 0) &&
+                ((len          & (alignment - 1)) == 0) &&
+                ((reinterpret_cast<uintptr_t>(ptr) & (alignment - 1)) == 0);
+
+            if (!is_aligned && !in_aligned_bounce) {
+                read_aligned_chunk(ptr, avail);
+                if (len > avail) {
+                    std::memset(reinterpret_cast<char *>(ptr) + avail, 0, len - avail);
+                }
+                return;
+            }
+
+            const size_t aligned_eof = size & ~(alignment - 1);
+            const size_t req_end     = start_offset + len;
+            const size_t dio_end     = std::min(req_end, aligned_eof);
+            const size_t max_dio_io  = ((size_t) 1 << 30) & ~(alignment - 1);
+
+            size_t cur_off = start_offset;
+            while (cur_off < dio_end) {
+                const size_t to_read = std::min(dio_end - cur_off, max_dio_io);
+                char * dst_cur = reinterpret_cast<char *>(ptr) + (cur_off - start_offset);
+                ssize_t ret = ::pread(fd, dst_cur, to_read, (off_t) cur_off);
 
                 if (ret == -1) {
                     if (errno == EINTR) {
                         continue;
                     }
+                    // EFAULT happens when ptr is a DRM GEM / vkMapMemory (VM_PFNMAP | VM_IO) buffer:
+                    // bounce through anonymous posix_memalign dio_buf while keeping O_DIRECT fd alive!
+                    if (errno == EFAULT && !in_aligned_bounce) {
+                        seek(start_offset, SEEK_SET);
+                        read_aligned_chunk(ptr, avail);
+                        if (len > avail) {
+                            std::memset(reinterpret_cast<char *>(ptr) + avail, 0, len - avail);
+                        }
+                        return;
+                    }
                     if (errno == EFAULT || errno == EINVAL || errno == EIO) {
                         LLAMA_LOG_WARN("%s: file '%s' falling back to buffered I/O due to %s\n",
                                        __func__, fname.c_str(), strerror(errno));
-                        const size_t read_offset = tell();
                         close(fd);
                         fd = -1;
                         alignment = 1;
+                        drop_page_cache = true;
                         init_fp("rb");
-                        seek(read_offset, SEEK_SET);
-                        read_raw_unsafe(static_cast<char *>(ptr) + bytes_read, to_read);
+                        seek(start_offset, SEEK_SET);
+                        read_raw_unsafe(ptr, len);
                         return;
                     }
                     throw std::runtime_error(format("read error: %s", strerror(errno)));
                 }
                 if (ret == 0) {
-                    off_t pos = lseek(fd, 0, SEEK_CUR);
-                    if (pos != -1 && (size_t) pos == size) {
-                        std::memset(reinterpret_cast<char *>(ptr) + bytes_read, 0, len - bytes_read);
-                        return;
-                    }
                     throw std::runtime_error("unexpectedly reached end of file");
                 }
-
-                bytes_read += (size_t) ret;
+                cur_off += (size_t) ret;
+                if ((ret & (ssize_t) (alignment - 1)) != 0) {
+                    break;
+                }
             }
+
+#ifdef __linux__
+            if (start_offset + avail > cur_off) {
+                read_tail_nocache(cur_off,
+                                  reinterpret_cast<char *>(ptr) + (cur_off - start_offset),
+                                  (start_offset + avail) - cur_off);
+            }
+#endif
+            if (len > avail) {
+                std::memset(reinterpret_cast<char *>(ptr) + avail, 0, len - avail);
+            }
+            seek(start_offset + avail, SEEK_SET);
         }
     }
 
     void read_aligned_chunk(void * dest, size_t len) {
-        size_t offset = tell();
-        off_t aligned_offset = offset & ~(alignment - 1);
-        off_t offset_from_alignment = offset - aligned_offset;
-        size_t bytes_to_read = (offset_from_alignment + len + alignment - 1) & ~(alignment - 1);
+        if (len == 0) {
+            return;
+        }
+        const size_t offset = tell();
+        if (offset > size || len > size - offset) {
+            throw std::runtime_error("unexpectedly reached end of file");
+        }
+        const size_t aligned_offset        = offset & ~(alignment - 1);
+        const size_t offset_from_alignment = offset - aligned_offset;
+        const size_t bytes_to_read         = (offset_from_alignment + len + alignment - 1) & ~(alignment - 1);
 
-        // stage through a bounded buffer, so that a large tensor is not held in memory twice while it loads
+        // Reuse a single bounded 64 MiB aligned anonymous buffer across calls (zero mmap/munmap churn)
         const size_t buffer_size = std::min<size_t>(bytes_to_read, LLAMA_DIRECT_IO_BUFFER_SIZE);
-
-        void * raw_buffer = nullptr;
-        int ret = posix_memalign(&raw_buffer, alignment, buffer_size);
-        if (ret != 0) {
-            LLAMA_LOG_WARN("%s: file '%s' falling back to buffered I/O due to %s\n",
-                           __func__, fname.c_str(), strerror(ret));
+        void * raw_buffer = ensure_dio_buf(buffer_size);
+        if (!raw_buffer) {
+            LLAMA_LOG_WARN("%s: file '%s' falling back to buffered I/O due to ENOMEM\n",
+                           __func__, fname.c_str());
             close(fd);
             fd = -1;
             alignment = 1;
+            drop_page_cache = true;
             init_fp("rb");
             seek(offset, SEEK_SET);
             read_raw_unsafe(dest, len);
             return;
         }
 
-        struct aligned_buffer_deleter {
-            void operator()(void * p) const { free(p); }
-        };
-        std::unique_ptr<void, aligned_buffer_deleter> buffer(raw_buffer);
-
         seek(aligned_offset, SEEK_SET);
 
+        in_aligned_bounce = true;
         size_t skip   = offset_from_alignment;
         size_t copied = 0;
-        for (size_t done = 0; done < bytes_to_read; ) {
-            const size_t n = std::min(buffer_size, bytes_to_read - done);
-            read_raw_unsafe(buffer.get(), n);
+        try {
+            for (size_t done = 0; done < bytes_to_read; ) {
+                const size_t n = std::min(buffer_size, bytes_to_read - done);
+                read_raw_unsafe(raw_buffer, n);
 
-            const size_t count = std::min(n - skip, len - copied);
-            memcpy(reinterpret_cast<char *>(dest) + copied, reinterpret_cast<char *>(buffer.get()) + skip, count);
+                const size_t count = std::min(n - skip, len - copied);
+                memcpy(reinterpret_cast<char *>(dest) + copied, reinterpret_cast<const char *>(raw_buffer) + skip, count);
 
-            copied += count;
-            skip    = 0;
-            done   += n;
+                copied += count;
+                skip    = 0;
+                done   += n;
+            }
+        } catch (...) {
+            in_aligned_bounce = false;
+            throw;
         }
+        in_aligned_bounce = false;
 
         seek(offset + len, SEEK_SET);
     }
@@ -618,13 +767,29 @@ struct llama_file::impl {
     }
 
     ~impl() {
+        free(dio_buf);
+        dio_buf     = nullptr;
+        dio_buf_cap = 0;
         if (fd != -1) {
+#ifdef __linux__
+            (void) posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+#endif
             close(fd);
         } else if (fp && owns_fp) {
+#ifdef __linux__
+            if (drop_page_cache) {
+                std::fflush(fp);
+                (void) posix_fadvise(::fileno(fp), 0, 0, POSIX_FADV_DONTNEED);
+            }
+#endif
             std::fclose(fp);
         }
     }
-    int fd = -1;
+    int    fd                = -1;
+    void * dio_buf           = nullptr;
+    size_t dio_buf_cap       = 0;
+    bool   in_aligned_bounce = false;
+    bool   drop_page_cache   = false;
     std::string fname;
 #endif
 

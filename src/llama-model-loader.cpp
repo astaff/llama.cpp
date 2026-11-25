@@ -1770,8 +1770,23 @@ bool llama_model_loader::load_all_data(
     std::vector<ggml_backend_event_t> events;
     std::vector<void *> host_ptrs;
     size_t buffer_idx = 0; // buffer to use for async loads
+    ggml_backend_buffer_type_t default_dev_buft = nullptr;
+    for (auto * buf : bufs) {
+        if (!buf) {
+            continue;
+        }
+        auto * buft  = ggml_backend_buffer_get_type(buf);
+        auto * b_dev = ggml_backend_buft_get_device(buft);
+        if (b_dev && buft == ggml_backend_dev_buffer_type(b_dev)) {
+            default_dev_buft = buft;
+            break;
+        }
+    }
+
     ggml_backend_t upload_backend = [&](const char * func) -> ggml_backend_t {
-        if (use_mmap || check_tensors) {
+        // Skip pinned-GPU-host-buffer (vkMapMemory / VM_PFNMAP) async staging when using mmap, check_tensors,
+        // or Direct I/O (alignment != 1: Linux O_DIRECT pin_user_pages rejects VM_PFNMAP VMAs with EFAULT).
+        if (use_mmap || check_tensors || alignment != 1) {
             return nullptr;
         }
         // When not using mmaped io use async uploads from pinned memory to GPU memory.
@@ -1794,6 +1809,11 @@ bool llama_model_loader::load_all_data(
             }
             ggml_backend_dev_props props;
             ggml_backend_dev_get_props(b_dev, &props);
+            // On UMA iGPUs (e.g. Apple AGX), set_tensor_async is a synchronous CPU memcpy into unified memory;
+            // allocating 4 * 64 MiB of Vulkan_Host buffers is pure memory/memcpy overhead.
+            if (props.type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                continue;
+            }
             if (!props.caps.async || !props.caps.host_buffer || !props.caps.events) {
                 continue;
             }
@@ -2012,7 +2032,42 @@ bool llama_model_loader::load_all_data(
                         ++buffer_idx;
                         buffer_idx %= n_buffers;
                     }
+                } else if (!check_tensors && default_dev_buft && cur->buffer &&
+                           ggml_backend_buffer_get_type(cur->buffer) == default_dev_buft &&
+                           n_size > LLAMA_DIRECT_IO_BUFFER_SIZE) {
+                    // Stream large default-device tensors (e.g. Vulkan0 on UMA) in 64 MiB aligned O_DIRECT chunks
+                    // instead of allocating a full-tensor multi-hundred-MiB bounce buffer.
+                    const size_t align          = file->read_alignment();
+                    const size_t aligned_offset = weight->offs & ~(align - 1);
+                    const size_t pad_head       = weight->offs - aligned_offset;
+                    const size_t total_aligned  = (pad_head + n_size + align - 1) & ~(align - 1);
+                    const size_t chunk_cap      = LLAMA_DIRECT_IO_BUFFER_SIZE;
+                    const size_t alloc_need     = chunk_cap + align - 1;
+
+                    const size_t cur_rb_size = read_buf ? ggml_backend_buffer_get_size(read_buf.get()) : 0;
+                    if (!read_buf || cur_rb_size < alloc_need) {
+                        read_buf.reset();
+                        read_buf.reset(ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), alloc_need));
+                        if (!read_buf) {
+                            throw std::runtime_error(format("failed to allocate a %zu-byte staging buffer", alloc_need));
+                        }
+                    }
+                    uint8_t * read_dst = (uint8_t *) GGML_PAD((uintptr_t) ggml_backend_buffer_get_base(read_buf.get()), align);
+                    file->seek(aligned_offset, SEEK_SET);
+
+                    size_t skip   = pad_head;
+                    size_t copied = 0;
+                    for (size_t done = 0; done < total_aligned; ) {
+                        const size_t n = std::min(chunk_cap, total_aligned - done);
+                        file->read_raw_unsafe(read_dst, n);
+                        const size_t count = std::min(n - skip, n_size - copied);
+                        ggml_backend_tensor_set(cur, read_dst + skip, copied, count);
+                        copied += count;
+                        skip    = 0;
+                        done   += n;
+                    }
                 } else {
+                    // Repack buffers (e.g. Vulkan0_Repack) require full-tensor set_tensor(offset=0, size=n_size)
                     // with direct IO read the aligned range around the tensor and use the data inside it, so no bounce buffer is needed
                     const size_t align          = file->read_alignment();
                     const size_t aligned_offset = weight->offs & ~(align - 1);

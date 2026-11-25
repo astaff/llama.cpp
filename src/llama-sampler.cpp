@@ -2824,6 +2824,20 @@ struct llama_sampler * llama_sampler_init_grammar_lazy_patterns(
     return llama_sampler_init_grammar_impl(vocab, grammar_str, grammar_root, /* lazy= */ true, trigger_tokens, num_trigger_tokens, trigger_patterns, num_trigger_patterns);
 }
 
+bool llama_sampler_grammar_is_dormant(const struct llama_sampler * smpl) {
+    if (!smpl) {
+        return true;
+    }
+    if (smpl->iface != &llama_sampler_grammar_i) {
+        return false;
+    }
+    const auto * ctx = (const llama_sampler_grammar *) smpl->ctx;
+    if (!ctx->grammar) {
+        return true;
+    }
+    return ctx->grammar->vocab != nullptr && ctx->grammar->lazy && ctx->grammar->awaiting_trigger;
+}
+
 // penalties
 
 struct llama_sampler_penalties : public llama_sampler_backend {
@@ -4448,6 +4462,46 @@ bool llama_sampler_chain_is_pure_temp_dist(
     }
     if (out_dist) {
         *out_dist = last;
+    }
+    return true;
+}
+
+bool llama_sampler_chain_is_pure_greedy(const struct llama_sampler * chain) {
+    if (!chain || chain->iface != &llama_sampler_chain_i) {
+        return false;
+    }
+    const int32_t n_sc = llama_sampler_chain_n(chain);
+    if (n_sc < 1) {
+        return false;
+    }
+    struct llama_sampler * last = llama_sampler_chain_get(const_cast<struct llama_sampler *>(chain), n_sc - 1);
+    if (!last || last->iface != &llama_sampler_greedy_i) {
+        return false;
+    }
+    for (int32_t k = 0; k < n_sc - 1; ++k) {
+        struct llama_sampler * s = llama_sampler_chain_get(const_cast<struct llama_sampler *>(chain), k);
+        if (!s) {
+            return false;
+        }
+        const char * nm = llama_sampler_name(s);
+        if (s->iface == &llama_sampler_empty_i || (nm && nm[0] == '?')) {
+            continue;
+        }
+        if (s->iface == &llama_sampler_temp_i) {
+            const float t = ((const llama_sampler_temp *) s->ctx)->temp;
+            if (t <= 0.0f || t == 1.0f) {
+                continue;
+            }
+            return false;
+        }
+        if (s->iface == &llama_sampler_temp_ext_i) {
+            const auto * ext = (const llama_sampler_temp_ext *) s->ctx;
+            if (ext->delta <= 0.0f && (ext->temp <= 0.0f || ext->temp == 1.0f)) {
+                continue;
+            }
+            return false;
+        }
+        return false;
     }
     return true;
 }
