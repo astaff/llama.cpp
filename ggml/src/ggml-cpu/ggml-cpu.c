@@ -37,6 +37,15 @@
 #include <signal.h>
 #if defined(__gnu_linux__)
 #include <syscall.h>
+#include <sched.h>
+static cpu_set_t s20_init_cpuset;
+static bool      s20_has_init_cpuset = false;
+__attribute__((constructor)) static void s20_capture_init_cpuset(void) {
+    CPU_ZERO(&s20_init_cpuset);
+    if (sched_getaffinity(0, sizeof(s20_init_cpuset), &s20_init_cpuset) == 0 && CPU_COUNT(&s20_init_cpuset) > 1) {
+        s20_has_init_cpuset = true;
+    }
+}
 #endif
 
 #ifdef GGML_USE_OPENMP
@@ -2310,6 +2319,11 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DUP:
         case GGML_OP_CONT:
         case GGML_OP_ADD:
+            {
+                const size_t nb_dst  = ggml_nbytes(node);
+                const size_t nb_src0 = node->src[0] ? ggml_nbytes(node->src[0]) : 0;
+                n_tasks = (nb_dst < 256 * 1024 && nb_src0 < 256 * 1024) ? 1 : n_threads;
+            } break;
         case GGML_OP_ADD_ID:
         case GGML_OP_ACC:
         case GGML_OP_CUMSUM:
@@ -2401,12 +2415,17 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                     GGML_ABORT("fatal error");
             }
             break;
+        case GGML_OP_MUL:
+        case GGML_OP_RMS_NORM:
+            {
+                const size_t nb_dst  = ggml_nbytes(node);
+                const size_t nb_src0 = node->src[0] ? ggml_nbytes(node->src[0]) : 0;
+                n_tasks = (nb_dst < 256 * 1024 && nb_src0 < 256 * 1024) ? 1 : n_threads;
+            } break;
         case GGML_OP_SILU_BACK:
         case GGML_OP_SIGMOID_BACK:
-        case GGML_OP_MUL:
         case GGML_OP_DIV:
         case GGML_OP_NORM:
-        case GGML_OP_RMS_NORM:
         case GGML_OP_RMS_NORM_BACK:
         case GGML_OP_L2_NORM:
         case GGML_OP_GROUP_NORM:
@@ -3469,6 +3488,16 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
+#if defined(__gnu_linux__)
+        cpu_set_t s20_prev_cpuset;
+        bool s20_restored_full = false;
+        CPU_ZERO(&s20_prev_cpuset);
+        if (s20_has_init_cpuset && sched_getaffinity(0, sizeof(s20_prev_cpuset), &s20_prev_cpuset) == 0 &&
+            CPU_COUNT(&s20_prev_cpuset) < CPU_COUNT(&s20_init_cpuset)) {
+            (void) sched_setaffinity(0, sizeof(s20_init_cpuset), &s20_init_cpuset);
+            s20_restored_full = true;
+        }
+#endif
         #pragma omp parallel num_threads(n_threads)
         {
             #pragma omp single
@@ -3487,6 +3516,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
             }
             ggml_graph_compute_thread(&threadpool->workers[ith]);
         }
+#if defined(__gnu_linux__)
+        if (s20_restored_full) {
+            (void) sched_setaffinity(0, sizeof(s20_prev_cpuset), &s20_prev_cpuset);
+        }
+#endif
     } else {
         atomic_store_explicit(&threadpool->n_graph, 1, memory_order_relaxed);
         ggml_graph_compute_thread(&threadpool->workers[0]);
@@ -3497,15 +3531,21 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         n_threads = threadpool->n_threads;
     }
 
-    // Kick all threads to start the new graph
-    ggml_graph_compute_kickoff(threadpool, n_threads);
+    if (n_threads > 1) {
+        // Kick all threads to start the new graph
+        ggml_graph_compute_kickoff(threadpool, n_threads);
+    } else {
+        atomic_store_explicit(&threadpool->n_graph, 1, memory_order_relaxed);
+    }
 
     // This is a work thread too
     ggml_graph_compute_thread(&threadpool->workers[0]);
 #endif
 
     // don't leave affinity set on the main thread
-    clear_numa_thread_affinity();
+    if (n_threads > 1) {
+        clear_numa_thread_affinity();
+    }
 
     enum ggml_status ret = threadpool->ec;
 

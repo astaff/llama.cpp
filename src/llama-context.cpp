@@ -1161,7 +1161,19 @@ enum llama_pooling_type llama_context::pooling_type() const {
     return cparams.pooling_type;
 }
 
+void llama_context::materialize_logits_uma_view() {
+    if (logits_uma_view != nullptr) {
+        synchronize();
+        if (logits.data != nullptr && logits_uma_n_floats > 0) {
+            memcpy(logits.data, logits_uma_view, logits_uma_n_floats * sizeof(float));
+        }
+        logits_uma_view     = nullptr;
+        logits_uma_n_floats = 0;
+    }
+}
+
 float * llama_context::get_logits() {
+    materialize_logits_uma_view();
     output_reorder();
 
     return logits.data;
@@ -1196,7 +1208,28 @@ int64_t llama_context::output_resolve_row(int32_t i) const {
     return j;
 }
 
+const float * llama_context::get_logits_ith_ro(int32_t i) {
+    output_reorder();
+
+    if (logits_uma_view != nullptr && output_swaps.empty() && !sampling.logits.has_data()) {
+        try {
+            const int64_t j = output_resolve_row(i);
+            return logits_uma_view + j * model.vocab.n_tokens();
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
+#ifndef NDEBUG
+            GGML_ABORT("fatal error");
+#else
+            return nullptr;
+#endif
+        }
+    }
+
+    return get_logits_ith(i);
+}
+
 float * llama_context::get_logits_ith(int32_t i) {
+    materialize_logits_uma_view();
     output_reorder();
 
     try {
@@ -2030,6 +2063,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch_ext & batch_inp) {
+    logits_uma_view     = nullptr;
+    logits_uma_n_floats = 0;
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -2282,6 +2317,8 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    logits_uma_view     = nullptr;
+    logits_uma_n_floats = 0;
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2594,7 +2631,25 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                // Series 20 (Pillar S20.5 + X-1): Zero-copy cached UMA view on final ubatch when contiguous F32
+                const void * uma_ptr = nullptr;
+                const bool is_final_ubatch = (n_tokens_prev + (int64_t) ubatch.n_tokens == (int64_t) n_tokens_all);
+                if (is_final_ubatch && n_outputs_prev == 0 && n_outputs == n_outputs_all &&
+                    output_swaps.empty() && t_logits->type == GGML_TYPE_F32 && ggml_is_contiguous(t_logits)) {
+                    using get_uma_ptr_fn = const void * (*)(ggml_backend_t, const ggml_tensor *);
+                    ggml_backend_dev_t dev = ggml_backend_get_device(backend_res);
+                    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                    auto fn = reg ? (get_uma_ptr_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_cached_uma_ptr") : nullptr;
+                    if (fn) {
+                        uma_ptr = fn(backend_res, t_logits);
+                    }
+                }
+                if (uma_ptr != nullptr) {
+                    logits_uma_view     = (const float *) uma_ptr;
+                    logits_uma_n_floats = (size_t) n_outputs * (size_t) n_vocab;
+                } else {
+                    ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                }
             }
         }
 
@@ -2801,6 +2856,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 //
 
 uint32_t llama_context::output_reserve(int32_t n_outputs) {
+    logits_uma_view     = nullptr;
+    logits_uma_n_floats = 0;
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
 
@@ -3007,6 +3064,9 @@ bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
 }
 
 void llama_context::output_reorder() {
+    if (!output_swaps.empty()) {
+        materialize_logits_uma_view();
+    }
     const uint64_t n_vocab     = model.vocab.n_tokens();
     const uint64_t n_embd      = model.hparams.n_embd;
     const uint64_t n_embd_out  = model.hparams.n_embd_out();
@@ -3184,6 +3244,7 @@ static void ubatch_prepare_reserve(
 
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+    materialize_logits_uma_view();
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
@@ -4832,6 +4893,14 @@ void llama_detach_threadpool(llama_context * ctx) {
     ctx->detach_threadpool();
 }
 
+ggml_threadpool_t llama_get_threadpool(llama_context * ctx) {
+    return ctx->get_threadpool();
+}
+
+ggml_threadpool_t llama_get_threadpool_batch(llama_context * ctx) {
+    return ctx->get_threadpool_batch();
+}
+
 void llama_set_n_threads(llama_context * ctx, int32_t n_threads, int32_t n_threads_batch) {
     ctx->set_n_threads(n_threads, n_threads_batch);
 }
@@ -4881,6 +4950,16 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
         res = ctx->get_logits_ith(i);
     }
 
+    return res;
+}
+
+const float * llama_get_logits_ith_ro(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+
+    const float * res = ctx->get_sampled_logits_ith(i);
+    if (!res) {
+        res = ctx->get_logits_ith_ro(i);
+    }
     return res;
 }
 

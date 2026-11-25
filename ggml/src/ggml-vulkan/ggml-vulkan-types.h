@@ -1370,7 +1370,9 @@ class vk_perf_logger {
 };
 
 static constexpr uint32_t VK_PREALLOC_RING = 8;
-static constexpr size_t   VK_REPLAY_CACHE_MAX = 8;
+static constexpr size_t   VK_REPLAY_CACHE_MAX = 16;
+static constexpr uint32_t VK_REPLAY_PROB_SLOTS = 16;
+static constexpr size_t   AGX_REPLAY_MAX_CHUNKS = 8;
 
 struct vk_graph_replay_entry {
     uint64_t hash1 {};
@@ -1384,8 +1386,11 @@ struct vk_graph_replay_entry {
 
     std::vector<uint64_t> sig_words;
 
+    uint64_t hash3 {};
+    uint64_t hash4 {};
+    int32_t  n_nodes {};
     vk_command_pool cmd_pool;
-    vk::CommandBuffer cmd_buf {};
+    std::vector<vk::CommandBuffer> cmd_bufs;
     std::vector<vk_staging_memset> memsets;
 
     std::vector<vk::DescriptorPool> descriptor_pools;
@@ -1532,10 +1537,14 @@ struct ggml_backend_vk_context {
     // Series 9: Single-Front reusable command buffer LRU cache + zero-submit UMA async readbacks
     std::vector<vk_graph_replay_entry> replay_cache;
     uint64_t replay_lru_clock {};
-    uint64_t replay_probation_h1[8] {};
-    uint64_t replay_probation_h2[8] {};
-    uint64_t replay_probation_destroy[8] {};
+    uint64_t replay_probation_h1[VK_REPLAY_PROB_SLOTS] {};
+    uint64_t replay_probation_h2[VK_REPLAY_PROB_SLOTS] {};
+    uint64_t replay_probation_destroy[VK_REPLAY_PROB_SLOTS] {};
     uint32_t replay_probation_clock {};
+    const ggml_cgraph * last_cgraph_ptr {};
+    double   ema_nonreplay_tail_us {};
+    double   ema_nonreplay_full_us {};
+    int64_t  last_submit_us {};
     uint32_t replay_consec_misses {};
     int32_t  replay_miss_n_nodes {};
     bool     recording_replay {};

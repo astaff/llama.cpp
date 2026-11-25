@@ -726,7 +726,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     if (gsmpl->pure_argmax_fast && !gsmpl->grmr && !gsmpl->rbudget &&
         !llama_get_sampled_probs_ith(ctx, idx) &&
         !llama_get_sampled_logits_ith(ctx, idx)) {
-        const float * logits = llama_get_logits_ith(ctx, idx);
+        const float * logits = llama_get_logits_ith_ro(ctx, idx);
         GGML_ASSERT(logits != nullptr);
         const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
         llama_token best_id = 0;
@@ -742,6 +742,26 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         gsmpl->cur[0] = llama_token_data{ best_id, best_val, 1.0f };
         cur_p = { gsmpl->cur.data(), 1, 0, true };
         return best_id;
+    }
+
+    // Series 20 (Pillar S20.5): Single-row zero-copy UMA + AoS-free 0-ULP temp+dist fastpath
+    if (!grammar_first && !gsmpl->grmr && !gsmpl->rbudget &&
+        gsmpl->params.mirostat == 0 && gsmpl->params.n_probs == 0 &&
+        llama_get_sampled_token_ith(ctx, idx) == LLAMA_TOKEN_NULL &&
+        !llama_get_sampled_probs_ith(ctx, idx) &&
+        !llama_get_sampled_logits_ith(ctx, idx)) {
+        float eff_temp = 1.0f;
+        struct llama_sampler * dist_smpl = nullptr;
+        if (llama_sampler_chain_is_pure_temp_dist(chain, &eff_temp, &dist_smpl)) {
+            const float * logits = llama_get_logits_ith_ro(ctx, idx);
+            GGML_ASSERT(logits != nullptr);
+            const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+            id = llama_sampler_temp_dist_sample_raw_0ulp(dist_smpl, logits, n_vocab, eff_temp);
+            gsmpl->cur.resize(1);
+            gsmpl->cur[0] = llama_token_data{ id, logits[id], 1.0f };
+            cur_p = { gsmpl->cur.data(), 1, 0, true };
+            return id;
+        }
     }
 
     gsmpl->set_logits(ctx, idx);
@@ -802,7 +822,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         llama_get_sampled_token_ith(ctx, idx) == LLAMA_TOKEN_NULL &&
         !llama_get_sampled_probs_ith(ctx, idx) &&
         !llama_get_sampled_logits_ith(ctx, idx)) {
-        const float * logits = llama_get_logits_ith(ctx, idx);
+        const float * logits = llama_get_logits_ith_ro(ctx, idx);
         GGML_ASSERT(logits != nullptr);
         const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
         llama_token best_id = 0;
@@ -837,89 +857,6 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return id;
 }
 
-namespace {
-struct s19_verify_pool {
-    static constexpr int N_HELPERS = 5;
-    std::mutex mu;
-    std::condition_variable cv_start;
-    std::condition_variable cv_done;
-    bool stop = false;
-    uint64_t epoch = 0;
-    int n_tasks = 0;
-    std::atomic<int> remaining { 0 };
-    const std::function<void(int)> * fn_ptr = nullptr;
-    std::vector<std::thread> workers;
-
-    s19_verify_pool() {
-        workers.reserve(N_HELPERS);
-        for (int t = 0; t < N_HELPERS; ++t) {
-            workers.emplace_back([this, t]() {
-                uint64_t seen = 0;
-                std::unique_lock<std::mutex> lk(mu);
-                while (true) {
-                    cv_start.wait(lk, [&]() { return stop || epoch != seen; });
-                    if (stop) {
-                        return;
-                    }
-                    seen = epoch;
-                    const int nt = n_tasks;
-                    const auto * f = fn_ptr;
-                    lk.unlock();
-                    for (int r = t + 1; r < nt; r += (N_HELPERS + 1)) {
-                        (*f)(r);
-                    }
-                    if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                        std::lock_guard<std::mutex> dlk(mu);
-                        cv_done.notify_one();
-                    }
-                    lk.lock();
-                }
-            });
-        }
-    }
-
-    ~s19_verify_pool() {
-        {
-            std::lock_guard<std::mutex> lk(mu);
-            stop = true;
-        }
-        cv_start.notify_all();
-        for (auto & w : workers) {
-            if (w.joinable()) {
-                w.join();
-            }
-        }
-    }
-
-    void run(int count, const std::function<void(int)> & fn) {
-        if (count <= 1) {
-            for (int r = 0; r < count; ++r) {
-                fn(r);
-            }
-            return;
-        }
-        {
-            std::lock_guard<std::mutex> lk(mu);
-            n_tasks = count;
-            fn_ptr  = &fn;
-            remaining.store(N_HELPERS, std::memory_order_release);
-            ++epoch;
-        }
-        cv_start.notify_all();
-        for (int r = 0; r < count; r += (N_HELPERS + 1)) {
-            fn(r);
-        }
-        std::unique_lock<std::mutex> lk(mu);
-        cv_done.wait(lk, [&]() { return remaining.load(std::memory_order_acquire) == 0; });
-    }
-};
-
-static s19_verify_pool & get_s19_verify_pool() {
-    static s19_verify_pool pool;
-    return pool;
-}
-} // namespace
-
 bool common_sampler_is_pure_argmax(const struct common_sampler * gsmpl) {
     return gsmpl && gsmpl->pure_argmax_fast && !gsmpl->grmr && !gsmpl->rbudget;
 }
@@ -932,82 +869,52 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
 
-    // Series 19 (W1.1): 0-ULP + seed-exact multi-core batch verification for stateless temp+dist chains
-    if (!grammar_first && idxs.size() >= 2 && gsmpl->stateless_dist_fast &&
+    // Series 20 (Pillar S20.5): Zero-copy UMA + AoS-free EOG-exact sequential early-exit verification (0-ULP, 0-RNG-drift)
+    if (!grammar_first && idxs.size() >= 2 &&
         !gsmpl->grmr && !gsmpl->rbudget &&
+        gsmpl->params.mirostat == 0 && gsmpl->params.n_probs == 0 &&
+        !getenv("LLAMA_NO_S20_DIST_FAST") &&
         llama_get_sampled_token_ith(ctx, idxs[0]) == LLAMA_TOKEN_NULL &&
         !llama_get_sampled_probs_ith(ctx, idxs[0]) &&
         !llama_get_sampled_logits_ith(ctx, idxs[0])) {
-        llama_synchronize(ctx);
-        const auto tm = gsmpl->tm();
-        const int n_rows  = (int) idxs.size();
-        const int n_vocab = llama_vocab_n_tokens(vocab);
+        float eff_temp = 1.0f;
+        struct llama_sampler * dist_smpl = nullptr;
+        if (llama_sampler_chain_is_pure_temp_dist(gsmpl->chain, &eff_temp, &dist_smpl)) {
+            llama_synchronize(ctx);
+            const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+            llama_token   last_id  = LLAMA_TOKEN_NULL;
+            const float * last_row = nullptr;
 
-        static thread_local std::vector<std::vector<llama_token_data>> par_cur;
-        if ((int) par_cur.size() < n_rows) {
-            par_cur.resize(n_rows);
-        }
-        std::vector<llama_sampler *> row_chains(n_rows, nullptr);
-        row_chains[0] = llama_sampler_clone(gsmpl->chain);
-        const int dist_idx = llama_sampler_chain_n(row_chains[0]) - 1;
-        for (int r = 1; r < n_rows; ++r) {
-            row_chains[r] = llama_sampler_clone(row_chains[r - 1]);
-            // Advance dist mt19937 by exact 1 draw of llama_sampler_dist (2-element O(1) dummy apply)
-            llama_token_data dummy[2] = { { 0, 0.0f, 0.5f }, { 1, 0.0f, 0.5f } };
-            llama_token_data_array darr = { dummy, 2, -1, true };
-            llama_sampler_apply(llama_sampler_chain_get(row_chains[r], dist_idx), &darr);
-        }
+            auto sample_one_row = [&](int batch_idx) -> llama_token {
+                const auto tm = gsmpl->tm();
+                const float * row = llama_get_logits_ith_ro(ctx, batch_idx);
+                GGML_ASSERT(row != nullptr);
+                const llama_token id = llama_sampler_temp_dist_sample_raw_0ulp(dist_smpl, row, n_vocab, eff_temp);
+                last_id  = id;
+                last_row = row;
+                return id;
+            };
 
-        std::vector<const float *> row_logits(n_rows, nullptr);
-        for (int r = 0; r < n_rows; ++r) {
-            row_logits[r] = llama_get_logits_ith(ctx, idxs[r]);
-            GGML_ASSERT(row_logits[r] != nullptr);
-            par_cur[r].resize(n_vocab);
-        }
-
-        std::vector<llama_token> sampled_ids(n_rows, LLAMA_TOKEN_NULL);
-        std::vector<int64_t>     selected_ix(n_rows, -1);
-        auto * par_cur_ptr = par_cur.data();
-
-        get_s19_verify_pool().run(n_rows, [&](int r) {
-            const float * lg = row_logits[r];
-            auto & buf       = par_cur_ptr[r];
-            for (llama_token tid = 0; tid < n_vocab; ++tid) {
-                buf[tid] = llama_token_data{ tid, lg[tid], 0.0f };
+            size_t k = 0;
+            for (; k < draft.size(); ++k) {
+                const llama_token id = sample_one_row(idxs[k]);
+                common_sampler_accept(gsmpl, id, true);
+                result.push_back(id);
+                if (draft[k] != id || (llama_vocab_is_eog(vocab, id) && k + 1 < draft.size())) {
+                    break;
+                }
             }
-            llama_token_data_array arr = { buf.data(), buf.size(), -1, false };
-            llama_sampler_apply(row_chains[r], &arr);
-            selected_ix[r] = arr.selected;
-            sampled_ids[r] = buf[arr.selected].id;
-        });
-
-        size_t k = 0;
-        size_t last_r = 0;
-        for (; k < draft.size(); ++k) {
-            const llama_token id = sampled_ids[k];
-            last_r = k;
-            common_sampler_accept(gsmpl, id, true);
-            result.push_back(id);
-            if (draft[k] != id || (llama_vocab_is_eog(vocab, id) && k + 1 < draft.size())) {
-                break;
+            if (k == draft.size()) {
+                const llama_token id = sample_one_row(idxs[k]);
+                common_sampler_accept(gsmpl, id, true);
+                result.push_back(id);
             }
-        }
-        if (k == draft.size()) {
-            const llama_token id = sampled_ids[k];
-            last_r = k;
-            common_sampler_accept(gsmpl, id, true);
-            result.push_back(id);
-        }
 
-        // Commit exact post-verification RNG & cur_p state from row_chains[last_r]
-        llama_sampler_copy(row_chains[last_r], gsmpl->chain);
-        gsmpl->cur   = par_cur[last_r];
-        gsmpl->cur_p = { gsmpl->cur.data(), gsmpl->cur.size(), selected_ix[last_r], false };
-
-        for (auto * rc : row_chains) {
-            llama_sampler_free(rc);
+            gsmpl->cur.resize(1);
+            gsmpl->cur[0] = llama_token_data{ last_id, last_row[last_id], 1.0f };
+            gsmpl->cur_p  = { gsmpl->cur.data(), 1, 0, true };
+            return result;
         }
-        return result;
     }
 
     size_t i = 0;

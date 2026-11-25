@@ -207,8 +207,9 @@ ggml_tensor * llama_model_dflash::build_dspark_inp_block(const llm_graph_context
         return ggml_get_rows(ctx0, tok_embd, inp_tokens);
     }
 
-    ggml_tensor * anchors = ggml_view_2d(ctx0, inp_tokens, 1, n_blocks, (size_t) block_drafts * inp_tokens->nb[0], 0);
-    anchors = ggml_get_rows(ctx0, tok_embd, ggml_cont_1d(ctx0, anchors, n_blocks));
+    ggml_tensor * anchors_v = ggml_view_2d(ctx0, inp_tokens, 1, n_blocks, (size_t) block_drafts * inp_tokens->nb[0], 0);
+    ggml_tensor * anchors   = (n_blocks == 1) ? ggml_reshape_1d(ctx0, anchors_v, 1) : ggml_cont_1d(ctx0, anchors_v, n_blocks);
+    anchors = ggml_get_rows(ctx0, tok_embd, anchors);
     if (model.tok_norm) {
         anchors = g.build_norm(anchors, model.tok_norm, nullptr, LLM_NORM_RMS, -1);
     }
@@ -271,8 +272,8 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     const size_t token_stride = (size_t) block_drafts * tokens->nb[0];
     const size_t base_stride = (size_t) block_drafts * base->nb[1];
 
-    ggml_tensor * prev = ggml_view_2d(ctx0, tokens, 1, n_blocks, token_stride, 0);
-    prev = ggml_cont_1d(ctx0, prev, n_blocks);
+    ggml_tensor * prev_v = ggml_view_2d(ctx0, tokens, 1, n_blocks, token_stride, 0);
+    ggml_tensor * prev   = (n_blocks == 1) ? ggml_reshape_1d(ctx0, prev_v, 1) : ggml_cont_1d(ctx0, prev_v, n_blocks);
 
     const int64_t n_embd = g.hparams.n_embd;
 

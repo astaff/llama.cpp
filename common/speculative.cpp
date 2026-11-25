@@ -3301,6 +3301,9 @@ common_speculative_init_result::common_speculative_init_result(
             LOG_ERR("%s: failed to create MTP context\n", __func__);
             return;
         }
+        if (ctx_tgt != nullptr && llama_get_threadpool(ctx_tgt) != nullptr) {
+            llama_attach_threadpool(ctx_dft, llama_get_threadpool(ctx_tgt), llama_get_threadpool_batch(ctx_tgt));
+        }
 
         pimpl->context.reset(ctx_dft);
     } else if (spec_mtp) {
@@ -3312,6 +3315,9 @@ common_speculative_init_result::common_speculative_init_result(
         if (ctx_dft == nullptr) {
             LOG_ERR("%s: failed to create MTP context\n", __func__);
             return;
+        }
+        if (ctx_tgt != nullptr && llama_get_threadpool(ctx_tgt) != nullptr) {
+            llama_attach_threadpool(ctx_dft, llama_get_threadpool(ctx_tgt), llama_get_threadpool_batch(ctx_tgt));
         }
 
         pimpl->context.reset(ctx_dft);
