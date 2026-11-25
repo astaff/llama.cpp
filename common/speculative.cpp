@@ -219,6 +219,9 @@ struct common_speculative_impl {
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+
+    virtual int32_t ctx_window() const { return 0; }
+    virtual bool should_skip_process(llama_seq_id /*seq_id*/) const { return false; }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -1002,8 +1005,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     int32_t n_embd_enc = 0;  // target_layer_ids_n * target_hidden_size
     int32_t n_embd_tgt = 0;  // target model hidden size
 
-    int32_t     block_size    = 0;
-    llama_token mask_token_id = 0;
+    int32_t     block_size        = 0;
+    int32_t     dspark_ctx_window = 0;
+    llama_token mask_token_id     = 0;
 
     // block-internal attention
     bool causal_attn = false;
@@ -1147,6 +1151,7 @@ protected:
     // LiliCorr and the Inkling2 DSpark keep context features from h_nextn; the other heads only need the KV cache
     // called after the injection of a chunk, while h_nextn still holds the context features of batch_inject
     virtual void store_context_features(llama_seq_id /*seq_id*/, int32_t /*n_chunk*/) {}
+    virtual void on_prefill_interrupt() {}
 
 public:
     ~common_speculative_impl_draft_dflash() override {
@@ -1233,7 +1238,23 @@ public:
                 continue;
             }
 
-            for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
+            if (n_rows > this->n_max + 1) {
+                on_prefill_interrupt();
+            } else if (n_rows == 1 && should_skip_process(seq_id)) {
+                continue;
+            }
+
+            int32_t start_offset = 0;
+            if (dspark_ctx_window > 0 && n_rows > dspark_ctx_window && !getenv("LLAMA_DSPARK_FULL_PREFILL")) {
+                start_offset = n_rows - dspark_ctx_window;
+                const llama_pos first_pos = batch_in.tokens[i_batch_beg[seq_id] + start_offset].pos[0];
+                const llama_pos cur_max   = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+                if (cur_max >= 0 && first_pos != cur_max + 1) {
+                    llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, -1, -1);
+                }
+            }
+
+            for (int32_t offset = start_offset; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
                 if (use_dev_features) {
@@ -1398,11 +1419,54 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
     std::vector<std::mt19937> draw_rng;
     std::vector<int64_t>      draw_seed; // the seed each generator was last seeded with (-1: reseed)
 
+    // Online adaptive draft depth ({0, 3, n_max}) + plain-decode parking controller (BatchPolicy)
+    bool                                         adapt_enabled       = false;
+    bool                                         timing_interrupted  = true;
+    bool                                         last_was_pure_plain = false;
+    bool                                         plain_warmup_done   = false;
+    int64_t                                      last_draft_us       = 0;
+    uint64_t                                     last_active_mask    = 0;
+    int32_t                                      cur_depth           = 0;
+    int32_t                                      last_mode_depth     = -1;
+    int32_t                                      prev_mode_depth     = -1;
+    int32_t                                      mtp_steps           = 0;
+    int32_t                                      losing_streak       = 0;
+    int32_t                                      clear_losing_streak = 0;
+    int32_t                                      calib_rem           = 0;
+    int32_t                                      park_rem            = 0;
+    int32_t                                      park_cooldown       = 128;
+    double                                       ema_mean_len        = 2.35;
+    std::vector<int32_t>                         last_draft_depth;
+    std::vector<bool>                            skip_seq;
+    std::vector<std::vector<double>>             std_ms_cache;
+    std::vector<std::vector<std::vector<double>>> mtp_ms_cache;
+
+    static void push_sample(std::vector<double> & buf, double v) {
+        if (buf.size() >= 7) {
+            buf.erase(buf.begin());
+        }
+        buf.push_back(v);
+    }
+
+    static double median_of(const std::vector<double> & buf, double fallback) {
+        if (buf.empty()) {
+            return fallback;
+        }
+        std::vector<double> tmp = buf;
+        std::sort(tmp.begin(), tmp.end());
+        return tmp[tmp.size() / 2];
+    }
+
     common_speculative_impl_draft_dspark(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl_draft_dflash(params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)
     {
+        if (!this->params.n_max_set) {
+            this->params.n_max = 5;
+        }
+
         const llama_model * model_dft = llama_get_model(this->params.ctx_dft);
 
+        int32_t swa_win = 0;
         {
             char buf[32] = {};
             if (llama_model_meta_val_str(model_dft, "dflash.sample_from_anchor", buf, sizeof(buf)) >= 0) {
@@ -1411,6 +1475,13 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
             if (llama_model_meta_val_str(model_dft, "dflash.has_markov_context", buf, sizeof(buf)) >= 0) {
                 has_markov_context = std::strcmp(buf, "true") == 0;
             }
+            if (llama_model_meta_val_str(model_dft, "dflash.attention.sliding_window", buf, sizeof(buf)) >= 0) {
+                swa_win = std::atoi(buf);
+            }
+        }
+
+        if (has_markov_context && swa_win > 0 && getenv("LLAMA_DSPARK_FORCE_ALL_SWA")) {
+            dspark_ctx_window = swa_win + block_size;
         }
 
         if (has_markov_context) {
@@ -1432,9 +1503,6 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
             }
         }
 
-        LOG_INF("%s: - sample_from_anchor=%s, has_markov_context=%s\n", __func__,
-                sample_from_anchor ? "true" : "false", has_markov_context ? "true" : "false");
-
         // anchor-first DSpark yields a full block_size draft tokens
         // the context state is read back from h_nextn at every injected row
         init({
@@ -1443,6 +1511,30 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
             /* .dev_features     = */ true,
             /* .nextn_masked     = */ !has_markov_context,
         });
+
+        adapt_enabled = has_markov_context && this->params.n_max > 0 && !getenv("LLAMA_DSPARK_FIXED_DEPTH");
+        cur_depth     = this->params.n_max;
+        ema_mean_len  = 2.35;
+        last_draft_depth.assign(n_seq, 0);
+        skip_seq.assign(n_seq, false);
+        std_ms_cache.resize((size_t) n_seq + 1);
+        mtp_ms_cache.assign((size_t) n_seq + 1, std::vector<std::vector<double>>((size_t) this->params.n_max + 2));
+
+        LOG_INF("%s: - sample_from_anchor=%s, has_markov_context=%s, ctx_window=%d, n_max=%d, adaptive=%s\n", __func__,
+                sample_from_anchor ? "true" : "false", has_markov_context ? "true" : "false",
+                dspark_ctx_window, this->params.n_max, adapt_enabled ? "true" : "false");
+    }
+
+    int32_t ctx_window() const override {
+        return dspark_ctx_window;
+    }
+
+    bool should_skip_process(llama_seq_id /*seq_id*/) const override {
+        return false;
+    }
+
+    void on_prefill_interrupt() override {
+        timing_interrupted = true;
     }
 
 protected:
@@ -1481,12 +1573,164 @@ public:
         if (has_markov_context && seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
             draw_seed[seq_id] = -1;
         }
+        if (adapt_enabled && seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+            timing_interrupted  = true;
+            last_was_pure_plain = false;
+            plain_warmup_done   = false;
+            cur_depth           = this->params.n_max;
+            last_mode_depth     = -1;
+            prev_mode_depth     = -1;
+            mtp_steps           = 0;
+            losing_streak       = 0;
+            clear_losing_streak = 0;
+            calib_rem           = 0;
+            park_rem            = 0;
+            park_cooldown       = 128;
+            ema_mean_len        = 2.35;
+            skip_seq[seq_id]         = false;
+            last_draft_depth[seq_id] = 0;
+            // Reset per-cohort timing caches because KV depth changes both plain and verify ms
+            for (auto & v : std_ms_cache) {
+                v.clear();
+            }
+            for (auto & by_d : mtp_ms_cache) {
+                for (auto & v : by_d) {
+                    v.clear();
+                }
+            }
+        }
 
         common_speculative_impl_draft_dflash::begin(seq_id, prompt);
     }
 
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        if (!is_other && adapt_enabled && seq_id >= 0 && seq_id < (llama_seq_id) last_draft_depth.size() &&
+            last_draft_depth[seq_id] > 0) {
+            ema_mean_len += 0.14 * ((1.0 + (double) n_accepted) - ema_mean_len);
+        }
+    }
+
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
+
+        const int64_t t_now = ggml_time_us();
+        uint64_t active_mask = 0;
+        int32_t  n_active    = 0;
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (dparams[seq_id].drafting) {
+                if (seq_id < 64) {
+                    active_mask |= (1ULL << seq_id);
+                }
+                n_active++;
+            }
+        }
+
+        if (adapt_enabled && n_active > 0) {
+            const int32_t na_key = std::min<int32_t>(n_active, (int32_t) std_ms_cache.size() - 1);
+            if (!timing_interrupted && last_draft_us > 0 && active_mask == last_active_mask) {
+                const double dt_ms = std::max(0.05, (t_now - last_draft_us) * 1e-3);
+                if (last_mode_depth == 0) {
+                    if (last_was_pure_plain && plain_warmup_done) {
+                        push_sample(std_ms_cache[na_key], dt_ms);
+                    } else if (last_was_pure_plain) {
+                        plain_warmup_done = true;
+                    }
+                } else if (last_mode_depth > 0 && last_mode_depth == prev_mode_depth &&
+                           last_mode_depth < (int32_t) mtp_ms_cache[na_key].size()) {
+                    push_sample(mtp_ms_cache[na_key][last_mode_depth], dt_ms);
+                }
+            }
+            timing_interrupted = false;
+            last_draft_us      = t_now;
+            last_active_mask   = active_mask;
+
+            auto set_active_skip = [&](bool skip) {
+                for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                    if (dparams[s].drafting) {
+                        skip_seq[s]         = skip;
+                        last_draft_depth[s] = 0;
+                    }
+                }
+            };
+
+            if (park_rem > 0) {
+                park_rem--;
+                set_active_skip(false);
+                prev_mode_depth     = last_mode_depth;
+                last_mode_depth     = 0;
+                last_was_pure_plain = true;
+                if (park_rem == 0) {
+                    plain_warmup_done   = false;
+                    cur_depth           = this->params.n_max;
+                    mtp_steps           = 0;
+                    losing_streak       = 0;
+                    clear_losing_streak = 0;
+                    ema_mean_len        = 2.20;
+                }
+                return;
+            }
+
+            if (calib_rem > 0) {
+                calib_rem--;
+                set_active_skip(false);
+                prev_mode_depth     = last_mode_depth;
+                last_mode_depth     = 0;
+                last_was_pure_plain = true;
+                return;
+            }
+
+            const int32_t max_d = std::max<int32_t>(1, this->params.n_max);
+            const double  e_max = ema_mean_len;
+
+            if (mtp_steps >= 5 && e_max < 1.95 && std_ms_cache[na_key].empty()) {
+                calib_rem           = 1;
+                plain_warmup_done   = false;
+                set_active_skip(false);
+                prev_mode_depth     = last_mode_depth;
+                last_mode_depth     = 0;
+                last_was_pure_plain = true;
+                return;
+            }
+
+            if (mtp_steps >= 5 && !std_ms_cache[na_key].empty()) {
+                const double c_max  = median_of(mtp_ms_cache[na_key][max_d], 65.0);
+                const double s_best = (n_active * e_max) / std::max(1e-3, c_max);
+                const double c_std  = median_of(std_ms_cache[na_key], 30.0);
+                const double s_std  = n_active / std::max(1e-3, c_std);
+                if (s_best <= s_std * 0.99) {
+                    losing_streak++;
+                } else {
+                    losing_streak = 0;
+                }
+                if (s_best < s_std * 0.90) {
+                    clear_losing_streak++;
+                } else {
+                    clear_losing_streak = 0;
+                }
+                if (clear_losing_streak >= 4 || losing_streak >= 9) {
+                    park_rem      = park_cooldown;
+                    park_cooldown = std::min<int32_t>(2048, park_cooldown * 2);
+                    park_rem--;
+                    set_active_skip(false);
+                    prev_mode_depth     = last_mode_depth;
+                    last_mode_depth     = 0;
+                    last_was_pure_plain = true;
+                    return;
+                }
+            }
+            cur_depth = max_d;
+
+            for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                if (dparams[s].drafting) {
+                    skip_seq[s] = false;
+                }
+            }
+            prev_mode_depth     = last_mode_depth;
+            last_mode_depth     = cur_depth;
+            last_was_pure_plain = false;
+            plain_warmup_done   = false;
+            mtp_steps++;
+        }
 
         batch.clear();
 
@@ -1494,6 +1738,7 @@ public:
         // record where each block starts and its size
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
+        std::vector<int32_t> n_emit_seq (n_seq,  0);
         std::vector<bool>    sampled    (n_seq,  false);
 
         block_state.clear();
@@ -1507,11 +1752,13 @@ public:
             // the Markov head reads the context state of the token before the block, no draft without it
             const float * state = has_markov_context ? get_context_state(seq_id, dp.pos0 - 1) : nullptr;
             if (has_markov_context && !state) {
+                last_draft_depth[seq_id] = 0;
                 continue;
             }
 
             // the graph draws the block at the target's temperature, the verifier then does rejection sampling with q
-            sampled[seq_id] = has_markov_context && params.probabilistic && dp.result_q && dp.temp > 0.0f;
+            const bool allow_prob = params.probabilistic || !getenv("LLAMA_DSPARK_FORCE_GREEDY");
+            sampled[seq_id] = has_markov_context && allow_prob && dp.result_q && dp.temp > 0.0f;
             if (sampled[seq_id] && draw_seed[seq_id] != dp.seed) {
                 draw_seed[seq_id] = dp.seed;
                 // the default seed means random; mixed so it differs from the target's, as in spec_retune
@@ -1524,14 +1771,17 @@ public:
 
             const int32_t n_draft = params.n_max;
             const int32_t n_block_tokens = n_draft + (sample_from_anchor ? 0 : 1);
+            const int32_t n_emit = adapt_enabled ? std::min<int32_t>(cur_depth, n_draft) : n_draft;
 
             // all blocks share one decode: a block that does not fit in the draft context fails every sequence's draft
             if ((uint64_t) dp.pos0 + n_block_tokens > llama_n_ctx_seq(ctx_dft)) {
+                last_draft_depth[seq_id] = 0;
                 continue;
             }
 
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
+            n_emit_seq [seq_id] = n_emit;
             const bool greedy_ids_only = has_markov_context && !sample_from_anchor && !sampled[seq_id] &&
                                          params.p_min <= 0.0f && !getenv("LLAMA_DSPARK_HOST_LOGITS");
             for (int32_t i = 0; i < n_block_tokens; ++i) {
@@ -1575,20 +1825,18 @@ public:
             auto & dp = dparams[seq_id];
 
             const int32_t beg            = i_block_beg[seq_id];
-            const int32_t n_block_tokens = n_block[seq_id];
+            const int32_t i_draft_beg    = sample_from_anchor ? 0 : 1;
+            const int32_t i_draft_end    = std::min<int32_t>(n_block[seq_id], i_draft_beg + n_emit_seq[seq_id]);
 
             auto * smpl = smpls[seq_id].get();
 
             auto & result = *dp.result;
 
-            // bonus-anchor drafts read the mask positions only, like DFlash
-            const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
-
             if (sampled[seq_id]) {
                 // the tokens the graph drew, and the distribution q each one was drawn from
                 const float * draws = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(draws && "DSpark draws missing from h_nextn");
-                for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
+                for (int32_t i = i_draft_beg; i < i_draft_end; ++i) {
                     const float * row = draws + (size_t) (beg + i) * n_embd_dec;
                     const int32_t n_cand = (int32_t) row[1];
 
@@ -1604,12 +1852,13 @@ public:
                     result.clear();
                     dp.result_q->clear();
                 }
+                last_draft_depth[seq_id] = (int32_t) result.size();
                 continue;
             }
 
             if (has_markov_context && !sample_from_anchor && !sampled[seq_id] &&
                 params.p_min <= 0.0f && !getenv("LLAMA_DSPARK_HOST_LOGITS")) {
-                for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
+                for (int32_t i = i_draft_beg; i < i_draft_end; ++i) {
                     const llama_token best = llama_get_sampled_token_ith(ctx_dft, beg + i);
                     if (best == LLAMA_TOKEN_NULL) {
                         break;
@@ -1619,12 +1868,13 @@ public:
                 if (result.size() < (size_t) params.n_min) {
                     result.clear();
                 }
+                last_draft_depth[seq_id] = (int32_t) result.size();
                 continue;
             }
 
             // DSpark: read from the first draft slot, truncate below the confidence threshold
             const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
-            for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
+            for (int32_t i = i_draft_beg; i < i_draft_end; ++i) {
                 const int32_t idx = beg + i;
 
                 if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
@@ -1651,6 +1901,7 @@ public:
             if (result.size() < (size_t) params.n_min) {
                 result.clear();
             }
+            last_draft_depth[seq_id] = (int32_t) result.size();
         }
     }
 };
@@ -3058,7 +3309,11 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+                n_max = std::max(n_max, std::max(0, spec->draft.n_max_set ? spec->draft.n_max : std::max<int32_t>(spec->draft.n_max, 7)));
+                break;
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+                n_max = std::max(n_max, std::max(0, spec->draft.n_max_set ? spec->draft.n_max : 5));
+                break;
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2:
             case COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR:
                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
@@ -3239,7 +3494,8 @@ common_params common_base_params_to_speculative(const common_params & params) {
         });
     if (has_block_draft) {
         // per-seq output positions: DFlash decodes anchor + n_max masks (n_max + 1); DSpark n_max -> +1 covers both
-        const int32_t per_seq = std::max(1, params_spec.n_max + 1);
+        const int32_t eff_n_max = std::max(params_spec.n_max, common_speculative_n_max(&params.speculative));
+        const int32_t per_seq   = std::max(1, eff_n_max + 1);
         result.n_outputs_max = params.n_parallel * per_seq;
         if (params_spec.backend_sampling) {
             result.n_outputs_max_per_seq = per_seq;
@@ -3626,6 +3882,33 @@ bool common_speculative_process_rows(
         }
     }
     return result;
+}
+
+int32_t common_speculative_ctx_window(const common_speculative * spec) {
+    if (spec == nullptr || spec->impls.empty()) {
+        return 0;
+    }
+    int32_t win = 0;
+    for (const auto & impl : spec->impls) {
+        const int32_t w = impl->ctx_window();
+        if (w <= 0) {
+            return 0;
+        }
+        win = std::max(win, w);
+    }
+    return win;
+}
+
+bool common_speculative_should_skip_process(const common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr || spec->impls.empty()) {
+        return false;
+    }
+    for (const auto & impl : spec->impls) {
+        if (!impl->should_skip_process(seq_id)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void common_speculative_draft(common_speculative * spec) {

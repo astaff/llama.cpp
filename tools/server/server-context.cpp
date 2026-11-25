@@ -4755,12 +4755,15 @@ private:
                 throw std::runtime_error("failed to process speculative batch");
             }
         } else if (spec) {
+            const int32_t spec_win = !getenv("LLAMA_DSPARK_FULL_PREFILL") ? common_speculative_ctx_window(spec.get()) : 0;
             bool any_spec_verify = false;
-            bool any_non_spec    = false;
-            std::vector<int32_t> non_spec_rows;
+            bool any_skipped     = false;
+            std::vector<int32_t> keep_rows;
+            keep_rows.reserve(batch.view.size());
             for (int32_t vr = 0; vr < batch.view.size(); ++vr) {
                 const int32_t sid = batch.tokens[off + vr].id_slot;
-                const bool is_spec_slot = sid >= 0 && sid < (int32_t) slots.size() &&
+                const bool valid_slot = sid >= 0 && sid < (int32_t) slots.size();
+                const bool is_spec_slot = valid_slot &&
                                           slots[sid].state == SLOT_STATE_GENERATING &&
                                           slots[sid].can_speculate() &&
                                           !slots[sid].spec_draft.empty() &&
@@ -4768,13 +4771,28 @@ private:
                                           ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 if (is_spec_slot) {
                     any_spec_verify = true;
-                } else {
-                    any_non_spec = true;
-                    non_spec_rows.push_back(vr);
+                    any_skipped     = true;
+                    continue;
                 }
+                if (valid_slot && spec_win > 0 && slots[sid].task &&
+                    (slots[sid].state == SLOT_STATE_PROCESSING_PROMPT || slots[sid].state == SLOT_STATE_DONE_PROMPT)) {
+                    const llama_pos min_pos = (llama_pos) slots[sid].task->n_tokens() - spec_win;
+                    if (batch.view.tokens[vr].pos[0] < min_pos) {
+                        any_skipped = true;
+                        continue;
+                    }
+                    if (ctx_dft) {
+                        const llama_pos cur_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slots[sid].id);
+                        if (cur_max >= 0 && batch.view.tokens[vr].pos[0] != cur_max + 1 &&
+                            (keep_rows.empty() || batch.tokens[off + keep_rows.back()].id_slot != sid)) {
+                            llama_memory_seq_rm(llama_get_memory(ctx_dft), slots[sid].id, -1, -1);
+                        }
+                    }
+                }
+                keep_rows.push_back(vr);
             }
 
-            if (!any_spec_verify) {
+            if (!any_skipped && !any_spec_verify) {
                 bool ok = true;
                 queue_tasks.yield_to_queue([&]() {
                     ok = common_speculative_process(spec.get(), batch.view);
@@ -4783,11 +4801,11 @@ private:
                     SRV_ERR("%s", "failed to process speculative batch\n");
                     throw std::runtime_error("failed to process speculative batch");
                 }
-            } else if (any_non_spec && !non_spec_rows.empty()) {
+            } else if (!keep_rows.empty()) {
                 bool ok = true;
                 queue_tasks.yield_to_queue([&]() {
                     ok = common_speculative_process_rows(
-                        spec.get(), batch.view, non_spec_rows.data(), (int32_t) non_spec_rows.size());
+                        spec.get(), batch.view, keep_rows.data(), (int32_t) keep_rows.size());
                 });
                 if (!ok) {
                     SRV_ERR("%s", "failed to process non-speculative rows\n");

@@ -90,6 +90,12 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 bool common_speculative_process(common_speculative * spec, const common_batch & batch);
 bool common_speculative_process_rows(common_speculative * spec, const common_batch & batch_full, const int32_t * rows, int32_t n_rows);
 
+// finite context window of the speculative drafter (0 if unbounded)
+int32_t common_speculative_ctx_window(const common_speculative * spec);
+
+// true when seq_id is parked in plain decode and needs no speculative injection this step
+bool common_speculative_should_skip_process(const common_speculative * spec, llama_seq_id seq_id);
+
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 

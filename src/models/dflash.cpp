@@ -79,6 +79,11 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         // DFlash has a single rope, so the SWA rope == main rope.
         hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
         ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl);
+        if (variant == VARIANT_DSPARK && hparams.dspark_f_rnn && getenv("LLAMA_DSPARK_FORCE_ALL_SWA")) {
+            for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+                hparams.is_swa_impl[il] = true;
+            }
+        }
         hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
         hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
     }

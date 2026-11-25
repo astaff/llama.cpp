@@ -330,7 +330,13 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         return ggml_pad(ctx0, row, n_embd - row->ne[0], 0, 0, 0);
     };
 
-    const float softcap = softcap_after_bias ? g.hparams.f_final_logit_softcapping : 0.0f;
+    float softcap = 0.0f;
+    if (softcap_after_bias) {
+        softcap = g.hparams.f_final_logit_softcapping;
+        if (softcap == 0.0f && g.cparams.ctx_other != nullptr) {
+            softcap = llama_get_model(g.cparams.ctx_other)->hparams.f_final_logit_softcapping;
+        }
+    }
 
     const bool ids_only = rnn_state != nullptr && !sample_from_anchor && !has_conf &&
                           g.ubatch.output != nullptr && g.ubatch.output[0] == 0 &&

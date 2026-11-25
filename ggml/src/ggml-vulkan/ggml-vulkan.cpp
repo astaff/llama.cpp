@@ -10212,14 +10212,15 @@ static uint32_t ggml_vk_compute_rel_const_prefix_end(
     static const bool disable_const_pfx = getenv("GGML_VK_DISABLE_REL_CONST_PREFIX") != nullptr;
     static const bool force_disable_vrow = getenv("GGML_VK_DISABLE_FA_VROW_PACK") != nullptr;
     static const bool fa_exact_split3    = getenv("GGML_VK_FA_EXACT_SPLIT3") != nullptr;
-    static const int min_kv_env = getenv("GGML_VK_FA_LONG_CTX_MIN_KV") ? atoi(getenv("GGML_VK_FA_LONG_CTX_MIN_KV")) : 4096;
+    static const int min_kv_env = getenv("GGML_VK_FA_LONG_CTX_MIN_KV") ? atoi(getenv("GGML_VK_FA_LONG_CTX_MIN_KV")) : -1;
+    const int eff_min_kv = min_kv_env >= 0 ? min_kv_env : ((ctx && ggml_vk_is_apple_agx_coopmat(ctx->device)) ? 256 : 4096);
     // Activate CONST_PREFIX strictly on multi-token (nr >= 2..8) FA_COOPMAT1 long-context queries
     // so N=1 flash_attn_vec_mhm.comp and FA_SCALAR remain 100% untouched at peak s20 occupancy.
     const uint32_t min_nr_cpfx = (force_disable_vrow || fa_exact_split3) ? 4u : 2u;
     if (disable_const_pfx || !kq_mask || !rel_pos_in || nr < min_nr_cpfx || nr > 8u ||
         gen_batch_invariant_for_n(nr) ||
         !ctx || !ctx->device->coopmat1_fa_support || !ctx->device->coopmat_support_8x8x8_f32acc ||
-        (int64_t)kq_mask->ne[0] < (int64_t)min_kv_env || blk_max < blk_min + 256u) {
+        (int64_t)kq_mask->ne[0] < (int64_t)eff_min_kv || blk_max < blk_min + 256u) {
         return blk_min;
     }
     const ggml_tensor * rp = (rel_pos_in->op == GGML_OP_CONT && rel_pos_in->src[0]) ? rel_pos_in->src[0] : rel_pos_in;
@@ -12369,10 +12370,11 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     static const bool force_disable_vrow     = getenv("GGML_VK_DISABLE_FA_VROW_PACK") != nullptr;
     static const bool force_enable_vrow      = getenv("GGML_VK_ENABLE_FA_VROW_PACK")  != nullptr;
     static const bool fa_exact_split3        = getenv("GGML_VK_FA_EXACT_SPLIT3")      != nullptr;
-    static const int  fa_long_ctx_min_kv     = getenv("GGML_VK_FA_LONG_CTX_MIN_KV") ? atoi(getenv("GGML_VK_FA_LONG_CTX_MIN_KV")) : 4096;
+    static const int  fa_long_ctx_min_kv     = getenv("GGML_VK_FA_LONG_CTX_MIN_KV") ? atoi(getenv("GGML_VK_FA_LONG_CTX_MIN_KV")) : -1;
     static const int  fa_8x8_min_rows_gqa    = getenv("GGML_VK_FA_8X8_MIN_ROWS") ? atoi(getenv("GGML_VK_FA_8X8_MIN_ROWS")) : -1;
+    const int eff_fa_long_ctx_min_kv = (fa_long_ctx_min_kv >= 0) ? fa_long_ctx_min_kv : (ggml_vk_is_apple_agx_coopmat(ctx->device) ? 256 : 4096);
     const int eff_fa_min_rows_gqa = (fa_8x8_min_rows_gqa >= 0) ? fa_8x8_min_rows_gqa : (KV >= 64 ? 4 : 8);
-    const bool long_ctx_fa = (int64_t)KV >= (int64_t)fa_long_ctx_min_kv;
+    const bool long_ctx_fa = (int64_t)KV >= (int64_t)eff_fa_long_ctx_min_kv;
     const bool allow_vrow_pack = !force_disable_vrow && (force_enable_vrow || long_ctx_fa);
     const uint32_t vrow_check_n = (long_ctx_fa && !fa_exact_split3) ? (N_orig * qk_ratio) : N_orig;
 
@@ -12641,7 +12643,10 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const uint32_t shader_core_count_multiplier = (ctx->device->vendor_id == VK_VENDOR_ID_INTEL && ctx->device->architecture != INTEL_XE2) ? 2 : 1;
 
     // Use a placeholder core count if one isn't available. split_k is a big help for perf.
-    const uint32_t shader_core_count = ctx->device->shader_core_count ? ctx->device->shader_core_count * shader_core_count_multiplier : 16;
+    const uint32_t fa_default_cores = (ggml_vk_is_apple_agx_coopmat(ctx->device) &&
+                                       strstr(ctx->device->properties.deviceName.data(), "M4 Max") != nullptr &&
+                                       !ggml_vk_exact_s8_enabled()) ? 40u : 16u;
+    const uint32_t shader_core_count = ctx->device->shader_core_count ? ctx->device->shader_core_count * shader_core_count_multiplier : fa_default_cores;
 
     const uint32_t Br = fa_pipeline_state.Br;
     const uint32_t Bc = fa_pipeline_state.Bc;
@@ -12681,8 +12686,11 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         // gen: in batch-invariant mode also above Br query tokens (gqa ratio 2 has Br 2), so k <= 8 keeps n=1's split
         // gen: GGML_VK_BATCH_INVARIANT=1 sizes the KV split as for one query token, so a token's attention sums in the
         // same order whether it is evaluated alone or in a small verification batch
+        static const bool fa_old_vec_split = getenv("GGML_VK_FA_OLD_VEC_SPLIT") != nullptr;
         const uint32_t wx_split = gen_batch_invariant() ? 1u : workgroups_x;
-        const uint32_t wy_split = (gqa_multi_head_mask && (!long_ctx_fa || fa_exact_split3 || gen_batch_invariant()))
+        const bool keep_mhm_neq2 = fa_exact_split3 || gen_batch_invariant() ||
+                                   ((!gqa_vec_mhm || fa_old_vec_split) && !long_ctx_fa);
+        const uint32_t wy_split = (gqa_multi_head_mask && keep_mhm_neq2)
                                 ? (uint32_t)neq2 : workgroups_y;
         split_k = shader_core_count * 2 / (wx_split * wy_split * workgroups_z);
     } else if (gqa_ratio <= 1) {
