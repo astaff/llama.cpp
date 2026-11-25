@@ -964,6 +964,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_mul_add_mul_partials_f32;
     vk_pipeline pipeline_rms_norm_set_rows_f32_f32;
     vk_pipeline pipeline_rms_norm_set_rows_f32_f16;
+    vk_pipeline pipeline_rms_norm_set_rows_f32_f32_32;
+    vk_pipeline pipeline_rms_norm_set_rows_f32_f16_32;
     vk_pipeline pipeline_rms_norm_partials_f32;
     vk_pipeline pipeline_rms_norm_mul_partials_f32;
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_rope_f32_f32;
@@ -990,7 +992,7 @@ struct vk_device_struct {
 
     // [src/dst 0=fp32,1=fp16,2=bf16]
     vk_pipeline pipeline_glu[GGML_GLU_OP_COUNT][3];
-    vk_pipeline pipeline_inkling_fused[6];
+    vk_pipeline pipeline_inkling_fused[8];
 
     vk_pipeline pipeline_silu_back_f32;
     vk_pipeline pipeline_soft_max_f32, pipeline_soft_max_f32_f16;
@@ -1563,6 +1565,8 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
+    bool fused_softcap_argmax {};
+    bool fused_inkling_clip_set_rows {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER

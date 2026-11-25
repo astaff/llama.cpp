@@ -113,6 +113,61 @@ void main() {
         return;
     }
 
+    // Fast in-register path for n_embd == 2304, K <= 6 (Inkling-2-Mini): 18 floats/thread, matching fallback FMA!
+    if ((p.n_embd & 0x80000000u) == 0u && p.n_embd == 2304u && p.K <= 6u) {
+        float v[6][18];
+        for (uint b = 0u; b < p.K; ++b) {
+            float ss = 0.0f;
+            [[unroll]] for (uint m = 0u; m < 18u; ++m) {
+                const float x = load_state(b, tok_base + tid + m * 128u);
+                v[b][m] = x;
+                ss += x * x;
+            }
+            const float rms_inv = 1.0f / sqrt(reduce_sum_128(ss) * inv_d + p.eps);
+            [[unroll]] for (uint m = 0u; m < 18u; ++m) {
+                precise float vn = v[b][m] * rms_inv;
+                v[b][m] = vn;
+            }
+        }
+
+        for (uint q = 0u; q < p.Q; ++q) {
+            const uint qb = p.off_q + q * 2304u;
+            float qv[18];
+            [[unroll]] for (uint m = 0u; m < 18u; ++m) {
+                qv[m] = data_q[qb + tid + m * 128u];
+            }
+            float scores[6];
+            float mx = -3.402823466e+38f;
+            for (uint b = 0u; b < p.K; ++b) {
+                float dp = 0.0f;
+                [[unroll]] for (uint m = 0u; m < 18u; ++m) {
+                    dp += v[b][m] * qv[m];
+                }
+                const float sc = reduce_sum_128(dp) * p.sm_scale;
+                scores[b] = sc;
+                mx = max(mx, sc);
+            }
+            float ex_sum = 0.0f;
+            for (uint b = 0u; b < p.K; ++b) {
+                scores[b] = exp(scores[b] - mx);
+                ex_sum += scores[b];
+            }
+            const float inv_ex = 1.0f / ex_sum;
+            for (uint b = 0u; b < p.K; ++b) {
+                scores[b] *= inv_ex;
+            }
+            const uint db = p.off_dst + (q * p.n_tokens + tok) * 2304u;
+            [[unroll]] for (uint m = 0u; m < 18u; ++m) {
+                float acc = 0.0f;
+                for (uint b = 0u; b < p.K; ++b) {
+                    acc += v[b][m] * scores[b];
+                }
+                data_dst[db + tid + m * 128u] = acc;
+            }
+        }
+        return;
+    }
+
     // Generic fallback for arbitrary n_embd, K <= 6
     float rms_inv[6];
     for (uint b = 0u; b < p.K; ++b) {

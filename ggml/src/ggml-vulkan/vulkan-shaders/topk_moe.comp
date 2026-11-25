@@ -196,13 +196,24 @@ void main() {
     }
 
     if (with_norm != 0) {
-        wt_sum              = subgroupAdd(wt_sum);
-        wt_sum              = (clamp_max < 0.0f) ? (wt_sum + clamp_min) : clamp(wt_sum, clamp_min, clamp_max);
-        const float inv_sum = 1.0f / wt_sum;
+        if (n_expert_used <= WARP_SIZE) {
+            // Series 18 (0-ULP): Match sum_rows.comp BLOCK_SIZE=32 strided halving tree in rank order k=0..n_expert_used-1
+            precise float lane_w = (lane < n_expert_used) ? (0.0f + output_weights[0]) : 0.0f;
+            [[unroll]] for (uint s = WARP_SIZE / 2; s > 0; s >>= 1) {
+                precise float shuf_w = subgroupShuffleXor(lane_w, s);
+                precise float next_w = lane_w + shuf_w;
+                lane_w = next_w;
+            }
+            wt_sum = subgroupShuffle(lane_w, 0u);
+        } else {
+            wt_sum = subgroupAdd(wt_sum);
+        }
+        precise float denom = (clamp_max < 0.0f) ? (wt_sum + clamp_min) : clamp(wt_sum, clamp_min, clamp_max);
 
         [[unroll]]
         for (uint i = 0; i < experts_per_thread; ++i) {
-            output_weights[i] *= inv_sum;
+            precise float wn = output_weights[i] / denom;
+            output_weights[i] = wn;
         }
     }
 
@@ -214,7 +225,9 @@ void main() {
     for (uint i = 0; i < experts_per_thread; ++i) {
         uint idx = i * WARP_SIZE + lane;
         if (idx < n_expert_used) {
-            weights[weights_offset + idx] = output_scale * output_weights[i] + output_bias;
+            precise float ws = output_scale * output_weights[i];
+            precise float wo = ws + output_bias;
+            weights[weights_offset + idx] = wo;
         }
     }
 }

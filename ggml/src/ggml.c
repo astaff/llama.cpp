@@ -3236,6 +3236,27 @@ struct ggml_tensor * ggml_inkling_rel_gather(
     ggml_set_op_params_i32(result, 1, n_seq_tokens);
     ggml_set_op_params_i32(result, 2, r0);
     ggml_set_op_params_i32(result, 3, extent);
+    ggml_set_op_params_i32(result, 4, 0);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_rel_gather_f16(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * kq_b,
+        struct ggml_tensor  * kq_mask,
+        int32_t               mask_r0) {
+    GGML_ASSERT(kq_b != NULL && kq_b->op == GGML_OP_INKLING_FUSED && ggml_get_op_params_i32(kq_b, 0) == 2);
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kq_b->ne[0], kq_b->ne[1], kq_b->ne[2], kq_b->ne[3]);
+    result->op     = GGML_OP_INKLING_FUSED;
+    result->src[0] = kq_b->src[0];
+    result->src[1] = kq_b->src[1];
+    result->src[2] = kq_b->src[2];
+    result->src[3] = kq_mask;
+    ggml_set_op_params_i32(result, 0, 2);
+    ggml_set_op_params_i32(result, 1, ggml_get_op_params_i32(kq_b, 1));
+    ggml_set_op_params_i32(result, 2, ggml_get_op_params_i32(kq_b, 2));
+    ggml_set_op_params_i32(result, 3, ggml_get_op_params_i32(kq_b, 3));
+    ggml_set_op_params_i32(result, 4, mask_r0);
     return result;
 }
 
@@ -3288,6 +3309,36 @@ struct ggml_tensor * ggml_inkling_ctrl_apply(
     result->src[2] = raw_gain;
     result->src[3] = raw_forget;
     ggml_set_op_params_i32(result, 0, 5);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_dspark_concat4(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * d) {
+    GGML_ASSERT(a->ne[1] == b->ne[1] && a->ne[1] == c->ne[1] && a->ne[1] == d->ne[1]);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a->ne[0] + b->ne[0] + c->ne[0] + d->ne[0], a->ne[1]);
+    result->op     = GGML_OP_INKLING_FUSED;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = c;
+    result->src[3] = d;
+    ggml_set_op_params_i32(result, 0, 6); // MODE_DSPARK_CONCAT4
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_dspark_gru(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * joint,
+        struct ggml_tensor  * state_in) {
+    GGML_ASSERT(joint->ne[0] == 3 * state_in->ne[0] && joint->ne[1] == state_in->ne[1]);
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, state_in->ne[0], state_in->ne[1], 2);
+    result->op     = GGML_OP_INKLING_FUSED;
+    result->src[0] = joint;
+    result->src[1] = state_in;
+    ggml_set_op_params_i32(result, 0, 7); // MODE_DSPARK_GRU
     return result;
 }
 

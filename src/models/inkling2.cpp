@@ -554,6 +554,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     // the first layer of each block starts a new residual stream, the earlier one joins the mixed blocks
     if (ip % hparams.attn_res_block_size == 0) {
         blocks.push_back(inpSA);
+    } else if (cur->op == GGML_OP_INKLING_FUSED && cur->op_params[0] == 1 &&
+               cur->src[5] == nullptr && !getenv("GGML_INKLING_NO_RES_FUSE")) {
+        cur->src[5] = inpSA;
     } else {
         cur = ggml_add(ctx0, inpSA, cur);
     }
@@ -584,9 +587,13 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             layer.ffn_gate_up_exps);
 
     cur = convolve(cur, layer.ffn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa + n_embd);
-    cb(cur, "ffn_out", il);
-
-    cur = ggml_add(ctx0, ffn_inp, cur);
+    if (cur->op == GGML_OP_INKLING_FUSED && cur->op_params[0] == 1 &&
+        cur->src[5] == nullptr && !getenv("GGML_INKLING_NO_RES_FUSE")) {
+        cur->src[5] = ffn_inp;
+    } else {
+        cb(cur, "ffn_out", il);
+        cur = ggml_add(ctx0, ffn_inp, cur);
+    }
     cb(cur, "l_out", il);
 
     return cur;

@@ -370,21 +370,31 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
 
             ggml_tensor * hidden_i = ggml_view_2d(ctx0, hidden, hidden->ne[0], n_blocks,
                                                   (size_t) block_drafts * hidden->nb[1], i*hidden->nb[1]);
-            ggml_tensor * joint = ggml_concat(ctx0, ggml_concat(ctx0, state, w1_prev, 0), ggml_cont(ctx0, hidden_i), 0);
-            if (f_rnn) {
-                joint = ggml_concat(ctx0, joint, f_rnn, 0);
+            ggml_tensor * hidden_c = ggml_is_contiguous(hidden_i) ? hidden_i : ggml_cont(ctx0, hidden_i);
+            if (f_rnn != nullptr && !getenv("GGML_INKLING_NO_FUSE") &&
+                ggml_is_contiguous(state) && ggml_is_contiguous(hidden_c) && ggml_is_contiguous(f_rnn)) {
+                ggml_tensor * joint = ggml_inkling_dspark_concat4(ctx0, state, w1_prev, hidden_c, f_rnn);
+                joint = ggml_add(ctx0, ggml_mul_mat(ctx0, model.dspark_joint_proj, joint), model.dspark_joint_proj_b);
+                ggml_tensor * st_lat = ggml_inkling_dspark_gru(ctx0, joint, state);
+                state  = ggml_view_2d(ctx0, st_lat, rank, st_lat->ne[1], st_lat->nb[1], 0);
+                markov = ggml_view_2d(ctx0, st_lat, rank, st_lat->ne[1], st_lat->nb[1], st_lat->nb[2]);
+            } else {
+                ggml_tensor * joint = ggml_concat(ctx0, ggml_concat(ctx0, state, w1_prev, 0), hidden_c, 0);
+                if (f_rnn) {
+                    joint = ggml_concat(ctx0, joint, f_rnn, 0);
+                }
+                joint = ggml_add(ctx0, ggml_mul_mat(ctx0, model.dspark_joint_proj, joint), model.dspark_joint_proj_b); // [3R, n_blocks]
+
+                const auto chunk = [&](int64_t k) {
+                    return ggml_cont(ctx0, ggml_view_2d(ctx0, joint, rank, n_blocks, joint->nb[1], k*rank*ggml_element_size(joint)));
+                };
+                ggml_tensor * gate = ggml_sigmoid(ctx0, chunk(0));
+                ggml_tensor * cand = ggml_tanh(ctx0, chunk(1));
+
+                // state = gate * state + (1 - gate) * cand
+                state  = ggml_add(ctx0, cand, ggml_mul(ctx0, gate, ggml_sub(ctx0, state, cand)));
+                markov = ggml_tanh(ctx0, chunk(2));
             }
-            joint = ggml_add(ctx0, ggml_mul_mat(ctx0, model.dspark_joint_proj, joint), model.dspark_joint_proj_b); // [3R, n_blocks]
-
-            const auto chunk = [&](int64_t k) {
-                return ggml_cont(ctx0, ggml_view_2d(ctx0, joint, rank, n_blocks, joint->nb[1], k*rank*ggml_element_size(joint)));
-            };
-            ggml_tensor * gate = ggml_sigmoid(ctx0, chunk(0));
-            ggml_tensor * cand = ggml_tanh(ctx0, chunk(1));
-
-            // state = gate * state + (1 - gate) * cand
-            state  = ggml_add(ctx0, cand, ggml_mul(ctx0, gate, ggml_sub(ctx0, state, cand)));
-            markov = ggml_tanh(ctx0, chunk(2));
         }
 
         ggml_tensor * bias = g.build_lora_mm(w2, markov, model.dspark_markov_w2_s); // [n_vocab_draft, n_blocks]

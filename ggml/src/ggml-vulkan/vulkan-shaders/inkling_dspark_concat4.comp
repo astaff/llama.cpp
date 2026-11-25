@@ -1,0 +1,36 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer Buf0   { float data_0[];   };
+layout(binding = 1) readonly  buffer Buf1   { float data_1[];   };
+layout(binding = 2) readonly  buffer Buf2   { float data_2[];   };
+layout(binding = 3) readonly  buffer Buf3   { float data_3[];   };
+layout(binding = 4) writeonly buffer BufDst { float data_dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n0, n1, n2, n3;
+    uint nb;
+    uint off0, off1, off2, off3, off_dst;
+} p;
+
+void main() {
+    const uint total_cols = p.n0 + p.n1 + p.n2 + p.n3;
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= total_cols * p.nb) {
+        return;
+    }
+    const uint row = idx / total_cols;
+    const uint col = idx - row * total_cols;
+    float v;
+    if (col < p.n0) {
+        v = data_0[p.off0 + row * p.n0 + col];
+    } else if (col < p.n0 + p.n1) {
+        v = data_1[p.off1 + row * p.n1 + (col - p.n0)];
+    } else if (col < p.n0 + p.n1 + p.n2) {
+        v = data_2[p.off2 + row * p.n2 + (col - p.n0 - p.n1)];
+    } else {
+        v = data_3[p.off3 + row * p.n3 + (col - p.n0 - p.n1 - p.n2)];
+    }
+    data_dst[p.off_dst + idx] = v;
+}

@@ -156,8 +156,8 @@ void iter_aligned_nonquant_a(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FL
 {
     const uint col = i*BLOCK_SIZE + K_PER_ITER*tid;
     uint ibi = first_row*p.ncols;
-    if (NUM_COLS <= 4) {
-        vec4 b_arr[4];
+    if (NUM_COLS <= 8) {
+        vec4 b_arr[8];
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
             b_arr[j] = data_b_v4[(j*p.batch_stride_b + b_offset + col) / 4];
         }

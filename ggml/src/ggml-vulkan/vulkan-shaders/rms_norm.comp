@@ -52,6 +52,10 @@ layout (binding = 4) readonly buffer E {float data_e[];};
 #elif RMS_NORM_SET_ROWS_FUSION
 
 layout (binding = 3) readonly buffer I {uvec2 data_i[];};
+#if USE_SUBGROUP_ADD
+layout (binding = 0) readonly  buffer A_V4     {vec4           data_a_v4[];};
+layout (binding = 2) writeonly buffer D_SET_V4 {SET_ROWS_D_V4  data_d_set_v4[];};
+#endif
 
 #elif RMS_NORM_SILU_GATE_FUSION
 
@@ -161,7 +165,30 @@ void main() {
             // Per-row offset in shared memory
             uint32_t d_offset = 0;
 #elif RMS_NORM_SET_ROWS_FUSION
-            uint32_t d_offset = data_i[channel].x*p.nb21 + row*ncols + get_doffset();
+            const uint i_misalign = uint(p.param3) >> 16u;
+            uint32_t d_offset = data_i[i_misalign + channel].x*p.nb21 + row*ncols + get_doffset();
+#if USE_SUBGROUP_ADD
+            if ((uint(p.param3) & 2u) != 0u && !do_multiply && (ncols >> 2u) == uint(BLOCK_SIZE)) {
+                const uint a_v4 = a_offset >> 2u;
+                const uint d_v4 = d_offset >> 2u;
+                const vec4 xv = data_a_v4[a_v4 + tid];
+                float sum_sq = subgroupAdd(dot(xv, xv));
+                if (BLOCK_SIZE > 32) {
+                    if (subgroupElect()) {
+                        sumsh[gl_SubgroupID] = sum_sq;
+                    }
+                    barrier();
+                    sum_sq = 0.0f;
+                    [[unroll]] for (uint i = 0u; i < gl_NumSubgroups; ++i) {
+                        sum_sq += sumsh[i];
+                    }
+                }
+                const float scale = inversesqrt(sum_sq / float(ncols) + p.param1);
+                const vec4 out_v4 = scale * xv;
+                data_d_set_v4[d_v4 + tid] = SET_ROWS_D_V4(out_v4);
+                continue;
+            }
+#endif
 #elif RMS_NORM_SCALE_FUSION
             const bool is_d2 = (p.param3 & 1) != 0 && row >= p.ne21;
             const uint eff_nrows = (p.param3 & 1) != 0 ? p.ne21 : nrows;

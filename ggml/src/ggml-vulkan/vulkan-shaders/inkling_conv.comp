@@ -9,6 +9,7 @@ layout(binding = 2) readonly  buffer BufW     { float data_w[];     };
 layout(binding = 3) readonly  buffer BufDyn   { float data_dyn[];   };
 layout(binding = 4) writeonly buffer BufState { float data_state[]; };
 layout(binding = 5) writeonly buffer BufDst   { float data_dst[];   };
+layout(binding = 6) readonly  buffer BufRes   { float data_res[];   };
 
 layout(push_constant) uniform PushConstants {
     uint  n_channels;
@@ -27,6 +28,8 @@ layout(push_constant) uniform PushConstants {
     uint  off_dyn;
     uint  off_dst;
     float scale_out;
+    uint  has_res;
+    uint  off_res;
 } p;
 
 float load_conv_x(uint seq, uint c, int pos) {
@@ -64,7 +67,11 @@ void main() {
         sum += x0 * data_dyn[db + 3u];
     }
 
-    data_dst[p.off_dst + tok_global * p.n_channels + c] = (x3 + sum) * p.scale_out;
+    const uint elem = tok_global * p.n_channels + c;
+    precise float pre_sum = x3 + sum;
+    precise float scaled  = pre_sum * p.scale_out;
+    precise float out_val = (p.has_res != 0u) ? (data_res[p.off_res + elem] + scaled) : scaled;
+    data_dst[p.off_dst + elem] = out_val;
 
     const int target_slot = int(p.n_seq_tokens) - 1 - int(t);
     if (target_slot >= 0 && uint(target_slot) < p.st_kw) {

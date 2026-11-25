@@ -1260,6 +1260,12 @@ extern "C" {
             int32_t               r0,
             int32_t               extent);
 
+    GGML_API struct ggml_tensor * ggml_inkling_rel_gather_f16(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kq_b,
+            struct ggml_tensor  * kq_mask,
+            int32_t               mask_r0);
+
     GGML_API struct ggml_tensor * ggml_inkling_depth_mix(
             struct ggml_context       * ctx,
             struct ggml_tensor * const * states,
@@ -1279,6 +1285,18 @@ extern "C" {
             struct ggml_tensor  * message,
             struct ggml_tensor  * raw_gain,
             struct ggml_tensor  * raw_forget);
+
+    GGML_API struct ggml_tensor * ggml_inkling_dspark_concat4(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * d);
+
+    GGML_API struct ggml_tensor * ggml_inkling_dspark_gru(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * joint,
+            struct ggml_tensor  * state_in);
 
     // normalize along rows
     GGML_API struct ggml_tensor * ggml_norm(

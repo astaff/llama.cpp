@@ -1,11 +1,15 @@
 #version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
-layout(binding = 0) readonly  buffer BufTable  { float data_table[];   };
-layout(binding = 1) readonly  buffer BufSinks  { float data_sinks[];   };
-layout(binding = 2) readonly  buffer BufRelPos { int   data_rel_pos[]; };
-layout(binding = 3) writeonly buffer BufDst    { float data_dst[];     };
+layout(binding = 0) readonly  buffer BufTable   { float     data_table[];    };
+layout(binding = 1) readonly  buffer BufSinks   { float     data_sinks[];    };
+layout(binding = 2) readonly  buffer BufRelPos  { int       data_rel_pos[];  };
+layout(binding = 3) readonly  buffer BufMaskF16 { float16_t data_mask_f16[]; };
+layout(binding = 4) writeonly buffer BufDstF32  { float     data_dst[];      };
+layout(binding = 4) writeonly buffer BufDstF16  { float16_t data_dst_f16[];  };
 
 layout(push_constant) uniform PushConstants {
     uint n_kv;
@@ -20,6 +24,12 @@ layout(push_constant) uniform PushConstants {
     uint off_sinks;
     uint off_rel;
     uint off_dst;
+    uint flags;     // bit 0: out_f16, bit 1: has_mask
+    uint off_mask;  // in f16 elements
+    uint mask_r0;
+    uint mask_ne1;
+    uint mask_ne2;
+    uint mask_ne3;
 } p;
 
 void main() {
@@ -42,5 +52,20 @@ void main() {
         ? data_table[p.off_table + (tok_global * p.n_head + h) * p.table_len + uint(r)]
         : 0.0f;
     const float sval      = data_sinks[p.off_sinks + tok_global * p.n_head + h];
-    data_dst[p.off_dst + idx] = tval - sval;
+    precise float b       = tval - sval;
+
+    if ((p.flags & 2u) != 0u) {
+        const uint m2   = (p.mask_ne2 > 1u) ? (h % p.mask_ne2) : 0u;
+        const uint m3   = (p.mask_ne3 > 1u) ? (s % p.mask_ne3) : 0u;
+        const uint midx = p.off_mask + (((m3 * p.mask_ne2 + m2) * p.mask_ne1 + (p.mask_r0 + tok_r)) * p.n_kv + kv_i);
+        precise float mv  = float(data_mask_f16[midx]);
+        precise float sum = b + mv;
+        b = sum;
+    }
+
+    if ((p.flags & 1u) != 0u) {
+        data_dst_f16[p.off_dst + idx] = float16_t(b);
+    } else {
+        data_dst[p.off_dst + idx] = b;
+    }
 }

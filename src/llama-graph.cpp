@@ -3793,14 +3793,6 @@ static ggml_tensor * build_attn_iswa_impl(
     // by doing so, the number of splits in the graph is reduced
     ggml_build_forward_expand(gf, q_cur);
 
-    if (k_cur) {
-        ggml_build_forward_expand(gf, k_cur);
-    }
-
-    if (v_cur) {
-        ggml_build_forward_expand(gf, v_cur);
-    }
-
     // whole seq fits into batch in training mode
     const bool use_kv_cur = cparams.training && k_cur && v_cur;
     if (use_kv_cur) {
@@ -3809,17 +3801,20 @@ static ggml_tensor * build_attn_iswa_impl(
 
     const bool store_kv = !use_kv_cur || hparams.n_layer_kv_from_start >= 0;
 
-    // optionally store to KV cache
-    if (store_kv && k_cur) {
-        const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
-
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+    if (k_cur) {
+        ggml_build_forward_expand(gf, k_cur);
+        if (store_kv) {
+            const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
+            ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        }
     }
 
-    if (store_kv && v_cur) {
-        const auto & v_idxs = is_swa ? inp->get_v_idxs_swa() : inp->get_v_idxs();
-
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+    if (v_cur) {
+        ggml_build_forward_expand(gf, v_cur);
+        if (store_kv) {
+            const auto & v_idxs = is_swa ? inp->get_v_idxs_swa() : inp->get_v_idxs();
+            ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        }
     }
 
     ggml_tensor * q = q_cur;
@@ -4518,19 +4513,26 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
     ggml_tensor * kq_mask = attn_mask.raw;
-    if (kq_b->ne[1] != kq_mask->ne[1]) {
-        ggml_tensor *& dev = inp->self_kq_mask_dev[is_swa];
-        if (!dev) {
-            dev = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+    if (cparams.flash_attn && kq_b && kq_b->op == GGML_OP_INKLING_FUSED &&
+        kq_b->op_params[0] == 2 && kq_mask && kq_mask->type == GGML_TYPE_F16 &&
+        ggml_is_contiguous(kq_mask) && kq_mask->ne[0] == kq_b->ne[0] &&
+        !getenv("GGML_INKLING_NO_F16_KQB")) {
+        kq_mask = ggml_inkling_rel_gather_f16(ctx0, kq_b, kq_mask, (int32_t) i_row);
+    } else {
+        if (kq_b->ne[1] != kq_mask->ne[1]) {
+            ggml_tensor *& dev = inp->self_kq_mask_dev[is_swa];
+            if (!dev) {
+                dev = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+            }
+            kq_mask = ggml_view_4d(ctx0, dev, dev->ne[0], kq_b->ne[1], dev->ne[2], dev->ne[3],
+                    dev->nb[1], dev->nb[2], dev->nb[3], i_row*dev->nb[1]);
+        } else if (kq_mask->type != GGML_TYPE_F32) {
+            kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
         }
-        kq_mask = ggml_view_4d(ctx0, dev, dev->ne[0], kq_b->ne[1], dev->ne[2], dev->ne[3],
-                dev->nb[1], dev->nb[2], dev->nb[3], i_row*dev->nb[1]);
-    } else if (kq_mask->type != GGML_TYPE_F32) {
-        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
-    }
-    kq_mask = ggml_add(ctx0, kq_b, kq_mask);
-    if (cparams.flash_attn) {
-        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
+        kq_mask = ggml_add(ctx0, kq_b, kq_mask);
+        if (cparams.flash_attn) {
+            kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
+        }
     }
     cb(kq_mask, "kq_mask_rel_pos", il);
 

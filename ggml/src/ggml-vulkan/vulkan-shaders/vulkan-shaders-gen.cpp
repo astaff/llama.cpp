@@ -926,8 +926,8 @@ void process_shaders() {
         string_to_spv("rms_norm_mul_silu_f32" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"RMS_NORM_SILU_GATE_FUSION", "1"}}));
         string_to_spv("rms_norm_mul_add_bf16_f32" + suffix, "rms_norm.comp", merge_maps(rms_bf16_dict, {{"RMS_NORM_ADD_FUSION", "1"}}));
         string_to_spv("rms_norm_mul_add_bf16_bf16" + suffix, "rms_norm.comp", merge_maps({{"C_TYPE", "uint16_t"}, {"DATA_C_BF16", "1"}, {"RMS_NORM_ADD_FUSION", "1"}}, rms_bf16_dict));
-        string_to_spv("rms_norm_set_rows_f32_f32" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"RMS_NORM_SET_ROWS_FUSION", "1"}}));
-        string_to_spv("rms_norm_set_rows_f32_f16" + suffix, "rms_norm.comp", merge_maps({{"D_TYPE", "float16_t"}, {"RMS_NORM_SET_ROWS_FUSION", "1"}}, rms_dict)); // keep rms_dict last so 'merge_maps' overwrites the value for key 'D_TYPE'
+        string_to_spv("rms_norm_set_rows_f32_f32" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"RMS_NORM_SET_ROWS_FUSION", "1"}, {"SET_ROWS_D_V4", "vec4"}}));
+        string_to_spv("rms_norm_set_rows_f32_f16" + suffix, "rms_norm.comp", merge_maps({{"D_TYPE", "float16_t"}, {"RMS_NORM_SET_ROWS_FUSION", "1"}, {"SET_ROWS_D_V4", "f16vec4"}}, rms_dict)); // keep rms_dict last so 'merge_maps' overwrites the value for key 'D_TYPE'
         string_to_spv("rms_norm_mul_rope_f32_f32" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"ROPE_D_TYPE", "float"}, {"RMS_NORM_ROPE_FUSION", "1"}}));
         string_to_spv("rms_norm_mul_rope_f32_f16" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"ROPE_D_TYPE", "float16_t"}, {"RMS_NORM_ROPE_FUSION", "1"}}));
     }
@@ -1158,7 +1158,9 @@ void process_shaders() {
     string_to_spv("inkling_rel_gather",  "inkling_rel_gather.comp",  {});
     string_to_spv("inkling_depth_mix",   "inkling_depth_mix.comp",   {});
     string_to_spv("inkling_rms2_concat", "inkling_rms2_concat.comp", {});
-    string_to_spv("inkling_ctrl_apply",  "inkling_ctrl_apply.comp",  {});
+    string_to_spv("inkling_ctrl_apply",     "inkling_ctrl_apply.comp",     {});
+    string_to_spv("inkling_dspark_concat4", "inkling_dspark_concat4.comp", {});
+    string_to_spv("inkling_dspark_gru",     "inkling_dspark_gru.comp",     {});
 
     string_to_spv("timestep_embedding_f32", "timestep_embedding.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
 
