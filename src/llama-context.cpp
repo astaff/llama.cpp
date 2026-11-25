@@ -2524,6 +2524,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
             copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
+        } else if (!res->t_sampled.empty() && sampling.sampled.has_data() && n_outputs > 0) {
+            copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get());
         }
 
         n_outputs_prev += n_outputs;
@@ -2660,6 +2662,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     if (has_sampling) {
         backend_float_count = 2 * n_vocab * n_outputs_max;      // logits + probs
         backend_token_count = (1 + n_vocab) * n_outputs_max;    // sampled + candidates
+    } else if (n_outputs_max > 0) {
+        backend_token_count = n_outputs_max;                    // lightweight t_sampled slot (e.g. DSpark greedy IDs)
     }
 
     if (output_ids.empty()) {
@@ -2758,12 +2762,18 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     } else {
         sampling.logits     = {nullptr, 0};
         sampling.probs      = {nullptr, 0};
-        sampling.sampled    = {nullptr, 0};
+        sampling.sampled    = n_outputs_max > 0
+            ? buffer_view<llama_token>{(llama_token *) (base + offset), (size_t) n_outputs_max}
+            : buffer_view<llama_token>{nullptr, 0};
+        offset += sampling.sampled.size * sizeof(llama_token);
         sampling.candidates = {nullptr, 0};
 
         sampling.logits_count.clear();
         sampling.probs_count.clear();
         sampling.candidates_count.clear();
+        if (sampling.sampled.data) {
+            std::fill_n(sampling.sampled.data, sampling.sampled.size, LLAMA_TOKEN_NULL);
+        }
     }
 
     // set all ids as invalid (negative)
@@ -2864,6 +2874,8 @@ void llama_context::output_reorder() {
             std::swap(sampling.logits_count[i0],     sampling.logits_count[i1]);
             std::swap(sampling.probs_count[i0],      sampling.probs_count[i1]);
             std::swap(sampling.candidates_count[i0], sampling.candidates_count[i1]);
+        } else if (sampling.sampled.size > 0) {
+            std::swap(sampling.sampled.data[i0],     sampling.sampled.data[i1]);
         }
     }
 

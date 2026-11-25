@@ -148,8 +148,8 @@ i32vec2 repack(uint ib, uint iqs) {
     const u8vec4 i_a0 = unpack8( qs       & 0x0F0F0F0F);
     const u8vec4 i_a1 = unpack8((qs >> 4) & 0x0F0F0F0F);
 
-    return i32vec2(pack32(i8vec4(kvalues_mxfp4[i_a0.x], kvalues_mxfp4[i_a0.y], kvalues_mxfp4[i_a0.z], kvalues_mxfp4[i_a0.w])),
-                   pack32(i8vec4(kvalues_mxfp4[i_a1.x], kvalues_mxfp4[i_a1.y], kvalues_mxfp4[i_a1.z], kvalues_mxfp4[i_a1.w])));
+    return i32vec2(pack32(i8vec4(int8_t(mxfp4_kval(uint(i_a0.x))), int8_t(mxfp4_kval(uint(i_a0.y))), int8_t(mxfp4_kval(uint(i_a0.z))), int8_t(mxfp4_kval(uint(i_a0.w))))),
+                   pack32(i8vec4(int8_t(mxfp4_kval(uint(i_a1.x))), int8_t(mxfp4_kval(uint(i_a1.y))), int8_t(mxfp4_kval(uint(i_a1.z))), int8_t(mxfp4_kval(uint(i_a1.w))))));
 }
 
 FLOAT_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const int32_t sum_divisor) {

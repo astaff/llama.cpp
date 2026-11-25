@@ -1,0 +1,46 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer BufTable  { float data_table[];   };
+layout(binding = 1) readonly  buffer BufSinks  { float data_sinks[];   };
+layout(binding = 2) readonly  buffer BufRelPos { int   data_rel_pos[]; };
+layout(binding = 3) writeonly buffer BufDst    { float data_dst[];     };
+
+layout(push_constant) uniform PushConstants {
+    uint n_kv;
+    uint nr;
+    uint n_head;
+    uint n_stream;
+    uint n_seq_tokens;
+    uint r0;
+    uint table_len;
+    uint extent;
+    uint off_table;
+    uint off_sinks;
+    uint off_rel;
+    uint off_dst;
+} p;
+
+void main() {
+    const uint idx   = gl_GlobalInvocationID.x + gl_WorkGroupID.y * (65535u * 256u);
+    const uint total = p.n_kv * p.nr * p.n_head * p.n_stream;
+    if (idx >= total) {
+        return;
+    }
+    const uint kv_i  = idx % p.n_kv;
+    const uint t1    = idx / p.n_kv;
+    const uint tok_r = t1 % p.nr;
+    const uint t2    = t1 / p.nr;
+    const uint h     = t2 % p.n_head;
+    const uint s     = t2 / p.n_head;
+
+    const uint tok_seq    = p.r0 + tok_r;
+    const uint tok_global = s * p.n_seq_tokens + tok_seq;
+    const int  r          = data_rel_pos[p.off_rel + tok_global * p.n_kv + kv_i];
+    const float tval      = (r >= 0 && uint(r) < p.extent && uint(r) < p.table_len)
+        ? data_table[p.off_table + (tok_global * p.n_head + h) * p.table_len + uint(r)]
+        : 0.0f;
+    const float sval      = data_sinks[p.off_sinks + tok_global * p.n_head + h];
+    data_dst[p.off_dst + idx] = tval - sval;
+}

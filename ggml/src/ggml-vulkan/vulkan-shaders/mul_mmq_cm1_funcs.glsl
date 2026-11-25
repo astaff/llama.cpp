@@ -230,11 +230,11 @@ void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
     const u8vec4 lo_idx = unpack8(blk.qs & 0x0F0F0F0F);
     const u8vec4 hi_idx = unpack8((blk.qs >> 4) & 0x0F0F0F0F);
     buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr    ] =
-        pack32(i8vec4(cm1_kvalues[lo_idx.x], cm1_kvalues[lo_idx.y],
-                      cm1_kvalues[lo_idx.z], cm1_kvalues[lo_idx.w]));
+        pack32(i8vec4(int8_t(mxfp4_kval(uint(lo_idx.x))), int8_t(mxfp4_kval(uint(lo_idx.y))),
+                      int8_t(mxfp4_kval(uint(lo_idx.z))), int8_t(mxfp4_kval(uint(lo_idx.w)))));
     buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr + 4] =
-        pack32(i8vec4(cm1_kvalues[hi_idx.x], cm1_kvalues[hi_idx.y],
-                      cm1_kvalues[hi_idx.z], cm1_kvalues[hi_idx.w]));
+        pack32(i8vec4(int8_t(mxfp4_kval(uint(hi_idx.x))), int8_t(mxfp4_kval(uint(hi_idx.y))),
+                      int8_t(mxfp4_kval(uint(hi_idx.z))), int8_t(mxfp4_kval(uint(hi_idx.w)))));
 
     if (loadr == 0) {
         buf_a_d[ks * BM + buf_ib] = in_bounds ? e8m0_to_fp32(blk.e) * 0.5 : 0.0f;
@@ -492,11 +492,11 @@ void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
     const uint sub_base = (loadr >> 1) * 4;
     const uint byte_group = loadr & 1u;
     buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + sub_base + byte_group] =
-        pack32(i8vec4(cm1_kvalues[lo_idx.x], cm1_kvalues[lo_idx.y],
-                      cm1_kvalues[lo_idx.z], cm1_kvalues[lo_idx.w]));
+        pack32(i8vec4(int8_t(mxfp4_kval(uint(lo_idx.x))), int8_t(mxfp4_kval(uint(lo_idx.y))),
+                      int8_t(mxfp4_kval(uint(lo_idx.z))), int8_t(mxfp4_kval(uint(lo_idx.w)))));
     buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + sub_base + 2 + byte_group] =
-        pack32(i8vec4(cm1_kvalues[hi_idx.x], cm1_kvalues[hi_idx.y],
-                      cm1_kvalues[hi_idx.z], cm1_kvalues[hi_idx.w]));
+        pack32(i8vec4(int8_t(mxfp4_kval(uint(hi_idx.x))), int8_t(mxfp4_kval(uint(hi_idx.y))),
+                      int8_t(mxfp4_kval(uint(hi_idx.z))), int8_t(mxfp4_kval(uint(hi_idx.w)))));
 
     if (loadr == 0) {
         buf_a_d[(ks * KSCALES    ) * BM + buf_ib] = in_bounds ? ue4m3_to_fp32(blk.d0) * 0.5 : 0.0f;

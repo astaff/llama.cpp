@@ -274,10 +274,10 @@
     store_a(col_sh, k_pair + 8, FLOAT_TYPEV2(bitcastExtractfe2m1EXT(packed, 4u)) * FLOAT_TYPE(d));
 #else
     const float d = e8m0_to_fp32(MM_DATA_A[ib].e) * 0.5;
-    store_a(col_sh, k_pair,     FLOAT_TYPEV2(kvalues_mxfp4[vui  & 0xF] * d,
-                                             kvalues_mxfp4[vui2 & 0xF] * d));
-    store_a(col_sh, k_pair + 8, FLOAT_TYPEV2(kvalues_mxfp4[vui  >>  4] * d,
-                                             kvalues_mxfp4[vui2 >>  4] * d));
+    store_a(col_sh, k_pair,     FLOAT_TYPEV2(float(mxfp4_kval(uint(vui)  & 0xFu)) * d,
+                                             float(mxfp4_kval(uint(vui2) & 0xFu)) * d));
+    store_a(col_sh, k_pair + 8, FLOAT_TYPEV2(float(mxfp4_kval(uint(vui)  >>  4u)) * d,
+                                             float(mxfp4_kval(uint(vui2) >>  4u)) * d));
 #endif
 #elif defined(DATA_A_NVFP4)
     const uint idx = pos_a + col_mem * p.stride_a / LOAD_VEC_A + row;
@@ -296,10 +296,10 @@
     store_a(col_sh, eff_row + 4, FLOAT_TYPEV2(bitcastExtractfe2m1EXT(packed, 4u)) * d);
 #else
     const float d = ue4m3_to_fp32(MM_DATA_A[ib].d[sub]) * 0.5;
-    store_a(col_sh, eff_row,     FLOAT_TYPEV2(kvalues_mxfp4[vui  & 0xF] * d,
-                                              kvalues_mxfp4[vui2 & 0xF] * d));
-    store_a(col_sh, eff_row + 4, FLOAT_TYPEV2(kvalues_mxfp4[vui  >>  4] * d,
-                                              kvalues_mxfp4[vui2 >>  4] * d));
+    store_a(col_sh, eff_row,     FLOAT_TYPEV2(float(mxfp4_kval(uint(vui)  & 0xFu)) * d,
+                                              float(mxfp4_kval(uint(vui2) & 0xFu)) * d));
+    store_a(col_sh, eff_row + 4, FLOAT_TYPEV2(float(mxfp4_kval(uint(vui)  >>  4u)) * d,
+                                              float(mxfp4_kval(uint(vui2) >>  4u)) * d));
 #endif
 #else
     if (MmTypeA == GGML_TYPE_Q4_0) {

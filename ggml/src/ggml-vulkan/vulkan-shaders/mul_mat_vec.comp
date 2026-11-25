@@ -1,7 +1,7 @@
 #version 450
 
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
-#if defined(DATA_A_Q8_0)
+#if defined(DATA_A_Q8_0) || defined(DATA_A_NVFP4)
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #endif
 
@@ -222,6 +222,104 @@ void iter_aligned_nonquant_a2(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const u
                 const vec4 b = data_b_v4[(j*p.batch_stride_b + b_offset + col) / 4];
                 temp[j][n] += dot(v, b);
             }
+        }
+    }
+}
+#endif
+
+#if defined(DATA_A_NVFP4) && !defined(USE_OCP_FP4)
+vec4 nvfp4_decode_nibs(const uint qs_shifted) {
+    const f16vec2 ev = unpackFloat2x16(nvfp4_e2m1_pair_fp16_bits(qs_shifted));
+    const f16vec2 od = unpackFloat2x16(nvfp4_e2m1_pair_fp16_bits(qs_shifted >> 8u));
+    return vec4(ev.x, od.x, ev.y, od.y);
+}
+
+float nvfp4_decode_scale(const uint d_u32, const uint sub) {
+    const uint du = (d_u32 >> (sub * 8u)) & 0xFFu;
+    return ue4m3_to_fp32_build(du);
+}
+
+void iter_aligned_nvfp4_a(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_TYPE temp2[NUM_COLS][NUM_ROWS], const uint row_base, const uint num_rows, const uint tid, const uint iter_idx) {
+    const uint b_col4 = iter_idx * (2u * BLOCK_SIZE) + 2u * tid;
+    const uint lane8  = tid & 7u;
+    const uint sub    = lane8 >> 1u;
+    const uint shift  = (lane8 & 1u) * 4u;
+    const uint ib_col = iter_idx * (BLOCK_SIZE >> 3u) + (tid >> 3u);
+    const uint blocks_per_row = p.ncols >> 6u;
+
+    if (NUM_COLS <= 4) {
+        vec4 bv0_arr[NUM_COLS];
+        vec4 bv1_arr[NUM_COLS];
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const uint b4 = (j * p.batch_stride_b + b_offset) >> 2u;
+            bv0_arr[j] = vec4(data_b_v4[b4 + b_col4]);
+            bv1_arr[j] = vec4(data_b_v4[b4 + b_col4 + 1u]);
+        }
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint rn = (n == 0u || n < num_rows) ? n : 0u;
+            const uint ib = a_offset + (row_base + rn) * blocks_per_row + ib_col;
+            const float da = nvfp4_decode_scale(data_a_packed32[ib].d[0], sub);
+            const vec4  v0 = nvfp4_decode_nibs(data_a_packed32[ib].qs[2u * sub + 0u] >> shift);
+            const vec4  v1 = nvfp4_decode_nibs(data_a_packed32[ib].qs[2u * sub + 1u] >> shift);
+            vec4 u0 = vec4(0.0), u1 = vec4(0.0);
+            float da2 = 0.0f;
+            if (GEN_GLU == 3) {
+                da2 = nvfp4_decode_scale(data_a2_packed32[ib].d[0], sub);
+                u0  = nvfp4_decode_nibs(data_a2_packed32[ib].qs[2u * sub + 0u] >> shift);
+                u1  = nvfp4_decode_nibs(data_a2_packed32[ib].qs[2u * sub + 1u] >> shift);
+            }
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                temp[j][n] += FLOAT_TYPE((dot(bv0_arr[j], v0) + dot(bv1_arr[j], v1)) * da);
+                if (GEN_GLU == 3) {
+                    temp2[j][n] += FLOAT_TYPE((dot(bv0_arr[j], u0) + dot(bv1_arr[j], u1)) * da2);
+                }
+            }
+        }
+    } else {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint rn = (n == 0u || n < num_rows) ? n : 0u;
+            const uint ib = a_offset + (row_base + rn) * blocks_per_row + ib_col;
+            const float da = nvfp4_decode_scale(data_a_packed32[ib].d[0], sub);
+            const vec4  v0 = nvfp4_decode_nibs(data_a_packed32[ib].qs[2u * sub + 0u] >> shift);
+            const vec4  v1 = nvfp4_decode_nibs(data_a_packed32[ib].qs[2u * sub + 1u] >> shift);
+            vec4 u0 = vec4(0.0), u1 = vec4(0.0);
+            float da2 = 0.0f;
+            if (GEN_GLU == 3) {
+                da2 = nvfp4_decode_scale(data_a2_packed32[ib].d[0], sub);
+                u0  = nvfp4_decode_nibs(data_a2_packed32[ib].qs[2u * sub + 0u] >> shift);
+                u1  = nvfp4_decode_nibs(data_a2_packed32[ib].qs[2u * sub + 1u] >> shift);
+            }
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                const uint b4 = (j * p.batch_stride_b + b_offset) >> 2u;
+                const vec4 bv0 = vec4(data_b_v4[b4 + b_col4]);
+                const vec4 bv1 = vec4(data_b_v4[b4 + b_col4 + 1u]);
+                temp[j][n] += FLOAT_TYPE((dot(bv0, v0) + dot(bv1, v1)) * da);
+                if (GEN_GLU == 3) {
+                    temp2[j][n] += FLOAT_TYPE((dot(bv0, u0) + dot(bv1, u1)) * da2);
+                }
+            }
+        }
+    }
+}
+
+void iter_aligned_nvfp4_a2(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint row_base, const uint num_rows, const uint tid, const uint iter_idx) {
+    const uint b_col4 = iter_idx * (2u * BLOCK_SIZE) + 2u * tid;
+    const uint lane8  = tid & 7u;
+    const uint sub    = lane8 >> 1u;
+    const uint shift  = (lane8 & 1u) * 4u;
+    const uint ib_col = iter_idx * (BLOCK_SIZE >> 3u) + (tid >> 3u);
+    const uint blocks_per_row = p.ncols >> 6u;
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        const uint rn = (n == 0u || n < num_rows) ? n : 0u;
+        const uint ib = a_offset + (row_base + rn) * blocks_per_row + ib_col;
+        const float da = nvfp4_decode_scale(data_a2_packed32[ib].d[0], sub);
+        const vec4  v0 = nvfp4_decode_nibs(data_a2_packed32[ib].qs[2u * sub + 0u] >> shift);
+        const vec4  v1 = nvfp4_decode_nibs(data_a2_packed32[ib].qs[2u * sub + 1u] >> shift);
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const uint b4 = (j * p.batch_stride_b + b_offset) >> 2u;
+            const vec4 bv0 = vec4(data_b_v4[b4 + b_col4]);
+            const vec4 bv1 = vec4(data_b_v4[b4 + b_col4 + 1u]);
+            temp[j][n] += FLOAT_TYPE((dot(bv0, v0) + dot(bv1, v1)) * da);
         }
     }
 }
@@ -551,6 +649,43 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
             }
         }
     }
+
+#if defined(DATA_A_NVFP4) && !defined(USE_OCP_FP4)
+    if ((p.ncols & 63u) == 0u && (p.batch_stride_b & 3u) == 0u && (b_offset & 3u) == 0u && (BLOCK_SIZE & 7u) == 0u) {
+        if (eff_rows == 0u) {
+            return;
+        }
+        const uint full_iters = p.ncols / (8u * BLOCK_SIZE);
+        const bool has_tail   = (full_iters * (8u * BLOCK_SIZE) + 8u * tid < p.ncols);
+        if (GEN_GLU == 2 && use_a2) {
+            for (uint it = 0u; it < full_iters; ++it) {
+                iter_aligned_nvfp4_a2(temp, row_base, eff_rows, tid, it);
+            }
+            if (has_tail) {
+                iter_aligned_nvfp4_a2(temp, row_base, eff_rows, tid, full_iters);
+            }
+        } else {
+            for (uint it = 0u; it < full_iters; ++it) {
+                iter_aligned_nvfp4_a(temp, temp2, row_base, eff_rows, tid, it);
+            }
+            if (has_tail) {
+                iter_aligned_nvfp4_a(temp, temp2, row_base, eff_rows, tid, full_iters);
+            }
+        }
+        if (GEN_GLU == 3) {
+            reduce_pair_glu(temp, temp2, d_offset, first_row, eff_rows, tid);
+        }
+#ifndef MUL_MAT_ID
+        else if (GEN_GLU == 2 && use_a2) {
+            reduce_result_d2(temp, row_base, eff_rows, tid);
+        }
+#endif
+        else {
+            reduce_result(temp, d_offset, first_row, eff_rows, tid);
+        }
+        return;
+    }
+#endif
 
 #if defined(DATA_A_Q8_0)
     if ((p.ncols & 31) == 0 && (p.batch_stride_b & 3) == 0 && (b_offset & 3) == 0 && (BLOCK_SIZE & 3) == 0) {

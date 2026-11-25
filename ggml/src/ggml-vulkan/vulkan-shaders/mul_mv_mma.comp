@@ -63,6 +63,11 @@ const uint BN_COLS    = 8u * RT * CSG;
 #define MMA_FVEC4 f16vec4
 #define MMA_FVEC2 f16vec2
 #define MMA_ELEM_SHIFT 8u
+#elif defined(DATA_A_NVFP4)
+#define MMA_FTYPE float16_t
+#define MMA_FVEC4 f16vec4
+#define MMA_FVEC2 f16vec2
+#define MMA_ELEM_SHIFT 6u
 #else
 #define MMA_FTYPE float16_t
 #define MMA_FVEC4 f16vec4
@@ -132,6 +137,9 @@ layout(binding = MMA_BIND_U) readonly buffer BUF_U_IQ4XSP32 { block_iq4_xs_packe
 #elif defined(DATA_A_IQ4_NL)
 layout(binding = 0)          readonly buffer BUF_A_IQ4_NL { block_iq4_nl_packed16 data[]; } a_iq4_nl;
 layout(binding = MMA_BIND_U) readonly buffer BUF_U_IQ4_NL { block_iq4_nl_packed16 data[]; } u_iq4_nl;
+#elif defined(DATA_A_NVFP4)
+layout(binding = 0)          readonly buffer BUF_A_NVFP4  { block_nvfp4_packed32  data[]; } a_nvfp4;
+layout(binding = MMA_BIND_U) readonly buffer BUF_U_NVFP4  { block_nvfp4_packed32  data[]; } u_nvfp4;
 #endif
 #ifdef REPACK_PLANAR
 #include "repack_planar.glsl"
@@ -191,6 +199,7 @@ layout(binding = MMA_BIND_AUX1) readonly buffer BUF_AUX1 { float data_aux1[]; };
 #define MAT_VEC_FUSION_FLAGS_SKIP_F32_D       0x40000u
 #define MAT_VEC_FUSION_FLAGS_LORA0            0x80000u
 #define MAT_VEC_FUSION_FLAGS_LORA1            0x100000u
+#define MAT_VEC_FUSION_FLAGS_EXP_SCALE0       0x200000u
 
 layout(push_constant) uniform parameter {
 #ifdef MUL_MAT_ID
@@ -753,6 +762,33 @@ void dequant16(bool use_u, uint row_unit_base, uint ci, out MMA_FVEC4 w0, out MM
     w1 = f16vec4(d * vec4(iq4nl_lut(q1.x), iq4nl_lut(q1.y), iq4nl_lut(q1.z), iq4nl_lut(q1.w)));
     w2 = f16vec4(d * vec4(iq4nl_lut(q2.x), iq4nl_lut(q2.y), iq4nl_lut(q2.z), iq4nl_lut(q2.w)));
     w3 = f16vec4(d * vec4(iq4nl_lut(q3.x), iq4nl_lut(q3.y), iq4nl_lut(q3.z), iq4nl_lut(q3.w)));
+#elif defined(DATA_A_NVFP4)
+    const uint ib  = row_unit_base + (ci >> 2u);
+    const uint sub = ci & 3u;
+    uint d_u32, q0, q1;
+    if (use_u) {
+        d_u32 = u_nvfp4.data[ib].d[0];
+        q0    = u_nvfp4.data[ib].qs[2u * sub + 0u];
+        q1    = u_nvfp4.data[ib].qs[2u * sub + 1u];
+    } else {
+        d_u32 = a_nvfp4.data[ib].d[0];
+        q0    = a_nvfp4.data[ib].qs[2u * sub + 0u];
+        q1    = a_nvfp4.data[ib].qs[2u * sub + 1u];
+    }
+    const uint du = (d_u32 >> (sub * 8u)) & 0xFFu;
+    const f16vec4 dv = f16vec4(float16_t(ue4m3_to_fp32_build(du)));
+    const f16vec2 e0_lo = unpackFloat2x16(nvfp4_e2m1_pair_fp16_bits(q0));
+    const f16vec2 o0_lo = unpackFloat2x16(nvfp4_e2m1_pair_fp16_bits(q0 >> 8u));
+    const f16vec2 e1_lo = unpackFloat2x16(nvfp4_e2m1_pair_fp16_bits(q1));
+    const f16vec2 o1_lo = unpackFloat2x16(nvfp4_e2m1_pair_fp16_bits(q1 >> 8u));
+    const f16vec2 e0_hi = unpackFloat2x16(nvfp4_e2m1_pair_fp16_bits(q0 >> 4u));
+    const f16vec2 o0_hi = unpackFloat2x16(nvfp4_e2m1_pair_fp16_bits(q0 >> 12u));
+    const f16vec2 e1_hi = unpackFloat2x16(nvfp4_e2m1_pair_fp16_bits(q1 >> 4u));
+    const f16vec2 o1_hi = unpackFloat2x16(nvfp4_e2m1_pair_fp16_bits(q1 >> 12u));
+    w0 = dv * f16vec4(e0_lo.x, o0_lo.x, e0_lo.y, o0_lo.y);
+    w1 = dv * f16vec4(e1_lo.x, o1_lo.x, e1_lo.y, o1_lo.y);
+    w2 = dv * f16vec4(e0_hi.x, o0_hi.x, e0_hi.y, o0_hi.y);
+    w3 = dv * f16vec4(e1_hi.x, o1_hi.x, e1_hi.y, o1_hi.y);
 #endif
 }
 
@@ -760,6 +796,10 @@ void dequant16(bool use_u, uint row_unit_base, uint ci, out MMA_FVEC4 w0, out MM
 float mma_apply_id_epilogue(float val, uint expert_idx, u16vec2 row_idx, uint d_row, uint d_idx) {
     if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0u) {
         val += data_aux0[expert_idx * p.stride_d + d_row];
+    }
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_EXP_SCALE0) != 0u) {
+        precise float v_exp = val * data_aux0[expert_idx];
+        val = v_exp;
     }
     if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0) != 0u) {
         const uint s0_idx = uint(row_idx.x) + ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0_TOK) != 0u ? uint(row_idx.y) * p.nei0 : 0u);
@@ -901,8 +941,13 @@ void main() {
             sh_r_ids[c_it]  = packed;
             sh_b_base[c_it] = tok * p.batch_stride_b + (slot % p.ne11) * p.stride_b;
             if (FUSE_MODE == 4u) {
-                const uint s0_idx = slot + (((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0_TOK) != 0u) ? (tok * p.nei0) : 0u);
-                sh_col_scale[c_it] = data_aux0[s0_idx];
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_EXP_SCALE0) != 0u) {
+                    const uint s1_idx = slot + (((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1_TOK) != 0u) ? (tok * p.nei0) : 0u);
+                    sh_col_scale[c_it] = ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1) != 0u) ? data_aux1[s1_idx] : 1.0f;
+                } else {
+                    const uint s0_idx = slot + (((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0_TOK) != 0u) ? (tok * p.nei0) : 0u);
+                    sh_col_scale[c_it] = data_aux0[s0_idx];
+                }
             }
         }
         barrier();
@@ -1999,8 +2044,19 @@ void main() {
                         const u16vec2 rid = u16vec2(packed & 0xFFFFu, packed >> 16u);
                         const uint d_col_base = uint(rid.y) * p.batch_stride_d + uint(rid.x) * p.stride_d;
                         float col_scale = 1.0f;
+                        float exp_scale = 1.0f;
                         if (FUSE_MODE == 4u) {
-                            if (USE_SH_IDS) {
+                            if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_EXP_SCALE0) != 0u) {
+                                exp_scale = data_aux0[expert_idx];
+                                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1) != 0u) {
+                                    if (USE_SH_IDS) {
+                                        col_scale = sh_col_scale[col_in_tile];
+                                    } else {
+                                        const uint s1_idx = uint(rid.x) + (((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1_TOK) != 0u) ? (uint(rid.y) * p.nei0) : 0u);
+                                        col_scale = data_aux1[s1_idx];
+                                    }
+                                }
+                            } else if (USE_SH_IDS) {
                                 col_scale = sh_col_scale[col_in_tile];
                             } else {
                                 const uint s0_idx = uint(rid.x) + (((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0_TOK) != 0u) ? (uint(rid.y) * p.nei0) : 0u);
@@ -2023,7 +2079,17 @@ void main() {
                                     }
                                 } else {
                                     if (FUSE_MODE == 4u) {
-                                        val *= col_scale;
+                                        if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_EXP_SCALE0) != 0u) {
+                                            precise float v_exp = val * exp_scale;
+                                            if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1) != 0u) {
+                                                precise float v_out = v_exp * col_scale;
+                                                val = v_out;
+                                            } else {
+                                                val = v_exp;
+                                            }
+                                        } else {
+                                            val *= col_scale;
+                                        }
                                     } else if (FUSE_MODE == 1u) {
                                         val = mma_apply_id_epilogue(val, expert_idx, rid, r0, d_idx);
                                     }

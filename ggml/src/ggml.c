@@ -1118,9 +1118,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SLEEP",
 
     "SIGMOID_BACK",
+    "INKLING_FUSED",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1235,9 +1236,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sleep(x)",
 
     "sigmoid_back(x)",
+    "inkling_fused(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1276,9 +1278,10 @@ static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
     "GEGLU_ERF",
     "GEGLU_QUICK",
     "SWIGLU_CLAMP",
+    "SITU",
 };
 
-static_assert(GGML_GLU_OP_COUNT == 7, "GGML_GLU_OP_COUNT != 7");
+static_assert(GGML_GLU_OP_COUNT == 8, "GGML_GLU_OP_COUNT != 8");
 
 static_assert(sizeof(struct ggml_object)%GGML_MEM_ALIGN == 0, "ggml_object size must be a multiple of GGML_MEM_ALIGN");
 static_assert(sizeof(struct ggml_tensor)%GGML_MEM_ALIGN == 0, "ggml_tensor size must be a multiple of GGML_MEM_ALIGN");
@@ -3142,6 +3145,149 @@ struct ggml_tensor * ggml_swiglu_clamp(
     struct ggml_tensor * result = ggml_glu_impl(ctx, a, b, GGML_GLU_OP_SWIGLU_CLAMP, false);
     ggml_set_op_params_f32(result, 3, limit);
 
+    return result;
+}
+
+struct ggml_tensor * ggml_situ(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        float                 beta,
+        float                 linear_beta) {
+    struct ggml_tensor * result = ggml_glu_impl(ctx, a, b, GGML_GLU_OP_SITU, false);
+    ggml_set_op_params_f32(result, 2, beta);
+    ggml_set_op_params_f32(result, 3, linear_beta);
+
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_l2_clip(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * scale,
+        struct ggml_tensor  * tau,
+        float                 threshold,
+        float                 eps) {
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, cur);
+    result->op     = GGML_OP_INKLING_FUSED;
+    result->src[0] = cur;
+    result->src[1] = scale;
+    result->src[2] = tau;
+    ggml_set_op_params_i32(result, 0, 0);
+    ggml_set_op_params_f32(result, 1, threshold);
+    ggml_set_op_params_f32(result, 2, eps);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_conv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * history,
+        struct ggml_tensor  * weight,
+        struct ggml_tensor  * dynamic,
+        struct ggml_tensor  * state,
+        int32_t               ch_offset,
+        int32_t               n_seq_tokens,
+        int32_t               n_seqs,
+        int32_t               n_heads,
+        int32_t               st_base_f32,
+        int32_t               st_seq_stride,
+        int32_t               st_slot_stride,
+        int32_t               st_kw,
+        float                 scale_out) {
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, cur);
+    result->op     = GGML_OP_INKLING_FUSED;
+    result->src[0] = cur;
+    result->src[1] = history;
+    result->src[2] = weight;
+    result->src[3] = dynamic;
+    result->src[4] = state;
+    ggml_set_op_params_i32(result, 0, 1);
+    ggml_set_op_params_i32(result, 1, ch_offset);
+    ggml_set_op_params_i32(result, 2, n_seq_tokens);
+    ggml_set_op_params_i32(result, 3, n_seqs);
+    ggml_set_op_params_i32(result, 4, n_heads);
+    ggml_set_op_params_i32(result, 5, st_base_f32);
+    ggml_set_op_params_i32(result, 6, st_seq_stride);
+    ggml_set_op_params_i32(result, 7, st_slot_stride);
+    ggml_set_op_params_i32(result, 8, st_kw);
+    ggml_set_op_params_f32(result, 9, scale_out);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_rel_gather(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * table,
+        struct ggml_tensor  * sinks,
+        struct ggml_tensor  * rel_pos,
+        int64_t               n_kv,
+        int64_t               nr,
+        int64_t               n_head,
+        int64_t               n_stream,
+        int32_t               n_seq_tokens,
+        int32_t               r0,
+        int32_t               extent) {
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_kv, nr, n_head, n_stream);
+    result->op     = GGML_OP_INKLING_FUSED;
+    result->src[0] = table;
+    result->src[1] = sinks;
+    result->src[2] = rel_pos;
+    ggml_set_op_params_i32(result, 0, 2);
+    ggml_set_op_params_i32(result, 1, n_seq_tokens);
+    ggml_set_op_params_i32(result, 2, r0);
+    ggml_set_op_params_i32(result, 3, extent);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_depth_mix(
+        struct ggml_context       * ctx,
+        struct ggml_tensor * const * states,
+        int                         n_states,
+        struct ggml_tensor        * query,
+        float                       eps) {
+    GGML_ASSERT(n_states >= 1 && n_states <= 6);
+    const int64_t n_embd   = states[0]->ne[0];
+    const int64_t n_tokens = states[0]->ne[1] * states[0]->ne[2];
+    const int64_t Q        = query->ne[1];
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_tokens, Q);
+    result->op = GGML_OP_INKLING_FUSED;
+    for (int i = 0; i < n_states; ++i) {
+        result->src[i] = states[i];
+    }
+    result->src[n_states] = query;
+    ggml_set_op_params_i32(result, 0, 3);
+    ggml_set_op_params_i32(result, 1, n_states);
+    ggml_set_op_params_f32(result, 2, eps);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_rms2_concat(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * message,
+        float                 eps) {
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * cur->ne[0], cur->ne[1]);
+    result->op     = GGML_OP_INKLING_FUSED;
+    result->src[0] = cur;
+    result->src[1] = message;
+    ggml_set_op_params_i32(result, 0, 4);
+    ggml_set_op_params_f32(result, 1, eps);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_ctrl_apply(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * message,
+        struct ggml_tensor  * raw_gain,
+        struct ggml_tensor  * raw_forget) {
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, cur);
+    result->op     = GGML_OP_INKLING_FUSED;
+    result->src[0] = cur;
+    result->src[1] = message;
+    result->src[2] = raw_gain;
+    result->src[3] = raw_forget;
+    ggml_set_op_params_i32(result, 0, 5);
     return result;
 }
 

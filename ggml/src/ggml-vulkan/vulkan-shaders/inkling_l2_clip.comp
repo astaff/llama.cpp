@@ -1,0 +1,61 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer BufCur   { float data_cur[];   };
+layout(binding = 1) readonly  buffer BufScale { float data_scale[]; };
+layout(binding = 2) readonly  buffer BufTau   { float data_tau[];   };
+layout(binding = 3) writeonly buffer BufDst   { float data_dst[];   };
+
+layout(push_constant) uniform PushConstants {
+    uint  ne0;
+    uint  ne1;
+    uint  ne2;
+    uint  flags; // bit 0: has_scale, bit 1: has_tau
+    uint  off_cur;
+    uint  off_scale;
+    uint  off_tau;
+    uint  off_dst;
+    float threshold;
+    float eps;
+} p;
+
+void main() {
+    const uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u;
+    if (row >= p.ne1 * p.ne2) {
+        return;
+    }
+    const uint lane     = gl_LocalInvocationID.x;
+    const uint cur_base = p.off_cur + row * p.ne0;
+    const uint dst_base = p.off_dst + row * p.ne0;
+    const uint sc_base  = p.off_scale + (row % p.ne1) * p.ne0;
+    const bool has_sc   = (p.flags & 1u) != 0u;
+    const bool has_tau  = (p.flags & 2u) != 0u;
+
+    float ss = 0.0f;
+    for (uint c = lane; c < p.ne0; c += 32u) {
+        float x = data_cur[cur_base + c];
+        if (has_sc) {
+            x *= data_scale[sc_base + c];
+        }
+        ss += x * x;
+    }
+    ss = subgroupAdd(ss);
+    const float norm   = sqrt(ss) + p.eps;
+    const float factor = clamp(p.threshold / norm, 0.0f, 1.0f);
+    const float tau_v  = has_tau ? data_tau[p.off_tau + (row / p.ne1)] : 1.0f;
+
+    for (uint c = lane; c < p.ne0; c += 32u) {
+        float x = data_cur[cur_base + c];
+        if (has_sc) {
+            x *= data_scale[sc_base + c];
+        }
+        float out_v = x * factor;
+        if (has_tau) {
+            out_v *= tau_v;
+        }
+        data_dst[dst_base + c] = out_v;
+    }
+}

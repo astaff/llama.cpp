@@ -1,0 +1,76 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer BufCur   { float data_cur[];   };
+layout(binding = 1) readonly  buffer BufHist  { float data_hist[];  };
+layout(binding = 2) readonly  buffer BufW     { float data_w[];     };
+layout(binding = 3) readonly  buffer BufDyn   { float data_dyn[];   };
+layout(binding = 4) writeonly buffer BufState { float data_state[]; };
+layout(binding = 5) writeonly buffer BufDst   { float data_dst[];   };
+
+layout(push_constant) uniform PushConstants {
+    uint  n_channels;
+    uint  n_seq_tokens;
+    uint  n_seqs;
+    uint  hist_sconv_ch;
+    uint  ch_offset;
+    uint  n_heads; // 0 if !has_dynamic
+    uint  st_base_f32;
+    uint  st_seq_stride;
+    uint  st_slot_stride;
+    uint  st_kw;
+    uint  off_cur;
+    uint  off_hist;
+    uint  off_w;
+    uint  off_dyn;
+    uint  off_dst;
+    float scale_out;
+} p;
+
+float load_conv_x(uint seq, uint c, int pos) {
+    if (pos < 0) {
+        return data_hist[p.off_hist + (seq * p.hist_sconv_ch + (p.ch_offset + c)) * 3u + uint(pos + 3)];
+    }
+    return data_cur[p.off_cur + (seq * p.n_seq_tokens + uint(pos)) * p.n_channels + c];
+}
+
+void main() {
+    const uint c   = gl_GlobalInvocationID.x;
+    const uint t   = gl_WorkGroupID.y;
+    const uint seq = gl_WorkGroupID.z;
+    if (c >= p.n_channels || t >= p.n_seq_tokens || seq >= p.n_seqs) {
+        return;
+    }
+
+    const float x0 = load_conv_x(seq, c, int(t) - 3);
+    const float x1 = load_conv_x(seq, c, int(t) - 2);
+    const float x2 = load_conv_x(seq, c, int(t) - 1);
+    const float x3 = load_conv_x(seq, c, int(t));
+
+    const uint wb = p.off_w + c * 4u;
+    float sum = ((x0 * data_w[wb + 0u] + x1 * data_w[wb + 1u]) + x2 * data_w[wb + 2u]) + x3 * data_w[wb + 3u];
+
+    const uint tok_global = seq * p.n_seq_tokens + t;
+    if (p.n_heads > 0u) {
+        const uint head_dim = p.n_channels / p.n_heads;
+        const uint head     = c / head_dim;
+        const uint db       = p.off_dyn + (tok_global * p.n_heads + head) * 4u;
+        // Exact sequential lag=0..3 accumulation matching inkling2.cpp:226-237
+        sum += x3 * data_dyn[db + 0u];
+        sum += x2 * data_dyn[db + 1u];
+        sum += x1 * data_dyn[db + 2u];
+        sum += x0 * data_dyn[db + 3u];
+    }
+
+    data_dst[p.off_dst + tok_global * p.n_channels + c] = (x3 + sum) * p.scale_out;
+
+    const int target_slot = int(p.n_seq_tokens) - 1 - int(t);
+    if (target_slot >= 0 && uint(target_slot) < p.st_kw) {
+        const uint sb = p.st_base_f32 + uint(target_slot) * p.st_slot_stride + seq * p.st_seq_stride + c * 3u;
+        data_state[sb + 0u] = x1;
+        data_state[sb + 1u] = x2;
+        data_state[sb + 2u] = x3;
+    }
+}

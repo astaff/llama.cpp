@@ -1526,8 +1526,11 @@ public:
 
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
+            const bool greedy_ids_only = has_markov_context && !sample_from_anchor && !sampled[seq_id] &&
+                                         params.p_min <= 0.0f && !getenv("LLAMA_DSPARK_HOST_LOGITS");
             for (int32_t i = 0; i < n_block_tokens; ++i) {
-                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, true);
+                const bool output = greedy_ids_only ? (i >= 1) : true;
+                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, output);
                 if (state) {
                     // reserved up front, so the views of the earlier tokens stay valid
                     GGML_ASSERT(block_state.size() + n_embd_dec <= block_state.capacity());
@@ -1594,6 +1597,21 @@ public:
                 if (result.size() < (size_t) params.n_min) {
                     result.clear();
                     dp.result_q->clear();
+                }
+                continue;
+            }
+
+            if (has_markov_context && !sample_from_anchor && !sampled[seq_id] &&
+                params.p_min <= 0.0f && !getenv("LLAMA_DSPARK_HOST_LOGITS")) {
+                for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
+                    const llama_token best = llama_get_sampled_token_ith(ctx_dft, beg + i);
+                    if (best == LLAMA_TOKEN_NULL) {
+                        break;
+                    }
+                    result.push_back(best);
+                }
+                if (result.size() < (size_t) params.n_min) {
+                    result.clear();
                 }
                 continue;
             }

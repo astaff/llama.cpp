@@ -551,6 +551,11 @@ static constexpr std::initializer_list<ggml_op> topk_moe_sigmoid_norm_bias{ GGML
                                                                             GGML_OP_RESHAPE,  GGML_OP_SUM_ROWS, GGML_OP_CLAMP,
                                                                             GGML_OP_DIV,      GGML_OP_RESHAPE };
 
+static constexpr std::initializer_list<ggml_op> topk_moe_sigmoid_norm_bias_eps{ GGML_OP_UNARY,    GGML_OP_RESHAPE,  GGML_OP_ADD,
+                                                                                GGML_OP_ARGSORT,  GGML_OP_VIEW,     GGML_OP_GET_ROWS,
+                                                                                GGML_OP_RESHAPE,  GGML_OP_SUM_ROWS, GGML_OP_SCALE,
+                                                                                GGML_OP_DIV,      GGML_OP_RESHAPE };
+
 static constexpr std::initializer_list<ggml_op> topk_moe_sqrt_softplus_norm_bias{ GGML_OP_UNARY,    GGML_OP_SQRT,
                                                                                   GGML_OP_RESHAPE,  GGML_OP_ADD,
                                                                                   GGML_OP_ARGSORT,  GGML_OP_VIEW,
@@ -668,6 +673,7 @@ enum topk_moe_mode {
     TOPK_MOE_EARLY_SOFTMAX_NORM,
     TOPK_MOE_LATE_SOFTMAX,
     TOPK_MOE_SIGMOID_NORM_BIAS,
+    TOPK_MOE_SIGMOID_NORM_BIAS_EPS,
     TOPK_MOE_SQRT_SOFTPLUS_NORM_BIAS,
     TOPK_MOE_COUNT,
 };
@@ -984,6 +990,7 @@ struct vk_device_struct {
 
     // [src/dst 0=fp32,1=fp16,2=bf16]
     vk_pipeline pipeline_glu[GGML_GLU_OP_COUNT][3];
+    vk_pipeline pipeline_inkling_fused[6];
 
     vk_pipeline pipeline_silu_back_f32;
     vk_pipeline pipeline_soft_max_f32, pipeline_soft_max_f32_f16;
@@ -1217,6 +1224,7 @@ typedef std::vector<vk_submission> vk_sequence;
 #define MAT_VEC_FUSION_FLAGS_SKIP_F32_D 0x40000 // s14: mul_mv_mma_id _pairglu skips dead FP32 D store
 #define MAT_VEC_FUSION_FLAGS_LORA0 0x80000 // fused dynamic LoRA0 epilogue
 #define MAT_VEC_FUSION_FLAGS_LORA1 0x100000 // fused dynamic LoRA1 epilogue (up in PAIR_GLU, second mm in PAIR_MM)
+#define MAT_VEC_FUSION_FLAGS_EXP_SCALE0 0x200000 // per-expert .scale indexed by expert_idx
 
 struct vk_staging_memcpy {
     vk_staging_memcpy(void * _dst, const void * _src, size_t _n) : dst(_dst), src(_src), n(_n) {}

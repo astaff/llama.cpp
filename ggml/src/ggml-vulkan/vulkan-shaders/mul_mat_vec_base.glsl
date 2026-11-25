@@ -268,6 +268,9 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
                     temp[j][n] += FLOAT_TYPE(data_fuse0[expert_id*p.stride_d + first_row + n]);
                 }
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_EXP_SCALE0) != 0) {
+                    temp[j][n] *= FLOAT_TYPE(data_fuse0[expert_id]);
+                }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0) != 0) {
                     const uint s0_idx = gen_expert_i0() + ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0_TOK) != 0 ? gen_expert_i1() * p.nei0 : 0u);
                     temp[j][n] *= FLOAT_TYPE(data_fuse0[s0_idx]);
@@ -442,6 +445,9 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
                     temp[j][n] += FLOAT_TYPE(data_fuse0[expert_id*p.stride_d + first_row + n]);
                 }
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_EXP_SCALE0) != 0) {
+                    temp[j][n] *= FLOAT_TYPE(data_fuse0[expert_id]);
+                }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0) != 0) {
                     const uint s0_idx = gen_expert_i0() + ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0_TOK) != 0 ? gen_expert_i1() * p.nei0 : 0u);
                     temp[j][n] *= FLOAT_TYPE(data_fuse0[s0_idx]);
@@ -508,6 +514,9 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
 #ifdef MUL_MAT_ID
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
                     tmpsh[j][n][0] += FLOAT_TYPE(data_fuse0[expert_id*p.stride_d + first_row + n]);
+                }
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_EXP_SCALE0) != 0) {
+                    tmpsh[j][n][0] *= FLOAT_TYPE(data_fuse0[expert_id]);
                 }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0) != 0) {
                     const uint s0_idx = gen_expert_i0() + ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0_TOK) != 0 ? gen_expert_i1() * p.nei0 : 0u);

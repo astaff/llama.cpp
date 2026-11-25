@@ -331,11 +331,19 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
 
     const float softcap = softcap_after_bias ? g.hparams.f_final_logit_softcapping : 0.0f;
 
+    const bool ids_only = rnn_state != nullptr && !sample_from_anchor && !has_conf &&
+                          g.ubatch.output != nullptr && g.ubatch.output[0] == 0 &&
+                          g.n_outputs > 0 && g.n_outputs == n_blocks * (block_drafts - i_draft_beg);
+    const int64_t n_draft = block_drafts - i_draft_beg;
+    if (ids_only) {
+        res->t_sampled.assign(n_draft * n_blocks, nullptr);
+    }
+
     ggml_tensor * cat      = nullptr;
     ggml_tensor * cat_conf = nullptr;
     ggml_tensor * cat_draw = nullptr;
 
-    if (!sample_from_anchor) {
+    if (!sample_from_anchor && !ids_only) {
         // bonus anchor slot: pass the logits through unbiased, pad the (unread) confidence column
         cat = ggml_cont(ctx0, ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, 0));
         if (has_conf) {
@@ -400,7 +408,9 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
             col = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, col, 1.0f/softcap)), softcap);
         }
 
-        cat = cat ? ggml_concat(ctx0, cat, col, 1) : col;
+        if (!ids_only) {
+            cat = cat ? ggml_concat(ctx0, cat, col, 1) : col;
+        }
 
         if (has_conf) {
             // confidence head input: predicts per-position acceptance
@@ -418,12 +428,31 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
             cat_conf = cat_conf ? ggml_concat(ctx0, cat_conf, conf, 1) : conf;
         }
 
-        if (rnn_state) {
+        if (ids_only) {
+            prev = ggml_argmax(ctx0, col);
+            if (n_blocks == 1) {
+                ggml_set_output(prev);
+                res->t_sampled[i - i_draft_beg] = prev;
+                ggml_build_forward_expand(g.gf, prev);
+            } else {
+                for (int64_t s = 0; s < n_blocks; ++s) {
+                    ggml_tensor * ps = ggml_view_1d(ctx0, prev, 1, s * prev->nb[0]);
+                    ggml_set_output(ps);
+                    res->t_sampled[s * n_draft + (i - i_draft_beg)] = ps;
+                    ggml_build_forward_expand(g.gf, ps);
+                }
+            }
+        } else if (rnn_state) {
             ggml_tensor * packed = draw(col, i, prev);
             cat_draw = cat_draw ? ggml_concat(ctx0, cat_draw, packed, 1) : packed;
         } else if (i + 1 < block_drafts) {
             prev = ggml_argmax(ctx0, col);
         }
+    }
+
+    if (ids_only) {
+        res->t_logits = nullptr;
+        return;
     }
 
     if (cat_draw) {

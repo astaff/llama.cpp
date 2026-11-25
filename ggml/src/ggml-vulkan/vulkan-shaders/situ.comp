@@ -1,0 +1,14 @@
+#version 450
+
+#include "glu_head.glsl"
+
+float op(float a, float b) {
+    const float beta = p.alpha;
+    const float lb   = p.limit;
+    const float inv_beta = 1.0f / beta;
+    const float act = (tanh(a * inv_beta) * beta) * (1.0f / (1.0f + exp(-a)));
+    const float u   = (lb > 0.0f) ? (tanh(b * (1.0f / lb)) * lb) : b;
+    return act * u;
+}
+
+#include "glu_main.glsl"

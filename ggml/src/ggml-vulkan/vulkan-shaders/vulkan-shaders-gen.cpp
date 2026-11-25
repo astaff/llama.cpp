@@ -814,7 +814,7 @@ void process_shaders() {
 
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     string_to_spv("mul_mv_mma_f32_f16", "mul_mv_mma.comp", {{"FLOAT16", "1"}, {"DATA_A_F32_F16", "1"}}, true, true, false, false);
-    for (const std::string & mma_t : {"f32", "f16", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "q4_k", "q5_k", "q6_k", "iq4_xs", "iq4_nl"}) {
+    for (const std::string & mma_t : {"f32", "f16", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "q4_k", "q5_k", "q6_k", "iq4_xs", "iq4_nl", "nvfp4"}) {
         const std::string mma_def = "DATA_A_" + to_uppercase(mma_t);
         string_to_spv("mul_mv_mma_" + mma_t,    "mul_mv_mma.comp", {{"FLOAT16", "1"}, {mma_def, "1"}}, true, true, false, false);
         string_to_spv("mul_mv_mma_id_" + mma_t, "mul_mv_mma.comp", {{"FLOAT16", "1"}, {"MUL_MAT_ID", "1"}, {mma_def, "1"}}, true, true, false, false);
@@ -1058,7 +1058,7 @@ void process_shaders() {
                                      "elu", "xielu", "sgn", "softplus", "step", "round", "ceil", "floor", "trunc"}) {
             string_to_spv(op + "_" + t, "unary.comp", merge_maps(dict, {{"OP", "op_" + op}}));
         }
-        for (const std::string op : {"geglu", "reglu", "swiglu", "swiglu_oai", "swiglu_clamp", "geglu_erf", "geglu_quick"}) {
+        for (const std::string op : {"geglu", "reglu", "swiglu", "swiglu_oai", "swiglu_clamp", "situ", "geglu_erf", "geglu_quick"}) {
             string_to_spv(op + "_" + t, op + ".comp", dict);
         }
         string_to_spv("log_" + t, "log.comp", dict);
@@ -1153,6 +1153,12 @@ void process_shaders() {
     }
 
     string_to_spv("out_prod_f32", "out_prod.comp", {});
+    string_to_spv("inkling_l2_clip",     "inkling_l2_clip.comp",     {});
+    string_to_spv("inkling_conv",        "inkling_conv.comp",        {});
+    string_to_spv("inkling_rel_gather",  "inkling_rel_gather.comp",  {});
+    string_to_spv("inkling_depth_mix",   "inkling_depth_mix.comp",   {});
+    string_to_spv("inkling_rms2_concat", "inkling_rms2_concat.comp", {});
+    string_to_spv("inkling_ctrl_apply",  "inkling_ctrl_apply.comp",  {});
 
     string_to_spv("timestep_embedding_f32", "timestep_embedding.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
 

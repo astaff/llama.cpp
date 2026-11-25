@@ -2103,6 +2103,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_glu(params, tensor);
             } break;
+        case GGML_OP_INKLING_FUSED:
+            {
+                ggml_compute_forward_inkling_fused(params, tensor);
+            } break;
         case GGML_OP_GET_REL_POS:
             {
                 ggml_compute_forward_get_rel_pos(params, tensor);
@@ -2330,6 +2334,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_INKLING_FUSED:
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
@@ -2388,6 +2393,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
                 case GGML_GLU_OP_SWIGLU_CLAMP:
+                case GGML_GLU_OP_SITU:
                     {
                         n_tasks = n_threads;
                     } break;
