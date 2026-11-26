@@ -4,6 +4,175 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+
+#include <algorithm>
+#include <cstring>
+#include <mutex>
+#include <strings.h>
+#include <thread>
+#include <vector>
+
+// Series 23 (B1): Lazily quantize BF16/F16/F32 dspark_markov_w2 ([256, 200058] = 102.4 MB) into Q4_K/Q5_K/Q6_K
+// so the entire Markov output projection fits inside Apple M4 Max's 48 MiB SLC across chained draft steps.
+static void s23_ensure_dspark_w2_quant(const llama_model & model) {
+    if (model.dspark_markov_w2_ready) {
+        return;
+    }
+    static std::mutex s23_w2_mtx;
+    std::lock_guard<std::mutex> lock(s23_w2_mtx);
+    if (model.dspark_markov_w2_ready) {
+        return;
+    }
+
+    const ggml_tensor * w2 = model.dspark_markov_w2;
+    if (!w2 || !w2->buffer || ggml_backend_buffer_get_size(w2->buffer) == 0) {
+        return;
+    }
+
+    ggml_type qtype = GGML_TYPE_Q6_K;
+    if (const char * env_t = getenv("LLAMA_DSPARK_W2_TYPE")) {
+        if (env_t[0] != '\0') {
+            if (strcasecmp(env_t, "raw") == 0 || strcasecmp(env_t, "bf16") == 0 ||
+                strcasecmp(env_t, "none") == 0 || strcmp(env_t, "0") == 0) {
+                model.dspark_markov_w2_ready = true;
+                return;
+            } else if (strcasecmp(env_t, "q4_k") == 0) {
+                qtype = GGML_TYPE_Q4_K;
+            } else if (strcasecmp(env_t, "q5_k") == 0) {
+                qtype = GGML_TYPE_Q5_K;
+            } else if (strcasecmp(env_t, "q6_k") == 0) {
+                qtype = GGML_TYPE_Q6_K;
+            } else if (strcasecmp(env_t, "q8_0") == 0) {
+                qtype = GGML_TYPE_Q8_0;
+            } else if (strcasecmp(env_t, "q4_0") == 0) {
+                qtype = GGML_TYPE_Q4_0;
+            } else if (strcasecmp(env_t, "nvfp4") == 0) {
+                qtype = GGML_TYPE_NVFP4;
+            }
+        }
+    }
+
+    const bool supported_src =
+        w2->type == GGML_TYPE_BF16 || w2->type == GGML_TYPE_F16 || w2->type == GGML_TYPE_F32;
+    const int64_t ne0 = w2->ne[0];
+    const int64_t ne1 = w2->ne[1];
+    if (!supported_src || w2->ne[2] != 1 || w2->ne[3] != 1 || !ggml_is_contiguous(w2) ||
+        model.dspark_markov_w2_s != nullptr || !model.loras.empty() ||
+        model.hdmd.rot.find(w2) != model.hdmd.rot.end() ||
+        (ne0 % ggml_blck_size(qtype)) != 0) {
+        model.dspark_markov_w2_ready = true;
+        return;
+    }
+
+    const auto * src_traits = ggml_get_type_traits(w2->type);
+    if (w2->type != GGML_TYPE_F32 && (!src_traits || !src_traits->to_float)) {
+        model.dspark_markov_w2_ready = true;
+        return;
+    }
+
+    ggml_init_params params = { ggml_tensor_overhead() * 4, nullptr, true };
+    ggml_context_ptr ctx(ggml_init(params));
+    if (!ctx) {
+        model.dspark_markov_w2_ready = true;
+        return;
+    }
+
+    ggml_tensor * w2_q = ggml_new_tensor_2d(ctx.get(), qtype, ne0, ne1);
+    ggml_set_name(w2_q, "markov_w2.weight.s23_q");
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(w2->buffer);
+    if ((qtype == GGML_TYPE_Q4_K || qtype == GGML_TYPE_Q5_K ||
+         qtype == GGML_TYPE_Q6_K || qtype == GGML_TYPE_NVFP4) &&
+        !getenv("LLAMA_DSPARK_W2_NO_REPACK")) {
+        ggml_backend_dev_t dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+        ggml_backend_reg_t reg = dev  ? ggml_backend_dev_backend_reg(dev)  : nullptr;
+        auto get_extra_bufts = reg
+            ? reinterpret_cast<ggml_backend_dev_get_extra_bufts_t>(
+                  ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts"))
+            : nullptr;
+        if (get_extra_bufts) {
+            ggml_backend_buffer_type_t * extra = get_extra_bufts(dev);
+            for (size_t bi = 0; extra && extra[bi] != nullptr; ++bi) {
+                const char * bname = ggml_backend_buft_name(extra[bi]);
+                if (bname && std::strstr(bname, "_Repack") != nullptr &&
+                    ggml_backend_buft_get_alloc_size(extra[bi], w2_q) > 0) {
+                    buft = extra[bi];
+                    break;
+                }
+            }
+        }
+    }
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+    if (!buf) {
+        model.dspark_markov_w2_ready = true;
+        return;
+    }
+    ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    const size_t src_bytes     = ggml_nbytes(w2);
+    const size_t dst_bytes     = ggml_nbytes(w2_q);
+    const size_t alloc_bytes   = ggml_backend_buffer_get_alloc_size(buf.get(), w2_q);
+    const size_t src_row_bytes = ggml_row_size(w2->type, ne0);
+    const size_t dst_row_bytes = ggml_row_size(qtype, ne0);
+
+    std::vector<uint8_t> raw_stage(src_bytes);
+    std::vector<uint8_t> q_stage(dst_bytes);
+    ggml_backend_tensor_get(w2, raw_stage.data(), 0, src_bytes);
+
+    ggml_quantize_init(qtype);
+
+    const unsigned hw_threads = std::thread::hardware_concurrency();
+    const int64_t  n_workers  = (int64_t) std::min<unsigned>(8u, std::max<unsigned>(1u, hw_threads));
+    const int64_t  rows_per_w = (ne1 + n_workers - 1) / n_workers;
+
+    auto quant_worker = [&](int64_t r_beg, int64_t r_end) {
+        constexpr int64_t TILE_ROWS = 256;
+        std::vector<float> f32_tile((size_t) (TILE_ROWS * ne0));
+        for (int64_t r0 = r_beg; r0 < r_end; r0 += TILE_ROWS) {
+            const int64_t nr      = std::min<int64_t>(TILE_ROWS, r_end - r0);
+            const uint8_t * s_ptr = raw_stage.data() + (size_t) r0 * src_row_bytes;
+            uint8_t       * d_ptr = q_stage.data()   + (size_t) r0 * dst_row_bytes;
+            const float   * f_ptr = nullptr;
+            if (w2->type == GGML_TYPE_F32) {
+                f_ptr = reinterpret_cast<const float *>(s_ptr);
+            } else {
+                src_traits->to_float(s_ptr, f32_tile.data(), nr * ne0);
+                f_ptr = f32_tile.data();
+            }
+            ggml_quantize_chunk(qtype, f_ptr, d_ptr, 0, nr, ne0, nullptr);
+        }
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve((size_t) std::max<int64_t>(0, n_workers - 1));
+    for (int64_t w = 1; w < n_workers; ++w) {
+        const int64_t r_beg = w * rows_per_w;
+        const int64_t r_end = std::min<int64_t>(ne1, r_beg + rows_per_w);
+        if (r_beg < r_end) {
+            workers.emplace_back(quant_worker, r_beg, r_end);
+        }
+    }
+    quant_worker(0, std::min<int64_t>(ne1, rows_per_w));
+    for (auto & th : workers) {
+        th.join();
+    }
+
+    ggml_backend_tensor_set(w2_q, q_stage.data(), 0, dst_bytes);
+
+    model.dspark_w2_q_ctx        = std::move(ctx);
+    model.dspark_w2_q_buf        = std::move(buf);
+    model.dspark_markov_w2_q     = w2_q;
+    model.dspark_markov_w2_ready = true;
+
+    LLAMA_LOG_INFO("%s: quantized dspark_markov_w2 [%lld, %lld] %s (%.2f MiB) -> %s on %s (%.2f MiB) for SLC residency\n",
+            __func__, (long long) ne0, (long long) ne1,
+            ggml_type_name(w2->type), (double) src_bytes / (1024.0 * 1024.0),
+            ggml_type_name(qtype),    ggml_backend_buft_name(buft),
+            (double) alloc_bytes / (1024.0 * 1024.0));
+}
+
 // DeepSeek-V4 DSpark backbone: stages are full DSV4 blocks, uniform sliding window (the draft KV ring)
 void llama_model_dflash::load_hparams_dsv4(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,                hparams.n_lora_q);
@@ -235,8 +404,12 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     ggml_context * ctx0 = g.ctx0;
     auto         & res  = g.res;
 
+    if (!model.dspark_markov_w2_ready) {
+        s23_ensure_dspark_w2_quant(model);
+    }
+
     ggml_tensor * w1 = model.dspark_markov_w1;
-    ggml_tensor * w2 = model.dspark_markov_w2;
+    ggml_tensor * w2 = model.dspark_markov_w2_q ? model.dspark_markov_w2_q : model.dspark_markov_w2;
     GGML_ASSERT(w1 && w2 && "DSpark markov weights not loaded");
 
     // confidence head is optional

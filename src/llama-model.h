@@ -975,6 +975,12 @@ struct llama_model {
     mutable struct ggml_tensor *    dspark_f_rnn_ring    = nullptr;
     mutable uint32_t                dspark_ring_n_seq    = 0;
 
+    // Series 23 (B1): SLC-resident quantized dspark_markov_w2 ([rank, n_vocab_draft])
+    mutable ggml_context_ptr        dspark_w2_q_ctx;
+    mutable ggml_backend_buffer_ptr dspark_w2_q_buf;
+    mutable struct ggml_tensor *    dspark_markov_w2_q     = nullptr;
+    mutable bool                    dspark_markov_w2_ready = false;
+
     // zaya1
     struct ggml_tensor * res_scale_in   = nullptr;
     struct ggml_tensor * res_scale_in_b = nullptr;
