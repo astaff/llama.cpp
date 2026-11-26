@@ -486,13 +486,18 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
         const int64_t Kw = std::min(n_seq_tokens, K);
         const int32_t n_heads = dynamic ? (int32_t)(dynamic->ne[0] / n_conv) : 0;
         const float scale_out = 1.0f / sqrtf((dynamic ? 2 : 1) * n_conv + 1);
-        return ggml_inkling_conv(
+        ggml_tensor * conv = ggml_inkling_conv(
             ctx0, cur, history, weight, dynamic, state,
             (int32_t)offset, (int32_t)n_seq_tokens, (int32_t)n_seqs, n_heads,
             (int32_t)(cell_offs / sizeof(float)),
             (int32_t)(row_size / sizeof(float)),
             (int32_t)(((size_t)mctx_cur->get_size() * row_size) / sizeof(float)),
             (int32_t)Kw, scale_out);
+        const ggml_tensor * vs = history ? history->view_src : nullptr;
+        if (inp && inp->s_copy && !getenv("S19_NO_SCOPY_BIND") && vs == state) {
+            conv->src[6] = inp->s_copy;
+        }
+        return conv;
     }
 
     ggml_tensor * past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
@@ -591,16 +596,19 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
     ggml_tensor * state   = recr->mctx->get_r_l(il);
     ggml_tensor * history = nullptr;
+    const int64_t  rs_k  = cparams.n_rs_seq == 0 ? 1 : ((int64_t)cparams.n_rs_seq + 1);
+    const uint32_t rs_kw = (uint32_t)std::min<int64_t>(ubatch.n_seq_tokens, rs_k);
     const bool direct_scopy = recr && recr->s_copy && hparams.n_shortconv_l_cache == 4 && ubatch.n_seq_tokens <= 16 &&
-                              cparams.n_rs_seq > 0 && ubatch.n_seqs == 1 && recr->mctx->get_n_rs() == 1 &&
+                              recr->mctx->can_direct_scopy(ubatch.n_seqs, rs_kw) &&
                               !getenv("GGML_INKLING_NO_FUSE") && !getenv("S19_NO_SCOPY_BIND");
     if (direct_scopy) {
         ggml_tensor * states = ggml_reshape_2d(ctx0, state, hparams.n_embd_r(), state->ne[1]);
         const int32_t rs_zero = recr->mctx->get_rs_z();
         ggml_tensor * state_zero = ggml_view_1d(ctx0, states, hparams.n_embd_r() * (rs_zero >= 0), rs_zero * states->nb[1] * (rs_zero >= 0));
         ggml_build_forward_expand(gf, ggml_fill_inplace(ctx0, state_zero, 0.0f));
-        history = ggml_view_3d(ctx0, state, hparams.n_shortconv_l_cache - 1, hparams.n_sconv_channels, 1,
-                               (hparams.n_shortconv_l_cache - 1) * sizeof(float), state->nb[1], 0);
+        history = ggml_view_3d(ctx0, state, hparams.n_shortconv_l_cache - 1, hparams.n_sconv_channels, ubatch.n_seqs,
+                               (hparams.n_shortconv_l_cache - 1) * sizeof(float), state->nb[1],
+                               (size_t)recr->mctx->get_head() * state->nb[1]);
     } else {
         history = build_rs(recr, state, hparams.n_embd_r(), ubatch.n_seqs);
         history = ggml_reshape_3d(ctx0, history, hparams.n_shortconv_l_cache - 1, hparams.n_sconv_channels, ubatch.n_seqs);
@@ -1021,21 +1029,6 @@ void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vec
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
-
-    // Series 19 (W1.3 / W6 / W10): Bind rs_s_copy (src[6]) onto mode=1 inkling_conv nodes when WAR-free
-    if (recr && recr->s_copy &&
-        (cparams.n_rs_seq == 0 || (ubatch.n_seqs == 1 && recr->mctx->get_n_rs() == 1)) &&
-        ubatch.n_seq_tokens <= 16 && !getenv("S19_NO_SCOPY_BIND")) {
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx0); t != nullptr; t = ggml_get_next_tensor(ctx0, t)) {
-            if (t->op == GGML_OP_INKLING_FUSED && t->op_params[0] == 1 &&
-                t->src[1] && t->src[4] && t->src[6] == nullptr) {
-                const ggml_tensor * vs = t->src[1]->view_src;
-                if (t->src[1] == t->src[4] || vs == t->src[4] || (vs && vs->view_src == t->src[4])) {
-                    t->src[6] = recr->s_copy;
-                }
-            }
-        }
-    }
 
     // Series 19 (W1.1): Slice model.output to n_vocab_unpadded before build_lora_mm (0-ULP, eliminates trailing CPY)
     ggml_tensor * w_out   = model.output;
