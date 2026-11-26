@@ -1114,6 +1114,280 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
     return result;
 }
 
+std::vector<llama_token> common_sampler_sample_and_accept_n_tree(
+        struct common_sampler * gsmpl,
+        struct llama_context  * ctx,
+        const std::vector<int> & idxs_b0,
+        const llama_tokens     & draft_b0,
+        const std::vector<int> & idxs_b1,
+        const llama_tokens     & draft_b1,
+        int                      branch_pos,
+        int                    * out_won_branch,
+        bool                     grammar_first) {
+    GGML_ASSERT(draft_b0.size() == draft_b1.size());
+    GGML_ASSERT(idxs_b0.size() == draft_b0.size() + 1);
+    GGML_ASSERT(idxs_b1.size() == draft_b1.size() + 1);
+    GGML_ASSERT(branch_pos >= 0 && branch_pos < (int) draft_b0.size());
+
+    if (out_won_branch) {
+        *out_won_branch = 0;
+    }
+
+    std::vector<llama_token> result;
+    result.reserve(idxs_b0.size());
+
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+
+    float eff_temp = 1.0f;
+    struct llama_sampler * dist_smpl = nullptr;
+    bool raw_pure_temp_dist = false;
+    bool raw_pure_greedy    = false;
+
+    if (!grammar_first &&
+        gsmpl->params.mirostat == 0 &&
+        gsmpl->params.n_probs == 0 &&
+        !getenv("LLAMA_NO_S20_DIST_FAST") &&
+        llama_get_sampled_token_ith(ctx, idxs_b0[0]) == LLAMA_TOKEN_NULL &&
+        !llama_get_sampled_probs_ith(ctx, idxs_b0[0]) &&
+        !llama_get_sampled_logits_ith(ctx, idxs_b0[0])) {
+        raw_pure_temp_dist = llama_sampler_chain_is_pure_temp_dist(gsmpl->chain, &eff_temp, &dist_smpl);
+        if (!raw_pure_temp_dist && !getenv("GGML_VK_DISABLE_GREEDY_FAST")) {
+            raw_pure_greedy = llama_sampler_chain_is_pure_greedy(gsmpl->chain);
+        }
+    }
+
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    bool synced = false;
+
+    auto sample_step = [&](int batch_idx) -> llama_token {
+        if ((raw_pure_temp_dist || raw_pure_greedy) &&
+            common_sampler_constraints_are_noop(gsmpl) &&
+            llama_get_sampled_token_ith(ctx, batch_idx) == LLAMA_TOKEN_NULL &&
+            !llama_get_sampled_probs_ith(ctx, batch_idx) &&
+            !llama_get_sampled_logits_ith(ctx, batch_idx)) {
+            if (!synced) {
+                llama_synchronize(ctx);
+                synced = true;
+            }
+            const auto tm = gsmpl->tm();
+            const float * row = llama_get_logits_ith_ro(ctx, batch_idx);
+            GGML_ASSERT(row != nullptr);
+
+            llama_token id = 0;
+            if (raw_pure_temp_dist) {
+                id = llama_sampler_temp_dist_sample_raw_0ulp(dist_smpl, row, n_vocab, eff_temp);
+            } else {
+                float best_val = row[0];
+                for (llama_token token_id = 1; token_id < n_vocab; ++token_id) {
+                    const float v = row[token_id];
+                    if (v > best_val) {
+                        best_val = v;
+                        id       = token_id;
+                    }
+                }
+            }
+            const float picked_logit = row[id];
+            gsmpl->cur.resize(1);
+            gsmpl->cur[0] = llama_token_data{ id, picked_logit, 1.0f };
+            gsmpl->cur_p  = { gsmpl->cur.data(), 1, 0, true };
+            return id;
+        }
+
+        return common_sampler_sample(gsmpl, ctx, batch_idx, grammar_first);
+    };
+
+    const size_t n_draft = draft_b0.size();
+    int win = 0;
+    size_t i = 0;
+    for (; i < n_draft; ++i) {
+        const auto & cur_idxs  = (win == 0) ? idxs_b0  : idxs_b1;
+        const auto & cur_draft = (win == 0) ? draft_b0 : draft_b1;
+        const llama_token id = sample_step(cur_idxs[i]);
+
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+
+        if (llama_vocab_is_eog(vocab, id) && i + 1 < n_draft) {
+            break;
+        }
+
+        if ((int) i == branch_pos) {
+            if (id == draft_b0[i]) {
+                win = 0;
+            } else if (id == draft_b1[i]) {
+                win = 1;
+            } else {
+                break;
+            }
+        } else if (cur_draft[i] != id) {
+            break;
+        }
+    }
+
+    if (i == n_draft) {
+        const auto & cur_idxs = (win == 0) ? idxs_b0 : idxs_b1;
+        const llama_token id = sample_step(cur_idxs[n_draft]);
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+    }
+
+    if (out_won_branch) {
+        *out_won_branch = win;
+    }
+    return result;
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n_tree_rejection(
+        struct common_sampler * gsmpl,
+        struct llama_context  * ctx,
+        const std::vector<int> & idxs_b0,
+        const llama_tokens     & draft_b0,
+        const std::vector<std::vector<llama_token_data>> & draft_q_b0,
+        const std::vector<int> & idxs_b1,
+        const llama_tokens     & draft_b1,
+        const std::vector<std::vector<llama_token_data>> & draft_q_b1,
+        int                      branch_pos,
+        int                    * out_won_branch,
+        bool                     grammar_first) {
+    GGML_ASSERT(draft_b0.size()   == draft_b1.size());
+    GGML_ASSERT(idxs_b0.size()    == draft_b0.size() + 1);
+    GGML_ASSERT(idxs_b1.size()    == draft_b1.size() + 1);
+    GGML_ASSERT(draft_q_b0.size() == draft_b0.size());
+    GGML_ASSERT(draft_q_b1.size() == draft_b1.size());
+    GGML_ASSERT(branch_pos >= 0 && branch_pos < (int) draft_b0.size());
+
+    if (out_won_branch) {
+        *out_won_branch = 0;
+    }
+
+    std::vector<llama_token> result;
+    result.reserve(idxs_b0.size());
+
+    std::uniform_real_distribution<float> uni(0.0f, 1.0f);
+    std::vector<llama_token_data> residual;
+    std::vector<llama_token_data> cand;
+
+    const size_t n_draft = draft_b0.size();
+    int win = 0;
+    size_t i = 0;
+    for (; i < n_draft; ++i) {
+        const auto & cur_idxs    = (win == 0) ? idxs_b0    : idxs_b1;
+        const auto & cur_draft   = (win == 0) ? draft_b0   : draft_b1;
+        const auto & cur_draft_q = (win == 0) ? draft_q_b0 : draft_q_b1;
+
+        const llama_token id_tgt = common_sampler_sample(gsmpl, ctx, cur_idxs[i], grammar_first);
+        const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
+        const auto & q1    = cur_draft_q[i];
+
+        const bool masked = !grammar_first && grammar_should_apply(gsmpl);
+        if (masked) {
+            cand.assign(cur_p->data, cur_p->data + cur_p->size);
+            llama_token_data_array arr = { cand.data(), cand.size(), -1, false };
+            llama_sampler_apply(gsmpl->grmr, &arr);
+        }
+
+        auto p_raw = [&](size_t k) {
+            return masked && cand[k].logit == -INFINITY ? 0.0f : cur_p->data[k].p;
+        };
+
+        float p_sum = 0.0f;
+        if (masked) {
+            for (size_t k = 0; k < cur_p->size; ++k) {
+                p_sum += p_raw(k);
+            }
+        }
+        const float p_norm = masked && p_sum > 0.0f ? 1.0f / p_sum : 1.0f;
+        auto p_of = [&](size_t k) {
+            return p_raw(k) * p_norm;
+        };
+
+        const llama_token a_tok = cur_draft[i];
+        const float q1_a = prob_of(q1.data(), q1.size(), a_tok);
+        float p_a = 0.0f;
+        for (size_t k = 0; k < cur_p->size; ++k) {
+            if (cur_p->data[k].id == a_tok) {
+                p_a = p_of(k);
+                break;
+            }
+        }
+
+        if (q1_a > 0.0f && (p_a >= q1_a || uni(gsmpl->rng) < p_a / q1_a)) {
+            common_sampler_accept(gsmpl, a_tok, true);
+            result.push_back(a_tok);
+            continue;
+        }
+
+        // Stage 1 rejected: compute unnormalized residual r_1(x) = max(0, p(x) - q_1(x))
+        residual.clear();
+        float z1 = 0.0f;
+        for (size_t k = 0; k < cur_p->size; ++k) {
+            const float r1 = p_of(k) - prob_of(q1.data(), q1.size(), cur_p->data[k].id);
+            if (r1 > 0.0f) {
+                residual.push_back({ cur_p->data[k].id, 0.0f, r1 });
+                z1 += r1;
+            }
+        }
+
+        // At branch_pos, test Branch 1's candidate b against normalized residual p^(1)(x) = r_1(x) / z_1
+        if ((int) i == branch_pos && z1 > 0.0f && draft_b1[i] != draft_b0[i]) {
+            const llama_token b_tok = draft_b1[i];
+            const auto & q2 = draft_q_b1[i];
+            const float q2_b = prob_of(q2.data(), q2.size(), b_tok);
+            const float r1_b = prob_of(residual.data(), residual.size(), b_tok);
+            const float p1_b = r1_b / z1;
+            if (q2_b > 0.0f && (p1_b >= q2_b || uni(gsmpl->rng) < p1_b / q2_b)) {
+                win = 1;
+                common_sampler_accept(gsmpl, b_tok, true);
+                result.push_back(b_tok);
+                continue;
+            }
+            // Stage 2 rejected: update residual to r_2(x) = max(0, p^(1)(x) - q_2(x))
+            float z2 = 0.0f;
+            std::vector<llama_token_data> res2;
+            res2.reserve(residual.size());
+            const float inv_z1 = 1.0f / z1;
+            for (const auto & e : residual) {
+                const float r2 = e.p * inv_z1 - prob_of(q2.data(), q2.size(), e.id);
+                if (r2 > 0.0f) {
+                    res2.push_back({ e.id, 0.0f, r2 });
+                    z2 += r2;
+                }
+            }
+            residual = std::move(res2);
+            z1 = z2;
+        }
+
+        llama_token id = id_tgt;
+        if (z1 > 0.0f && !residual.empty()) {
+            float u = uni(gsmpl->rng) * z1;
+            id = residual.back().id;
+            for (const auto & e : residual) {
+                u -= e.p;
+                if (u <= 0.0f) {
+                    id = e.id;
+                    break;
+                }
+            }
+        }
+
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+        break;
+    }
+
+    if (i == n_draft) {
+        const auto & cur_idxs = (win == 0) ? idxs_b0 : idxs_b1;
+        const llama_token id = common_sampler_sample(gsmpl, ctx, cur_idxs[n_draft], grammar_first);
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+    }
+
+    if (out_won_branch) {
+        *out_won_branch = win;
+    }
+    return result;
+}
+
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first) {
     std::vector<int> idxs(draft.size() + 1);
     for (size_t i = 0; i < idxs.size(); ++i) {

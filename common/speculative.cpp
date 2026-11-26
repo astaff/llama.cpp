@@ -1410,6 +1410,8 @@ public:
     }
 };
 
+extern "C" int32_t llama_s23_get_dspark_tree_meta(const llama_context * ctx, float * out, int32_t max_n);
+
 // DSpark: a semi-autoregressive Markov head (+ Confidence head) on the block, anchor-first block layout
 struct common_speculative_impl_draft_dspark final : public common_speculative_impl_draft_dflash {
     // bonus anchor (SpecForge exports) when false: slot 0 is a bonus token, not a prediction slot
@@ -1751,14 +1753,16 @@ public:
                     clear_losing_streak = 0;
                 }
                 if (clear_losing_streak >= 4 || losing_streak >= 9) {
-                    park_rem      = park_cooldown;
-                    park_cooldown = std::min<int32_t>(2048, park_cooldown * 2);
-                    park_rem--;
-                    set_active_skip(false);
-                    prev_mode_depth     = last_mode_depth;
-                    last_mode_depth     = 0;
-                    last_was_pure_plain = true;
-                    return;
+                    if (!getenv("LLAMA_DSPARK_TREE_NO_PARK")) {
+                        park_rem      = park_cooldown;
+                        park_cooldown = std::min<int32_t>(2048, park_cooldown * 2);
+                        park_rem--;
+                        set_active_skip(false);
+                        prev_mode_depth     = last_mode_depth;
+                        last_mode_depth     = 0;
+                        last_was_pure_plain = true;
+                        return;
+                    }
                 }
             }
             if (mtp_steps == 0 || cur_depth <= 0 || cur_depth > max_d) {
@@ -1884,6 +1888,15 @@ public:
             auto * smpl = smpls[seq_id].get();
 
             auto & result = *dp.result;
+            if (dp.result_alt) {
+                dp.result_alt->clear();
+            }
+            if (dp.result_alt_q) {
+                dp.result_alt_q->clear();
+            }
+            if (dp.result_branch_pos) {
+                *dp.result_branch_pos = -1;
+            }
 
             if (sampled[seq_id]) {
                 // the tokens the graph drew, and the distribution q each one was drawn from
@@ -1904,6 +1917,48 @@ public:
                 if (result.size() < (size_t) params.n_min) {
                     result.clear();
                     dp.result_q->clear();
+                } else if (dp.result_alt && dp.result_alt_q && n_seq == 1 && result.size() >= 2 &&
+                           !getenv("LLAMA_DSPARK_NO_TREE")) {
+                    const auto & q0 = (*dp.result_q)[0];
+                    float p_a0 = 0.0f;
+                    float sum_rem = 0.0f;
+                    for (const auto & cd : q0) {
+                        if (cd.id == result[0]) {
+                            p_a0 = cd.p;
+                        } else {
+                            sum_rem += cd.p;
+                        }
+                    }
+                    if (p_a0 < 0.85f && sum_rem > 1e-6f && q0.size() >= 2) {
+                        std::vector<llama_token_data> q2;
+                        q2.reserve(q0.size() - 1);
+                        const float inv_rem = 1.0f / sum_rem;
+                        for (const auto & cd : q0) {
+                            if (cd.id != result[0]) {
+                                const float pn = cd.p * inv_rem;
+                                q2.push_back({ cd.id, std::log(std::max(pn, 1e-12f)), pn });
+                            }
+                        }
+                        float u = (float) std::uniform_real_distribution<double>(0.0, 1.0)(draw_rng[seq_id]);
+                        llama_token b0 = q2.back().id;
+                        for (const auto & cd : q2) {
+                            u -= cd.p;
+                            if (u <= 0.0f) {
+                                b0 = cd.id;
+                                break;
+                            }
+                        }
+                        const size_t m_d = std::min<size_t>(result.size(), 2);
+                        result.resize(m_d);
+                        dp.result_q->resize(m_d);
+                        dp.result_alt->assign(result.begin(), result.end());
+                        (*dp.result_alt)[0] = b0;
+                        dp.result_alt_q->assign(dp.result_q->begin(), dp.result_q->end());
+                        (*dp.result_alt_q)[0] = std::move(q2);
+                        if (dp.result_branch_pos) {
+                            *dp.result_branch_pos = 0;
+                        }
+                    }
                 }
                 last_draft_depth[seq_id] = (int32_t) result.size();
                 continue;
@@ -1920,6 +1975,74 @@ public:
                 }
                 if (result.size() < (size_t) params.n_min) {
                     result.clear();
+                } else if (dp.result_alt && n_seq == 1 && result.size() >= 2 &&
+                           getenv("LLAMA_DSPARK_ENABLE_2BRANCH") && !getenv("LLAMA_DSPARK_NO_TREE")) {
+                    float tmeta[16] = {};
+                    const int32_t n_tm = llama_s23_get_dspark_tree_meta(ctx_dft, tmeta, 16);
+                    if (n_tm >= 2) {
+                        const float theta = getenv("LLAMA_DSPARK_TREE_MARGIN")
+                            ? (float) std::atof(getenv("LLAMA_DSPARK_TREE_MARGIN"))
+                            : 0.35f;
+                        const int32_t m_short = getenv("LLAMA_DSPARK_TREE_DRAFT_LEN")
+                            ? std::max(2, std::atoi(getenv("LLAMA_DSPARK_TREE_DRAFT_LEN")))
+                            : 2;
+                        const int32_t m_long  = getenv("LLAMA_DSPARK_TREE_DRAFT_LEN_LONG")
+                            ? std::max(2, std::atoi(getenv("LLAMA_DSPARK_TREE_DRAFT_LEN_LONG")))
+                            : 3;
+                        const int32_t n_vocab_dft = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+
+                        const float   marg_0  = tmeta[0];
+                        const int64_t cand_id = (int64_t) std::llround(tmeta[1]);
+                        if (marg_0 < theta && cand_id >= 0 && cand_id < n_vocab_dft &&
+                            (llama_token) cand_id != result[0]) {
+                            const int32_t full_d   = (int32_t) result.size();
+                            const int32_t target_m = (dp.pos0 >= 24576) ? m_long : m_short;
+                            const int32_t b1_avail = n_tm - 2;
+                            const int32_t m_d      = std::min<int32_t>(full_d, std::min<int32_t>(target_m, 1 + b1_avail));
+                            if (m_d >= 1 && m_d >= std::max<int32_t>(1, params.n_min)) {
+                                result.resize((size_t) m_d);
+                                dp.result_alt->assign(result.begin(), result.end());
+                                (*dp.result_alt)[0] = (llama_token) cand_id;
+                                for (int32_t k = 1; k < m_d; ++k) {
+                                    const int64_t c_id = (int64_t) std::llround(tmeta[2 + (k - 1)]);
+                                    if (c_id >= 0 && c_id < n_vocab_dft) {
+                                        (*dp.result_alt)[k] = (llama_token) c_id;
+                                    }
+                                }
+                                if (dp.result_branch_pos) {
+                                    *dp.result_branch_pos = 0;
+                                }
+                            }
+                        }
+                    }
+                } else if (n_seq == 1 && result.size() >= 4 &&
+                           getenv("LLAMA_DSPARK_ENABLE_MARGIN") && !getenv("LLAMA_DSPARK_NO_MARGIN")) {
+                    // Series 23 (B2): Logit-margin guided single-tile verification depth!
+                    // On Apple M4 Max, Q4_K/Q5_K/Q6_K repack dmmv has max_r_cols = 4:
+                    //   d = 3 (N = 4) executes in 1 single weight pass across all 36 layers,
+                    //   whereas d = 4 (N = 5 = 4 + 1) spills into 2 passes over every repacked dense matrix!
+                    // Only pay the 2nd weight pass (d = 4) when all 4 draft steps have confident logit margins.
+                    float tmeta[8] = {};
+                    const int32_t n_tm = llama_s23_get_dspark_tree_meta(ctx_dft, tmeta, 8);
+                    if (n_tm >= 4) {
+                        const float theta_d4 = getenv("LLAMA_DSPARK_D4_MARGIN")
+                            ? (float) std::atof(getenv("LLAMA_DSPARK_D4_MARGIN"))
+                            : 1.50f;
+                        const float theta_32k = getenv("LLAMA_DSPARK_D7_MARGIN")
+                            ? (float) std::atof(getenv("LLAMA_DSPARK_D7_MARGIN"))
+                            : 0.60f;
+                        if (dp.pos0 < 24576 && result.size() == 4) {
+                            const float min_m4 = std::min(std::min(tmeta[0], tmeta[1]), std::min(tmeta[2], tmeta[3]));
+                            if (min_m4 < theta_d4 && 3 >= std::max<int32_t>(1, params.n_min)) {
+                                result.resize(3);
+                            }
+                        } else if (dp.pos0 >= 24576 && result.size() > 4) {
+                            const float min_m3 = std::min(tmeta[0], std::min(tmeta[1], tmeta[2]));
+                            if (min_m3 < theta_32k && 3 >= std::max<int32_t>(1, params.n_min)) {
+                                result.resize(3);
+                            }
+                        }
+                    }
                 }
                 last_draft_depth[seq_id] = (int32_t) result.size();
                 continue;

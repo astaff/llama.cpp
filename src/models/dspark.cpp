@@ -14,6 +14,8 @@
 #include <thread>
 #include <vector>
 
+extern "C" void llama_s23_set_dspark_tree_meta(ggml_tensor * t);
+
 // Series 23 (B1): Lazily quantize BF16/F16/F32 dspark_markov_w2 ([256, 200058] = 102.4 MB) into Q4_K/Q5_K/Q6_K
 // so the entire Markov output projection fits inside Apple M4 Max's 48 MiB SLC across chained draft steps.
 static void s23_ensure_dspark_w2_quant(const llama_model & model) {
@@ -520,6 +522,268 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     const int64_t n_draft = block_drafts - i_draft_beg;
     if (ids_only) {
         res->t_sampled.assign(n_draft * n_blocks, nullptr);
+    }
+
+    const bool ids_tree = ids_only && n_blocks == 1 && n_draft >= 2 && model.d2t == nullptr &&
+                          getenv("LLAMA_DSPARK_ENABLE_2BRANCH") && !getenv("LLAMA_DSPARK_NO_TREE");
+    const bool ids_margin = ids_only && n_blocks == 1 && n_draft >= 4 && model.d2t == nullptr &&
+                            !ids_tree && getenv("LLAMA_DSPARK_ENABLE_MARGIN") && !getenv("LLAMA_DSPARK_NO_MARGIN");
+    if (ids_margin) {
+        ggml_tensor * state_m = nullptr;
+        ggml_tensor * margs_m[4] = { nullptr, nullptr, nullptr, nullptr };
+        const int64_t n_marg = std::min<int64_t>(n_draft, 4);
+
+        for (int64_t s = 0; s < n_draft; ++s) {
+            const int64_t i       = i_draft_beg + s;
+            const int64_t bi      = base_trimmed ? s : i;
+            ggml_tensor * w1_prev = ggml_get_rows(ctx0, w1, prev);
+            ggml_tensor * markov  = w1_prev;
+            if (is_rnn) {
+                const int64_t rank = w1_prev->ne[0];
+                if (state_m == nullptr) {
+                    state_m = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, rank, 1), 0.0f);
+                }
+                ggml_tensor * hid_i = hidden ? ggml_view_2d(ctx0, hidden, hidden->ne[0], 1,
+                                                            (size_t) block_drafts * hidden->nb[1], i * hidden->nb[1]) : nullptr;
+                ggml_tensor * hid_c = (hid_i && !ggml_is_contiguous(hid_i)) ? ggml_cont(ctx0, hid_i) : hid_i;
+                const bool can_fuse_joint_gru =
+                    f_rnn != nullptr &&
+                    !getenv("GGML_INKLING_NO_FUSE") &&
+                    (!g.loras || g.loras->empty()) &&
+                    (!g.hdmd || g.hdmd->rot.find(model.dspark_joint_proj) == g.hdmd->rot.end()) &&
+                    (model.dspark_markov_w1->type == GGML_TYPE_BF16 || model.dspark_markov_w1->type == GGML_TYPE_F32) &&
+                    (model.dspark_joint_proj->type == GGML_TYPE_BF16 || model.dspark_joint_proj->type == GGML_TYPE_F32) &&
+                    ggml_is_contiguous(prev) && ggml_is_contiguous(state_m) &&
+                    ggml_is_contiguous(hid_c) && ggml_is_contiguous(f_rnn);
+                if (can_fuse_joint_gru) {
+                    ggml_tensor * st_lat = ggml_inkling_dspark_joint_gru(
+                        ctx0, prev, model.dspark_markov_w1, state_m, hid_c, f_rnn,
+                        model.dspark_joint_proj, model.dspark_joint_proj_b);
+                    state_m = ggml_view_2d(ctx0, st_lat, rank, 1, st_lat->nb[1], 0);
+                    markov  = ggml_view_2d(ctx0, st_lat, rank, 1, st_lat->nb[1], st_lat->nb[2]);
+                } else {
+                    ggml_tensor * joint = ggml_concat(ctx0, ggml_concat(ctx0, state_m, w1_prev, 0), hid_c, 0);
+                    if (f_rnn) {
+                        joint = ggml_concat(ctx0, joint, f_rnn, 0);
+                    }
+                    joint = ggml_add(ctx0, ggml_mul_mat(ctx0, model.dspark_joint_proj, joint), model.dspark_joint_proj_b);
+                    const auto chunk = [&](int64_t k) {
+                        return ggml_cont(ctx0, ggml_view_2d(ctx0, joint, rank, 1, joint->nb[1], k*rank*ggml_element_size(joint)));
+                    };
+                    ggml_tensor * gate = ggml_sigmoid(ctx0, chunk(0));
+                    ggml_tensor * cand = ggml_tanh(ctx0, chunk(1));
+                    state_m = ggml_add(ctx0, cand, ggml_mul(ctx0, gate, ggml_sub(ctx0, state_m, cand)));
+                    markov  = ggml_tanh(ctx0, chunk(2));
+                }
+            }
+            ggml_tensor * bias = g.build_lora_mm(w2, markov, model.dspark_markov_w2_s);
+            if (model.dspark_markov_w2_b) {
+                bias = ggml_add(ctx0, bias, model.dspark_markov_w2_b);
+            }
+            ggml_tensor * base_i = ggml_view_2d(ctx0, base, n_vocab, 1, base_stride, bi * base->nb[1]);
+            ggml_tensor * raw_s  = ggml_add(ctx0, base_i, bias);
+            ggml_tensor * col_s  = (softcap > 0.0f)
+                ? ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, raw_s, 1.0f/softcap)), softcap)
+                : raw_s;
+            prev = ggml_argmax(ctx0, col_s);
+            ggml_set_output(prev);
+            res->t_sampled[s] = prev;
+            ggml_build_forward_expand(g.gf, prev);
+
+            if (s < n_marg) {
+                ggml_tensor * raw_rows    = ggml_reshape_2d(ctx0, raw_s, 1, n_vocab);
+                ggml_tensor * v0          = ggml_get_rows(ctx0, raw_rows, prev);
+                ggml_build_forward_expand(g.gf, v0);
+                ggml_tensor * neg_inf     = ggml_scale_bias(ctx0, ggml_clamp(ctx0, v0, 0.0f, 0.0f), 1.0f, -1e9f);
+                ggml_tensor * masked_rows = ggml_set_rows(ctx0, raw_rows, neg_inf, prev);
+                ggml_tensor * alt_i32     = ggml_argmax(ctx0, ggml_reshape_2d(ctx0, masked_rows, n_vocab, 1));
+                ggml_tensor * v1          = ggml_get_rows(ctx0, masked_rows, alt_i32);
+                ggml_tensor * t2_raw      = ggml_concat(ctx0, ggml_reshape_1d(ctx0, v0, 1), ggml_reshape_1d(ctx0, v1, 1), 0);
+                ggml_tensor * t2_vals     = (softcap > 0.0f)
+                    ? ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, t2_raw, 1.0f/softcap)), softcap)
+                    : t2_raw;
+                margs_m[s] = ggml_sub(ctx0, ggml_view_1d(ctx0, t2_vals, 1, 0), ggml_view_1d(ctx0, t2_vals, 1, sizeof(float)));
+            }
+        }
+
+        ggml_tensor * tree_meta = ggml_concat(ctx0, margs_m[0], margs_m[1], 0);
+        tree_meta = ggml_concat(ctx0, tree_meta, margs_m[2], 0);
+        tree_meta = ggml_concat(ctx0, tree_meta, margs_m[3], 0);
+        ggml_set_output(tree_meta);
+        ggml_build_forward_expand(g.gf, tree_meta);
+        llama_s23_set_dspark_tree_meta(tree_meta);
+
+        res->t_logits = nullptr;
+        return;
+    }
+    if (ids_tree) {
+        const int64_t env_m_s = getenv("LLAMA_DSPARK_TREE_DRAFT_LEN")
+            ? std::max<int64_t>(2, std::atoi(getenv("LLAMA_DSPARK_TREE_DRAFT_LEN")))
+            : 2;
+        const int64_t env_m_l = getenv("LLAMA_DSPARK_TREE_DRAFT_LEN_LONG")
+            ? std::max<int64_t>(2, std::atoi(getenv("LLAMA_DSPARK_TREE_DRAFT_LEN_LONG")))
+            : 3;
+        const int64_t tree_m  = std::min<int64_t>(n_draft, (n_draft >= 6) ? env_m_l : env_m_s);
+
+        auto step_markov = [&](ggml_tensor * prev_in, ggml_tensor *& state_io, ggml_tensor * hid_in,
+                               ggml_tensor * frnn_in, int64_t nb_cur) -> ggml_tensor * {
+            ggml_tensor * w1_prev = ggml_get_rows(ctx0, w1, prev_in);
+            ggml_tensor * markov  = w1_prev;
+            if (is_rnn) {
+                const int64_t rank = w1_prev->ne[0];
+                if (state_io == nullptr) {
+                    state_io = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, rank, nb_cur), 0.0f);
+                }
+                ggml_tensor * hid_c = ggml_is_contiguous(hid_in) ? hid_in : ggml_cont(ctx0, hid_in);
+                const bool can_fuse_joint_gru =
+                    frnn_in != nullptr &&
+                    !getenv("GGML_INKLING_NO_FUSE") &&
+                    (!g.loras || g.loras->empty()) &&
+                    (!g.hdmd || g.hdmd->rot.find(model.dspark_joint_proj) == g.hdmd->rot.end()) &&
+                    (model.dspark_markov_w1->type == GGML_TYPE_BF16 || model.dspark_markov_w1->type == GGML_TYPE_F32) &&
+                    (model.dspark_joint_proj->type == GGML_TYPE_BF16 || model.dspark_joint_proj->type == GGML_TYPE_F32) &&
+                    ggml_is_contiguous(prev_in) && ggml_is_contiguous(state_io) &&
+                    ggml_is_contiguous(hid_c) && ggml_is_contiguous(frnn_in);
+                if (can_fuse_joint_gru) {
+                    ggml_tensor * st_lat = ggml_inkling_dspark_joint_gru(
+                        ctx0, prev_in, model.dspark_markov_w1, state_io, hid_c, frnn_in,
+                        model.dspark_joint_proj, model.dspark_joint_proj_b);
+                    state_io = ggml_view_2d(ctx0, st_lat, rank, st_lat->ne[1], st_lat->nb[1], 0);
+                    markov   = ggml_view_2d(ctx0, st_lat, rank, st_lat->ne[1], st_lat->nb[1], st_lat->nb[2]);
+                } else if (frnn_in != nullptr && !getenv("GGML_INKLING_NO_FUSE") &&
+                    ggml_is_contiguous(state_io) && ggml_is_contiguous(hid_c) && ggml_is_contiguous(frnn_in)) {
+                    ggml_tensor * joint = ggml_inkling_dspark_concat4(ctx0, state_io, w1_prev, hid_c, frnn_in);
+                    joint = ggml_add(ctx0, ggml_mul_mat(ctx0, model.dspark_joint_proj, joint), model.dspark_joint_proj_b);
+                    ggml_tensor * st_lat = ggml_inkling_dspark_gru(ctx0, joint, state_io);
+                    state_io = ggml_view_2d(ctx0, st_lat, rank, st_lat->ne[1], st_lat->nb[1], 0);
+                    markov   = ggml_view_2d(ctx0, st_lat, rank, st_lat->ne[1], st_lat->nb[1], st_lat->nb[2]);
+                } else {
+                    ggml_tensor * joint = ggml_concat(ctx0, ggml_concat(ctx0, state_io, w1_prev, 0), hid_c, 0);
+                    if (frnn_in) {
+                        joint = ggml_concat(ctx0, joint, frnn_in, 0);
+                    }
+                    joint = ggml_add(ctx0, ggml_mul_mat(ctx0, model.dspark_joint_proj, joint), model.dspark_joint_proj_b);
+                    const auto chunk = [&](int64_t k) {
+                        return ggml_cont(ctx0, ggml_view_2d(ctx0, joint, rank, nb_cur, joint->nb[1], k*rank*ggml_element_size(joint)));
+                    };
+                    ggml_tensor * gate = ggml_sigmoid(ctx0, chunk(0));
+                    ggml_tensor * cand = ggml_tanh(ctx0, chunk(1));
+                    state_io = ggml_add(ctx0, cand, ggml_mul(ctx0, gate, ggml_sub(ctx0, state_io, cand)));
+                    markov   = ggml_tanh(ctx0, chunk(2));
+                }
+            }
+            ggml_tensor * bias = g.build_lora_mm(w2, markov, model.dspark_markov_w2_s);
+            if (model.dspark_markov_w2_b) {
+                bias = ggml_add(ctx0, bias, model.dspark_markov_w2_b);
+            }
+            return bias;
+        };
+
+        ggml_tensor * state_2b = nullptr;
+        ggml_tensor * marg_0   = nullptr;
+        ggml_tensor * alt_0_f  = nullptr;
+        std::vector<ggml_tensor *> b1_cont_f;
+
+        // Step s = 0 (nb = 1) + 2-dispatch masked-argmax Top-2 extraction (zero bitonic sort!)
+        {
+            const int64_t i      = i_draft_beg;
+            const int64_t bi     = base_trimmed ? 0 : i;
+            ggml_tensor * hid_0  = hidden ? ggml_view_2d(ctx0, hidden, hidden->ne[0], 1,
+                                                         (size_t) block_drafts * hidden->nb[1], i * hidden->nb[1]) : nullptr;
+            ggml_tensor * bias_0 = step_markov(prev, state_2b, hid_0, f_rnn, 1);
+            ggml_tensor * base_0 = ggml_view_2d(ctx0, base, n_vocab, 1, base_stride, bi * base->nb[1]);
+            ggml_tensor * raw_0  = ggml_add(ctx0, base_0, bias_0);
+            ggml_tensor * col_0  = (softcap > 0.0f)
+                ? ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, raw_0, 1.0f/softcap)), softcap)
+                : raw_0;
+            ggml_tensor * prev_0 = ggml_argmax(ctx0, col_0);
+            ggml_set_output(prev_0);
+            res->t_sampled[0] = prev_0;
+            ggml_build_forward_expand(g.gf, prev_0);
+
+            // Extract v0 = raw_0[prev_0], mask raw_0[prev_0] = -1e9f in-place strictly after v0, then argmax for alt_0
+            ggml_tensor * raw_0_rows  = ggml_reshape_2d(ctx0, raw_0, 1, n_vocab);
+            ggml_tensor * v0          = ggml_get_rows(ctx0, raw_0_rows, prev_0);
+            ggml_build_forward_expand(g.gf, v0);
+            ggml_tensor * neg_inf     = ggml_scale_bias(ctx0, ggml_clamp(ctx0, v0, 0.0f, 0.0f), 1.0f, -1e9f);
+            ggml_tensor * masked_rows = ggml_set_rows(ctx0, raw_0_rows, neg_inf, prev_0);
+            ggml_tensor * masked_0    = ggml_reshape_2d(ctx0, masked_rows, n_vocab, 1);
+            ggml_tensor * alt_0_i32   = ggml_argmax(ctx0, masked_0);
+            ggml_tensor * v1          = ggml_get_rows(ctx0, masked_rows, alt_0_i32);
+
+            ggml_tensor * t2_raw  = ggml_concat(ctx0, ggml_reshape_1d(ctx0, v0, 1), ggml_reshape_1d(ctx0, v1, 1), 0);
+            ggml_tensor * t2_vals = (softcap > 0.0f)
+                ? ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, t2_raw, 1.0f/softcap)), softcap)
+                : t2_raw;
+            marg_0  = ggml_sub(ctx0, ggml_view_1d(ctx0, t2_vals, 1, 0), ggml_view_1d(ctx0, t2_vals, 1, sizeof(float)));
+            alt_0_f = ggml_cast(ctx0, alt_0_i32, GGML_TYPE_F32);
+
+            prev = ggml_concat(ctx0, prev_0, alt_0_i32, 0); // I32 [2]: [beam0, alt_0_cont]
+            if (state_2b) {
+                state_2b = ggml_repeat_4d(ctx0, ggml_cont(ctx0, state_2b), state_2b->ne[0], 2, 1, 1);
+            }
+        }
+
+        // Steps s = 1 .. tree_m - 1 (nb = 2 <= col_tile = 4: single SLC-resident dmmv_repack pass for both beams)
+        ggml_tensor * f_rnn_2 = f_rnn ? ggml_repeat_4d(ctx0, f_rnn, n_embd, 2, 1, 1) : nullptr;
+        for (int64_t s = 1; s < tree_m; ++s) {
+            const int64_t i     = i_draft_beg + s;
+            const int64_t bi    = base_trimmed ? s : i;
+            ggml_tensor * hid_i = hidden ? ggml_view_2d(ctx0, hidden, hidden->ne[0], 1,
+                                                        (size_t) block_drafts * hidden->nb[1], i * hidden->nb[1]) : nullptr;
+            ggml_tensor * hid_2 = hid_i
+                ? ggml_repeat_4d(ctx0, ggml_is_contiguous(hid_i) ? hid_i : ggml_cont(ctx0, hid_i), hidden->ne[0], 2, 1, 1)
+                : nullptr;
+            ggml_tensor * bias_2 = step_markov(prev, state_2b, hid_2, f_rnn_2, 2);
+            ggml_tensor * base_i = ggml_view_2d(ctx0, base, n_vocab, 1, base_stride, bi * base->nb[1]);
+            ggml_tensor * raw_2  = ggml_add(ctx0, bias_2, base_i);
+            ggml_tensor * col_2  = (softcap > 0.0f)
+                ? ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, raw_2, 1.0f/softcap)), softcap)
+                : raw_2;
+            prev = ggml_argmax(ctx0, col_2); // I32 [2]
+
+            ggml_tensor * prev_b0 = ggml_view_1d(ctx0, prev, 1, 0);
+            ggml_set_output(prev_b0);
+            res->t_sampled[s] = prev_b0;
+            ggml_build_forward_expand(g.gf, prev_b0);
+
+            b1_cont_f.push_back(ggml_cast(ctx0, ggml_view_1d(ctx0, prev, 1, sizeof(int32_t)), GGML_TYPE_F32));
+        }
+
+        // Steps s = tree_m .. n_draft - 1 (nb = 1: single primary beam with full ADD_SOFTCAP_ARGMAX fusion)
+        if (tree_m < n_draft) {
+            prev = ggml_view_1d(ctx0, prev, 1, 0);
+            if (state_2b) {
+                state_2b = ggml_view_2d(ctx0, state_2b, state_2b->ne[0], 1, state_2b->nb[1], 0);
+            }
+            for (int64_t s = tree_m; s < n_draft; ++s) {
+                const int64_t i      = i_draft_beg + s;
+                const int64_t bi     = base_trimmed ? s : i;
+                ggml_tensor * hid_i  = hidden ? ggml_view_2d(ctx0, hidden, hidden->ne[0], 1,
+                                                             (size_t) block_drafts * hidden->nb[1], i * hidden->nb[1]) : nullptr;
+                ggml_tensor * bias_1 = step_markov(prev, state_2b, hid_i, f_rnn, 1);
+                ggml_tensor * base_i = ggml_view_2d(ctx0, base, n_vocab, 1, base_stride, bi * base->nb[1]);
+                ggml_tensor * raw_1  = ggml_add(ctx0, base_i, bias_1);
+                ggml_tensor * col_1  = (softcap > 0.0f)
+                    ? ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, raw_1, 1.0f/softcap)), softcap)
+                    : raw_1;
+                prev = ggml_argmax(ctx0, col_1); // I32 [1]
+                ggml_set_output(prev);
+                res->t_sampled[s] = prev;
+                ggml_build_forward_expand(g.gf, prev);
+            }
+        }
+
+        ggml_tensor * tree_meta = ggml_concat(ctx0, marg_0, alt_0_f, 0);
+        for (ggml_tensor * cf : b1_cont_f) {
+            tree_meta = ggml_concat(ctx0, tree_meta, cf, 0);
+        }
+        ggml_set_output(tree_meta);
+        ggml_build_forward_expand(g.gf, tree_meta);
+        llama_s23_set_dspark_tree_meta(tree_meta);
+
+        res->t_logits = nullptr;
+        return;
     }
 
     ggml_tensor * cat      = nullptr;

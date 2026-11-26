@@ -8,6 +8,12 @@
 // llama_memory_hybrid_iswa
 //
 
+static thread_local bool g_s23_single_slot_tree_swa = false;
+extern "C" LLAMA_API void llama_s23_set_single_slot_tree_swa(bool v);
+extern "C" LLAMA_API void llama_s23_set_single_slot_tree_swa(bool v) {
+    g_s23_single_slot_tree_swa = v;
+}
+
 llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         const llama_model & model,
                       bool   no_alloc,
@@ -42,7 +48,10 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         unified,
         kv_size,
         n_seq_max,
-        n_ubatch,
+        (g_s23_single_slot_tree_swa && unified && n_seq_max == 2 && !swa_full &&
+         model.hparams.n_swa > 0 && n_ubatch > model.hparams.n_swa)
+            ? (n_ubatch - model.hparams.n_swa)
+            : n_ubatch,
         nullptr,
         filter_attn == nullptr ?
             [&](int32_t il) { return !hparams.is_recr(il); }
@@ -157,6 +166,22 @@ bool llama_memory_hybrid_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_p
 }
 
 void llama_memory_hybrid_iswa::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    if (p0 >= 0) {
+        mem_attn->seq_rm(seq_id_dst, p0, -1);
+        mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+        mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+        return;
+    }
+    if (p0 < 0 && hparams.n_swa > 0 && mem_attn->get_swa() != nullptr) {
+        const llama_pos pos_max = mem_attn->get_swa()->seq_pos_max(seq_id_src);
+        if (pos_max > (llama_pos) hparams.n_swa + 4) {
+            const llama_pos swa_p0 = pos_max - (llama_pos) hparams.n_swa - 4;
+            mem_attn->get_base()->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+            mem_attn->get_swa()->seq_cp(seq_id_src, seq_id_dst, swa_p0, p1);
+            mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+            return;
+        }
+    }
     mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }

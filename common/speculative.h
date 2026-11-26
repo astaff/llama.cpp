@@ -73,8 +73,13 @@ struct common_speculative_draft_params {
     // the generated draft from the last _draft() call
     llama_tokens * result;
 
+    // optional 2-branch speculative tree candidate chain (same length as *result when populated)
+    llama_tokens * result_alt        = nullptr;
+    int32_t      * result_branch_pos = nullptr;
+
     // candidate distribution per drafted token; set it to make draft-simple, draft-mtp and draft-dflash2 sample
-    std::vector<std::vector<llama_token_data>> * result_q = nullptr;
+    std::vector<std::vector<llama_token_data>> * result_q     = nullptr;
+    std::vector<std::vector<llama_token_data>> * result_alt_q = nullptr;
 
     // the target's temp and seed, read only when the drafter samples probabilistically
     float    temp = 1.0f;

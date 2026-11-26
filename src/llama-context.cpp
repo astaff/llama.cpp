@@ -651,6 +651,7 @@ struct s19_dspark_sched_entry {
     llama_seq_id            first_seq_id = 0;
     llm_graph_result_ptr    res;
     ggml_backend_sched_ptr  sched;
+    ggml_tensor *           tree_meta    = nullptr;
     bool                    allocated    = false;
 };
 
@@ -658,6 +659,9 @@ struct s19_ctx_ext {
     bool                                greedy_argmax_req     = false;
     bool                                built_greedy[2]       = { false, false };
     bool                                built_direct_scopy[2] = { false, false };
+    ggml_tensor *                       active_tree_meta      = nullptr;
+    float                               tree_meta_host[32]    = {};
+    int32_t                             tree_meta_count       = 0;
     ggml_backend_sched_ptr              primary_sched;
     std::vector<s19_dspark_sched_entry> dspark_pool;
 };
@@ -665,12 +669,33 @@ struct s19_ctx_ext {
 static std::mutex g_s19_ctx_mu;
 static std::unordered_map<const llama_context *, s19_ctx_ext> g_s19_ctx_map;
 static thread_local bool g_s19_building_greedy_argmax = false;
+static thread_local ggml_tensor * g_s23_built_tree_meta = nullptr;
 
 static s19_ctx_ext & s19_get_ext(const llama_context * ctx) {
     std::lock_guard<std::mutex> lk(g_s19_ctx_mu);
     return g_s19_ctx_map[ctx];
 }
 } // namespace
+
+extern "C" LLAMA_API void llama_s23_set_dspark_tree_meta(ggml_tensor * t);
+extern "C" LLAMA_API void llama_s23_set_dspark_tree_meta(ggml_tensor * t) {
+    g_s23_built_tree_meta = t;
+}
+
+extern "C" LLAMA_API int32_t llama_s23_get_dspark_tree_meta(const llama_context * ctx, float * out, int32_t max_n);
+extern "C" LLAMA_API int32_t llama_s23_get_dspark_tree_meta(const llama_context * ctx, float * out, int32_t max_n) {
+    if (!ctx || !out || max_n <= 0) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lk(g_s19_ctx_mu);
+    auto it = g_s19_ctx_map.find(ctx);
+    if (it == g_s19_ctx_map.end() || it->second.tree_meta_count <= 0) {
+        return 0;
+    }
+    const int32_t n = std::min<int32_t>(max_n, it->second.tree_meta_count);
+    std::memcpy(out, it->second.tree_meta_host, (size_t) n * sizeof(float));
+    return n;
+}
 
 extern "C" void llama_s19_set_greedy_argmax_only(llama_context * ctx, bool enabled);
 extern "C" void llama_s19_set_greedy_argmax_only(llama_context * ctx, bool enabled) {
@@ -1928,6 +1953,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     auto & ext = s19_get_ext(this);
     const bool is_dspark_ctx = model.hparams.dspark_f_rnn;
+    const int  prev_slot     = (n_outputs > 0) ? 1 : 0;
+    const bool want_greedy_argmax = !is_dspark_ctx && (n_outputs > 0) &&
+        ext.greedy_argmax_req && sampling.samplers.empty() && !cparams.embeddings;
+
+    bool cur_direct_scopy = false;
+    if (!is_dspark_ctx && ubatch.n_seq_tokens <= 16) {
+        const llama_memory_recurrent_context * recr_mctx = nullptr;
+        if (const auto * hyb = dynamic_cast<const llama_memory_hybrid_iswa_context *>(mctx)) {
+            recr_mctx = hyb->get_recr();
+        } else {
+            recr_mctx = dynamic_cast<const llama_memory_recurrent_context *>(mctx);
+        }
+        if (recr_mctx) {
+            const int64_t  rs_k  = cparams.n_rs_seq == 0 ? 1 : ((int64_t) cparams.n_rs_seq + 1);
+            const uint32_t rs_kw = (uint32_t) std::min<int64_t>(ubatch.n_seq_tokens, rs_k);
+            cur_direct_scopy = recr_mctx->can_direct_scopy(ubatch.n_seqs, rs_kw);
+        }
+    }
+
     s19_dspark_sched_entry * pool_entry = nullptr;
     llm_graph_result * res = nullptr;
 
@@ -1950,7 +1994,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         const llama_seq_id first_sid = (ubatch.n_tokens > 0 && ubatch.seq_id && ubatch.seq_id[0]) ? ubatch.seq_id[0][0] : 0;
         for (auto & e : ext.dspark_pool) {
             if (e.is_embd == is_embd && e.n_tokens == ubatch.n_tokens &&
-                (uint32_t) e.n_outputs == n_outputs && e.gtype == gtype && e.first_seq_id == first_sid) {
+                (uint32_t) e.n_outputs == n_outputs &&
+                e.gtype == gtype && e.first_seq_id == first_sid) {
                 pool_entry = &e;
                 break;
             }
@@ -1981,13 +2026,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         this->sched = std::move(pool_entry->sched);
         res = pool_entry->res.get();
     } else {
+        if (ext.primary_sched) {
+            if (this->sched) {
+                for (auto & e : ext.dspark_pool) {
+                    if (!e.sched && e.allocated) {
+                        e.sched = std::move(this->sched);
+                        break;
+                    }
+                }
+            }
+            this->sched = std::move(ext.primary_sched);
+        }
         res = get_gf_res_prev();
     }
 
     auto * gf = res->get_gf();
-    const int prev_slot = (n_outputs > 0) ? 1 : 0;
-    const bool want_greedy_argmax = !is_dspark_ctx && (n_outputs > 0) &&
-        ext.greedy_argmax_req && sampling.samplers.empty() && !cparams.embeddings;
 
     struct s19_greedy_tls_guard {
         s19_greedy_tls_guard(bool v) { g_s19_building_greedy_argmax = v; }
@@ -1997,21 +2050,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
-
-    bool cur_direct_scopy = false;
-    if (!is_dspark_ctx && ubatch.n_seq_tokens <= 16) {
-        const llama_memory_recurrent_context * recr_mctx = nullptr;
-        if (const auto * hyb = dynamic_cast<const llama_memory_hybrid_iswa_context *>(mctx)) {
-            recr_mctx = hyb->get_recr();
-        } else {
-            recr_mctx = dynamic_cast<const llama_memory_recurrent_context *>(mctx);
-        }
-        if (recr_mctx) {
-            const int64_t  rs_k  = cparams.n_rs_seq == 0 ? 1 : ((int64_t) cparams.n_rs_seq + 1);
-            const uint32_t rs_kw = (uint32_t) std::min<int64_t>(ubatch.n_seq_tokens, rs_k);
-            cur_direct_scopy = recr_mctx->can_direct_scopy(ubatch.n_seqs, rs_kw);
-        }
-    }
 
     const bool can_reuse_slot = is_dspark_ctx
         ? (pool_entry->allocated && res->can_reuse(gparams))
@@ -2037,6 +2075,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
+        g_s23_built_tree_meta = nullptr;
         gf = model.build_graph(gparams);
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
@@ -2055,12 +2094,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         if (is_dspark_ctx) {
             pool_entry->allocated = true;
+            pool_entry->tree_meta = g_s23_built_tree_meta;
         } else {
             gf_res_prev_active                = res;
             ext.built_greedy[prev_slot]       = want_greedy_argmax;
             ext.built_direct_scopy[prev_slot] = cur_direct_scopy;
         }
     }
+
+    ext.active_tree_meta = (is_dspark_ctx && pool_entry) ? pool_entry->tree_meta : nullptr;
 
     // set the input data for the input tensors
     {
@@ -2775,6 +2817,23 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
             copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
+            if (!write_h_nextn) {
+                auto & ext = s19_get_ext(this);
+                if (ext.active_tree_meta != nullptr) {
+                    ggml_tensor * tm_t  = ext.active_tree_meta;
+                    const int32_t tm_n  = (int32_t) std::min<int64_t>(32, ggml_nelements(tm_t));
+                    ggml_backend_t tm_b = ggml_backend_sched_get_tensor_backend(sched.get(), tm_t);
+                    if (tm_b && tm_n > 0) {
+                        ggml_backend_tensor_get_async(tm_b, tm_t, ext.tree_meta_host, 0, (size_t) tm_n * sizeof(float));
+                        ext.tree_meta_count = tm_n;
+                    } else {
+                        ext.tree_meta_count = 0;
+                    }
+                    ext.active_tree_meta = nullptr;
+                } else if (ubatch.embd == nullptr && ubatch.embd_row == nullptr) {
+                    ext.tree_meta_count = 0;
+                }
+            }
         } else if (!res->t_sampled.empty() && sampling.sampled.has_data() && n_outputs > 0) {
             if (res->t_sampled.size() == 1 && (int64_t) ggml_nelements(res->t_sampled[0]) == n_outputs) {
                 ggml_tensor * tensor = res->t_sampled[0];
