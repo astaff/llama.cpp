@@ -336,6 +336,11 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
             cell_src.seq_id.insert(seq_id_dst);
             tail_dst.tail = tail_src.tail;
         }
+        if (n_rs_seq > 0 &&
+            seq_id_src >= 0 && (size_t) seq_id_src < rs_idx.size() &&
+            seq_id_dst >= 0 && (size_t) seq_id_dst < rs_idx.size()) {
+            rs_idx[seq_id_dst] = rs_idx[seq_id_src];
+        }
     }
 }
 
@@ -1515,4 +1520,53 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
         }
     }
     return (int32_t)(idx * mem->size) + src0;
+}
+
+int32_t llama_memory_recurrent_context::peek_s_copy(int i) const {
+    if (is_full) {
+        return i;
+    }
+    const uint32_t cell_idx = (uint32_t) i + mem->head;
+    const int32_t  src0     = mem->cells[cell_idx].src0;
+
+    if (mem->n_rs_seq == 0) {
+        return src0;
+    }
+
+    uint32_t idx = 0;
+    if (!mem->cells[cell_idx].seq_id.empty()) {
+        const llama_seq_id seq = *mem->cells[cell_idx].seq_id.begin();
+        if (seq >= 0 && (size_t) seq < mem->rs_idx.size()) {
+            idx = mem->rs_idx[seq];
+        }
+    }
+    return (int32_t)(idx * mem->size) + src0;
+}
+
+bool llama_memory_recurrent_context::can_direct_scopy(uint32_t n_seqs, uint32_t kw) const {
+    if (is_full || n_seqs == 0 || get_n_rs() != n_seqs) {
+        return false;
+    }
+    const uint32_t head = get_head();
+    const uint32_t size = get_size();
+    if (head + n_seqs > size) {
+        return false;
+    }
+    for (uint32_t i = 0; i < n_seqs; ++i) {
+        const int32_t src_i = peek_s_copy((int) i);
+        if (src_i < 0) {
+            return false;
+        }
+        for (uint32_t j = 0; j < n_seqs; ++j) {
+            if (i == j) {
+                continue;
+            }
+            for (uint32_t slot = 0; slot < kw; ++slot) {
+                if (src_i == (int32_t)(slot * size + head + j)) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
 }

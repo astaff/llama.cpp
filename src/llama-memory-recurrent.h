@@ -201,6 +201,8 @@ public:
     ggml_tensor * get_spgb_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+    int32_t peek_s_copy(int i) const;
+    bool    can_direct_scopy(uint32_t n_seqs, uint32_t kw) const;
 
     bool     get_rs_replay() const;
     uint32_t get_rs_rep(int i) const; // pending tokens replayed by ubatch seq i
