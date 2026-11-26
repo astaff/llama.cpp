@@ -2058,6 +2058,14 @@ private:
             // TODO: check verify if this actually works with TTS
             use_backend_sampling &= task.type != SERVER_TASK_TYPE_TTS;
 
+            // Series 23 (B3): Keep pure-greedy slots off per-seq backend sampler chains so ctx_tgt
+            // executes batched greedy_argmax_only (1 softcap + 1 batched argmax, eliding ggml_pad).
+            if (task.params.sampling.n_probs == 0 &&
+                common_sampler_is_pure_argmax(slot.smpl.get()) &&
+                !getenv("LLAMA_FORCE_BACKEND_ARGMAX_CHAIN")) {
+                use_backend_sampling = false;
+            }
+
             // TODO: tmp until backend sampling is fully implemented
             if (use_backend_sampling) {
                 llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));

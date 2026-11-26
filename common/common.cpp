@@ -1383,7 +1383,17 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         pimpl->samplers_seq_config[i] = { i, common_sampler_get(pimpl->samplers[i].get()) };
     }
 
-    if (params.sampling.backend_sampling) {
+    char arch_buf[64] = {};
+    const bool is_inkling2_arch =
+        llama_model_meta_val_str(model, "general.architecture", arch_buf, sizeof(arch_buf)) >= 0 &&
+        std::strncmp(arch_buf, "inkling2", 8) == 0;
+    const bool init_pure_greedy_fast =
+        is_inkling2_arch &&
+        !pimpl->samplers.empty() &&
+        params.sampling.n_probs == 0 &&
+        common_sampler_is_pure_argmax(pimpl->samplers[0].get()) &&
+        !getenv("LLAMA_FORCE_BACKEND_ARGMAX_CHAIN");
+    if (params.sampling.backend_sampling && !init_pure_greedy_fast) {
         cparams.samplers   = pimpl->samplers_seq_config.data();
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }

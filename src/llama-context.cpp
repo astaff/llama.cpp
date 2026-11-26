@@ -7,6 +7,8 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid-iswa.h"
+#include "llama-memory-recurrent.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -653,8 +655,9 @@ struct s19_dspark_sched_entry {
 };
 
 struct s19_ctx_ext {
-    bool                                greedy_argmax_req = false;
-    bool                                built_greedy[2]   = { false, false };
+    bool                                greedy_argmax_req     = false;
+    bool                                built_greedy[2]       = { false, false };
+    bool                                built_direct_scopy[2] = { false, false };
     ggml_backend_sched_ptr              primary_sched;
     std::vector<s19_dspark_sched_entry> dspark_pool;
 };
@@ -1995,9 +1998,27 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    bool cur_direct_scopy = false;
+    if (!is_dspark_ctx && ubatch.n_seq_tokens <= 16) {
+        const llama_memory_recurrent_context * recr_mctx = nullptr;
+        if (const auto * hyb = dynamic_cast<const llama_memory_hybrid_iswa_context *>(mctx)) {
+            recr_mctx = hyb->get_recr();
+        } else {
+            recr_mctx = dynamic_cast<const llama_memory_recurrent_context *>(mctx);
+        }
+        if (recr_mctx) {
+            const int64_t  rs_k  = cparams.n_rs_seq == 0 ? 1 : ((int64_t) cparams.n_rs_seq + 1);
+            const uint32_t rs_kw = (uint32_t) std::min<int64_t>(ubatch.n_seq_tokens, rs_k);
+            cur_direct_scopy = recr_mctx->can_direct_scopy(ubatch.n_seqs, rs_kw);
+        }
+    }
+
     const bool can_reuse_slot = is_dspark_ctx
         ? (pool_entry->allocated && res->can_reuse(gparams))
-        : (gf_res_prev_active == res && ext.built_greedy[prev_slot] == want_greedy_argmax && res->can_reuse(gparams));
+        : (gf_res_prev_active == res &&
+           ext.built_greedy[prev_slot] == want_greedy_argmax &&
+           ext.built_direct_scopy[prev_slot] == cur_direct_scopy &&
+           res->can_reuse(gparams));
 
     if (!graph_reuse_disable && can_reuse_slot) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -2035,8 +2056,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (is_dspark_ctx) {
             pool_entry->allocated = true;
         } else {
-            gf_res_prev_active          = res;
-            ext.built_greedy[prev_slot] = want_greedy_argmax;
+            gf_res_prev_active                = res;
+            ext.built_greedy[prev_slot]       = want_greedy_argmax;
+            ext.built_direct_scopy[prev_slot] = cur_direct_scopy;
         }
     }
 
