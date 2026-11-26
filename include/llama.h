@@ -522,6 +522,8 @@ extern "C" {
                ggml_threadpool_t   threadpool_batch);
 
     LLAMA_API void llama_detach_threadpool(struct llama_context * ctx);
+    LLAMA_API ggml_threadpool_t llama_get_threadpool(struct llama_context * ctx);
+    LLAMA_API ggml_threadpool_t llama_get_threadpool_batch(struct llama_context * ctx);
 
     typedef void (*llama_model_set_tensor_data_t)(struct ggml_tensor * tensor, void * userdata);
 
@@ -1155,6 +1157,7 @@ extern "C" {
     // Negative indices can be used to access logits in reverse order, -1 is the last logit.
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
+    LLAMA_API const float * llama_get_logits_ith_ro(struct llama_context * ctx, int32_t i);
 
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
@@ -1673,6 +1676,12 @@ extern "C" {
     //    return token;
     // Returns the sampled token
     LLAMA_API llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_context * ctx, int32_t idx);
+    LLAMA_API bool        llama_sampler_grammar_is_dormant(const struct llama_sampler * smpl);
+    LLAMA_API bool        llama_sampler_chain_is_pure_greedy(const struct llama_sampler * chain);
+    LLAMA_API bool        llama_sampler_chain_is_pure_temp_dist(const struct llama_sampler * chain, float * out_temp, struct llama_sampler ** out_dist);
+    LLAMA_API bool        llama_sampler_chain_is_bias_temp_dist(const struct llama_sampler * chain, float * out_temp, struct llama_sampler ** out_dist, struct llama_sampler ** out_logit_bias);
+    LLAMA_API llama_token llama_sampler_temp_dist_sample_raw_0ulp(struct llama_sampler * dist_smpl, const float * logits_row, int32_t n_vocab, float temp);
+    LLAMA_API llama_token llama_sampler_temp_dist_probs_raw_0ulp(struct llama_sampler * dist_smpl, struct llama_sampler * lb_smpl, const float * logits_row, int32_t n_vocab, float temp, const float ** out_unnorm_p, double * out_sum_p);
 
     // TODO: extend in the future
     //LLAMA_API void llama_decode_with_sampler(struct llama_context * ctx, struct llama_sampler * smpl, struct llama_batch batch, ...);

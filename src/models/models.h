@@ -2532,7 +2532,7 @@ struct llama_model_inkling2 : public llama_model_base {
     llama_model_inkling2(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
-    uint32_t graph_nodes_per_tensor() const override { return 32; }
+    uint32_t graph_nodes_per_tensor() const override { return 64; }
 
     // the layers stored in the file
     virtual int n_layer_phys() const { return hparams.n_layer(); }
@@ -2550,7 +2550,7 @@ struct llama_model_inkling2 : public llama_model_base {
     struct graph : public llm_graph_context {
         graph(const llm_graph_params & params);
         ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
-        ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
+        ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold, ggml_tensor * mul_tau = nullptr);
         ggml_tensor * convolve(
                 ggml_tensor * cur,
                 ggml_tensor * weight,

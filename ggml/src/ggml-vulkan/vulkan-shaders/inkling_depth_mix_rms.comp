@@ -1,0 +1,296 @@
+#version 450
+// S19 W11d: Zero-spill (~36 GPRs) 3D query-parallel depth_mix + 0-ULP 512-tree RMS_NORM_MUL epilogue
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer BufS0  { float     s0[];         };
+layout(binding = 1) readonly  buffer BufS1  { float     s1[];         };
+layout(binding = 2) readonly  buffer BufS2  { float     s2[];         };
+layout(binding = 3) readonly  buffer BufS3  { float     s3[];         };
+layout(binding = 4) readonly  buffer BufS4  { float     s4[];         };
+layout(binding = 5) readonly  buffer BufS5  { float     s5[];         };
+layout(binding = 6) readonly  buffer BufQ   { float     data_q[];     };
+layout(binding = 7) writeonly buffer BufD   { float     data_dst[];   };
+layout(binding = 8) readonly  buffer BufW   { float     data_w[];     };
+layout(binding = 9) writeonly buffer BufD16 { float16_t data_dst16[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint  n_embd;
+    uint  n_tokens;
+    uint  K;
+    uint  Q;
+    uint  off_s[6];
+    uint  off_q;
+    uint  off_dst;
+    float eps;
+    float sm_scale;
+    uint  has_rms_w;
+    uint  off_w;
+    uint  w_s1;
+    float rms_eps;
+} p;
+
+shared float sh_red[4];
+shared float sh_mix[2304];
+shared float sh_rms[16];
+
+float reduce_sum_128(float v) {
+    const float sg = subgroupAdd(v);
+    if (gl_SubgroupInvocationID == 0u) {
+        sh_red[gl_SubgroupID] = sg;
+    }
+    barrier();
+    const float res = sh_red[0] + sh_red[1] + sh_red[2] + sh_red[3];
+    barrier();
+    return res;
+}
+
+float load_state(uint b, uint idx) {
+    switch (b) {
+        case 0u: return s0[p.off_s[0] + idx];
+        case 1u: return s1[p.off_s[1] + idx];
+        case 2u: return s2[p.off_s[2] + idx];
+        case 3u: return s3[p.off_s[3] + idx];
+        case 4u: return s4[p.off_s[4] + idx];
+        default: return s5[p.off_s[5] + idx];
+    }
+}
+
+void epilogue_rms512_from_shmem(uint tid, uint q, uint db, uint db16, bool do_f16) {
+    barrier();
+    const uint num_blocks = (p.n_embd + 511u) >> 9u;
+    [[unroll]] for (uint vsg = 0u; vsg < 4u; ++vsg) {
+        const uint tid512 = vsg * 128u + tid;
+        float sum = 0.0f;
+        [[dont_unroll]] for (uint col = tid512, idx = 0u; idx < num_blocks; col += 512u, ++idx) {
+            float xi = 0.0f;
+            if (col < p.n_embd) {
+                xi = sh_mix[col];
+            }
+            sum += xi * xi;
+        }
+        sum = subgroupAdd(sum);
+        if (gl_SubgroupInvocationID == 0u) {
+            sh_rms[vsg * 4u + gl_SubgroupID] = sum;
+        }
+    }
+    barrier();
+    float total = (gl_SubgroupInvocationID < 16u) ? sh_rms[gl_SubgroupInvocationID] : 0.0f;
+    total = subgroupAdd(total);
+    const float mean  = total / float(p.n_embd);
+    const float scale = inversesqrt(mean + p.rms_eps);
+    const uint wb = p.off_w + q * p.w_s1;
+    for (uint col = tid; col < p.n_embd; col += 128u) {
+        const float val = scale * sh_mix[col] * data_w[wb + col];
+        data_dst[db + col] = val;
+        if (do_f16) {
+            data_dst16[db16 + col] = float16_t(val);
+        }
+    }
+}
+
+void main() {
+    const uint tok = gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u;
+    const uint q   = gl_WorkGroupID.z;
+    if (tok >= p.n_tokens || q >= p.Q) {
+        return;
+    }
+    const uint tid      = gl_LocalInvocationID.x;
+    const uint tok_base = tok * p.n_embd;
+    const float inv_d   = 1.0f / float(p.n_embd);
+
+    if (p.n_embd == 1280u && p.K <= 6u) {
+        float v[6][10];
+        for (uint b = 0u; b < p.K; ++b) {
+            float ss = 0.0f;
+            [[unroll]] for (uint m = 0u; m < 10u; ++m) {
+                const float x = load_state(b, tok_base + tid + m * 128u);
+                v[b][m] = x;
+                ss += x * x;
+            }
+            const float rms_inv = 1.0f / sqrt(reduce_sum_128(ss) * inv_d + p.eps);
+            [[unroll]] for (uint m = 0u; m < 10u; ++m) {
+                v[b][m] *= rms_inv;
+            }
+        }
+        const uint qb = p.off_q + q * 1280u;
+        float qv[10];
+        [[unroll]] for (uint m = 0u; m < 10u; ++m) {
+            qv[m] = data_q[qb + tid + m * 128u];
+        }
+        float scores[6];
+        float mx = -3.402823466e+38f;
+        for (uint b = 0u; b < p.K; ++b) {
+            float dp = 0.0f;
+            [[unroll]] for (uint m = 0u; m < 10u; ++m) {
+                dp += v[b][m] * qv[m];
+            }
+            const float sc = reduce_sum_128(dp) * p.sm_scale;
+            scores[b] = sc;
+            mx = max(mx, sc);
+        }
+        float ex_sum = 0.0f;
+        for (uint b = 0u; b < p.K; ++b) {
+            scores[b] = exp(scores[b] - mx);
+            ex_sum += scores[b];
+        }
+        const float inv_ex = 1.0f / ex_sum;
+        for (uint b = 0u; b < p.K; ++b) {
+            scores[b] *= inv_ex;
+        }
+        const uint db16 = (q * p.n_tokens + tok) * 1280u;
+        const uint db   = p.off_dst + db16;
+        [[unroll]] for (uint m = 0u; m < 10u; ++m) {
+            float acc = 0.0f;
+            for (uint b = 0u; b < p.K; ++b) {
+                acc += v[b][m] * scores[b];
+            }
+            if (p.has_rms_w != 0u) {
+                sh_mix[tid + m * 128u] = acc;
+            } else {
+                data_dst[db + tid + m * 128u] = acc;
+            }
+        }
+        if (p.has_rms_w != 0u) {
+            epilogue_rms512_from_shmem(tid, q, db, db16, (p.has_rms_w & 2u) != 0u);
+        }
+        return;
+    }
+
+    if (p.n_embd == 2304u && p.K <= 6u) {
+        float rms_inv[6];
+        for (uint b = 0u; b < p.K; ++b) {
+            float ss = 0.0f;
+            switch (b) {
+                case 0u: { const uint sb = p.off_s[0] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { const float x = s0[sb + m * 128u]; ss += x * x; } break; }
+                case 1u: { const uint sb = p.off_s[1] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { const float x = s1[sb + m * 128u]; ss += x * x; } break; }
+                case 2u: { const uint sb = p.off_s[2] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { const float x = s2[sb + m * 128u]; ss += x * x; } break; }
+                case 3u: { const uint sb = p.off_s[3] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { const float x = s3[sb + m * 128u]; ss += x * x; } break; }
+                case 4u: { const uint sb = p.off_s[4] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { const float x = s4[sb + m * 128u]; ss += x * x; } break; }
+                default: { const uint sb = p.off_s[5] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { const float x = s5[sb + m * 128u]; ss += x * x; } break; }
+            }
+            rms_inv[b] = 1.0f / sqrt(reduce_sum_128(ss) * inv_d + p.eps);
+        }
+        const uint qb = p.off_q + q * 2304u;
+        float qv[18];
+        [[unroll]] for (uint m = 0u; m < 18u; ++m) {
+            qv[m] = data_q[qb + tid + m * 128u];
+        }
+        float scores[6];
+        float mx = -3.402823466e+38f;
+        for (uint b = 0u; b < p.K; ++b) {
+            const float rinv = rms_inv[b];
+            float dp = 0.0f;
+            switch (b) {
+                case 0u: { const uint sb = p.off_s[0] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { precise float vn = s0[sb + m * 128u] * rinv; dp += vn * qv[m]; } break; }
+                case 1u: { const uint sb = p.off_s[1] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { precise float vn = s1[sb + m * 128u] * rinv; dp += vn * qv[m]; } break; }
+                case 2u: { const uint sb = p.off_s[2] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { precise float vn = s2[sb + m * 128u] * rinv; dp += vn * qv[m]; } break; }
+                case 3u: { const uint sb = p.off_s[3] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { precise float vn = s3[sb + m * 128u] * rinv; dp += vn * qv[m]; } break; }
+                case 4u: { const uint sb = p.off_s[4] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { precise float vn = s4[sb + m * 128u] * rinv; dp += vn * qv[m]; } break; }
+                default: { const uint sb = p.off_s[5] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { precise float vn = s5[sb + m * 128u] * rinv; dp += vn * qv[m]; } break; }
+            }
+            const float sc = reduce_sum_128(dp) * p.sm_scale;
+            scores[b] = sc;
+            mx = max(mx, sc);
+        }
+        float ex_sum = 0.0f;
+        for (uint b = 0u; b < p.K; ++b) {
+            scores[b] = exp(scores[b] - mx);
+            ex_sum += scores[b];
+        }
+        const float inv_ex = 1.0f / ex_sum;
+        for (uint b = 0u; b < p.K; ++b) {
+            scores[b] *= inv_ex;
+        }
+        float acc[18];
+        [[unroll]] for (uint m = 0u; m < 18u; ++m) {
+            acc[m] = 0.0f;
+        }
+        for (uint b = 0u; b < p.K; ++b) {
+            const float rinv = rms_inv[b];
+            const float sc   = scores[b];
+            switch (b) {
+                case 0u: { const uint sb = p.off_s[0] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { precise float vn = s0[sb + m * 128u] * rinv; acc[m] += vn * sc; } break; }
+                case 1u: { const uint sb = p.off_s[1] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { precise float vn = s1[sb + m * 128u] * rinv; acc[m] += vn * sc; } break; }
+                case 2u: { const uint sb = p.off_s[2] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { precise float vn = s2[sb + m * 128u] * rinv; acc[m] += vn * sc; } break; }
+                case 3u: { const uint sb = p.off_s[3] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { precise float vn = s3[sb + m * 128u] * rinv; acc[m] += vn * sc; } break; }
+                case 4u: { const uint sb = p.off_s[4] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { precise float vn = s4[sb + m * 128u] * rinv; acc[m] += vn * sc; } break; }
+                default: { const uint sb = p.off_s[5] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { precise float vn = s5[sb + m * 128u] * rinv; acc[m] += vn * sc; } break; }
+            }
+        }
+        const uint db16 = (q * p.n_tokens + tok) * 2304u;
+        const uint db   = p.off_dst + db16;
+        if (p.has_rms_w != 0u) {
+            [[unroll]] for (uint m = 0u; m < 18u; ++m) {
+                sh_mix[tid + m * 128u] = acc[m];
+            }
+        } else {
+            [[unroll]] for (uint m = 0u; m < 18u; ++m) {
+                data_dst[db + tid + m * 128u] = acc[m];
+            }
+        }
+        if (p.has_rms_w != 0u) {
+            epilogue_rms512_from_shmem(tid, q, db, db16, (p.has_rms_w & 2u) != 0u);
+        }
+        return;
+    }
+
+    float rms_inv[6];
+    for (uint b = 0u; b < p.K; ++b) {
+        float ss = 0.0f;
+        for (uint c = tid; c < p.n_embd; c += 128u) {
+            const float x = load_state(b, tok_base + c);
+            ss += x * x;
+        }
+        rms_inv[b] = 1.0f / sqrt(reduce_sum_128(ss) * inv_d + p.eps);
+    }
+    const uint qb = p.off_q + q * p.n_embd;
+    float scores[6];
+    float mx = -3.402823466e+38f;
+    for (uint b = 0u; b < p.K; ++b) {
+        float dp = 0.0f;
+        for (uint c = tid; c < p.n_embd; c += 128u) {
+            precise float vn = load_state(b, tok_base + c) * rms_inv[b];
+            dp += vn * data_q[qb + c];
+        }
+        const float sc = reduce_sum_128(dp) * p.sm_scale;
+        scores[b] = sc;
+        mx = max(mx, sc);
+    }
+    float ex_sum = 0.0f;
+    for (uint b = 0u; b < p.K; ++b) {
+        scores[b] = exp(scores[b] - mx);
+        ex_sum += scores[b];
+    }
+    const float inv_ex = 1.0f / ex_sum;
+    for (uint b = 0u; b < p.K; ++b) {
+        scores[b] *= inv_ex;
+    }
+    const uint db16 = (q * p.n_tokens + tok) * p.n_embd;
+    const uint db   = p.off_dst + db16;
+    if (p.has_rms_w != 0u && p.n_embd <= 2304u) {
+        for (uint c = tid; c < p.n_embd; c += 128u) {
+            float acc = 0.0f;
+            for (uint b = 0u; b < p.K; ++b) {
+                precise float vn = load_state(b, tok_base + c) * rms_inv[b];
+                acc += vn * scores[b];
+            }
+            sh_mix[c] = acc;
+        }
+        epilogue_rms512_from_shmem(tid, q, db, db16, (p.has_rms_w & 2u) != 0u);
+    } else {
+        for (uint c = tid; c < p.n_embd; c += 128u) {
+            float acc = 0.0f;
+            for (uint b = 0u; b < p.K; ++b) {
+                precise float vn = load_state(b, tok_base + c) * rms_inv[b];
+                acc += vn * scores[b];
+            }
+            data_dst[db + c] = acc;
+        }
+    }
+}

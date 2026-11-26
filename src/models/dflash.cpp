@@ -79,6 +79,11 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         // DFlash has a single rope, so the SWA rope == main rope.
         hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
         ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl);
+        if (variant == VARIANT_DSPARK && hparams.dspark_f_rnn && getenv("LLAMA_DSPARK_FORCE_ALL_SWA")) {
+            for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+                hparams.is_swa_impl[il] = true;
+            }
+        }
         hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
         hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
     }
@@ -555,12 +560,21 @@ ggml_tensor * llama_model_dflash::graph_base::build_layers(ggml_tensor * inp_tok
 }
 
 ggml_tensor * llama_model_dflash::graph_base::build_logits(ggml_tensor * cur) {
-    const auto [output, output_s] = get_lm_head(*this, model);
+    auto [output, output_s] = get_lm_head(*this, model);
+    const int64_t n_vocab_unpadded = model.vocab.n_tokens();
+    if (!model.d2t && output->ne[1] > n_vocab_unpadded &&
+        (!hdmd || hdmd->rot.find(output) == hdmd->rot.end()) &&
+        (!loras || loras->empty())) {
+        output = ggml_view_2d(ctx0, output, output->ne[0], n_vocab_unpadded, output->nb[1], 0);
+        if (output_s) {
+            output_s = ggml_view_1d(ctx0, output_s, n_vocab_unpadded, 0);
+        }
+    }
     cur = build_lora_mm(output, cur, output_s);
 
     // a padded lm head (e.g. shared from the target): drop the rows past the vocabulary
-    if (!model.d2t && cur->ne[0] > (int64_t) model.vocab.n_tokens()) {
-        cur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, model.vocab.n_tokens(), cur->ne[1], cur->nb[1], 0));
+    if (!model.d2t && cur->ne[0] > n_vocab_unpadded) {
+        cur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, n_vocab_unpadded, cur->ne[1], cur->nb[1], 0));
     }
 
     // DFlash2 feeds these logits to the selector, so they need the target's output

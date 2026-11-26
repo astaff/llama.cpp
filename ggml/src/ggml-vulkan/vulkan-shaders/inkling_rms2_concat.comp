@@ -1,0 +1,60 @@
+#version 450
+// S19_WAVE3: multi-slice C=1|3 (gl_WorkGroupID.z = sl) with optional cur broadcast (cur_s2 = 0 on SWA)
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer BufCur { float data_cur[]; };
+layout(binding = 1) readonly  buffer BufMsg { float data_msg[]; };
+layout(binding = 2) writeonly buffer BufDst { float data_dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint  n_embd;
+    uint  n_tokens;
+    uint  off_cur;
+    uint  off_msg;
+    uint  off_dst;
+    float eps;
+    uint  C;
+    uint  cur_s2;
+    uint  msg_s2;
+} p;
+
+shared float sh_red[4][2];
+
+void main() {
+    const uint tok = gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u;
+    const uint sl  = gl_WorkGroupID.z;
+    if (tok >= p.n_tokens || sl >= p.C) {
+        return;
+    }
+    const uint tid = gl_LocalInvocationID.x;
+    const uint cb  = p.off_cur + sl * p.cur_s2 + tok * p.n_embd;
+    const uint mb  = p.off_msg + sl * p.msg_s2 + tok * p.n_embd;
+    const uint db  = p.off_dst + (sl * p.n_tokens + tok) * (2u * p.n_embd);
+
+    float ss0 = 0.0f;
+    float ss1 = 0.0f;
+    for (uint c = tid; c < p.n_embd; c += 128u) {
+        const float x0 = data_cur[cb + c];
+        const float x1 = data_msg[mb + c];
+        ss0 += x0 * x0;
+        ss1 += x1 * x1;
+    }
+    ss0 = subgroupAdd(ss0);
+    ss1 = subgroupAdd(ss1);
+    if (gl_SubgroupInvocationID == 0u) {
+        sh_red[gl_SubgroupID][0] = ss0;
+        sh_red[gl_SubgroupID][1] = ss1;
+    }
+    barrier();
+    const float inv_d  = 1.0f / float(p.n_embd);
+    const float r0_inv = 1.0f / sqrt((sh_red[0][0] + sh_red[1][0] + sh_red[2][0] + sh_red[3][0]) * inv_d + p.eps);
+    const float r1_inv = 1.0f / sqrt((sh_red[0][1] + sh_red[1][1] + sh_red[2][1] + sh_red[3][1]) * inv_d + p.eps);
+
+    for (uint c = tid; c < p.n_embd; c += 128u) {
+        data_dst[db + c]            = data_cur[cb + c] * r0_inv;
+        data_dst[db + p.n_embd + c] = data_msg[mb + c] * r1_inv;
+    }
+}

@@ -30,6 +30,9 @@ const bool Q_IN_REGS       = (Flags & 32) != 0;
 // coopmat1: subgroups own Q rows, O in coopmat accumulators. K/V staged in LDS, or loaded from global memory with FLIP_DIRECT.
 const bool FLIP            = (Flags & 64) != 0;
 const bool FLIP_DIRECT     = (Flags & 128) != 0;
+const bool USE_LPT_GQA_SWIZZLE = (Flags & 256) != 0;
+const bool GQA_VROW_PACK       = (Flags & 512) != 0;
+const bool REL_BIAS_ENABLE     = (Flags & 2048) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -78,7 +81,15 @@ layout (push_constant) uniform parameter {
     uint32_t k_num;
 } p;
 
+// When REL_BIAS_ENABLE is set, ALiBi (max_bias > 0) and LOGIT_SOFTCAP are unused, so max_bias/logit_softcap
+// carry packed rel_params & rel_offsets while preserving m0/m1 for ACTIVE_SPAN_BIT / CONST_PREFIX_BIT.
+#define FA_REL_PARAMS  floatBitsToUint(p.max_bias)
+#define FA_REL_OFFSETS floatBitsToUint(p.logit_softcap)
+
 #define SINK_ENABLE_BIT (1<<24)
+#define ACTIVE_SPAN_BIT (1u<<25)
+#define CONST_PREFIX_BIT (1u<<26)
+#define SINK_2D_BIT (1u<<27)
 #define N_LOG2_MASK 0xFFFF
 
 layout (binding = 4) readonly buffer S {float data_s[];};
@@ -89,6 +100,10 @@ layout (binding = 5) writeonly buffer OV4 {D_TYPEV4 data_ov4[];};
 layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 
 layout (binding = 7) readonly buffer SP {int32_t data_sparse[];};
+
+layout (binding = 8) readonly buffer RT {float data_rel_table[];};
+
+layout (binding = 9) readonly buffer RP {int32_t data_rel_pos[];};
 
 // Use -FLT_MAX/2 rather than -inf to reduce the possibility of NaNs, e.g. when computing Mold-M.
 #define NEG_FLT_MAX_OVER_2 uintBitsToFloat(0xFEFFFFFF)
@@ -103,7 +118,7 @@ layout (binding = 7) readonly buffer SP {int32_t data_sparse[];};
 
 #include "fa_types.glsl"
 
-#if defined(BFLOAT16)
+#if defined(BFLOAT16) || defined(COOPMAT_8X8)
 #define O_TYPE float
 #define O_TYPEV4 vec4
 #else
@@ -147,17 +162,36 @@ ACC_TYPE perElemOpComputeSlope(const in uint32_t r, const in uint32_t c, const i
     return ACC_TYPE(pow(base, ACC_TYPE(exph)));
 }
 
-// Load the sink value, indexed by Q's dimension 2.
+uint32_t i, N, KV, split_k_index, Tr, start_j, end_j,
+#if defined(COOPMAT_8X8)
+         j_const_min, j_const_end,
+#endif
+         gqa_iq1, iq2, iq3, rk2, rk3, rv2, rv3, ik2, ik3, iv2, iv3,
+         q_stride, k_stride, v_stride, m_stride, sparse_base;
+
+// Load the sink value, indexed by Q's dimension 2 (or 2D [n_head, n_tokens] when SINK_2D_BIT is set).
 ACC_TYPE perElemOpGetSink(const in uint32_t r, const in uint32_t c, const in ACC_TYPE elem, const in uint32_t iq2)
 {
+    if ((p.mask_n_head_log2 & SINK_2D_BIT) != 0u) {
+        uint32_t q_tok, h;
+        if (GQA_VROW_PACK) {
+            q_tok = r / p.gqa_ratio;
+            h     = iq2 + (r - q_tok * p.gqa_ratio);
+        } else if (p.gqa_ratio > 1u) {
+            q_tok = gqa_iq1;
+            h     = iq2 + r;
+        } else {
+            q_tok = i * Br + r;
+            h     = iq2;
+        }
+        q_tok = min(q_tok, p.ne2 - 1u);
+        h     = min(h,     p.ne1 - 1u);
+        return ACC_TYPE(data_s[(iq3 * p.ne2 + q_tok) * p.ne1 + h]);
+    }
     const uint32_t h = iq2 + (r % p.gqa_ratio);
 
     return ACC_TYPE(data_s[h]);
 }
-
-uint32_t i, N, KV, split_k_index, Tr, start_j, end_j,
-         gqa_iq1, iq2, iq3, rk2, rk3, rv2, rv3, ik2, ik3, iv2, iv3,
-         q_stride, k_stride, v_stride, m_stride, sparse_base;
 
 void init_indices()
 {
@@ -165,7 +199,7 @@ void init_indices()
     KV = p.KV;
 
     if (p.k_num > 1) {
-        if (p.gqa_ratio > 1) {
+        if (p.gqa_ratio > 1 && !GQA_VROW_PACK) {
             i = 0;
             // batch and split_k share gl_WorkGroupID.x
             gqa_iq1 = gl_WorkGroupID.x / p.k_num;
@@ -175,7 +209,7 @@ void init_indices()
             split_k_index = gl_WorkGroupID.x % p.k_num;
             i = gl_WorkGroupID.x / p.k_num;
         }
-    } else if (p.gqa_ratio > 1) {
+    } else if (p.gqa_ratio > 1 && !GQA_VROW_PACK) {
         i = 0;
         gqa_iq1 = gl_WorkGroupID.x;
         split_k_index = 0;
@@ -189,6 +223,26 @@ void init_indices()
 
     start_j = split_k_index * p.split_kv / Bc;
     end_j = CEIL_DIV(min(KV, (split_k_index + 1) * p.split_kv), Bc);
+#if defined(COOPMAT_8X8)
+    j_const_min = 0u;
+    j_const_end = 0u;
+    if (!USE_SPARSE && (p.mask_n_head_log2 & ACTIVE_SPAN_BIT) != 0u) {
+        const uint32_t m0_u = floatBitsToUint(p.m0);
+        if ((p.mask_n_head_log2 & CONST_PREFIX_BIT) != 0u) {
+            j_const_min = m0_u & 0xFFFFu;
+            j_const_end = m0_u >> 16;
+            start_j = max(start_j, j_const_min);
+        } else {
+            start_j = max(start_j, m0_u);
+        }
+        end_j = min(end_j, floatBitsToUint(p.m1));
+    }
+#else
+    if (!USE_SPARSE && (p.mask_n_head_log2 & ACTIVE_SPAN_BIT) != 0u) {
+        start_j = max(start_j, floatBitsToUint(p.m0));
+        end_j   = min(end_j,   floatBitsToUint(p.m1));
+    }
+#endif
 
     // When not using grouped query attention, all rows share the same iq2, equal to gl_WorkGroupID.y.
     // When using grouped query attention, each workgroup does gqa_ratio consecutive values of iq2.
@@ -213,7 +267,7 @@ void init_indices()
     // nb?1 are already divided by the type size and are in units of elements.
     // When using grouped query attention, Q is indexed by iq2, so the stride
     // should be nb02 (which is in bytes).
-    q_stride = p.gqa_ratio > 1 ? (p.nb02 / 4) : p.nb01;
+    q_stride = (p.gqa_ratio > 1 && !GQA_VROW_PACK) ? (p.nb02 / 4) : p.nb01;
     k_stride = p.nb11;
     v_stride = p.nb21;
     // When using grouped query attention, all rows use the same mask (stride 0).
@@ -221,6 +275,22 @@ void init_indices()
     // that prevents the compiler from folding the "&" through the select
     // and breaking the alignment detection.
     m_stride = (p.gqa_ratio > 1) ? (p.gqa_ratio >> 16) : KV;
+
+    if (USE_LPT_GQA_SWIZZLE) {
+        if (!USE_SPARSE) {
+            if (p.k_num == 1u && p.gqa_ratio == 1u && p.nek2 == p.nev2 && rk2 > 1u && p.neq2 == p.nek2 * rk2) {
+                const uint32_t wg_lin = gl_WorkGroupID.y * Tr + gl_WorkGroupID.x;
+                const uint32_t h_sub  = wg_lin % rk2;
+                const uint32_t tmp    = wg_lin / rk2;
+                const uint32_t i_rev  = tmp % Tr;
+                const uint32_t ik_lin = tmp / Tr;
+                i   = (Tr - 1u) - i_rev;
+                iq2 = ik_lin * rk2 + h_sub;
+                ik2 = ik_lin;
+                iv2 = ik_lin;
+            }
+        }
+    }
 
     // Sparse: the tile shares one mask row (gqa heads, or Br==1). split_k
     // partitions the n_kv_max blocks.

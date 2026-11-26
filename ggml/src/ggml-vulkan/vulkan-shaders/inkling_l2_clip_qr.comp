@@ -1,0 +1,78 @@
+#version 450
+// S19_WAVE3 (mode = 12): Heterogeneous Q [q_ne0, n_head, N] + R [r_ne0, n_head, N] L2 clip in 1 dispatch
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer BufQCur   { float data_q[];   };
+layout(binding = 1) readonly  buffer BufRCur   { float data_r[];   };
+layout(binding = 2) readonly  buffer BufQScale { float data_qs[];  };
+layout(binding = 3) readonly  buffer BufRScale { float data_rs[];  };
+layout(binding = 4) readonly  buffer BufTau    { float data_tau[]; };
+layout(binding = 5) writeonly buffer BufDst    { float data_dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint  q_ne0;
+    uint  r_ne0;
+    uint  n_head;
+    uint  n_tokens;
+    uint  flags; // bit 0: has_q_scale, bit 1: has_r_scale, bit 2: has_tau
+    uint  off_q;
+    uint  off_r;
+    uint  off_qs;
+    uint  off_rs;
+    uint  off_tau;
+    uint  off_dst;
+    float q_threshold;
+    float r_threshold;
+    float eps;
+    uint  q_tok_s;
+    uint  r_tok_s;
+} p;
+
+void main() {
+    const uint row    = gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u;
+    const uint q_rows = p.n_head * p.n_tokens;
+    if (row >= 2u * q_rows) {
+        return;
+    }
+    const uint lane    = gl_LocalInvocationID.x;
+    const bool is_r    = row >= q_rows;
+    const uint sub_row = is_r ? (row - q_rows) : row;
+    const uint head    = sub_row % p.n_head;
+    const uint tok     = sub_row / p.n_head;
+    const uint ne0     = is_r ? p.r_ne0 : p.q_ne0;
+    const bool has_sc  = is_r ? ((p.flags & 2u) != 0u) : ((p.flags & 1u) != 0u);
+    const bool has_tau = (p.flags & 4u) != 0u;
+    const float thresh = is_r ? p.r_threshold : p.q_threshold;
+    const uint cur_b   = is_r ? (p.off_r + tok * p.r_tok_s + head * p.r_ne0)
+                              : (p.off_q + tok * p.q_tok_s + head * p.q_ne0);
+    const uint sc_b    = (is_r ? p.off_rs : p.off_qs) + head * ne0;
+    const uint dst_b   = p.off_dst + (is_r ? (q_rows * p.q_ne0 + sub_row * p.r_ne0) : (sub_row * p.q_ne0));
+
+    float ss = 0.0f;
+    for (uint c = lane; c < ne0; c += 32u) {
+        float x = is_r ? data_r[cur_b + c] : data_q[cur_b + c];
+        if (has_sc) {
+            x *= is_r ? data_rs[sc_b + c] : data_qs[sc_b + c];
+        }
+        ss += x * x;
+    }
+    ss = subgroupAdd(ss);
+    const float norm   = sqrt(ss) + p.eps;
+    const float factor = clamp(thresh / norm, 0.0f, 1.0f);
+    const float tau_v  = has_tau ? data_tau[p.off_tau + tok] : 1.0f;
+
+    for (uint c = lane; c < ne0; c += 32u) {
+        float x = is_r ? data_r[cur_b + c] : data_q[cur_b + c];
+        if (has_sc) {
+            x *= is_r ? data_rs[sc_b + c] : data_qs[sc_b + c];
+        }
+        float out_v = x * factor;
+        if (has_tau) {
+            out_v *= tau_v;
+        }
+        data_dst[dst_b + c] = out_v;
+    }
+}

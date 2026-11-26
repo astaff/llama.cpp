@@ -35,7 +35,7 @@ bool ggml_vk_intel_windows_driver_in_range(uint32_t driver_version, uint32_t low
 // shaders
 void ggml_vk_destroy_pipeline(vk::Device& device, vk_pipeline& pipeline);
 vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc, uint32_t qk_ratio, bool allow_flip = true);
-vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc, bool use_mask, bool use_mask_opt, bool use_logit_softcap, bool use_sparse, ggml_type k_type, ggml_type v_type);
+vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc, bool use_mask, bool use_mask_opt, bool use_logit_softcap, bool use_sparse, ggml_type k_type, ggml_type v_type, uint32_t extra_flags = 0u);
 uint32_t get_subgroup_size(const std::string &pipeline_name, const vk_device_architecture &arch);
 void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested = nullptr);
 bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type, ggml_type v_type);
@@ -111,7 +111,7 @@ void ggml_vk_dsv4_hc_pre(ggml_backend_vk_context * ctx, vk_context& subctx, cons
 void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * x, const ggml_tensor * residual, const ggml_tensor * post, const ggml_tensor * comb, ggml_tensor * dst, const ggml_tensor * gate_scale_in = nullptr);
 void ggml_vk_top_k_mask(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst);
 void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx);
-bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int node_idx);
+bool ggml_vk_use_mul_mat_vec_id(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx);
 void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx);
 
 // flash-attn
@@ -303,6 +303,14 @@ inline void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     GGML_ASSERT(pipeline->parameter_count == descriptor_buffer_infos.size());
     GGML_ASSERT(pipeline->push_constant_size == push_constant_size(push_constants));
 
+    ctx->stat_dispatches++;
+    {
+        // gen: GGML_VK_GRAPH_STATS=2 lists every dispatch (pipeline and workgroups)
+        static const int gen_stats_level = getenv("GGML_VK_GRAPH_STATS") ? atoi(getenv("GGML_VK_GRAPH_STATS")) : 0;
+        if (gen_stats_level >= 2) {
+            fprintf(stderr, "ggml_vk_dispatch: %s %u %u %u\n", pipeline->name.c_str(), wg0, wg1, wg2);
+        }
+    }
     const uint32_t descriptor_set_idx = ctx->descriptor_set_idx++;
     vk::DescriptorSet& descriptor_set = ctx->descriptor_sets[descriptor_set_idx];
 

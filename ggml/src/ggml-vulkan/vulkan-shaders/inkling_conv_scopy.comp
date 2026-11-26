@@ -1,0 +1,112 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+// S19 W6: Dedicated N<=16 WAR-free wg_y=1 ShortConv + n_exp MoE sum8 epilogue (supports both direct s_copy & build_rs history)
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer BufCur   { float data_cur[];   };
+layout(binding = 1) readonly  buffer BufHist  { float data_hist[];  };
+layout(binding = 2) readonly  buffer BufW     { float data_w[];     };
+layout(binding = 3) readonly  buffer BufDyn   { float data_dyn[];   };
+layout(binding = 4)           buffer BufState { float data_state[]; };
+layout(binding = 5) writeonly buffer BufDst   { float data_dst[];   };
+layout(binding = 6) readonly  buffer BufRes   { float data_res[];   };
+layout(binding = 7) readonly  buffer BufSCopy { int   data_scopy[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint  n_channels;
+    uint  n_seq_tokens;
+    uint  n_seqs;
+    uint  n_exp;
+    uint  ch_offset;
+    uint  n_heads;
+    uint  st_base_f32;
+    uint  st_seq_stride;
+    uint  st_slot_stride;
+    uint  st_kw;
+    uint  off_cur;
+    uint  off_w;
+    uint  off_dyn;
+    uint  off_dst;
+    float scale_out;
+    uint  has_res;
+    uint  off_res;
+    uint  off_state;
+    uint  off_scopy;
+    uint  use_hist;
+    uint  off_hist;
+    uint  hist_sconv_ch;
+    uint  cur_s1;
+} p;
+
+void main() {
+    const uint c   = gl_GlobalInvocationID.x;
+    const uint seq = gl_WorkGroupID.z;
+    if (c >= p.n_channels || seq >= p.n_seqs) {
+        return;
+    }
+
+    const uint wb = p.off_w + c * 4u;
+    const float w0 = data_w[wb + 0u];
+    const float w1 = data_w[wb + 1u];
+    const float w2 = data_w[wb + 2u];
+    const float w3 = data_w[wb + 3u];
+
+    float x0, x1, x2;
+    if (p.use_hist != 0u) {
+        const uint hb = p.off_hist + (seq * p.hist_sconv_ch + (p.ch_offset + c)) * 3u;
+        x0 = data_hist[hb + 0u];
+        x1 = data_hist[hb + 1u];
+        x2 = data_hist[hb + 2u];
+    } else {
+        const uint src_cell = uint(data_scopy[p.off_scopy + seq]);
+        const uint hb       = p.off_state + src_cell * p.st_seq_stride + (p.ch_offset + c) * 3u;
+        x0 = data_state[hb + 0u];
+        x1 = data_state[hb + 1u];
+        x2 = data_state[hb + 2u];
+    }
+
+    const uint head = (p.n_heads > 0u) ? (c / (p.n_channels / p.n_heads)) : 0u;
+    for (uint t = 0u; t < p.n_seq_tokens; ++t) {
+        const uint tok_global = seq * p.n_seq_tokens + t;
+        const uint elem       = tok_global * p.n_channels + c;
+        float x3;
+        if (p.n_exp <= 1u) {
+            x3 = data_cur[p.off_cur + tok_global * p.cur_s1 + c];
+        } else {
+            const uint base = p.off_cur + tok_global * (p.n_exp * p.n_channels) + c;
+            float s = data_cur[base];
+            for (uint e = 1u; e < p.n_exp; ++e) {
+                precise float ns = s + data_cur[base + e * p.n_channels];
+                s = ns;
+            }
+            x3 = s;
+        }
+
+        float sum = ((x0 * w0 + x1 * w1) + x2 * w2) + x3 * w3;
+        if (p.n_heads > 0u) {
+            const uint db = p.off_dyn + (tok_global * p.n_heads + head) * 4u;
+            sum += x3 * data_dyn[db + 0u];
+            sum += x2 * data_dyn[db + 1u];
+            sum += x1 * data_dyn[db + 2u];
+            sum += x0 * data_dyn[db + 3u];
+        }
+
+        precise float pre_sum = x3 + sum;
+        precise float scaled  = pre_sum * p.scale_out;
+        precise float out_val = (p.has_res != 0u) ? (data_res[p.off_res + elem] + scaled) : scaled;
+        data_dst[p.off_dst + elem] = out_val;
+
+        const int target_slot = int(p.n_seq_tokens) - 1 - int(t);
+        if (target_slot >= 0 && uint(target_slot) < p.st_kw) {
+            const uint sb = p.st_base_f32 + uint(target_slot) * p.st_slot_stride + seq * p.st_seq_stride + c * 3u;
+            data_state[sb + 0u] = x1;
+            data_state[sb + 1u] = x2;
+            data_state[sb + 2u] = x3;
+        }
+
+        x0 = x1;
+        x1 = x2;
+        x2 = x3;
+    }
+}

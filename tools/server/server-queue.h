@@ -150,9 +150,12 @@ private:
     bool process_new_tasks(bool is_yielding);
 
     // for worker_t
+    void wake_worker_if_yielding_locked();
     void worker_loop();
     void worker_stop();
 };
+
+void server_restore_init_thread_affinity();
 
 // struct for managing server responses
 // in most cases, use server_response_reader to retrieve results

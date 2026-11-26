@@ -1,130 +1,608 @@
 #version 450
 
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#ifdef REPACK_PLANAR
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#endif
 
 #include "mul_mat_vec_base.glsl"
 
+#ifdef REPACK_PLANAR
+#include "repack_planar.glsl"
+layout (binding = 0) readonly buffer A_U32  { uint  data_a_u32[];  };
+layout (binding = 0) readonly buffer A_U4   { uvec4 data_a_u4[];   };
+layout (binding = 3) readonly buffer A2_U32 { uint  data_a2_u32[]; };
+layout (binding = 3) readonly buffer A2_U4  { uvec4 data_a2_u4[];  };
+#endif
+
+#ifdef USE_SUBGROUP_ADD_NO_SHMEM
+layout(local_size_x_id = 0, local_size_y_id = 4, local_size_z = 1) in;
+#else
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+#endif
 
-shared FLOAT_TYPE sccache[2][BLOCK_SIZE/16][16];
+#define LOAD_Q6_K_16(PFX, ARR_A, ARR_P16) \
+    const uint32_t PFX##_ql0_u32  = uint32_t(ARR_P16[ib0 + i].ql[ql_offset / 2])      | (uint32_t(ARR_P16[ib0 + i].ql[ql_offset / 2 +  1]) << 16); \
+    const uint32_t PFX##_ql32_u32 = uint32_t(ARR_P16[ib0 + i].ql[ql_offset / 2 + 16]) | (uint32_t(ARR_P16[ib0 + i].ql[ql_offset / 2 + 17]) << 16); \
+    const uint32_t PFX##_qh_u32   = uint32_t(ARR_P16[ib0 + i].qh[qh_offset / 2])      | (uint32_t(ARR_P16[ib0 + i].qh[qh_offset / 2 +  1]) << 16); \
+    const vec4 PFX##_q0 = vec4(unpack8((PFX##_ql0_u32  & 0x0F0F0F0Fu) | ((PFX##_qh_u32 & 0x03030303u) << 4))) - 32.0f; \
+    const vec4 PFX##_q1 = vec4(unpack8((PFX##_ql32_u32 & 0x0F0F0F0Fu) | ((PFX##_qh_u32 & 0x0C0C0C0Cu) << 2))) - 32.0f; \
+    const vec4 PFX##_q2 = vec4(unpack8(((PFX##_ql0_u32  >> 4) & 0x0F0F0F0Fu) | (PFX##_qh_u32 & 0x30303030u))) - 32.0f; \
+    const vec4 PFX##_q3 = vec4(unpack8(((PFX##_ql32_u32 >> 4) & 0x0F0F0F0Fu) | ((PFX##_qh_u32 & 0xC0C0C0C0u) >> 2))) - 32.0f; \
+    const FLOAT_TYPE PFX##_sc0 = FLOAT_TYPE(ARR_A[ib0 + i].scales[s_offset]); \
+    const FLOAT_TYPE PFX##_sc1 = FLOAT_TYPE(ARR_A[ib0 + i].scales[s_offset + 2]); \
+    const FLOAT_TYPE PFX##_sc2 = FLOAT_TYPE(ARR_A[ib0 + i].scales[s_offset + 4]); \
+    const FLOAT_TYPE PFX##_sc3 = FLOAT_TYPE(ARR_A[ib0 + i].scales[s_offset + 6]); \
+    const FLOAT_TYPE PFX##_d   = FLOAT_TYPE(ARR_A[ib0 + i].d)
 
-FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
-uint csel = 0;
+#define DOT_Q6_K_16_WITH_BY(PFX, DST_TEMP, BY0, BY32, BY64, BY96) do { \
+    FLOAT_TYPE sum[4] = {0, 0, 0, 0}; \
+    [[unroll]] for (uint l = 0; l < 4; ++l) { \
+        sum[0] = fma(FLOAT_TYPE((BY0)[l]),  PFX##_q0[l], sum[0]); \
+        sum[1] = fma(FLOAT_TYPE((BY32)[l]), PFX##_q1[l], sum[1]); \
+        sum[2] = fma(FLOAT_TYPE((BY64)[l]), PFX##_q2[l], sum[2]); \
+        sum[3] = fma(FLOAT_TYPE((BY96)[l]), PFX##_q3[l], sum[3]); \
+    } \
+    DST_TEMP[j][n] = fma(fma(sum[0], PFX##_sc0, fma(sum[1], PFX##_sc1, fma(sum[2], PFX##_sc2, sum[3] * PFX##_sc3))), PFX##_d, DST_TEMP[j][n]); \
+} while (false)
 
-void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, const uint ix, const uint ql_offset, const uint qh_offset, const uint s_offset, const uint y_offset, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows, const bool all_threads) {
+void calc_superblock_a(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_TYPE temp2[NUM_COLS][NUM_ROWS], const uint a_offset, const uint b_offset, const uint ql_offset, const uint qh_offset, const uint s_offset, const uint y_offset, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
     const uint y_idx = i * QUANT_K + y_offset;
 
-    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-        const uint ib0 = a_offset + (first_row+n)*num_blocks_per_row;
-        csel ^= 1;
-
-        if (!all_threads) { // when we don't have enough blocks to use all threads
-            if (i < num_blocks_per_row)
-                sccache[csel][ix][itid] = FLOAT_TYPE(data_a[ib0 + i].scales[itid]);
-            barrier();
-
-            if (i >= num_blocks_per_row)
-                continue;
-        }
-
-        const uint32_t ql0_u32 =  uint32_t(data_a_packed16[ib0 + i].ql[ql_offset / 2]) | (uint32_t(data_a_packed16[ib0 + i].ql[ql_offset / 2 + 1]) << 16);
-        const uint32_t ql32_u32 = uint32_t(data_a_packed16[ib0 + i].ql[ql_offset / 2 + 16]) | (uint32_t(data_a_packed16[ib0 + i].ql[ql_offset / 2 + 17]) << 16);
-
-        const uint32_t ql0_u32_lo4 = ql0_u32 & 0x0F0F0F0F;
-        const uint32_t ql0_u32_hi4 = (ql0_u32 >> 4) & 0x0F0F0F0F;
-        const uint32_t ql32_u32_lo4 = ql32_u32 & 0x0F0F0F0F;
-        const uint32_t ql32_u32_hi4 = (ql32_u32 >> 4) & 0x0F0F0F0F;
-
-        const uint32_t qh_u32 = uint32_t(data_a_packed16[ib0 + i].qh[qh_offset / 2]) | (uint32_t(data_a_packed16[ib0 + i].qh[qh_offset / 2 + 1]) << 16);
-        const uint32_t qh0_u32 = (qh_u32 & 0x03030303) << 4;
-        const uint32_t qh2_u32 = (qh_u32 & 0x0C0C0C0C) << 2;
-        const uint32_t qh4_u32 = (qh_u32 & 0x30303030);
-        const uint32_t qh6_u32 = (qh_u32 & 0xC0C0C0C0) >> 2;
-
-        const uint32_t q0_u32 = ql0_u32_lo4  | qh0_u32;
-        const uint32_t q1_u32 = ql32_u32_lo4 | qh2_u32;
-        const uint32_t q2_u32 = ql0_u32_hi4  | qh4_u32;
-        const uint32_t q3_u32 = ql32_u32_hi4 | qh6_u32;
-
-        const vec4 q0 = vec4(unpack8(q0_u32)) - 32;
-        const vec4 q1 = vec4(unpack8(q1_u32)) - 32;
-        const vec4 q2 = vec4(unpack8(q2_u32)) - 32;
-        const vec4 q3 = vec4(unpack8(q3_u32)) - 32;
-
-        if (all_threads) {
-            sccache[csel][ix][itid] = FLOAT_TYPE(data_a[ib0 + i].scales[itid]);
-            barrier();
-        }
-
-        const FLOAT_TYPE d = FLOAT_TYPE(data_a[ib0 + i].d);
-
+    if (NUM_COLS <= 4) {
+        vec4 by0_a[NUM_COLS], by32_a[NUM_COLS], by64_a[NUM_COLS], by96_a[NUM_COLS];
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-            vec4 by0  = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4     ]);
-            vec4 by32 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 +  8]);
-            vec4 by64 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 16]);
-            vec4 by96 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 24]);
-
-            FLOAT_TYPE sum[4] = {0, 0, 0, 0};
-            [[unroll]] for (uint l = 0; l < 4; ++l) {
-                sum[0] = fma(FLOAT_TYPE(by0[l]), q0[l], sum[0]);
-                sum[1] = fma(FLOAT_TYPE(by32[l]), q1[l], sum[1]);
-                sum[2] = fma(FLOAT_TYPE(by64[l]), q2[l], sum[2]);
-                sum[3] = fma(FLOAT_TYPE(by96[l]), q3[l], sum[3]);
-            }
-            temp[j][n] = fma(fma(sum[0], sccache[csel][ix][s_offset], fma(sum[1], sccache[csel][ix][s_offset + 2], fma(sum[2], sccache[csel][ix][s_offset + 4], sum[3] * sccache[csel][ix][s_offset + 6]))), d, temp[j][n]);
+            const uint b4 = (j * p.batch_stride_b + b_offset + y_idx) / 4;
+            by0_a[j]  = vec4(data_b_v4[b4     ]);
+            by32_a[j] = vec4(data_b_v4[b4 +  8]);
+            by64_a[j] = vec4(data_b_v4[b4 + 16]);
+            by96_a[j] = vec4(data_b_v4[b4 + 24]);
         }
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint rn = (n == 0 || n < num_rows) ? n : 0;
+            const uint ib0 = a_offset + (first_row + rn) * num_blocks_per_row;
+            LOAD_Q6_K_16(a1, data_a, data_a_packed16);
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                DOT_Q6_K_16_WITH_BY(a1, temp, by0_a[j], by32_a[j], by64_a[j], by96_a[j]);
+            }
+            if (GEN_GLU == 3) {
+                LOAD_Q6_K_16(a2, data_a2, data_a2_packed16);
+                [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                    DOT_Q6_K_16_WITH_BY(a2, temp2, by0_a[j], by32_a[j], by64_a[j], by96_a[j]);
+                }
+            }
+        }
+    } else {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint rn = (n == 0 || n < num_rows) ? n : 0;
+            const uint ib0 = a_offset + (first_row + rn) * num_blocks_per_row;
+            LOAD_Q6_K_16(a1, data_a, data_a_packed16);
+            if (GEN_GLU == 3) {
+                LOAD_Q6_K_16(a2, data_a2, data_a2_packed16);
+                [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                    const uint b4 = (j * p.batch_stride_b + b_offset + y_idx) / 4;
+                    const vec4 by0 = vec4(data_b_v4[b4]), by32 = vec4(data_b_v4[b4 + 8]), by64 = vec4(data_b_v4[b4 + 16]), by96 = vec4(data_b_v4[b4 + 24]);
+                    DOT_Q6_K_16_WITH_BY(a1, temp,  by0, by32, by64, by96);
+                    DOT_Q6_K_16_WITH_BY(a2, temp2, by0, by32, by64, by96);
+                }
+            } else {
+                [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                    const uint b4 = (j * p.batch_stride_b + b_offset + y_idx) / 4;
+                    const vec4 by0 = vec4(data_b_v4[b4]), by32 = vec4(data_b_v4[b4 + 8]), by64 = vec4(data_b_v4[b4 + 16]), by96 = vec4(data_b_v4[b4 + 24]);
+                    DOT_Q6_K_16_WITH_BY(a1, temp, by0, by32, by64, by96);
+                }
+            }
+        }
+    }
+}
+
+void calc_superblock_a2(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint a_offset, const uint b_offset, const uint ql_offset, const uint qh_offset, const uint s_offset, const uint y_offset, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
+    const uint y_idx = i * QUANT_K + y_offset;
+
+    if (NUM_COLS <= 4) {
+        vec4 by0_a[NUM_COLS], by32_a[NUM_COLS], by64_a[NUM_COLS], by96_a[NUM_COLS];
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const uint b4 = (j * p.batch_stride_b + b_offset + y_idx) / 4;
+            by0_a[j]  = vec4(data_b_v4[b4     ]);
+            by32_a[j] = vec4(data_b_v4[b4 +  8]);
+            by64_a[j] = vec4(data_b_v4[b4 + 16]);
+            by96_a[j] = vec4(data_b_v4[b4 + 24]);
+        }
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint rn = (n == 0 || n < num_rows) ? n : 0;
+            const uint ib0 = a_offset + (first_row + rn) * num_blocks_per_row;
+            LOAD_Q6_K_16(a2, data_a2, data_a2_packed16);
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                DOT_Q6_K_16_WITH_BY(a2, temp, by0_a[j], by32_a[j], by64_a[j], by96_a[j]);
+            }
+        }
+    } else {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint rn = (n == 0 || n < num_rows) ? n : 0;
+            const uint ib0 = a_offset + (first_row + rn) * num_blocks_per_row;
+            LOAD_Q6_K_16(a2, data_a2, data_a2_packed16);
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                const uint b4 = (j * p.batch_stride_b + b_offset + y_idx) / 4;
+                const vec4 by0 = vec4(data_b_v4[b4]), by32 = vec4(data_b_v4[b4 + 8]), by64 = vec4(data_b_v4[b4 + 16]), by96 = vec4(data_b_v4[b4 + 24]);
+                DOT_Q6_K_16_WITH_BY(a2, temp, by0, by32, by64, by96);
+            }
+        }
+    }
+}
+
+#define RUN_Q6_K_8(ARR_A, ARR_P16, DST_TEMP) do { \
+    const FLOAT_TYPE d = FLOAT_TYPE(ARR_A[ib].d); \
+    [[unroll]] for (uint h = 0; h < 2; ++h) { \
+        const uint ql_h = 32 * h + 2 * itid8; \
+        const uint qh_h = 16 * h + 2 * itid8; \
+        const uint s_h  = 8 * h + (itid8 >> 2); \
+        const uint32_t ql0_u32  = uint32_t(ARR_P16[ib].ql[ql_h])      | (uint32_t(ARR_P16[ib].ql[ql_h +  1]) << 16); \
+        const uint32_t ql32_u32 = uint32_t(ARR_P16[ib].ql[ql_h + 16]) | (uint32_t(ARR_P16[ib].ql[ql_h + 17]) << 16); \
+        const uint32_t qh_u32   = uint32_t(ARR_P16[ib].qh[qh_h])      | (uint32_t(ARR_P16[ib].qh[qh_h +  1]) << 16); \
+        const vec4 q0 = vec4(unpack8((ql0_u32  & 0x0F0F0F0Fu) | ((qh_u32 & 0x03030303u) << 4))) - 32.0f; \
+        const vec4 q1 = vec4(unpack8((ql32_u32 & 0x0F0F0F0Fu) | ((qh_u32 & 0x0C0C0C0Cu) << 2))) - 32.0f; \
+        const vec4 q2 = vec4(unpack8(((ql0_u32  >> 4) & 0x0F0F0F0Fu) | (qh_u32 & 0x30303030u))) - 32.0f; \
+        const vec4 q3 = vec4(unpack8(((ql32_u32 >> 4) & 0x0F0F0F0Fu) | ((qh_u32 & 0xC0C0C0C0u) >> 2))) - 32.0f; \
+        const FLOAT_TYPE sc0 = FLOAT_TYPE(ARR_A[ib].scales[s_h    ]) * d; \
+        const FLOAT_TYPE sc1 = FLOAT_TYPE(ARR_A[ib].scales[s_h + 2]) * d; \
+        const FLOAT_TYPE sc2 = FLOAT_TYPE(ARR_A[ib].scales[s_h + 4]) * d; \
+        const FLOAT_TYPE sc3 = FLOAT_TYPE(ARR_A[ib].scales[s_h + 6]) * d; \
+        const uint bk = 32 * h; \
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) { \
+            const uint b4 = (j * p.batch_stride_b + b_offset + y_idx) / 4 + bk; \
+            const vec4 by0 = vec4(data_b_v4[b4     ]), by1 = vec4(data_b_v4[b4 +  8]); \
+            const vec4 by2 = vec4(data_b_v4[b4 + 16]), by3 = vec4(data_b_v4[b4 + 24]); \
+            DST_TEMP[j][n] += (dot(by0, q0) * sc0 + dot(by1, q1) * sc1) + (dot(by2, q2) * sc2 + dot(by3, q3) * sc3); \
+        } \
+    } \
+} while (false)
+
+#define RUN_Q6_K_8_BY(ARR_A, ARR_P16, DST_TEMP) do { \
+    const FLOAT_TYPE d = FLOAT_TYPE(ARR_A[ib].d); \
+    [[unroll]] for (uint h = 0; h < 2; ++h) { \
+        const uint ql_h = 32 * h + 2 * itid8; \
+        const uint qh_h = 16 * h + 2 * itid8; \
+        const uint s_h  = 8 * h + (itid8 >> 2); \
+        const uint32_t ql0_u32  = uint32_t(ARR_P16[ib].ql[ql_h])      | (uint32_t(ARR_P16[ib].ql[ql_h +  1]) << 16); \
+        const uint32_t ql32_u32 = uint32_t(ARR_P16[ib].ql[ql_h + 16]) | (uint32_t(ARR_P16[ib].ql[ql_h + 17]) << 16); \
+        const uint32_t qh_u32   = uint32_t(ARR_P16[ib].qh[qh_h])      | (uint32_t(ARR_P16[ib].qh[qh_h +  1]) << 16); \
+        const vec4 q0 = vec4(unpack8((ql0_u32  & 0x0F0F0F0Fu) | ((qh_u32 & 0x03030303u) << 4))) - 32.0f; \
+        const vec4 q1 = vec4(unpack8((ql32_u32 & 0x0F0F0F0Fu) | ((qh_u32 & 0x0C0C0C0Cu) << 2))) - 32.0f; \
+        const vec4 q2 = vec4(unpack8(((ql0_u32  >> 4) & 0x0F0F0F0Fu) | (qh_u32 & 0x30303030u))) - 32.0f; \
+        const vec4 q3 = vec4(unpack8(((ql32_u32 >> 4) & 0x0F0F0F0Fu) | ((qh_u32 & 0xC0C0C0C0u) >> 2))) - 32.0f; \
+        const FLOAT_TYPE sc0 = FLOAT_TYPE(ARR_A[ib].scales[s_h    ]) * d; \
+        const FLOAT_TYPE sc1 = FLOAT_TYPE(ARR_A[ib].scales[s_h + 2]) * d; \
+        const FLOAT_TYPE sc2 = FLOAT_TYPE(ARR_A[ib].scales[s_h + 4]) * d; \
+        const FLOAT_TYPE sc3 = FLOAT_TYPE(ARR_A[ib].scales[s_h + 6]) * d; \
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) { \
+            DST_TEMP[j][n] += (dot(by_h[h][j][0], q0) * sc0 + dot(by_h[h][j][1], q1) * sc1) + (dot(by_h[h][j][2], q2) * sc2 + dot(by_h[h][j][3], q3) * sc3); \
+        } \
+    } \
+} while (false)
+
+void calc_superblock_8_a(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], inout FLOAT_TYPE temp2[NUM_COLS][NUM_ROWS], const uint a_offset, const uint b_offset, const uint itid8, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
+    const uint y_idx = i * QUANT_K + 4 * itid8;
+    if (NUM_COLS <= 4 && NUM_ROWS > 1) {
+        vec4 by_h[2][NUM_COLS][4];
+        [[unroll]] for (uint h = 0; h < 2; ++h) {
+            const uint bk = 32 * h;
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                const uint b4 = (j * p.batch_stride_b + b_offset + y_idx) / 4 + bk;
+                by_h[h][j][0] = vec4(data_b_v4[b4     ]); by_h[h][j][1] = vec4(data_b_v4[b4 +  8]);
+                by_h[h][j][2] = vec4(data_b_v4[b4 + 16]); by_h[h][j][3] = vec4(data_b_v4[b4 + 24]);
+            }
+        }
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint rn = (n == 0 || n < num_rows) ? n : 0;
+            const uint ib = a_offset + (first_row + rn) * num_blocks_per_row + i;
+            RUN_Q6_K_8_BY(data_a, data_a_packed16, temp);
+            if (GEN_GLU == 3) {
+                RUN_Q6_K_8_BY(data_a2, data_a2_packed16, temp2);
+            }
+        }
+    } else {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint rn = (n == 0 || n < num_rows) ? n : 0;
+            const uint ib = a_offset + (first_row + rn) * num_blocks_per_row + i;
+            RUN_Q6_K_8(data_a, data_a_packed16, temp);
+            if (GEN_GLU == 3) {
+                RUN_Q6_K_8(data_a2, data_a2_packed16, temp2);
+            }
+        }
+    }
+}
+
+void calc_superblock_8_a2(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint a_offset, const uint b_offset, const uint itid8, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
+    const uint y_idx = i * QUANT_K + 4 * itid8;
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        const uint rn = (n == 0 || n < num_rows) ? n : 0;
+        const uint ib = a_offset + (first_row + rn) * num_blocks_per_row + i;
+        RUN_Q6_K_8(data_a2, data_a2_packed16, temp);
     }
 }
 
 void compute_outputs(const uint first_row, const uint num_rows) {
     uint a_offset, b_offset, d_offset;
     get_offsets(a_offset, b_offset, d_offset);
+#ifndef MUL_MAT_ID
+    const bool use_a2   = (GEN_GLU == 2) && (first_row >= p.pair_m0);
+    const uint row_base = use_a2 ? (first_row - p.pair_m0) : first_row;
+    const uint eff_rows = (!use_a2 && GEN_GLU == 2) ? min(num_rows, p.pair_m0 - first_row) : num_rows;
+#else
+    const bool use_a2   = false;
+    const uint row_base = first_row;
+    const uint eff_rows = num_rows;
+#endif
 
     const uint num_blocks_per_row = p.ncols / QUANT_K;
 
-    // 16 threads are used to process each block
-    const uint it_size = gl_WorkGroupSize.x/16;
+#ifdef USE_SUBGROUP_ADD_NO_SHMEM
+    const uint tid = gl_SubgroupInvocationID;
+#else
     const uint tid = gl_LocalInvocationID.x;
-    const uint itid = tid%16;  // 0...15
-    const uint ix = tid/16;
+#endif
 
-    const uint v_im = itid/8;                               // 0 or 1. 0 computes 0..., 1 computes 128...
-    const uint v_in = itid - 8*v_im;                        // 0...7
-
-    const uint l0 = 4 * v_in;                               // 0, 4, 8, ..., 28
-    const uint is = v_in / 4;
-
-    const uint ql_offset = 64*v_im + l0;
-    const uint qh_offset = 32*v_im + l0;
-    const uint s_offset  =  8*v_im + is;
-    const uint y_offset = 128*v_im + l0;
+    FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+    FLOAT_TYPE temp2[NUM_COLS][NUM_ROWS];
 
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
         [[unroll]] for (uint i = 0; i < NUM_ROWS; ++i) {
             temp[j][i] = FLOAT_TYPE(0);
+            if (GEN_GLU == 3) {
+                temp2[j][i] = FLOAT_TYPE(0);
+            }
         }
     }
 
-    const uint nbr_par_th = num_blocks_per_row%it_size;
-    const uint nbr_all_th = num_blocks_per_row - nbr_par_th;
-    uint i0 = 0;
-    [[unroll]] for (; i0 < nbr_all_th; i0 += it_size)
-        calc_superblock(a_offset, b_offset, itid, ix, ql_offset, qh_offset, s_offset, y_offset, i0 + ix, num_blocks_per_row, first_row, num_rows, true);
-    calc_superblock(a_offset, b_offset, itid, ix, ql_offset, qh_offset, s_offset, y_offset, i0 + ix, num_blocks_per_row, first_row, num_rows, false);
+#ifdef REPACK_PLANAR
+#ifndef REPACK_FAST_KQ
+#define REPACK_FAST_KQ GEN_FAST_KQ
+#endif
+    if (REPACK_FAST_KQ >= 2) {
+        const uint it_size8 = gl_WorkGroupSize.x >> 3u;
+        const uint itid8 = tid & 7u;
+        const uint ix8 = tid >> 3u;
+        const uint sel = itid8 >> 2u;
+        for (uint i = ix8; i < num_blocks_per_row; i += it_size8) {
+            const uint y_idx = i * QUANT_K + 4u * itid8;
+            if (NUM_COLS <= 2) {
+                vec4 by_h[2][NUM_COLS][4];
+                [[unroll]] for (uint h = 0u; h < 2u; ++h) {
+                    const uint bk = 32u * h;
+                    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                        const uint b4 = ((j * p.batch_stride_b + b_offset + y_idx) >> 2u) + bk;
+                        by_h[h][j][0] = vec4(data_b_v4[b4      ]); by_h[h][j][1] = vec4(data_b_v4[b4 +  8u]);
+                        by_h[h][j][2] = vec4(data_b_v4[b4 + 16u]); by_h[h][j][3] = vec4(data_b_v4[b4 + 24u]);
+                    }
+                }
+                [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                    const uint rn = (n == 0 || n < eff_rows) ? n : 0;
+                    const uint sb_u4  = (a_offset + (row_base + rn) * num_blocks_per_row + i) * REPACK_Q6_K_SB_U4;
+                    const uint sb_u32 = sb_u4 << 2u;
+                    {
+                        const uvec4 sc_hdr = use_a2 ? data_a2_u4[sb_u4 + REPACK_Q6_K_SC_OFF_U4] : data_a_u4[sb_u4 + REPACK_Q6_K_SC_OFF_U4];
+                        const float d = unpackHalf2x16(use_a2 ? data_a2_u32[sb_u32 + REPACK_Q6_K_D_OFF_U32] : data_a_u32[sb_u32 + REPACK_Q6_K_D_OFF_U32]).x;
+                        const uvec4 q = use_a2 ? data_a2_u4[sb_u4 + REPACK_Q6_K_QL_OFF_U4 + itid8] : data_a_u4[sb_u4 + REPACK_Q6_K_QL_OFF_U4 + itid8];
+                        const uint qh0 = use_a2 ? data_a2_u32[sb_u32 + REPACK_Q6_K_QH_OFF_U32 + itid8 * 2u + 0u] : data_a_u32[sb_u32 + REPACK_Q6_K_QH_OFF_U32 + itid8 * 2u + 0u];
+                        const uint qh1 = use_a2 ? data_a2_u32[sb_u32 + REPACK_Q6_K_QH_OFF_U32 + itid8 * 2u + 1u] : data_a_u32[sb_u32 + REPACK_Q6_K_QH_OFF_U32 + itid8 * 2u + 1u];
+                        [[unroll]] for (uint h = 0u; h < 2u; ++h) {
+                            const uint ql0  = (h == 0u) ? q.x : q.z;
+                            const uint ql32 = (h == 0u) ? q.y : q.w;
+                            const uint qh   = (h == 0u) ? qh0 : qh1;
+                            const uint sw_a = (h == 0u) ? sc_hdr.x : sc_hdr.z;
+                            const uint sw_b = (h == 0u) ? sc_hdr.y : sc_hdr.w;
+                            const vec4 q0 = repack_magic_q6((ql0  & 0x000F000Fu) | ((qh & 0x00030003u) << 4u), ((ql0  >> 8u) & 0x000F000Fu) | ((qh & 0x03000300u) >> 4u));
+                            const vec4 q1 = repack_magic_q6((ql32 & 0x000F000Fu) | ((qh & 0x000C000Cu) << 2u), ((ql32 >> 8u) & 0x000F000Fu) | ((qh & 0x0C000C00u) >> 6u));
+                            const vec4 q2 = repack_magic_q6(((ql0 >> 4u) & 0x000F000Fu) | (qh & 0x00300030u),  ((ql0  >> 12u) & 0x000F000Fu) | ((qh & 0x30003000u) >> 8u));
+                            const vec4 q3 = repack_magic_q6(((ql32>> 4u) & 0x000F000Fu) | ((qh & 0x00C000C0u) >> 2u), ((ql32 >> 12u) & 0x000F000Fu) | ((qh & 0xC000C000u) >> 10u));
+                            const FLOAT_TYPE sc0 = FLOAT_TYPE(bitfieldExtract(int(sw_a), int(sel * 8u),       8)) * d;
+                            const FLOAT_TYPE sc1 = FLOAT_TYPE(bitfieldExtract(int(sw_a), int((sel + 2u) * 8u), 8)) * d;
+                            const FLOAT_TYPE sc2 = FLOAT_TYPE(bitfieldExtract(int(sw_b), int(sel * 8u),       8)) * d;
+                            const FLOAT_TYPE sc3 = FLOAT_TYPE(bitfieldExtract(int(sw_b), int((sel + 2u) * 8u), 8)) * d;
+                            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                                temp[j][n] += (dot(by_h[h][j][0], q0) * sc0 + dot(by_h[h][j][1], q1) * sc1) +
+                                              (dot(by_h[h][j][2], q2) * sc2 + dot(by_h[h][j][3], q3) * sc3);
+                            }
+                        }
+                    }
+                    if (GEN_GLU == 3) {
+                        const uvec4 sc_hdr = data_a2_u4[sb_u4 + REPACK_Q6_K_SC_OFF_U4];
+                        const float d = unpackHalf2x16(data_a2_u32[sb_u32 + REPACK_Q6_K_D_OFF_U32]).x;
+                        const uvec4 q = data_a2_u4[sb_u4 + REPACK_Q6_K_QL_OFF_U4 + itid8];
+                        const uint qh0 = data_a2_u32[sb_u32 + REPACK_Q6_K_QH_OFF_U32 + itid8 * 2u + 0u];
+                        const uint qh1 = data_a2_u32[sb_u32 + REPACK_Q6_K_QH_OFF_U32 + itid8 * 2u + 1u];
+                        [[unroll]] for (uint h = 0u; h < 2u; ++h) {
+                            const uint ql0  = (h == 0u) ? q.x : q.z;
+                            const uint ql32 = (h == 0u) ? q.y : q.w;
+                            const uint qh   = (h == 0u) ? qh0 : qh1;
+                            const uint sw_a = (h == 0u) ? sc_hdr.x : sc_hdr.z;
+                            const uint sw_b = (h == 0u) ? sc_hdr.y : sc_hdr.w;
+                            const vec4 q0 = repack_magic_q6((ql0  & 0x000F000Fu) | ((qh & 0x00030003u) << 4u), ((ql0  >> 8u) & 0x000F000Fu) | ((qh & 0x03000300u) >> 4u));
+                            const vec4 q1 = repack_magic_q6((ql32 & 0x000F000Fu) | ((qh & 0x000C000Cu) << 2u), ((ql32 >> 8u) & 0x000F000Fu) | ((qh & 0x0C000C00u) >> 6u));
+                            const vec4 q2 = repack_magic_q6(((ql0 >> 4u) & 0x000F000Fu) | (qh & 0x00300030u),  ((ql0  >> 12u) & 0x000F000Fu) | ((qh & 0x30003000u) >> 8u));
+                            const vec4 q3 = repack_magic_q6(((ql32>> 4u) & 0x000F000Fu) | ((qh & 0x00C000C0u) >> 2u), ((ql32 >> 12u) & 0x000F000Fu) | ((qh & 0xC000C000u) >> 10u));
+                            const FLOAT_TYPE sc0 = FLOAT_TYPE(bitfieldExtract(int(sw_a), int(sel * 8u),       8)) * d;
+                            const FLOAT_TYPE sc1 = FLOAT_TYPE(bitfieldExtract(int(sw_a), int((sel + 2u) * 8u), 8)) * d;
+                            const FLOAT_TYPE sc2 = FLOAT_TYPE(bitfieldExtract(int(sw_b), int(sel * 8u),       8)) * d;
+                            const FLOAT_TYPE sc3 = FLOAT_TYPE(bitfieldExtract(int(sw_b), int((sel + 2u) * 8u), 8)) * d;
+                            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                                temp2[j][n] += (dot(by_h[h][j][0], q0) * sc0 + dot(by_h[h][j][1], q1) * sc1) +
+                                               (dot(by_h[h][j][2], q2) * sc2 + dot(by_h[h][j][3], q3) * sc3);
+                            }
+                        }
+                    }
+                }
+            } else {
+                [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                    const uint rn = (n == 0 || n < eff_rows) ? n : 0;
+                    const uint sb_u4  = (a_offset + (row_base + rn) * num_blocks_per_row + i) * REPACK_Q6_K_SB_U4;
+                    const uint sb_u32 = sb_u4 << 2u;
+                    {
+                        const uvec4 sc_hdr = use_a2 ? data_a2_u4[sb_u4 + REPACK_Q6_K_SC_OFF_U4] : data_a_u4[sb_u4 + REPACK_Q6_K_SC_OFF_U4];
+                        const float d = unpackHalf2x16(use_a2 ? data_a2_u32[sb_u32 + REPACK_Q6_K_D_OFF_U32] : data_a_u32[sb_u32 + REPACK_Q6_K_D_OFF_U32]).x;
+                        const uvec4 q = use_a2 ? data_a2_u4[sb_u4 + REPACK_Q6_K_QL_OFF_U4 + itid8] : data_a_u4[sb_u4 + REPACK_Q6_K_QL_OFF_U4 + itid8];
+                        const uint qh0 = use_a2 ? data_a2_u32[sb_u32 + REPACK_Q6_K_QH_OFF_U32 + itid8 * 2u + 0u] : data_a_u32[sb_u32 + REPACK_Q6_K_QH_OFF_U32 + itid8 * 2u + 0u];
+                        const uint qh1 = use_a2 ? data_a2_u32[sb_u32 + REPACK_Q6_K_QH_OFF_U32 + itid8 * 2u + 1u] : data_a_u32[sb_u32 + REPACK_Q6_K_QH_OFF_U32 + itid8 * 2u + 1u];
+                        [[unroll]] for (uint h = 0u; h < 2u; ++h) {
+                            const uint ql0  = (h == 0u) ? q.x : q.z;
+                            const uint ql32 = (h == 0u) ? q.y : q.w;
+                            const uint qh   = (h == 0u) ? qh0 : qh1;
+                            const uint sw_a = (h == 0u) ? sc_hdr.x : sc_hdr.z;
+                            const uint sw_b = (h == 0u) ? sc_hdr.y : sc_hdr.w;
+                            const vec4 q0 = repack_magic_q6((ql0  & 0x000F000Fu) | ((qh & 0x00030003u) << 4u), ((ql0  >> 8u) & 0x000F000Fu) | ((qh & 0x03000300u) >> 4u));
+                            const vec4 q1 = repack_magic_q6((ql32 & 0x000F000Fu) | ((qh & 0x000C000Cu) << 2u), ((ql32 >> 8u) & 0x000F000Fu) | ((qh & 0x0C000C00u) >> 6u));
+                            const vec4 q2 = repack_magic_q6(((ql0 >> 4u) & 0x000F000Fu) | (qh & 0x00300030u),  ((ql0  >> 12u) & 0x000F000Fu) | ((qh & 0x30003000u) >> 8u));
+                            const vec4 q3 = repack_magic_q6(((ql32>> 4u) & 0x000F000Fu) | ((qh & 0x00C000C0u) >> 2u), ((ql32 >> 12u) & 0x000F000Fu) | ((qh & 0xC000C000u) >> 10u));
+                            const FLOAT_TYPE sc0 = FLOAT_TYPE(bitfieldExtract(int(sw_a), int(sel * 8u),       8)) * d;
+                            const FLOAT_TYPE sc1 = FLOAT_TYPE(bitfieldExtract(int(sw_a), int((sel + 2u) * 8u), 8)) * d;
+                            const FLOAT_TYPE sc2 = FLOAT_TYPE(bitfieldExtract(int(sw_b), int(sel * 8u),       8)) * d;
+                            const FLOAT_TYPE sc3 = FLOAT_TYPE(bitfieldExtract(int(sw_b), int((sel + 2u) * 8u), 8)) * d;
+                            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                                const uint b4 = ((j * p.batch_stride_b + b_offset + y_idx) >> 2u) + 32u * h;
+                                const vec4 by0 = vec4(data_b_v4[b4      ]), by1 = vec4(data_b_v4[b4 +  8u]);
+                                const vec4 by2 = vec4(data_b_v4[b4 + 16u]), by3 = vec4(data_b_v4[b4 + 24u]);
+                                temp[j][n] += (dot(by0, q0) * sc0 + dot(by1, q1) * sc1) + (dot(by2, q2) * sc2 + dot(by3, q3) * sc3);
+                            }
+                        }
+                    }
+                    if (GEN_GLU == 3) {
+                        const uvec4 sc_hdr = data_a2_u4[sb_u4 + REPACK_Q6_K_SC_OFF_U4];
+                        const float d = unpackHalf2x16(data_a2_u32[sb_u32 + REPACK_Q6_K_D_OFF_U32]).x;
+                        const uvec4 q = data_a2_u4[sb_u4 + REPACK_Q6_K_QL_OFF_U4 + itid8];
+                        const uint qh0 = data_a2_u32[sb_u32 + REPACK_Q6_K_QH_OFF_U32 + itid8 * 2u + 0u];
+                        const uint qh1 = data_a2_u32[sb_u32 + REPACK_Q6_K_QH_OFF_U32 + itid8 * 2u + 1u];
+                        [[unroll]] for (uint h = 0u; h < 2u; ++h) {
+                            const uint ql0  = (h == 0u) ? q.x : q.z;
+                            const uint ql32 = (h == 0u) ? q.y : q.w;
+                            const uint qh   = (h == 0u) ? qh0 : qh1;
+                            const uint sw_a = (h == 0u) ? sc_hdr.x : sc_hdr.z;
+                            const uint sw_b = (h == 0u) ? sc_hdr.y : sc_hdr.w;
+                            const vec4 q0 = repack_magic_q6((ql0  & 0x000F000Fu) | ((qh & 0x00030003u) << 4u), ((ql0  >> 8u) & 0x000F000Fu) | ((qh & 0x03000300u) >> 4u));
+                            const vec4 q1 = repack_magic_q6((ql32 & 0x000F000Fu) | ((qh & 0x000C000Cu) << 2u), ((ql32 >> 8u) & 0x000F000Fu) | ((qh & 0x0C000C00u) >> 6u));
+                            const vec4 q2 = repack_magic_q6(((ql0 >> 4u) & 0x000F000Fu) | (qh & 0x00300030u),  ((ql0  >> 12u) & 0x000F000Fu) | ((qh & 0x30003000u) >> 8u));
+                            const vec4 q3 = repack_magic_q6(((ql32>> 4u) & 0x000F000Fu) | ((qh & 0x00C000C0u) >> 2u), ((ql32 >> 12u) & 0x000F000Fu) | ((qh & 0xC000C000u) >> 10u));
+                            const FLOAT_TYPE sc0 = FLOAT_TYPE(bitfieldExtract(int(sw_a), int(sel * 8u),       8)) * d;
+                            const FLOAT_TYPE sc1 = FLOAT_TYPE(bitfieldExtract(int(sw_a), int((sel + 2u) * 8u), 8)) * d;
+                            const FLOAT_TYPE sc2 = FLOAT_TYPE(bitfieldExtract(int(sw_b), int(sel * 8u),       8)) * d;
+                            const FLOAT_TYPE sc3 = FLOAT_TYPE(bitfieldExtract(int(sw_b), int((sel + 2u) * 8u), 8)) * d;
+                            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                                const uint b4 = ((j * p.batch_stride_b + b_offset + y_idx) >> 2u) + 32u * h;
+                                const vec4 by0 = vec4(data_b_v4[b4      ]), by1 = vec4(data_b_v4[b4 +  8u]);
+                                const vec4 by2 = vec4(data_b_v4[b4 + 16u]), by3 = vec4(data_b_v4[b4 + 24u]);
+                                temp2[j][n] += (dot(by0, q0) * sc0 + dot(by1, q1) * sc1) + (dot(by2, q2) * sc2 + dot(by3, q3) * sc3);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        const uint it_size16 = gl_WorkGroupSize.x >> 4u;
+        const uint itid16 = tid & 15u;
+        const uint ix16 = tid >> 4u;
+        const uint itid8 = itid16 & 7u;
+        const uint h = itid16 >> 3u;
+        const uint sel = itid8 >> 2u;
+        for (uint i = ix16; i < num_blocks_per_row; i += it_size16) {
+            const uint y_idx = i * QUANT_K + 128u * h + 4u * itid8;
+            if (NUM_COLS <= 2) {
+                vec4 by0_a[NUM_COLS], by1_a[NUM_COLS], by2_a[NUM_COLS], by3_a[NUM_COLS];
+                [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                    const uint b4 = (j * p.batch_stride_b + b_offset + y_idx) >> 2u;
+                    by0_a[j] = vec4(data_b_v4[b4      ]); by1_a[j] = vec4(data_b_v4[b4 +  8u]);
+                    by2_a[j] = vec4(data_b_v4[b4 + 16u]); by3_a[j] = vec4(data_b_v4[b4 + 24u]);
+                }
+                [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                    const uint rn = (n == 0 || n < eff_rows) ? n : 0;
+                    const uint sb_u4  = (a_offset + (row_base + rn) * num_blocks_per_row + i) * REPACK_Q6_K_SB_U4;
+                    const uint sb_u32 = sb_u4 << 2u;
+                    const uint ql_base = ((sb_u4 + REPACK_Q6_K_QL_OFF_U4 + itid8) << 2u) + h * 2u;
+                    {
+                        const float d = unpackHalf2x16(use_a2 ? data_a2_u32[sb_u32 + REPACK_Q6_K_D_OFF_U32] : data_a_u32[sb_u32 + REPACK_Q6_K_D_OFF_U32]).x;
+                        const uint sw_a = use_a2 ? data_a2_u32[sb_u32 + REPACK_Q6_K_SC_OFF_U32 + h * 2u + 0u] : data_a_u32[sb_u32 + REPACK_Q6_K_SC_OFF_U32 + h * 2u + 0u];
+                        const uint sw_b = use_a2 ? data_a2_u32[sb_u32 + REPACK_Q6_K_SC_OFF_U32 + h * 2u + 1u] : data_a_u32[sb_u32 + REPACK_Q6_K_SC_OFF_U32 + h * 2u + 1u];
+                        const FLOAT_TYPE sc0 = FLOAT_TYPE(bitfieldExtract(int(sw_a), int(sel * 8u),       8));
+                        const FLOAT_TYPE sc1 = FLOAT_TYPE(bitfieldExtract(int(sw_a), int((sel + 2u) * 8u), 8));
+                        const FLOAT_TYPE sc2 = FLOAT_TYPE(bitfieldExtract(int(sw_b), int(sel * 8u),       8));
+                        const FLOAT_TYPE sc3 = FLOAT_TYPE(bitfieldExtract(int(sw_b), int((sel + 2u) * 8u), 8));
+                        const uint ql0  = use_a2 ? data_a2_u32[ql_base + 0u] : data_a_u32[ql_base + 0u];
+                        const uint ql32 = use_a2 ? data_a2_u32[ql_base + 1u] : data_a_u32[ql_base + 1u];
+                        const uint qh   = use_a2 ? data_a2_u32[sb_u32 + REPACK_Q6_K_QH_OFF_U32 + itid8 * 2u + h] : data_a_u32[sb_u32 + REPACK_Q6_K_QH_OFF_U32 + itid8 * 2u + h];
+                        const vec4 q0 = repack_magic_q6((ql0  & 0x000F000Fu) | ((qh & 0x00030003u) << 4u), ((ql0  >> 8u) & 0x000F000Fu) | ((qh & 0x03000300u) >> 4u));
+                        const vec4 q1 = repack_magic_q6((ql32 & 0x000F000Fu) | ((qh & 0x000C000Cu) << 2u), ((ql32 >> 8u) & 0x000F000Fu) | ((qh & 0x0C000C00u) >> 6u));
+                        const vec4 q2 = repack_magic_q6(((ql0 >> 4u) & 0x000F000Fu) | (qh & 0x00300030u),  ((ql0  >> 12u) & 0x000F000Fu) | ((qh & 0x30003000u) >> 8u));
+                        const vec4 q3 = repack_magic_q6(((ql32>> 4u) & 0x000F000Fu) | ((qh & 0x00C000C0u) >> 2u), ((ql32 >> 12u) & 0x000F000Fu) | ((qh & 0xC000C000u) >> 10u));
+                        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                            FLOAT_TYPE sum[4] = {0, 0, 0, 0};
+                            [[unroll]] for (uint l = 0; l < 4; ++l) {
+                                sum[0] = fma(FLOAT_TYPE(by0_a[j][l]), q0[l], sum[0]);
+                                sum[1] = fma(FLOAT_TYPE(by1_a[j][l]), q1[l], sum[1]);
+                                sum[2] = fma(FLOAT_TYPE(by2_a[j][l]), q2[l], sum[2]);
+                                sum[3] = fma(FLOAT_TYPE(by3_a[j][l]), q3[l], sum[3]);
+                            }
+                            temp[j][n] = fma(fma(sum[0], sc0, fma(sum[1], sc1, fma(sum[2], sc2, sum[3] * sc3))), d, temp[j][n]);
+                        }
+                    }
+                    if (GEN_GLU == 3) {
+                        const float d = unpackHalf2x16(data_a2_u32[sb_u32 + REPACK_Q6_K_D_OFF_U32]).x;
+                        const uint sw_a = data_a2_u32[sb_u32 + REPACK_Q6_K_SC_OFF_U32 + h * 2u + 0u];
+                        const uint sw_b = data_a2_u32[sb_u32 + REPACK_Q6_K_SC_OFF_U32 + h * 2u + 1u];
+                        const FLOAT_TYPE sc0 = FLOAT_TYPE(bitfieldExtract(int(sw_a), int(sel * 8u),       8));
+                        const FLOAT_TYPE sc1 = FLOAT_TYPE(bitfieldExtract(int(sw_a), int((sel + 2u) * 8u), 8));
+                        const FLOAT_TYPE sc2 = FLOAT_TYPE(bitfieldExtract(int(sw_b), int(sel * 8u),       8));
+                        const FLOAT_TYPE sc3 = FLOAT_TYPE(bitfieldExtract(int(sw_b), int((sel + 2u) * 8u), 8));
+                        const uint ql0  = data_a2_u32[ql_base + 0u];
+                        const uint ql32 = data_a2_u32[ql_base + 1u];
+                        const uint qh   = data_a2_u32[sb_u32 + REPACK_Q6_K_QH_OFF_U32 + itid8 * 2u + h];
+                        const vec4 q0 = repack_magic_q6((ql0  & 0x000F000Fu) | ((qh & 0x00030003u) << 4u), ((ql0  >> 8u) & 0x000F000Fu) | ((qh & 0x03000300u) >> 4u));
+                        const vec4 q1 = repack_magic_q6((ql32 & 0x000F000Fu) | ((qh & 0x000C000Cu) << 2u), ((ql32 >> 8u) & 0x000F000Fu) | ((qh & 0x0C000C00u) >> 6u));
+                        const vec4 q2 = repack_magic_q6(((ql0 >> 4u) & 0x000F000Fu) | (qh & 0x00300030u),  ((ql0  >> 12u) & 0x000F000Fu) | ((qh & 0x30003000u) >> 8u));
+                        const vec4 q3 = repack_magic_q6(((ql32>> 4u) & 0x000F000Fu) | ((qh & 0x00C000C0u) >> 2u), ((ql32 >> 12u) & 0x000F000Fu) | ((qh & 0xC000C000u) >> 10u));
+                        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                            FLOAT_TYPE sum[4] = {0, 0, 0, 0};
+                            [[unroll]] for (uint l = 0; l < 4; ++l) {
+                                sum[0] = fma(FLOAT_TYPE(by0_a[j][l]), q0[l], sum[0]);
+                                sum[1] = fma(FLOAT_TYPE(by1_a[j][l]), q1[l], sum[1]);
+                                sum[2] = fma(FLOAT_TYPE(by2_a[j][l]), q2[l], sum[2]);
+                                sum[3] = fma(FLOAT_TYPE(by3_a[j][l]), q3[l], sum[3]);
+                            }
+                            temp2[j][n] = fma(fma(sum[0], sc0, fma(sum[1], sc1, fma(sum[2], sc2, sum[3] * sc3))), d, temp2[j][n]);
+                        }
+                    }
+                }
+            } else {
+                [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                    const uint rn = (n == 0 || n < eff_rows) ? n : 0;
+                    const uint sb_u4  = (a_offset + (row_base + rn) * num_blocks_per_row + i) * REPACK_Q6_K_SB_U4;
+                    const uint sb_u32 = sb_u4 << 2u;
+                    const uint ql_base = ((sb_u4 + REPACK_Q6_K_QL_OFF_U4 + itid8) << 2u) + h * 2u;
+                    {
+                        const float d = unpackHalf2x16(use_a2 ? data_a2_u32[sb_u32 + REPACK_Q6_K_D_OFF_U32] : data_a_u32[sb_u32 + REPACK_Q6_K_D_OFF_U32]).x;
+                        const uint sw_a = use_a2 ? data_a2_u32[sb_u32 + REPACK_Q6_K_SC_OFF_U32 + h * 2u + 0u] : data_a_u32[sb_u32 + REPACK_Q6_K_SC_OFF_U32 + h * 2u + 0u];
+                        const uint sw_b = use_a2 ? data_a2_u32[sb_u32 + REPACK_Q6_K_SC_OFF_U32 + h * 2u + 1u] : data_a_u32[sb_u32 + REPACK_Q6_K_SC_OFF_U32 + h * 2u + 1u];
+                        const FLOAT_TYPE sc0 = FLOAT_TYPE(bitfieldExtract(int(sw_a), int(sel * 8u),       8));
+                        const FLOAT_TYPE sc1 = FLOAT_TYPE(bitfieldExtract(int(sw_a), int((sel + 2u) * 8u), 8));
+                        const FLOAT_TYPE sc2 = FLOAT_TYPE(bitfieldExtract(int(sw_b), int(sel * 8u),       8));
+                        const FLOAT_TYPE sc3 = FLOAT_TYPE(bitfieldExtract(int(sw_b), int((sel + 2u) * 8u), 8));
+                        const uint ql0  = use_a2 ? data_a2_u32[ql_base + 0u] : data_a_u32[ql_base + 0u];
+                        const uint ql32 = use_a2 ? data_a2_u32[ql_base + 1u] : data_a_u32[ql_base + 1u];
+                        const uint qh   = use_a2 ? data_a2_u32[sb_u32 + REPACK_Q6_K_QH_OFF_U32 + itid8 * 2u + h] : data_a_u32[sb_u32 + REPACK_Q6_K_QH_OFF_U32 + itid8 * 2u + h];
+                        const vec4 q0 = repack_magic_q6((ql0  & 0x000F000Fu) | ((qh & 0x00030003u) << 4u), ((ql0  >> 8u) & 0x000F000Fu) | ((qh & 0x03000300u) >> 4u));
+                        const vec4 q1 = repack_magic_q6((ql32 & 0x000F000Fu) | ((qh & 0x000C000Cu) << 2u), ((ql32 >> 8u) & 0x000F000Fu) | ((qh & 0x0C000C00u) >> 6u));
+                        const vec4 q2 = repack_magic_q6(((ql0 >> 4u) & 0x000F000Fu) | (qh & 0x00300030u),  ((ql0  >> 12u) & 0x000F000Fu) | ((qh & 0x30003000u) >> 8u));
+                        const vec4 q3 = repack_magic_q6(((ql32>> 4u) & 0x000F000Fu) | ((qh & 0x00C000C0u) >> 2u), ((ql32 >> 12u) & 0x000F000Fu) | ((qh & 0xC000C000u) >> 10u));
+                        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                            const uint b4 = (j * p.batch_stride_b + b_offset + y_idx) >> 2u;
+                            const vec4 by0 = vec4(data_b_v4[b4      ]), by1 = vec4(data_b_v4[b4 +  8u]);
+                            const vec4 by2 = vec4(data_b_v4[b4 + 16u]), by3 = vec4(data_b_v4[b4 + 24u]);
+                            FLOAT_TYPE sum[4] = {0, 0, 0, 0};
+                            [[unroll]] for (uint l = 0; l < 4; ++l) {
+                                sum[0] = fma(FLOAT_TYPE(by0[l]), q0[l], sum[0]);
+                                sum[1] = fma(FLOAT_TYPE(by1[l]), q1[l], sum[1]);
+                                sum[2] = fma(FLOAT_TYPE(by2[l]), q2[l], sum[2]);
+                                sum[3] = fma(FLOAT_TYPE(by3[l]), q3[l], sum[3]);
+                            }
+                            temp[j][n] = fma(fma(sum[0], sc0, fma(sum[1], sc1, fma(sum[2], sc2, sum[3] * sc3))), d, temp[j][n]);
+                        }
+                    }
+                    if (GEN_GLU == 3) {
+                        const float d = unpackHalf2x16(data_a2_u32[sb_u32 + REPACK_Q6_K_D_OFF_U32]).x;
+                        const uint sw_a = data_a2_u32[sb_u32 + REPACK_Q6_K_SC_OFF_U32 + h * 2u + 0u];
+                        const uint sw_b = data_a2_u32[sb_u32 + REPACK_Q6_K_SC_OFF_U32 + h * 2u + 1u];
+                        const FLOAT_TYPE sc0 = FLOAT_TYPE(bitfieldExtract(int(sw_a), int(sel * 8u),       8));
+                        const FLOAT_TYPE sc1 = FLOAT_TYPE(bitfieldExtract(int(sw_a), int((sel + 2u) * 8u), 8));
+                        const FLOAT_TYPE sc2 = FLOAT_TYPE(bitfieldExtract(int(sw_b), int(sel * 8u),       8));
+                        const FLOAT_TYPE sc3 = FLOAT_TYPE(bitfieldExtract(int(sw_b), int((sel + 2u) * 8u), 8));
+                        const uint ql0  = data_a2_u32[ql_base + 0u];
+                        const uint ql32 = data_a2_u32[ql_base + 1u];
+                        const uint qh   = data_a2_u32[sb_u32 + REPACK_Q6_K_QH_OFF_U32 + itid8 * 2u + h];
+                        const vec4 q0 = repack_magic_q6((ql0  & 0x000F000Fu) | ((qh & 0x00030003u) << 4u), ((ql0  >> 8u) & 0x000F000Fu) | ((qh & 0x03000300u) >> 4u));
+                        const vec4 q1 = repack_magic_q6((ql32 & 0x000F000Fu) | ((qh & 0x000C000Cu) << 2u), ((ql32 >> 8u) & 0x000F000Fu) | ((qh & 0x0C000C00u) >> 6u));
+                        const vec4 q2 = repack_magic_q6(((ql0 >> 4u) & 0x000F000Fu) | (qh & 0x00300030u),  ((ql0  >> 12u) & 0x000F000Fu) | ((qh & 0x30003000u) >> 8u));
+                        const vec4 q3 = repack_magic_q6(((ql32>> 4u) & 0x000F000Fu) | ((qh & 0x00C000C0u) >> 2u), ((ql32 >> 12u) & 0x000F000Fu) | ((qh & 0xC000C000u) >> 10u));
+                        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                            const uint b4 = (j * p.batch_stride_b + b_offset + y_idx) >> 2u;
+                            const vec4 by0 = vec4(data_b_v4[b4      ]), by1 = vec4(data_b_v4[b4 +  8u]);
+                            const vec4 by2 = vec4(data_b_v4[b4 + 16u]), by3 = vec4(data_b_v4[b4 + 24u]);
+                            FLOAT_TYPE sum[4] = {0, 0, 0, 0};
+                            [[unroll]] for (uint l = 0; l < 4; ++l) {
+                                sum[0] = fma(FLOAT_TYPE(by0[l]), q0[l], sum[0]);
+                                sum[1] = fma(FLOAT_TYPE(by1[l]), q1[l], sum[1]);
+                                sum[2] = fma(FLOAT_TYPE(by2[l]), q2[l], sum[2]);
+                                sum[3] = fma(FLOAT_TYPE(by3[l]), q3[l], sum[3]);
+                            }
+                            temp2[j][n] = fma(fma(sum[0], sc0, fma(sum[1], sc1, fma(sum[2], sc2, sum[3] * sc3))), d, temp2[j][n]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+#else
+    if (GEN_FAST_KQ >= 2) {
+        const uint it_size8 = gl_WorkGroupSize.x / 8;
+        const uint itid8 = tid & 7;
+        const uint ix8 = tid >> 3;
+        if (GEN_GLU == 2 && use_a2) {
+            for (uint i = ix8; i < num_blocks_per_row; i += it_size8) {
+                calc_superblock_8_a2(temp, a_offset, b_offset, itid8, i, num_blocks_per_row, row_base, eff_rows);
+            }
+        } else {
+            for (uint i = ix8; i < num_blocks_per_row; i += it_size8) {
+                calc_superblock_8_a(temp, temp2, a_offset, b_offset, itid8, i, num_blocks_per_row, row_base, eff_rows);
+            }
+        }
+    } else {
+        // 16 threads are used to process each block
+        const uint it_size = gl_WorkGroupSize.x/16;
+        const uint itid = tid%16;  // 0...15
+        const uint ix = tid/16;
 
-    reduce_result(temp, d_offset, first_row, num_rows, tid);
+        const uint v_im = itid/8;                               // 0 or 1. 0 computes 0..., 1 computes 128...
+        const uint v_in = itid - 8*v_im;                        // 0...7
+
+        const uint l0 = 4 * v_in;                               // 0, 4, 8, ..., 28
+        const uint is = v_in / 4;
+
+        const uint ql_offset = 64*v_im + l0;
+        const uint qh_offset = 32*v_im + l0;
+        const uint s_offset  =  8*v_im + is;
+        const uint y_offset = 128*v_im + l0;
+
+        if (GEN_GLU == 2 && use_a2) {
+            for (uint i = ix; i < num_blocks_per_row; i += it_size) {
+                calc_superblock_a2(temp, a_offset, b_offset, ql_offset, qh_offset, s_offset, y_offset, i, num_blocks_per_row, row_base, eff_rows);
+            }
+        } else {
+            for (uint i = ix; i < num_blocks_per_row; i += it_size) {
+                calc_superblock_a(temp, temp2, a_offset, b_offset, ql_offset, qh_offset, s_offset, y_offset, i, num_blocks_per_row, row_base, eff_rows);
+            }
+        }
+    }
+#endif
+
+    if (GEN_GLU == 3) {
+        reduce_pair_glu(temp, temp2, d_offset, first_row, eff_rows, tid);
+    }
+#ifndef MUL_MAT_ID
+    else if (GEN_GLU == 2 && use_a2) {
+        reduce_result_d2(temp, row_base, eff_rows, tid);
+    }
+#endif
+    else {
+        reduce_result(temp, d_offset, first_row, eff_rows, tid);
+    }
 }
 
 void main() {
+#ifdef USE_SUBGROUP_ADD_NO_SHMEM
+    const uint first_row = NUM_ROWS * (NUM_SUBGROUPS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z) + gl_SubgroupID);
+#else
     const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+#endif
 
-    // do NUM_ROWS at a time, unless there aren't enough remaining rows
-    if (first_row + NUM_ROWS <= p.stride_d) {
-        compute_outputs(first_row, NUM_ROWS);
-    } else {
-        if (first_row >= p.stride_d) {
-            return;
-        }
-        compute_outputs(first_row, p.stride_d - first_row);
+    if (first_row >= p.stride_d) {
+        return;
     }
+    compute_outputs(first_row, min(NUM_ROWS, p.stride_d - first_row));
 }

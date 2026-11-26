@@ -4,6 +4,17 @@
 #define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+// gen: SWIGLU epilogue, this result is the gate (A) or the up operand (B); the other comes from fuse0
+#define MAT_VEC_FUSION_FLAGS_GLU_A 0x10
+#define MAT_VEC_FUSION_FLAGS_GLU_B 0x20
+// gen: MUL_MAT_ID with all tokens in one dispatch: workgroup y = expert slot + nei0 * token
+#define MAT_VEC_FUSION_FLAGS_GEN_TOKY 0x40
+// gen: dense mat-vec epilogues (GGML_GEN_FUSE=mmgate,shexp), compiled into the GEN_GLU=1 twin
+#define MAT_VEC_FUSION_FLAGS_SIGMOID 0x80
+#define MAT_VEC_FUSION_FLAGS_SOFTPLUS_GATE 0x100
+#define MAT_VEC_FUSION_FLAGS_ROW_SCALE0 0x200
+#define MAT_VEC_FUSION_FLAGS_SRC1_SCALE 0x4000000
+#define MAT_VEC_FUSION_FLAGS_EXP_SCALE0 0x200000
 
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
 #if defined(A_TYPEV4)
@@ -17,6 +28,10 @@ layout (binding = 0) readonly buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32
 #endif
 #if defined(A_TYPE_PACKED64)
 layout (binding = 0) readonly buffer A_PACKED64 {A_TYPE_PACKED64 data_a_packed64[];};
+#endif
+#if defined(DATA_A_NVFP4) && defined(REPACK_PLANAR)
+layout (binding = 0) readonly buffer A_REPACK_U32 {uint  data_a_repack_u32[];};
+layout (binding = 0) readonly buffer A_REPACK_U2  {uvec2 data_a_repack_u2[];};
 #endif
 
 layout (binding = 1) readonly buffer B {B_TYPE data_b[];};

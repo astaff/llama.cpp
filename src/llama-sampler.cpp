@@ -2824,6 +2824,20 @@ struct llama_sampler * llama_sampler_init_grammar_lazy_patterns(
     return llama_sampler_init_grammar_impl(vocab, grammar_str, grammar_root, /* lazy= */ true, trigger_tokens, num_trigger_tokens, trigger_patterns, num_trigger_patterns);
 }
 
+bool llama_sampler_grammar_is_dormant(const struct llama_sampler * smpl) {
+    if (!smpl) {
+        return true;
+    }
+    if (smpl->iface != &llama_sampler_grammar_i) {
+        return false;
+    }
+    const auto * ctx = (const llama_sampler_grammar *) smpl->ctx;
+    if (!ctx->grammar) {
+        return true;
+    }
+    return ctx->grammar->vocab != nullptr && ctx->grammar->lazy && ctx->grammar->awaiting_trigger;
+}
+
 // penalties
 
 struct llama_sampler_penalties : public llama_sampler_backend {
@@ -4378,4 +4392,238 @@ void llama_perf_sampler_reset(struct llama_sampler * chain) {
 
     ctx->t_sample_us = 0;
     ctx->n_sample    = 0;
+}
+
+
+// Series 20 (Pillar S20.5 + Micro-Defect X-5): 0-ULP + 0-RNG-drift raw-logit pure temp+dist verifier & sampler
+bool llama_sampler_chain_is_bias_temp_dist(
+        const struct llama_sampler * chain, float * out_temp, struct llama_sampler ** out_dist, struct llama_sampler ** out_logit_bias) {
+    if (!chain || chain->iface != &llama_sampler_chain_i) {
+        return false;
+    }
+    const int32_t n_sc = llama_sampler_chain_n(chain);
+    if (n_sc < 1) {
+        return false;
+    }
+    struct llama_sampler * last = llama_sampler_chain_get(const_cast<struct llama_sampler *>(chain), n_sc - 1);
+    if (!last || last->iface != &llama_sampler_dist_i) {
+        return false;
+    }
+    const auto * dctx = (const llama_sampler_dist *) last->ctx;
+    if (dctx->backend_transactional) {
+        return false;
+    }
+
+    float eff_temp = 1.0f;
+    bool seen_active_temp = false;
+    struct llama_sampler * lb_smpl = nullptr;
+    for (int32_t k = 0; k < n_sc - 1; ++k) {
+        struct llama_sampler * s = llama_sampler_chain_get(const_cast<struct llama_sampler *>(chain), k);
+        if (!s) {
+            return false;
+        }
+        const char * nm = llama_sampler_name(s);
+        if (s->iface == &llama_sampler_empty_i || (nm && nm[0] == '?')) {
+            continue;
+        }
+        if (s->iface == &llama_sampler_logit_bias_i) {
+            if (seen_active_temp || lb_smpl != nullptr) {
+                return false;
+            }
+            lb_smpl = s;
+            continue;
+        }
+        if (s->iface == &llama_sampler_temp_i) {
+            const float t = ((const llama_sampler_temp *) s->ctx)->temp;
+            if (t <= 0.0f) {
+                return false;
+            }
+            if (t != 1.0f) {
+                if (seen_active_temp) {
+                    return false;
+                }
+                eff_temp = t;
+                seen_active_temp = true;
+            }
+            continue;
+        }
+        if (s->iface == &llama_sampler_temp_ext_i) {
+            const auto * ext = (const llama_sampler_temp_ext *) s->ctx;
+            if (ext->delta > 0.0f || ext->temp <= 0.0f) {
+                return false;
+            }
+            if (ext->temp != 1.0f) {
+                if (seen_active_temp) {
+                    return false;
+                }
+                eff_temp = ext->temp;
+                seen_active_temp = true;
+            }
+            continue;
+        }
+        return false;
+    }
+
+    if (out_temp) {
+        *out_temp = eff_temp;
+    }
+    if (out_dist) {
+        *out_dist = last;
+    }
+    if (out_logit_bias) {
+        *out_logit_bias = lb_smpl;
+    }
+    return true;
+}
+
+bool llama_sampler_chain_is_pure_temp_dist(
+        const struct llama_sampler * chain, float * out_temp, struct llama_sampler ** out_dist) {
+    struct llama_sampler * lb_smpl = nullptr;
+    if (!llama_sampler_chain_is_bias_temp_dist(chain, out_temp, out_dist, &lb_smpl)) {
+        return false;
+    }
+    return lb_smpl == nullptr;
+}
+
+bool llama_sampler_chain_is_pure_greedy(const struct llama_sampler * chain) {
+    if (!chain || chain->iface != &llama_sampler_chain_i) {
+        return false;
+    }
+    const int32_t n_sc = llama_sampler_chain_n(chain);
+    if (n_sc < 1) {
+        return false;
+    }
+    struct llama_sampler * last = llama_sampler_chain_get(const_cast<struct llama_sampler *>(chain), n_sc - 1);
+    if (!last || last->iface != &llama_sampler_greedy_i) {
+        return false;
+    }
+    for (int32_t k = 0; k < n_sc - 1; ++k) {
+        struct llama_sampler * s = llama_sampler_chain_get(const_cast<struct llama_sampler *>(chain), k);
+        if (!s) {
+            return false;
+        }
+        const char * nm = llama_sampler_name(s);
+        if (s->iface == &llama_sampler_empty_i || (nm && nm[0] == '?')) {
+            continue;
+        }
+        if (s->iface == &llama_sampler_temp_i) {
+            const float t = ((const llama_sampler_temp *) s->ctx)->temp;
+            if (t <= 0.0f || t == 1.0f) {
+                continue;
+            }
+            return false;
+        }
+        if (s->iface == &llama_sampler_temp_ext_i) {
+            const auto * ext = (const llama_sampler_temp_ext *) s->ctx;
+            if (ext->delta <= 0.0f && (ext->temp <= 0.0f || ext->temp == 1.0f)) {
+                continue;
+            }
+            return false;
+        }
+        return false;
+    }
+    return true;
+}
+
+llama_token llama_sampler_temp_dist_probs_raw_0ulp(
+        struct llama_sampler * dist_smpl, struct llama_sampler * lb_smpl,
+        const float * logits_row, int32_t n_vocab, float temp,
+        const float ** out_unnorm_p, double * out_sum_p) {
+    GGML_ASSERT(dist_smpl && dist_smpl->iface == &llama_sampler_dist_i && logits_row && n_vocab > 0);
+    auto * ctx = (llama_sampler_dist *) dist_smpl->ctx;
+    std::uniform_real_distribution<double> dist(0.0f, 1.0f);
+
+    if (n_vocab == 1) {
+        static const float one = 1.0f;
+        (void) dist(ctx->rng);
+        if (out_unnorm_p) { *out_unnorm_p = &one; }
+        if (out_sum_p)    { *out_sum_p    = 1.0;  }
+        return 0;
+    }
+
+    static thread_local std::vector<float> p_buf;
+    if ((int32_t) p_buf.size() < n_vocab) {
+        p_buf.resize(n_vocab);
+    }
+    float * __restrict p_arr = p_buf.data();
+
+    if (lb_smpl == nullptr && temp == 1.0f) {
+        float max_l = logits_row[0];
+        for (int32_t i = 1; i < n_vocab; ++i) {
+            max_l = std::max(max_l, logits_row[i]);
+        }
+        double sum_cum = 0.0;
+        for (int32_t i = 0; i < n_vocab; ++i) {
+            const float p = expf(logits_row[i] - max_l);
+            p_arr[i] = p;
+            sum_cum += p;
+        }
+        if (out_unnorm_p) { *out_unnorm_p = p_arr;   }
+        if (out_sum_p)    { *out_sum_p    = sum_cum; }
+        const double rnd     = dist(ctx->rng);
+        const double sum_tgt = sum_cum * rnd;
+        double sum_run = 0.0;
+        llama_token selected = n_vocab - 1;
+        for (int32_t i = 0; i < n_vocab; ++i) {
+            sum_run += p_arr[i];
+            if (sum_run >= sum_tgt) {
+                selected = i;
+                break;
+            }
+        }
+        return selected;
+    }
+
+    std::memcpy(p_arr, logits_row, (size_t) n_vocab * sizeof(float));
+    if (lb_smpl != nullptr) {
+        GGML_ASSERT(lb_smpl->iface == &llama_sampler_logit_bias_i);
+        const auto * lb_ctx = (const llama_sampler_logit_bias *) lb_smpl->ctx;
+        for (const auto & lb : lb_ctx->logit_bias) {
+            if (lb.token >= 0 && lb.token < n_vocab) {
+                p_arr[lb.token] += lb.bias;
+            }
+        }
+    }
+
+    float max_l;
+    if (temp == 1.0f) {
+        max_l = p_arr[0];
+        for (int32_t i = 1; i < n_vocab; ++i) {
+            max_l = std::max(max_l, p_arr[i]);
+        }
+    } else {
+        p_arr[0] /= temp;
+        max_l = p_arr[0];
+        for (int32_t i = 1; i < n_vocab; ++i) {
+            const float sl = p_arr[i] / temp;
+            p_arr[i] = sl;
+            max_l = std::max(max_l, sl);
+        }
+    }
+
+    double sum_cum = 0.0;
+    for (int32_t i = 0; i < n_vocab; ++i) {
+        const float p = expf(p_arr[i] - max_l);
+        p_arr[i] = p;
+        sum_cum += p;
+    }
+    if (out_unnorm_p) { *out_unnorm_p = p_arr;   }
+    if (out_sum_p)    { *out_sum_p    = sum_cum; }
+    const double rnd     = dist(ctx->rng);
+    const double sum_tgt = sum_cum * rnd;
+    double sum_run = 0.0;
+    llama_token selected = n_vocab - 1;
+    for (int32_t i = 0; i < n_vocab; ++i) {
+        sum_run += p_arr[i];
+        if (sum_run >= sum_tgt) {
+            selected = i;
+            break;
+        }
+    }
+    return selected;
+}
+
+llama_token llama_sampler_temp_dist_sample_raw_0ulp(
+        struct llama_sampler * dist_smpl, const float * logits_row, int32_t n_vocab, float temp) {
+    return llama_sampler_temp_dist_probs_raw_0ulp(dist_smpl, nullptr, logits_row, n_vocab, temp, nullptr, nullptr);
 }

@@ -434,6 +434,7 @@ extern "C" {
         GGML_OP_SLEEP,
 
         GGML_OP_SIGMOID_BACK,
+        GGML_OP_INKLING_FUSED,
 
         GGML_OP_COUNT,
     };
@@ -473,6 +474,7 @@ extern "C" {
         GGML_GLU_OP_GEGLU_ERF,
         GGML_GLU_OP_GEGLU_QUICK,
         GGML_GLU_OP_SWIGLU_CLAMP,
+        GGML_GLU_OP_SITU,
 
         GGML_GLU_OP_COUNT,
     };
@@ -1212,6 +1214,148 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b,
             float                 limit);
+
+    GGML_API struct ggml_tensor * ggml_situ(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            float                 beta,
+            float                 linear_beta);
+
+    GGML_API struct ggml_tensor * ggml_inkling_l2_clip(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * tau,
+            float                 threshold,
+            float                 eps);
+
+    GGML_API struct ggml_tensor * ggml_inkling_conv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * history,
+            struct ggml_tensor  * weight,
+            struct ggml_tensor  * dynamic,
+            struct ggml_tensor  * state,
+            int32_t               ch_offset,
+            int32_t               n_seq_tokens,
+            int32_t               n_seqs,
+            int32_t               n_heads,
+            int32_t               st_base_f32,
+            int32_t               st_seq_stride,
+            int32_t               st_slot_stride,
+            int32_t               st_kw,
+            float                 scale_out);
+
+    GGML_API struct ggml_tensor * ggml_inkling_rel_gather(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * table,
+            struct ggml_tensor  * sinks,
+            struct ggml_tensor  * rel_pos,
+            int64_t               n_kv,
+            int64_t               nr,
+            int64_t               n_head,
+            int64_t               n_stream,
+            int32_t               n_seq_tokens,
+            int32_t               r0,
+            int32_t               extent);
+
+    GGML_API struct ggml_tensor * ggml_inkling_rel_gather_f16(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kq_b,
+            struct ggml_tensor  * kq_mask,
+            int32_t               mask_r0);
+
+    // S19_WAVE3: Inkling-2 depth-mix with optional 0-ULP 512-tree RMS_NORM_MUL epilogue
+    GGML_API struct ggml_tensor * ggml_inkling_depth_mix(
+            struct ggml_context       * ctx,
+            struct ggml_tensor * const * states,
+            int                         n_states,
+            struct ggml_tensor        * query,
+            float                       eps);
+
+    GGML_API struct ggml_tensor * ggml_inkling_depth_mix_rms(
+            struct ggml_context       * ctx,
+            struct ggml_tensor * const * states,
+            int                         n_states,
+            struct ggml_tensor        * query,
+            struct ggml_tensor        * rms_w,
+            float                       eps,
+            float                       rms_eps);
+
+    GGML_API struct ggml_tensor * ggml_inkling_rms2_concat(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * message,
+            float                 eps);
+
+    GGML_API struct ggml_tensor * ggml_inkling_ctrl_apply(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * message,
+            struct ggml_tensor  * raw_gain,
+            struct ggml_tensor  * raw_forget);
+
+    GGML_API struct ggml_tensor * ggml_inkling_ctrl_apply_rms_mul(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * message,
+            struct ggml_tensor  * up_gf,
+            struct ggml_tensor  * rms_w,
+            float                 eps);
+
+    GGML_API struct ggml_tensor * ggml_inkling_l2_clip_qr(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q_cur,
+            struct ggml_tensor  * r_cur,
+            struct ggml_tensor  * q_scale,
+            struct ggml_tensor  * r_scale,
+            struct ggml_tensor  * mul_tau,
+            float                 q_threshold,
+            float                 r_threshold,
+            float                 eps);
+
+    GGML_API struct ggml_tensor * ggml_inkling_dspark_concat4(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * d);
+
+    GGML_API struct ggml_tensor * ggml_inkling_dspark_gru(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * joint,
+            struct ggml_tensor  * state_in);
+
+    GGML_API struct ggml_tensor * ggml_inkling_softcap(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            float                 inv_cap,
+            float                 cap);
+
+    GGML_API struct ggml_tensor * ggml_inkling_dspark_joint_gru(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * prev,
+            struct ggml_tensor  * markov_w1,
+            struct ggml_tensor  * state_in,
+            struct ggml_tensor  * hidden,
+            struct ggml_tensor  * context,
+            struct ggml_tensor  * joint_proj,
+            struct ggml_tensor  * joint_proj_b);
+
+    GGML_API struct ggml_tensor * ggml_inkling_dspark_inject_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * features,
+            struct ggml_tensor  * fuse_w,
+            struct ggml_tensor  * norm0,
+            struct ggml_tensor  * norm1,
+            struct ggml_tensor  * norm2,
+            struct ggml_tensor  * norm3,
+            struct ggml_tensor  * positions,
+            struct ggml_tensor  * ring_dst,
+            int32_t               ring_seq_offset,
+            int32_t               ring_rows,
+            float                 eps);
 
     // normalize along rows
     GGML_API struct ggml_tensor * ggml_norm(
@@ -2300,6 +2444,16 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * table,
             struct ggml_tensor * indices);
+
+    GGML_API bool ggml_flash_attn_ext_has_banded_rel_bias(const struct ggml_tensor * a);
+
+    // Add table[q_pos - cell_pos, head, query] for 0 <= q_pos - cell_pos < extent inside FlashAttention.
+    // pos_info is 1D I32 packing [cell_pos (n_stream*n_kv), q_pos (n_tokens), tile64_minmax (n_stream*ceil(n_kv/64)*2)].
+    GGML_API void ggml_flash_attn_ext_add_banded_rel_bias(
+            struct ggml_tensor * a,
+            struct ggml_tensor * table,
+            struct ggml_tensor * pos_info,
+            int32_t              extent);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

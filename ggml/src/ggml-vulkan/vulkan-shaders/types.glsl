@@ -1911,49 +1911,38 @@ i32vec2 iq4nl_to_i8x8(uint32_t vui) {
 #endif
 
 #if defined(DATA_A_MXFP4) || defined(DATA_A_NVFP4)
-#if !defined(USE_OCP_FP4)
-const int8_t kvalues_mxfp4_const[16] = {
-    int8_t(0), int8_t(1), int8_t(2), int8_t(3), int8_t(4), int8_t(6), int8_t(8), int8_t(12),
-    int8_t(0), int8_t(-1), int8_t(-2), int8_t(-3), int8_t(-4), int8_t(-6), int8_t(-8), int8_t(-12),
-};
+int mxfp4_kval(uint nib) {
+    const int mag = int((0xC8643210u >> ((nib & 7u) * 4u)) & 0xFu);
+    return ((nib & 8u) != 0u) ? -mag : mag;
+}
 
-shared int8_t kvalues_mxfp4[16];
-#endif
+uint nvfp4_e2m1_pair_fp16_bits(const uint q) {
+    // Decodes low nibbles of byte 0 (bits 3..0) and byte 2 (bits 19..16) into exact IEEE-754 normal FP16 u16x2
+    // (0 -> 0x0000, 0.5 -> 0x3800, 1..6 -> normal e_fp16 in 15..17; zero FP16 denormals -> FTZ-safe on AGX coopmat!).
+    const uint s     = (q & 0x00080008u) << 12u;
+    const uint x     =  q & 0x00070007u;
+    const uint has_e = ((x & 0x00060006u) + 0x00060006u) & 0x00080008u;
+    const uint has_m = (x + 0x00070007u) & 0x00080008u;
+    const uint xm    = x & (0x00060006u | (has_e >> 3u));
+    return s | ((xm << 9u) + has_m * 0x0700u);
+}
 
 #if defined(DATA_A_NVFP4) && !defined(USE_OCP_FP4)
-// Cover all scale bytes accepted by ggml_validate_row_data.
-// ue4m3_to_fp32_build() masks the exponent and mantissa, but checks the full byte for 0 and 0x7F.
-shared float ue4m3_fp32_lut[256];
-
 float ue4m3_to_fp32_build(uint u) {
     if (u == 0u || u == 127u) {
-        return 0.0;
+        return 0.0f;
     }
-    const uint exp = (u >> 3) & 15u;
+    const uint exp = (u >> 3u) & 15u;
     const uint man = u & 7u;
-    if (exp == 0u) {
-        return float(man) * (1.0 / 512.0);
-    }
-    const uint bits = (exp + 120u) << 23 | (man << 20);
-    return uintBitsToFloat(bits);
+    return (exp == 0u)
+        ? (float(man) * (1.0f / 512.0f))
+        : uintBitsToFloat(((exp + 120u) << 23u) | (man << 20u));
 }
 #endif
 
-#if (defined(DATA_A_MXFP4) || defined(DATA_A_NVFP4)) && !defined(USE_OCP_FP4)
-#define NEEDS_INIT_IQ_SHMEM
-void init_iq_shmem(uvec3 wgsize)
-{
-    // copy the table into shared memory and sync
-    for (uint i = gl_LocalInvocationIndex.x; i < kvalues_mxfp4.length(); i += wgsize.x) {
-        kvalues_mxfp4[i] = kvalues_mxfp4_const[i];
-    }
-#if defined(DATA_A_NVFP4)
-    for (uint i = gl_LocalInvocationIndex.x; i < 256u; i += wgsize.x) {
-        ue4m3_fp32_lut[i] = ue4m3_to_fp32_build(i);
-    }
-#endif
-    barrier();
-}
+#if !defined(USE_OCP_FP4)
+// Series 17: Zero shared memory and zero barrier for MXFP4 / NVFP4; keep empty stub for callers in dequant/mul_mm.
+void init_iq_shmem(uvec3 wgsize) {}
 #endif
 #endif
 
@@ -2024,7 +2013,7 @@ float ue4m3_to_fp32(uint8_t x) {
 #if defined(USE_OCP_FP4)
     return float(ue4m3_from_bits(x));
 #else
-    return ue4m3_fp32_lut[uint(x)];
+    return ue4m3_to_fp32_build(uint(x));
 #endif
 }
 #endif

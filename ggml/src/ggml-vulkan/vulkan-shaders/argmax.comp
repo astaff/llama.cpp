@@ -9,52 +9,117 @@
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
-layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
+layout (binding = 0) readonly buffer A   { A_TYPE data_a[];    };
+layout (binding = 0) readonly buffer AV4 { vec4   data_a_v4[]; };
+layout (binding = 1) writeonly buffer D  { D_TYPE data_d[];    };
+layout (binding = 2) readonly buffer B   { A_TYPE data_b[];    };
+layout (binding = 2) readonly buffer BV4 { vec4   data_b_v4[]; };
 
-layout (constant_id = 0) const uint BLOCK_SIZE = 32;
+layout (constant_id = 0) const uint BLOCK_SIZE = 512;
 
-shared FLOAT_TYPE tmpmax[BLOCK_SIZE];
-shared uint tmp[BLOCK_SIZE];
+shared FLOAT_TYPE tmpmax[512];
+shared uint tmp[512];
+
+void update_best(inout FLOAT_TYPE amax, inout uint acol, FLOAT_TYPE val, uint idx) {
+    if (val > amax || (val == amax && idx < acol)) {
+        amax = val;
+        acol = idx;
+    }
+}
+
+FLOAT_TYPE apply_softcap(FLOAT_TYPE x) {
+    if (p.param1 == 0.0f) {
+        return x;
+    }
+    precise float s0 = float(x) * p.param1 + 0.0f;
+    precise float t  = tanh(s0);
+    precise float s1 = t * p.param2 + 0.0f;
+    return FLOAT_TYPE(s1);
+}
 
 void main() {
     const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
-    const uint col = gl_LocalInvocationID.x;
+    const uint tid = gl_LocalInvocationID.x;
 
     if (row >= p.KY) {
         return;
     }
 
-    A_TYPE amax = -FLT_MAX;
-    uint acol = col;
+    FLOAT_TYPE amax = FLOAT_TYPE(uintBitsToFloat(0xFF800000u));
+    uint acol = 0xFFFFFFFFu;
+    const uint a_misalign = uint(p.param3);
+    const uint p4_bits    = floatBitsToUint(p.param4);
+    const bool is_packed4 = (p4_bits & 0xFF000000u) == 0x40000000u;
+    const uint d_misalign = is_packed4 ? (p4_bits & 0x3FFu) : uint(p.param4);
+    const uint b_misalign = is_packed4 ? ((p4_bits >> 10u) & 0x3FFu) : 0u;
+    const bool has_add    = is_packed4 && (((p4_bits >> 20u) & 1u) != 0u);
+    const uint row_base   = a_misalign + row * p.KX;
 
-    if (col < p.KX) {
-        amax = data_a[row*p.KX + col];
-    }
-
-    for (uint i = col + BLOCK_SIZE; i < p.KX; i += BLOCK_SIZE) {
-        A_TYPE val = data_a[row*p.KX + i];
-        if (val > amax) {
-            amax = val;
-            acol = i;
+    if (!has_add) {
+        if ((row_base & 3u) == 0u) {
+            const uint kx4 = p.KX >> 2u;
+            const uint base4 = row_base >> 2u;
+            for (uint v4_i = tid; v4_i < kx4; v4_i += BLOCK_SIZE) {
+                const vec4 v = data_a_v4[base4 + v4_i];
+                const uint c0 = v4_i << 2u;
+                update_best(amax, acol, apply_softcap(FLOAT_TYPE(v.x)), c0 + 0u);
+                update_best(amax, acol, apply_softcap(FLOAT_TYPE(v.y)), c0 + 1u);
+                update_best(amax, acol, apply_softcap(FLOAT_TYPE(v.z)), c0 + 2u);
+                update_best(amax, acol, apply_softcap(FLOAT_TYPE(v.w)), c0 + 3u);
+            }
+            const uint tail_start = kx4 << 2u;
+            for (uint i = tail_start + tid; i < p.KX; i += BLOCK_SIZE) {
+                update_best(amax, acol, apply_softcap(FLOAT_TYPE(data_a[row_base + i])), i);
+            }
+        } else {
+            for (uint i = tid; i < p.KX; i += BLOCK_SIZE) {
+                update_best(amax, acol, apply_softcap(FLOAT_TYPE(data_a[row_base + i])), i);
+            }
+        }
+    } else {
+        const uint row_b_base = b_misalign + row * p.KX;
+        if ((row_base & 3u) == 0u && (row_b_base & 3u) == 0u) {
+            const uint kx4    = p.KX >> 2u;
+            const uint base4  = row_base >> 2u;
+            const uint bbase4 = row_b_base >> 2u;
+            for (uint v4_i = tid; v4_i < kx4; v4_i += BLOCK_SIZE) {
+                const vec4 va = data_a_v4[base4 + v4_i];
+                const vec4 vb = data_b_v4[bbase4 + v4_i];
+                const uint c0 = v4_i << 2u;
+                precise float sx = va.x + vb.x;
+                precise float sy = va.y + vb.y;
+                precise float sz = va.z + vb.z;
+                precise float sw = va.w + vb.w;
+                update_best(amax, acol, apply_softcap(FLOAT_TYPE(sx)), c0 + 0u);
+                update_best(amax, acol, apply_softcap(FLOAT_TYPE(sy)), c0 + 1u);
+                update_best(amax, acol, apply_softcap(FLOAT_TYPE(sz)), c0 + 2u);
+                update_best(amax, acol, apply_softcap(FLOAT_TYPE(sw)), c0 + 3u);
+            }
+            const uint tail_start = kx4 << 2u;
+            for (uint i = tail_start + tid; i < p.KX; i += BLOCK_SIZE) {
+                precise float s = float(data_a[row_base + i]) + float(data_b[row_b_base + i]);
+                update_best(amax, acol, apply_softcap(FLOAT_TYPE(s)), i);
+            }
+        } else {
+            for (uint i = tid; i < p.KX; i += BLOCK_SIZE) {
+                precise float s = float(data_a[row_base + i]) + float(data_b[row_b_base + i]);
+                update_best(amax, acol, apply_softcap(FLOAT_TYPE(s)), i);
+            }
         }
     }
 
-    tmp[col] = acol;
-    tmpmax[col] = amax;
-
+    tmp[tid]    = acol;
+    tmpmax[tid] = amax;
     barrier();
-    [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
-        if (col < s && col + s < p.KX) {
-            if (tmpmax[col] < tmpmax[col + s]) {
-                tmpmax[col] = tmpmax[col + s];
-                tmp[col] = tmp[col + s];
-            }
+
+    [[unroll]] for (uint s = BLOCK_SIZE >> 1u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            update_best(tmpmax[tid], tmp[tid], tmpmax[tid + s], tmp[tid + s]);
         }
         barrier();
     }
 
-    if (col == 0) {
-        data_d[row] = D_TYPE(tmp[0]);
+    if (tid == 0u) {
+        data_d[d_misalign + row] = D_TYPE(tmp[0]);
     }
 }

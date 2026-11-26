@@ -37,6 +37,15 @@
 #include <signal.h>
 #if defined(__gnu_linux__)
 #include <syscall.h>
+#include <sched.h>
+static cpu_set_t s20_init_cpuset;
+static bool      s20_has_init_cpuset = false;
+__attribute__((constructor)) static void s20_capture_init_cpuset(void) {
+    CPU_ZERO(&s20_init_cpuset);
+    if (sched_getaffinity(0, sizeof(s20_init_cpuset), &s20_init_cpuset) == 0 && CPU_COUNT(&s20_init_cpuset) > 1) {
+        s20_has_init_cpuset = true;
+    }
+}
 #endif
 
 #ifdef GGML_USE_OPENMP
@@ -2103,6 +2112,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_glu(params, tensor);
             } break;
+        case GGML_OP_INKLING_FUSED:
+            {
+                ggml_compute_forward_inkling_fused(params, tensor);
+            } break;
         case GGML_OP_GET_REL_POS:
             {
                 ggml_compute_forward_get_rel_pos(params, tensor);
@@ -2306,6 +2319,11 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DUP:
         case GGML_OP_CONT:
         case GGML_OP_ADD:
+            {
+                const size_t nb_dst  = ggml_nbytes(node);
+                const size_t nb_src0 = node->src[0] ? ggml_nbytes(node->src[0]) : 0;
+                n_tasks = (nb_dst < 256 * 1024 && nb_src0 < 256 * 1024) ? 1 : n_threads;
+            } break;
         case GGML_OP_ADD_ID:
         case GGML_OP_ACC:
         case GGML_OP_CUMSUM:
@@ -2330,6 +2348,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_INKLING_FUSED:
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
@@ -2388,6 +2407,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
                 case GGML_GLU_OP_SWIGLU_CLAMP:
+                case GGML_GLU_OP_SITU:
                     {
                         n_tasks = n_threads;
                     } break;
@@ -2395,12 +2415,17 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                     GGML_ABORT("fatal error");
             }
             break;
+        case GGML_OP_MUL:
+        case GGML_OP_RMS_NORM:
+            {
+                const size_t nb_dst  = ggml_nbytes(node);
+                const size_t nb_src0 = node->src[0] ? ggml_nbytes(node->src[0]) : 0;
+                n_tasks = (nb_dst < 256 * 1024 && nb_src0 < 256 * 1024) ? 1 : n_threads;
+            } break;
         case GGML_OP_SILU_BACK:
         case GGML_OP_SIGMOID_BACK:
-        case GGML_OP_MUL:
         case GGML_OP_DIV:
         case GGML_OP_NORM:
-        case GGML_OP_RMS_NORM:
         case GGML_OP_RMS_NORM_BACK:
         case GGML_OP_L2_NORM:
         case GGML_OP_GROUP_NORM:
@@ -3445,6 +3470,19 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     bool disposable_threadpool = false;
 
+#if defined(__gnu_linux__)
+    cpu_set_t s20_prev_cpuset;
+    bool s20_restored_full = false;
+    if (n_threads > 1 && s20_has_init_cpuset) {
+        CPU_ZERO(&s20_prev_cpuset);
+        if (sched_getaffinity(0, sizeof(s20_prev_cpuset), &s20_prev_cpuset) == 0 &&
+            CPU_COUNT(&s20_prev_cpuset) < CPU_COUNT(&s20_init_cpuset)) {
+            (void) sched_setaffinity(0, sizeof(s20_init_cpuset), &s20_init_cpuset);
+            s20_restored_full = true;
+        }
+    }
+#endif
+
     if (threadpool == NULL) {
         //GGML_PRINT_DEBUG("Threadpool is not specified. Will create a disposable threadpool : n_threads %d\n", n_threads);
         disposable_threadpool = true;
@@ -3491,15 +3529,27 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         n_threads = threadpool->n_threads;
     }
 
-    // Kick all threads to start the new graph
-    ggml_graph_compute_kickoff(threadpool, n_threads);
+    if (n_threads > 1) {
+        // Kick all threads to start the new graph
+        ggml_graph_compute_kickoff(threadpool, n_threads);
+    } else {
+        atomic_store_explicit(&threadpool->n_graph, 1, memory_order_relaxed);
+    }
 
     // This is a work thread too
     ggml_graph_compute_thread(&threadpool->workers[0]);
 #endif
 
     // don't leave affinity set on the main thread
-    clear_numa_thread_affinity();
+    if (n_threads > 1) {
+        clear_numa_thread_affinity();
+    }
+
+#if defined(__gnu_linux__)
+    if (s20_restored_full) {
+        (void) sched_setaffinity(0, sizeof(s20_prev_cpuset), &s20_prev_cpuset);
+    }
+#endif
 
     enum ggml_status ret = threadpool->ec;
 

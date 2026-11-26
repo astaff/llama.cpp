@@ -341,6 +341,14 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+
+    // gen (GGML_GEN_GDN_INPLACE): 1 when every state of the ubatch is read from its own cell (identity copy),
+    // so build_rs can view the cache instead of gathering; -1 when the feature is off
+    int gen_identity = -1;
+    static int gen_compute_identity(const llama_memory_recurrent_context * mctx, int64_t n_seqs, uint32_t n_rs_seq);
+
+    bool direct_scopy = false;
+    static bool compute_direct_scopy(const llama_memory_recurrent_context * mctx, const llama_ubatch & ubatch, const llama_cparams & cparams);
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
@@ -817,8 +825,16 @@ public:
     llm_graph_input_rs           * get_recr() const { return inp_rs.get(); }
 
     // distance from the token to the cell, extent for the empty, future and more distant cells
-    ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
-    ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
+    ggml_tensor * self_rel_pos          = nullptr; // I32 [n_kv,     n_batch]
+    ggml_tensor * self_rel_pos_swa      = nullptr; // I32 [n_kv_swa, n_batch]
+    ggml_tensor * self_rel_pos_pack     = nullptr; // I32 [n_stream*n_kv     + n_tokens + n_stream*ceil(n_kv/64)*2]
+    ggml_tensor * self_rel_pos_pack_swa = nullptr; // I32 [n_stream*n_kv_swa + n_tokens + n_stream*ceil(n_kv_swa/64)*2]
+    uint32_t      n_stream_rel          = 1;
+    uint32_t      n_stream_rel_swa      = 1;
+
+    // [base, swa] device copies, made once per graph
+    ggml_tensor * self_rel_pos_dev[2] = { nullptr, nullptr };
+    ggml_tensor * self_kq_mask_dev[2] = { nullptr, nullptr };
 
     const uint32_t extent;
     const uint32_t extent_swa;
@@ -1345,11 +1361,14 @@ struct llm_graph_context {
             ggml_tensor * kq_b,
             ggml_tensor * kq_mask,
             ggml_tensor * kv_rows, // [n_kv, n_stream], k and v are shared by the streams
-            ggml_tensor * sinks,   // [n_head_q]
+            ggml_tensor * sinks,   // [n_head_q] or [n_head_q, n_tokens]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * rel_table    = nullptr,
+            ggml_tensor * rel_pos_pack = nullptr,
+                int32_t   rel_extent   = 0) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
@@ -1556,10 +1575,14 @@ struct llm_graph_context {
             ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
             ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
-            ggml_tensor * kq_b,  // [n_kv, n_tokens/n_stream, n_head_q, n_stream]
-            ggml_tensor * sinks, // [n_head_q]
+            ggml_tensor * kq_b,  // [n_kv, n_rows, n_head_q, n_stream]
+            ggml_tensor * sinks, // [n_head_q] or [n_head_q, n_tokens]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+                int64_t   i_row        = 0, // first mask row of q_cur and kq_b
+            ggml_tensor * rel_table    = nullptr,
+            ggml_tensor * rel_pos_pack = nullptr,
+                int32_t   rel_extent   = 0) const;
 
     //
     // pooling

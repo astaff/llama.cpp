@@ -78,7 +78,7 @@ void main() {
 
     float sink;
     if (p.sinks != 0) {
-        sink = data_s[n];
+        sink = (p.sinks > 1u) ? data_s[(i3 * p.ne2 + i2) * p.ne1 + n] : data_s[n];
 
         float ms = 1.0f;
         float vs = 1.0f;

@@ -352,6 +352,30 @@ static size_t gbnf_escape_length(const std::string & pattern, size_t pos) {
     return 2 + n_hex;
 }
 
+static const char * gbnf_shorthand_to_rule(char c) {
+    switch (c) {
+        case 'd': return "[0-9]";
+        case 'D': return "[^0-9]";
+        case 's': return "[ \\t\\n\\r\\x0B\\x0C]";
+        case 'S': return "[^ \\t\\n\\r\\x0B\\x0C]";
+        case 'w': return "[0-9A-Za-z_]";
+        case 'W': return "[^0-9A-Za-z_]";
+        default:  return nullptr;
+    }
+}
+
+static const char * gbnf_shorthand_in_char_class(char c) {
+    switch (c) {
+        case 'd': return "0-9";
+        case 'D': return "\\x00-\\x2F\\x3A-\\U0010FFFF";
+        case 's': return " \\t\\n\\r\\x0B\\x0C";
+        case 'S': return "\\x00-\\x08\\x0E-\\x1F\\x21-\\U0010FFFF";
+        case 'w': return "0-9A-Za-z_";
+        case 'W': return "\\x00-\\x2F\\x3A-\\x40\\x5B-\\x5E\\x60\\x7B-\\U0010FFFF";
+        default:  return nullptr;
+    }
+}
+
 class common_chat_schema_converter {
 private:
     friend std::string build_grammar(const std::function<void(const common_grammar_builder &)> & cb, const common_grammar_options & options);
@@ -522,14 +546,34 @@ private:
                 } else if (c == '[') {
                     std::string square_brackets = std::string(1, c);
                     i++;
+                    if (i < length && sub_pattern[i] == '^') {
+                        square_brackets += '^';
+                        i++;
+                    }
                     while (i < length && sub_pattern[i] != ']') {
                         if (sub_pattern[i] == '\\') {
+                            if (i + 1 < length) {
+                                if (const char * expanded = gbnf_shorthand_in_char_class(sub_pattern[i + 1])) {
+                                    square_brackets += expanded;
+                                    i += 2;
+                                    if (i < length && sub_pattern[i] == '-' && i + 1 < length && sub_pattern[i + 1] != ']') {
+                                        square_brackets += "\\-";
+                                        i++;
+                                    }
+                                    continue;
+                                }
+                            }
                             auto escape_length = gbnf_escape_length(sub_pattern, i);
                             if (escape_length == 0) {
                                 throw unsupported_pattern("unsupported escape in character class: " + sub_pattern.substr(i, 2));
                             }
                             square_brackets += sub_pattern.substr(i, escape_length);
                             i += escape_length;
+                        } else if (sub_pattern[i] == '-' &&
+                                   i + 1 < length && sub_pattern[i + 1] == '\\' &&
+                                   i + 2 < length && gbnf_shorthand_in_char_class(sub_pattern[i + 2]) != nullptr) {
+                            square_brackets += "\\-";
+                            i++;
                         } else {
                             square_brackets += sub_pattern[i];
                             i++;
@@ -541,6 +585,9 @@ private:
                     square_brackets += ']';
                     i++;
                     seq.emplace_back(square_brackets, false);
+                } else if (c == '\\' && i + 1 < length && gbnf_shorthand_to_rule(sub_pattern[i + 1]) != nullptr) {
+                    seq.emplace_back(gbnf_shorthand_to_rule(sub_pattern[i + 1]), false);
+                    i += 2;
                 } else if (c == '|') {
                     seq.emplace_back("|", false);
                     i++;
@@ -614,6 +661,9 @@ private:
                                 throw invalid_pattern("trailing backslash");
                             }
                             char next = sub_pattern[i + 1];
+                            if (gbnf_shorthand_to_rule(next) != nullptr) {
+                                break;
+                            }
                             if (ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS.find(next) != ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS.end()) {
                                 i++;
                                 literal += sub_pattern[i];

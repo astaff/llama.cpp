@@ -342,18 +342,43 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
 
         auto * buft = ggml_backend_buffer_get_type(model_tensor->buffer);
 
-        // do not load loras to extra buffer types (i.e. bufts for repacking) -> use the CPU in that case
-        for (auto & ex : buft_extra) {
-            if (ex == buft) {
-                LLAMA_LOG_WARN("%s: lora for '%s' cannot use buft '%s', fallback to CPU\n", __func__, model_tensor->name, ggml_backend_buft_name(buft));
-
-                auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-                if (!cpu_dev) {
-                    throw std::runtime_error(format("%s: no CPU backend found", __func__));
+        // do not load loras to extra buffer types (i.e. bufts for repacking):
+        // for GPU extra bufts (e.g. Vulkan_Repack), use the device's default buft (e.g. Vulkan0);
+        // for CPU extra bufts, use the default CPU buft.
+        bool remapped = false;
+        if (auto * dev = ggml_backend_buft_get_device(buft)) {
+            if (auto * reg = ggml_backend_dev_backend_reg(dev)) {
+                auto get_extra_fn = (ggml_backend_dev_get_extra_bufts_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+                if (get_extra_fn) {
+                    ggml_backend_buffer_type_t * extra_bufts = get_extra_fn(dev);
+                    while (extra_bufts && *extra_bufts) {
+                        if (*extra_bufts == buft) {
+                            auto * fallback_buft = ggml_backend_dev_buffer_type(dev);
+                            LLAMA_LOG_WARN("%s: lora for '%s' cannot use buft '%s', remap to '%s'\n",
+                                __func__, model_tensor->name, ggml_backend_buft_name(buft), ggml_backend_buft_name(fallback_buft));
+                            buft = fallback_buft;
+                            remapped = true;
+                            break;
+                        }
+                        ++extra_bufts;
+                    }
                 }
-                buft = ggml_backend_dev_buffer_type(cpu_dev);
+            }
+        }
+        if (!remapped) {
+            for (auto & ex : buft_extra) {
+                if (ex == buft) {
+                    LLAMA_LOG_WARN("%s: lora for '%s' cannot use buft '%s', fallback to CPU\n", __func__, model_tensor->name, ggml_backend_buft_name(buft));
 
-                break;
+                    auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                    if (!cpu_dev) {
+                        throw std::runtime_error(format("%s: no CPU backend found", __func__));
+                    }
+                    buft = ggml_backend_dev_buffer_type(cpu_dev);
+
+                    break;
+                }
             }
         }
 

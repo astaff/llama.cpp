@@ -1153,6 +1153,8 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
+extern "C" void llama_s23_set_single_slot_tree_swa(bool v);
+
 static const std::map<common_decision_type, std::string> COMMON_DECISION_TYPE_NAMES = {
     { COMMON_DECISION_TYPE_OPENJEV,        "openjev"       },
     { COMMON_DECISION_TYPE_LEV,            "lev"           },
@@ -1318,10 +1320,21 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_outputs_max = std::max(cparams.n_outputs_max, (uint32_t) COMMON_DECISION_LFM3_D1_SET_SIZE);
     }
 
+    char arch_buf[64] = {};
+    const bool is_inkling2_arch =
+        llama_model_meta_val_str(model, "general.architecture", arch_buf, sizeof(arch_buf)) >= 0 &&
+        std::strncmp(arch_buf, "inkling2", 8) == 0;
+
+    bool s23_single_slot_tree_swa = false;
     if (llama_model_classifier_free_guidance(model)) {
         params.kv_unified   = true;
         cparams.kv_unified  = true;
         cparams.n_seq_max  *= 2;
+    } else if (is_inkling2_arch && params.n_parallel == 1 && params.speculative.has_dft() &&
+               !cparams.embeddings && getenv("LLAMA_DSPARK_ENABLE_2BRANCH") && !getenv("LLAMA_DSPARK_NO_TREE")) {
+        s23_single_slot_tree_swa = (!params.kv_unified && cparams.n_seq_max == 1);
+        cparams.kv_unified = true;
+        cparams.n_seq_max  = std::max<uint32_t>(cparams.n_seq_max, 2);
     }
 
     // embeddings need the whole batch in one ubatch, so n_batch must not be larger than n_ubatch
@@ -1383,12 +1396,24 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         pimpl->samplers_seq_config[i] = { i, common_sampler_get(pimpl->samplers[i].get()) };
     }
 
-    if (params.sampling.backend_sampling) {
+    const bool init_pure_greedy_fast =
+        is_inkling2_arch &&
+        !pimpl->samplers.empty() &&
+        params.sampling.n_probs == 0 &&
+        common_sampler_is_pure_argmax(pimpl->samplers[0].get()) &&
+        !getenv("LLAMA_FORCE_BACKEND_ARGMAX_CHAIN");
+    if (params.sampling.backend_sampling && !init_pure_greedy_fast) {
         cparams.samplers   = pimpl->samplers_seq_config.data();
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
+    if (s23_single_slot_tree_swa) {
+        llama_s23_set_single_slot_tree_swa(true);
+    }
     llama_context * lctx = llama_init_from_model(model, cparams);
+    if (s23_single_slot_tree_swa) {
+        llama_s23_set_single_slot_tree_swa(false);
+    }
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
         return;

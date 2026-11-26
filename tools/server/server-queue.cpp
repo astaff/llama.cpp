@@ -21,6 +21,28 @@
 // server_queue
 //
 
+#if defined(__linux__)
+#include <sched.h>
+static cpu_set_t g_s21_srv_init_cpuset;
+static bool      g_s21_srv_has_init_cpuset = false;
+
+__attribute__((constructor)) static void s21_srv_capture_init_cpuset() {
+    CPU_ZERO(&g_s21_srv_init_cpuset);
+    if (sched_getaffinity(0, sizeof(g_s21_srv_init_cpuset), &g_s21_srv_init_cpuset) == 0 &&
+        CPU_COUNT(&g_s21_srv_init_cpuset) > 1) {
+        g_s21_srv_has_init_cpuset = true;
+    }
+}
+
+void server_restore_init_thread_affinity() {
+    if (g_s21_srv_has_init_cpuset) {
+        (void) sched_setaffinity(0, sizeof(g_s21_srv_init_cpuset), &g_s21_srv_init_cpuset);
+    }
+}
+#else
+void server_restore_init_thread_affinity() {}
+#endif
+
 static bool task_resets_idle_timer(server_task_type type) {
     return type != SERVER_TASK_TYPE_METRICS;
 }
@@ -43,6 +65,7 @@ int server_queue::post(server_task && task, bool front) {
     if (reset_timer) {
         time_last_task = ggml_time_ms();
     }
+    wake_worker_if_yielding_locked();
     condition_tasks.notify_one();
     return task_id;
 }
@@ -69,6 +92,7 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
     if (reset_timer) {
         time_last_task = ggml_time_ms();
     }
+    wake_worker_if_yielding_locked();
     condition_tasks.notify_one();
     return 0;
 }
@@ -109,7 +133,15 @@ void server_queue::pop_deferred_task(int id_slot) {
         }
     }
     time_last_task = ggml_time_ms();
+    wake_worker_if_yielding_locked();
     condition_tasks.notify_one();
+}
+
+void server_queue::wake_worker_if_yielding_locked() {
+    if (worker.yielding && !worker.busy && !queue_tasks.empty()) {
+        worker.busy = true;
+        worker.cv.notify_one();
+    }
 }
 
 void server_queue::wait_until_no_sleep() {
@@ -166,6 +198,7 @@ bool server_queue::process_new_tasks(bool is_yielding) {
 }
 
 void server_queue::worker_loop() {
+    server_restore_init_thread_affinity();
     while (true) {
         {
             std::unique_lock<std::mutex> lock(mutex_tasks);
@@ -229,13 +262,23 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
 
     QUE_DBG("%s", "yielding to queue\n");
 
+    // Series 20 (Pillar S20.4): Race-free mutex_tasks-guarded lazy worker wakeup.
+    // Eliminates 112.3 vcsw/s on worker.thread and 56.2 vcsw/s + 12-P-core wake_affine
+    // bounce on main loop when queue_tasks is empty during decode/verify!
+    bool notify_worker = false;
     {
         std::unique_lock<std::mutex> lock(mutex_tasks);
-        GGML_ASSERT(!worker.busy && "yield_to_queue() cannot be nested");
-        worker.busy     = true;
+        GGML_ASSERT(!worker.busy && !worker.yielding && "yield_to_queue() cannot be nested");
         worker.yielding = true;
+        time_last_task  = ggml_time_ms();
+        if (!queue_tasks.empty()) {
+            worker.busy   = true;
+            notify_worker = true;
+        }
     }
-    worker.cv.notify_one();
+    if (notify_worker) {
+        worker.cv.notify_one();
+    }
 
     // run the work on the current thread, so that all ggml compute stays on the same thread
     std::exception_ptr exception;
@@ -248,12 +291,14 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
     {
         std::unique_lock<std::mutex> lock(mutex_tasks);
 
-        // the yield is over, wait for the worker to finish its current task
+        // the yield is over; only wait if the worker actually woke to process a task
         worker.yielding = false;
-        condition_tasks.notify_all();
-        condition_tasks.wait(lock, [&]{
-            return !worker.busy;
-        });
+        if (worker.busy) {
+            condition_tasks.notify_all();
+            condition_tasks.wait(lock, [&]{
+                return !worker.busy;
+            });
+        }
 
         // put the declined tasks back, keeping their order
         while (!queue_tasks_unhandled.empty()) {
@@ -281,6 +326,7 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
 }
 
 void server_queue::start_loop(int64_t idle_sleep_ms) {
+    server_restore_init_thread_affinity();
     running = true;
     time_last_task = ggml_time_ms();
 
@@ -331,6 +377,7 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
             // no tasks, check for sleeping state
             if (should_sleep()) {
                 QUE_INF("%s", "entering sleeping state\n");
+                server_restore_init_thread_affinity();
                 sleeping = true;
                 // Call order cb0 -> cb1 -> cb{N}
                 for (auto & cb : callback_sleeping_state) {

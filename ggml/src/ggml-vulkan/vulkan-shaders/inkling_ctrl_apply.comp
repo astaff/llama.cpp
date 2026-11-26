@@ -1,0 +1,33 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer BufCur { float data_cur[]; };
+layout(binding = 1) readonly  buffer BufMsg { float data_msg[]; };
+layout(binding = 2) readonly  buffer BufGn  { float data_gn[];  };
+layout(binding = 3) readonly  buffer BufFg  { float data_fg[];  };
+layout(binding = 4) writeonly buffer BufDst { float data_dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint ne;
+    uint off_cur;
+    uint off_msg;
+    uint off_gn;
+    uint off_fg;
+    uint off_dst;
+} p;
+
+void main() {
+    const uint base = (gl_GlobalInvocationID.x + gl_WorkGroupID.y * (65535u * 256u)) * 4u;
+    if (base >= p.ne) {
+        return;
+    }
+    for (uint k = 0u; k < 4u && (base + k) < p.ne; ++k) {
+        const uint i   = base + k;
+        const float c  = data_cur[p.off_cur + i];
+        const float m  = data_msg[p.off_msg + i];
+        const float gn = tanh(data_gn[p.off_gn + i]);
+        const float fg = tanh(data_fg[p.off_fg + i]);
+        data_dst[p.off_dst + i] = (c - fg * c) + gn * m;
+    }
+}

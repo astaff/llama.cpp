@@ -1,0 +1,116 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+struct block_q8_0_u16 {
+    float16_t d;
+    uint16_t  qs16[16];
+};
+
+layout(binding = 0) readonly  buffer BufCur   { float          data_cur[];    };
+layout(binding = 1) readonly  buffer BufScale { float          data_scale[];  };
+layout(binding = 2) readonly  buffer BufTau   { float          data_tau[];    };
+layout(binding = 3) writeonly buffer BufDst   { float          data_dst[];    };
+layout(binding = 3) writeonly buffer BufDst16 { float16_t      data_dst16[];  };
+layout(binding = 3) writeonly buffer BufDstQ8 { block_q8_0_u16 data_dst_q8[]; };
+layout(binding = 4) readonly  buffer BufIdx   { uvec2          data_idx[];    };
+
+layout(push_constant) uniform PushConstants {
+    uint  ne0;
+    uint  ne1;
+    uint  ne2;
+    uint  flags; // bit 0: has_scale, bit 1: has_tau, bit 2: set_rows, bit 3: dst_f16, bit 4: dst_q8_0
+    uint  off_cur;
+    uint  off_scale;
+    uint  off_tau;
+    uint  off_dst;
+    float threshold;
+    float eps;
+    uint  off_idx;
+    uint  set_rows_nb1;
+} p;
+
+void main() {
+    const uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u;
+    if (row >= p.ne1 * p.ne2) {
+        return;
+    }
+    const uint lane     = gl_LocalInvocationID.x;
+    const uint cur_base = p.off_cur + row * p.ne0;
+    const uint head     = row % p.ne1;
+    const uint tok      = row / p.ne1;
+    const uint sc_base  = p.off_scale + head * p.ne0;
+    const bool has_sc   = (p.flags & 1u) != 0u;
+    const bool has_tau  = (p.flags & 2u) != 0u;
+    const bool do_sr    = (p.flags & 4u) != 0u;
+    const bool dst_f16  = (p.flags & 8u) != 0u;
+    const bool dst_q8   = (p.flags & 16u) != 0u;
+
+    const uint dst_base = do_sr
+        ? (p.off_dst + data_idx[p.off_idx + tok].x * p.set_rows_nb1 + head * (dst_q8 ? (p.ne0 >> 5u) : p.ne0))
+        : (p.off_dst + row * p.ne0);
+
+    float ss = 0.0f;
+    for (uint c = lane; c < p.ne0; c += 32u) {
+        float x = data_cur[cur_base + c];
+        if (has_sc) {
+            x *= data_scale[sc_base + c];
+        }
+        ss += x * x;
+    }
+    ss = subgroupAdd(ss);
+    const float norm   = sqrt(ss) + p.eps;
+    const float factor = clamp(p.threshold / norm, 0.0f, 1.0f);
+    const float tau_v  = has_tau ? data_tau[p.off_tau + tok] : 1.0f;
+
+    if (dst_q8) {
+        const uint n_blks = p.ne0 >> 5u;
+        for (uint b = 0u; b < n_blks; ++b) {
+            const uint c = (b << 5u) + lane;
+            float x = data_cur[cur_base + c];
+            if (has_sc) {
+                x *= data_scale[sc_base + c];
+            }
+            float out_v = x * factor;
+            if (has_tau) {
+                out_v *= tau_v;
+            }
+            const float amax = subgroupMax(abs(out_v));
+            const float d    = amax / 127.0f;
+            const float id   = (d != 0.0f) ? (1.0f / d) : 0.0f;
+            const uint  qlo  = uint(int(round(out_v * id))) & 0xFFu;
+            const uint  qhi  = subgroupShuffleXor(qlo, 1u);
+            const uint  bi   = dst_base + b;
+            if (lane == 0u) {
+                data_dst_q8[bi].d = float16_t(d);
+            }
+            if ((lane & 1u) == 0u) {
+                data_dst_q8[bi].qs16[lane >> 1u] = uint16_t(qlo | (qhi << 8u));
+            }
+        }
+        return;
+    }
+
+    for (uint c = lane; c < p.ne0; c += 32u) {
+        float x = data_cur[cur_base + c];
+        if (has_sc) {
+            x *= data_scale[sc_base + c];
+        }
+        float out_v = x * factor;
+        if (has_tau) {
+            out_v *= tau_v;
+        }
+        if (dst_f16) {
+            data_dst16[dst_base + c] = float16_t(out_v);
+        } else {
+            data_dst[dst_base + c] = out_v;
+        }
+    }
+}

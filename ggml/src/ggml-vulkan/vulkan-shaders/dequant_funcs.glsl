@@ -121,9 +121,9 @@ vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     return vec2(int(data_a[a_offset + ib].qs[iqs]), int(data_a[a_offset + ib].qs[iqs + 1]));
 }
 vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
-    const i8vec2 v0 = unpack8(int32_t(data_a_packed16[a_offset + ib].qs[iqs/2])).xy; // vec4 used due to #12147
-    const i8vec2 v1 = unpack8(int32_t(data_a_packed16[a_offset + ib].qs[iqs/2 + 1])).xy;
-    return vec4(v0.x, v0.y, v1.x, v1.y);
+    return vec4(unpack8(pack32(i16vec2(
+        data_a_packed16[a_offset + ib].qs[iqs/2],
+        data_a_packed16[a_offset + ib].qs[iqs/2 + 1]))));
 }
 #endif
 
@@ -495,7 +495,7 @@ vec2 dequantize(uint ib, uint iqs, uint a_offset) {
 #ifdef USE_OCP_FP4
     return vec2(unpackFloat2xfe2m1EXT(uint8_t(vui)));
 #else
-    return vec2(kvalues_mxfp4[vui & 0xF], kvalues_mxfp4[vui >> 4]) * 0.5;
+    return vec2(float(mxfp4_kval(vui & 0xFu)), float(mxfp4_kval(vui >> 4u))) * 0.5f;
 #endif
 }
 vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
@@ -512,36 +512,76 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 #endif
 
 #if defined(DATA_A_NVFP4)
+#if defined(REPACK_PLANAR)
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
-    const uint sub = iqs >> 4;
+    const uint sub = iqs >> 4u;
+    const uint j = iqs & 7u;
+    const uint shift = (iqs & 8u) >> 1u;
+#ifdef MUL_MAT_ID
+    const uint s_blks = (p.ncols >> 6u) * p.stride_d;
+#else
+    const uint s_blks = (p.ncols >> 6u) * ((GEN_GLU == 2u) ? p.pair_m0 : p.stride_d);
+#endif
+    const uint slice_u32 = a_offset * 9u;
+    const uint d_u32 = data_a_repack_u32[slice_u32 + s_blks * 8u + ib];
+    const float d = ue4m3_to_fp32(uint8_t((d_u32 >> (sub * 8u)) & 0xFFu));
+    const uint q_word = data_a_repack_u32[slice_u32 + ib * 8u + sub * 2u + (j >> 2u)];
+    const uint bsh = (j & 3u) * 8u;
+    const uint vui0 = (q_word >> bsh) & 0xFFu;
+    const uint vui1 = (q_word >> (bsh + 8u)) & 0xFFu;
+    const uint qs0 = (vui0 >> shift) & 0xFu;
+    const uint qs1 = (vui1 >> shift) & 0xFu;
+    return vec2(float(mxfp4_kval(qs0)), float(mxfp4_kval(qs1))) * (d * 0.5f);
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    const uint sub = iqs >> 4u;
+    const uint j = iqs & 7u;
+    const uint shift = (iqs & 8u) >> 1u;
+#ifdef MUL_MAT_ID
+    const uint s_blks = (p.ncols >> 6u) * p.stride_d;
+#else
+    const uint s_blks = (p.ncols >> 6u) * ((GEN_GLU == 2u) ? p.pair_m0 : p.stride_d);
+#endif
+    const uint slice_u32 = a_offset * 9u;
+    const uint d_u32 = data_a_repack_u32[slice_u32 + s_blks * 8u + ib];
+    const float d = ue4m3_to_fp32(uint8_t((d_u32 >> (sub * 8u)) & 0xFFu));
+    const uint vui = data_a_repack_u32[slice_u32 + ib * 8u + (sub * 8u + j) / 4u];
+    const u8vec4 qv = unpack8((vui >> shift) & 0x0F0F0F0Fu);
+    return vec4(float(mxfp4_kval(uint(qv.x))), float(mxfp4_kval(uint(qv.y))),
+                float(mxfp4_kval(uint(qv.z))), float(mxfp4_kval(uint(qv.w)))) * (d * 0.5f);
+}
+#else
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    const uint sub = iqs >> 4u;
     const float d = ue4m3_to_fp32(data_a[a_offset + ib].d[sub]);
-    const uint j = iqs & 7;
-    const uint shift = (iqs & 8) >> 1; // 0 or 4
+    const uint j = iqs & 7u;
+    const uint shift = (iqs & 8u) >> 1u; // 0 or 4
 #ifdef USE_OCP_FP4
     const uint vui = uint(data_a_packed16[a_offset + ib].qs[(sub * 8u + j) / 2u]);
     return vec2(bitcastExtractfe2m1EXT(unpack8(vui).xy, shift)) * d;
 #else
     const uint vui0 = uint(data_a[a_offset + ib].qs[sub * 8u + j]);
-    const uint vui1 = uint(data_a[a_offset + ib].qs[sub * 8u + j + 1]);
-    const uint qs0 = (vui0 >> shift) & 0xF;
-    const uint qs1 = (vui1 >> shift) & 0xF;
-    return vec2(float(kvalues_mxfp4[qs0]), float(kvalues_mxfp4[qs1])) * d * 0.5;
+    const uint vui1 = uint(data_a[a_offset + ib].qs[sub * 8u + j + 1u]);
+    const uint qs0 = (vui0 >> shift) & 0xFu;
+    const uint qs1 = (vui1 >> shift) & 0xFu;
+    return vec2(float(mxfp4_kval(qs0)), float(mxfp4_kval(qs1))) * (d * 0.5f);
 #endif
 }
 vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
-#ifdef USE_OCP_FP4
-    const uint sub = iqs >> 4;
+    const uint sub = iqs >> 4u;
     const float d = ue4m3_to_fp32(data_a[a_offset + ib].d[sub]);
-    const uint j = iqs & 7;
-    const uint shift = (iqs & 8) >> 1; // 0 or 4
+    const uint j = iqs & 7u;
+    const uint shift = (iqs & 8u) >> 1u; // 0 or 4
     const uint vui = data_a_packed32[a_offset + ib].qs[(sub * 8u + j) / 4u];
+#ifdef USE_OCP_FP4
     return vec4(bitcastExtractfe2m1EXT(unpack8(vui), shift)) * d;
 #else
-    const vec2 v0 = dequantize(ib, iqs, a_offset);
-    const vec2 v1 = dequantize(ib, iqs + 2u, a_offset);
-    return vec4(v0.x, v0.y, v1.x, v1.y);
+    const u8vec4 qv = unpack8((vui >> shift) & 0x0F0F0F0Fu);
+    return vec4(float(mxfp4_kval(uint(qv.x))), float(mxfp4_kval(uint(qv.y))),
+                float(mxfp4_kval(uint(qv.z))), float(mxfp4_kval(uint(qv.w)))) * (d * 0.5f);
 #endif
 }
+#endif
 #endif
 
 #if defined(DATA_A_F32) || defined(DATA_A_F16) || defined(DATA_A_BF16)

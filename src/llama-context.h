@@ -83,6 +83,7 @@ struct llama_context {
 
     float * get_logits();
     float * get_logits_ith(int32_t i);
+    const float * get_logits_ith_ro(int32_t i);
 
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
@@ -115,6 +116,8 @@ struct llama_context {
             ggml_threadpool_t threadpool_batch);
 
     void detach_threadpool();
+    ggml_threadpool_t get_threadpool() const { return threadpool; }
+    ggml_threadpool_t get_threadpool_batch() const { return threadpool_batch; }
 
     void set_n_threads(int32_t n_threads, int32_t n_threads_batch);
 
@@ -250,6 +253,7 @@ private:
     uint32_t output_reserve(int32_t n_outputs);
 
     void output_reorder();
+    void materialize_logits_uma_view();
 
     // map the output row index `i` to batch index
     int64_t output_resolve_row(int32_t i) const;
@@ -348,6 +352,8 @@ private:
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
+    const float *      logits_uma_view = nullptr;
+    size_t             logits_uma_n_floats = 0;
 
     // embeddings output (2-dimensional array: [n_outputs][n_embd])
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE

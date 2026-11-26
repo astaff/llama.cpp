@@ -1,5 +1,7 @@
 #include "llama-model-loader.h"
 
+#include <mutex>
+
 #include "ggml-alloc.h"
 #include "ggml.h"
 #include "gguf.h"
@@ -1208,6 +1210,19 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
     return true;
 }
 
+static std::mutex             g_gen_bf16_mutex;
+static std::set<std::string>  g_gen_bf16_names;
+
+bool llama_gen_bf16_converted(const char * name) {
+    std::lock_guard<std::mutex> lock(g_gen_bf16_mutex);
+    return g_gen_bf16_names.count(name) != 0;
+}
+
+int64_t llama_gen_bf16_cast_above() {
+    static const int64_t v = getenv("GGML_GEN_BF16_CAST_ABOVE") ? atoll(getenv("GGML_GEN_BF16_CAST_ABOVE")) : 8;
+    return v;
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
@@ -1455,9 +1470,78 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     GGML_ASSERT(ggml_nbytes(&t_meta) == ggml_nbytes(cur));
 
+    // gen: GGML_GEN_BF16_EXACT=1 stores the F32 router / shared-expert gate / ssm_alpha / ssm_beta weights as
+    // BF16 when every value is exactly representable (low 16 bits zero), checked here per tensor from the file.
+    // The values are unchanged, so the matrix-vector product gives the same result with half the bytes.
+    bool gen_to_bf16 = false;
+    {
+        static const bool gen_bf16_exact = getenv("GGML_GEN_BF16_EXACT") != nullptr && atoi(getenv("GGML_GEN_BF16_EXACT")) != 0;
+        const std::string name = tn.str();
+        auto ends_with = [&](const char * suf) {
+            const size_t n = strlen(suf);
+            return name.size() >= n && name.compare(name.size() - n, n, suf) == 0;
+        };
+        if (gen_bf16_exact && !is_lazy && !(flags & TENSOR_DUPLICATED) && t_meta.type == GGML_TYPE_F32 &&
+            t_meta.ne[0] % 2 == 0 &&
+            (ends_with(".ffn_gate_inp.weight") || ends_with(".ffn_gate_inp_shexp.weight") ||
+             ends_with(".ssm_alpha.weight") || ends_with(".ssm_beta.weight") ||
+             ends_with(".ssm_beta_alpha.weight") || ends_with(".ssm_ba.weight"))) {
+            const auto & w = require_weight(name.c_str());
+            std::vector<uint32_t> vals(ggml_nelements(&t_meta));
+            files.at(w.idx)->seek(w.offs, SEEK_SET);
+            files.at(w.idx)->read_raw(vals.data(), ggml_nbytes(&t_meta));
+            bool exact = true;
+            for (uint32_t v : vals) {
+                if (v & 0xffffu) {
+                    exact = false;
+                    break;
+                }
+            }
+            if (exact) {
+                t_meta.type = GGML_TYPE_BF16;
+                t_meta.nb[0] = ggml_type_size(GGML_TYPE_BF16);
+                t_meta.nb[1] = ggml_row_size(GGML_TYPE_BF16, t_meta.ne[0]);
+                for (int dim = 2; dim < GGML_MAX_DIMS; dim++) {
+                    t_meta.nb[dim] = t_meta.ne[dim-1]*t_meta.nb[dim-1];
+                }
+                gen_to_bf16 = true;
+            } else {
+                LLAMA_LOG_WARN("%s: %s is not bf16-exact, kept as F32\n", __func__, name.c_str());
+            }
+        }
+    }
+
     ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
     if (buft == nullptr) {
         return nullptr;
+    }
+
+    // Under mmap, only keep BF16 compaction when the target buffer type is NOT
+    // mmap-aliased directly from the file via buffer_from_host_ptr (e.g. Vulkan0).
+    if (gen_to_bf16 && use_mmap) {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        if (!dev) {
+            dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        }
+        bool may_mmap_alias = false;
+        if (dev) {
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(dev, &props);
+            may_mmap_alias = props.caps.buffer_from_host_ptr && (buft == ggml_backend_dev_buffer_type(dev));
+        }
+        if (may_mmap_alias) {
+            t_meta.type = GGML_TYPE_F32;
+            t_meta.nb[0] = ggml_type_size(GGML_TYPE_F32);
+            t_meta.nb[1] = ggml_row_size(GGML_TYPE_F32, t_meta.ne[0]);
+            for (int dim = 2; dim < GGML_MAX_DIMS; dim++) {
+                t_meta.nb[dim] = t_meta.ne[dim-1]*t_meta.nb[dim-1];
+            }
+            gen_to_bf16 = false;
+            buft = buft_for_tensor(&t_meta);
+            if (buft == nullptr) {
+                return nullptr;
+            }
+        }
     }
 
     ggml_context * ctx = ctx_for_buft(buft);
@@ -1474,6 +1558,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
     ggml_set_name(tensor, ggml_get_name(&t_meta));
+
+    if (gen_to_bf16) {
+        gen_bf16_tensors.insert(ggml_get_name(tensor));
+        std::lock_guard<std::mutex> lock(g_gen_bf16_mutex);
+        g_gen_bf16_names.insert(ggml_get_name(tensor));
+    }
 
     if (duplicated) {
         size_data += ggml_nbytes(&t_meta);
@@ -1658,6 +1748,10 @@ bool llama_model_loader::load_all_data(
     }
     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
 
+    if (!gen_bf16_tensors.empty()) {
+        fprintf(stderr, "gen: %zu bf16-exact F32 weight tensors stored as BF16 (GGML_GEN_BF16_EXACT)\n", gen_bf16_tensors.size());
+    }
+
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
 
     // 4 staging buffers for async uploads, each sized 1MB seems to be a good default for single NVMe drives.
@@ -1676,44 +1770,63 @@ bool llama_model_loader::load_all_data(
     std::vector<ggml_backend_event_t> events;
     std::vector<void *> host_ptrs;
     size_t buffer_idx = 0; // buffer to use for async loads
+    ggml_backend_buffer_type_t default_dev_buft = nullptr;
+    for (auto * buf : bufs) {
+        if (!buf) {
+            continue;
+        }
+        auto * buft  = ggml_backend_buffer_get_type(buf);
+        auto * b_dev = ggml_backend_buft_get_device(buft);
+        if (b_dev && buft == ggml_backend_dev_buffer_type(b_dev)) {
+            default_dev_buft = buft;
+            break;
+        }
+    }
+
     ggml_backend_t upload_backend = [&](const char * func) -> ggml_backend_t {
-        if (use_mmap || check_tensors) {
+        // Skip pinned-GPU-host-buffer (vkMapMemory / VM_PFNMAP) async staging when using mmap, check_tensors,
+        // or Direct I/O (alignment != 1: Linux O_DIRECT pin_user_pages rejects VM_PFNMAP VMAs with EFAULT).
+        if (use_mmap || check_tensors || alignment != 1) {
             return nullptr;
         }
         // When not using mmaped io use async uploads from pinned memory to GPU memory.
-        // First determine if the backend supports the necessary features for async uploads.
-        auto * buf = bufs.empty() ? nullptr : bufs[0];
-        if (!buf) {
+        // First determine if any buffer's backend supports the necessary features for async uploads.
+        if (bufs.empty()) {
             LLAMA_LOG_DEBUG("%s: no buffer found for async uploads\n", func);
             return nullptr;
         }
 
-        auto * buft = ggml_backend_buffer_get_type(buf);
-        auto * dev = ggml_backend_buft_get_device(buft);
+        ggml_backend_dev_t dev = nullptr;
+        ggml_backend_buffer_type_t host_buft = nullptr;
+        for (auto * buf : bufs) {
+            if (!buf) {
+                continue;
+            }
+            auto * buft = ggml_backend_buffer_get_type(buf);
+            auto * b_dev = ggml_backend_buft_get_device(buft);
+            if (!b_dev || buft != ggml_backend_dev_buffer_type(b_dev)) {
+                continue;
+            }
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(b_dev, &props);
+            // On UMA iGPUs (e.g. Apple AGX), set_tensor_async is a synchronous CPU memcpy into unified memory;
+            // allocating 4 * 64 MiB of Vulkan_Host buffers is pure memory/memcpy overhead.
+            if (props.type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                continue;
+            }
+            if (!props.caps.async || !props.caps.host_buffer || !props.caps.events) {
+                continue;
+            }
+            auto * h_buft = ggml_backend_dev_host_buffer_type(b_dev);
+            if (!h_buft) {
+                continue;
+            }
+            dev = b_dev;
+            host_buft = h_buft;
+            break;
+        }
         if (!dev) {
-            LLAMA_LOG_DEBUG("%s: no device found for buffer type %s for async uploads\n", func,
-                ggml_backend_buft_name(buft));
-            return nullptr;
-        }
-
-        if (buft != ggml_backend_dev_buffer_type(dev)) {
-            LLAMA_LOG_DEBUG("%s: buffer type %s is not the default buffer type for device %s for async uploads\n", func,
-                ggml_backend_buft_name(buft), ggml_backend_dev_name(dev));
-            return nullptr;
-        }
-
-        ggml_backend_dev_props props;
-        ggml_backend_dev_get_props(dev, &props);
-        if (!props.caps.async || !props.caps.host_buffer || !props.caps.events) {
-            LLAMA_LOG_DEBUG("%s: device %s does not support async, host buffers or events\n", func,
-                ggml_backend_dev_name(dev));
-            return nullptr;
-        }
-
-        auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
-        if (!host_buft) {
-            LLAMA_LOG_DEBUG("%s: no host buffer type found for device %s\n", func,
-                ggml_backend_dev_name(dev));
+            LLAMA_LOG_DEBUG("%s: no device supporting async uploads found in model buffers\n", func);
             return nullptr;
         }
 
@@ -1750,10 +1863,13 @@ bool llama_model_loader::load_all_data(
         return backend;
     }(__func__);
 
+    ggml_backend_buffer_type_t upload_buft = upload_backend
+        ? ggml_backend_dev_buffer_type(ggml_backend_get_device(upload_backend))
+        : nullptr;
     if (upload_backend) {
         LLAMA_LOG_DEBUG("%s: using async uploads for device %s, buffer type %s, backend %s\n", __func__,
             ggml_backend_dev_name(ggml_backend_get_device(upload_backend)),
-            ggml_backend_buft_name(ggml_backend_buffer_get_type(bufs[0])),
+            ggml_backend_buft_name(upload_buft),
             ggml_backend_name(upload_backend));
     }
 
@@ -1792,6 +1908,26 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        if (!gen_bf16_tensors.empty() && gen_bf16_tensors.count(ggml_get_name(cur))) {
+            // gen: the file holds F32; convert (exactly, see create_tensor) and upload as BF16
+            const auto & file = files.at(weight->idx);
+            const int64_t n = ggml_nelements(cur);
+            std::vector<uint32_t> f32(n);
+            std::vector<uint16_t> bf16(n);
+            file->seek(weight->offs, SEEK_SET);
+            file->read_raw(f32.data(), n * sizeof(uint32_t));
+            for (int64_t i = 0; i < n; i++) {
+                GGML_ASSERT((f32[i] & 0xffffu) == 0);
+                bf16[i] = (uint16_t) (f32[i] >> 16);
+            }
+            if (upload_backend) {
+                ggml_backend_synchronize(upload_backend);
+            }
+            ggml_backend_tensor_set(cur, bf16.data(), 0, n_size);
+            size_done += n * sizeof(uint32_t);
+            continue;
+        }
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 
@@ -1844,7 +1980,7 @@ bool llama_model_loader::load_all_data(
                 }
             } else {
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
-                if (upload_backend) {
+                if (upload_backend && cur->buffer && ggml_backend_buffer_get_type(cur->buffer) == upload_buft) {
                     size_t offset = weight->offs;
                     alignment = file->read_alignment();
                     size_t aligned_offset = offset & ~(alignment - 1);
@@ -1896,7 +2032,42 @@ bool llama_model_loader::load_all_data(
                         ++buffer_idx;
                         buffer_idx %= n_buffers;
                     }
+                } else if (!check_tensors && default_dev_buft && cur->buffer &&
+                           ggml_backend_buffer_get_type(cur->buffer) == default_dev_buft &&
+                           n_size > LLAMA_DIRECT_IO_BUFFER_SIZE) {
+                    // Stream large default-device tensors (e.g. Vulkan0 on UMA) in 64 MiB aligned O_DIRECT chunks
+                    // instead of allocating a full-tensor multi-hundred-MiB bounce buffer.
+                    const size_t align          = file->read_alignment();
+                    const size_t aligned_offset = weight->offs & ~(align - 1);
+                    const size_t pad_head       = weight->offs - aligned_offset;
+                    const size_t total_aligned  = (pad_head + n_size + align - 1) & ~(align - 1);
+                    const size_t chunk_cap      = LLAMA_DIRECT_IO_BUFFER_SIZE;
+                    const size_t alloc_need     = chunk_cap + align - 1;
+
+                    const size_t cur_rb_size = read_buf ? ggml_backend_buffer_get_size(read_buf.get()) : 0;
+                    if (!read_buf || cur_rb_size < alloc_need) {
+                        read_buf.reset();
+                        read_buf.reset(ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), alloc_need));
+                        if (!read_buf) {
+                            throw std::runtime_error(format("failed to allocate a %zu-byte staging buffer", alloc_need));
+                        }
+                    }
+                    uint8_t * read_dst = (uint8_t *) GGML_PAD((uintptr_t) ggml_backend_buffer_get_base(read_buf.get()), align);
+                    file->seek(aligned_offset, SEEK_SET);
+
+                    size_t skip   = pad_head;
+                    size_t copied = 0;
+                    for (size_t done = 0; done < total_aligned; ) {
+                        const size_t n = std::min(chunk_cap, total_aligned - done);
+                        file->read_raw_unsafe(read_dst, n);
+                        const size_t count = std::min(n - skip, n_size - copied);
+                        ggml_backend_tensor_set(cur, read_dst + skip, copied, count);
+                        copied += count;
+                        skip    = 0;
+                        done   += n;
+                    }
                 } else {
+                    // Repack buffers (e.g. Vulkan0_Repack) require full-tensor set_tensor(offset=0, size=n_size)
                     // with direct IO read the aligned range around the tensor and use the data inside it, so no bounce buffer is needed
                     const size_t align          = file->read_alignment();
                     const size_t aligned_offset = weight->offs & ~(align - 1);

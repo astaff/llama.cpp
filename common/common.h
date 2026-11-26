@@ -344,6 +344,7 @@ struct common_params_model {
 struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
+    bool    n_max_set = false; // true if --spec-draft-n-max was explicitly provided
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
@@ -424,7 +425,9 @@ struct common_params_speculative {
                    t == COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        const bool has_dspark = std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != types.end();
+        const int32_t eff_n_max = (has_dspark && !draft.n_max_set) ? std::max<int32_t>(draft.n_max, 7) : draft.n_max;
+        return needs_rs_seq ? eff_n_max : 0u;
     }
 };
 

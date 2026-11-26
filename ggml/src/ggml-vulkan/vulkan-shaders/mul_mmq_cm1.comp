@@ -110,7 +110,7 @@ shared float buf_b_d[BN * BK_STEP];
 shared float buf_b_s[BN * BK_STEP];
 #endif
 
-#if defined(DATA_A_IQ4_NL) || defined(DATA_A_IQ4_XS) || defined(DATA_A_MXFP4) || defined(DATA_A_NVFP4)
+#if defined(DATA_A_IQ4_NL) || defined(DATA_A_IQ4_XS)
 shared int8_t cm1_kvalues[16];
 #endif
 
@@ -162,21 +162,6 @@ void main() {
     if (gl_LocalInvocationIndex < 16u) {
         cm1_kvalues[gl_LocalInvocationIndex] = kvalues_iq4nl_const[gl_LocalInvocationIndex];
     }
-    barrier();
-#elif defined(DATA_A_MXFP4)
-    if (gl_LocalInvocationIndex < 16u) {
-        cm1_kvalues[gl_LocalInvocationIndex] = kvalues_mxfp4_const[gl_LocalInvocationIndex];
-    }
-    barrier();
-#elif defined(DATA_A_NVFP4)
-    if (gl_LocalInvocationIndex < 16u) {
-        cm1_kvalues[gl_LocalInvocationIndex] = kvalues_mxfp4_const[gl_LocalInvocationIndex];
-    }
-#if !defined(USE_OCP_FP4)
-    for (uint i = gl_LocalInvocationIndex; i < 256u; i += BLOCK_SIZE) {
-        ue4m3_fp32_lut[i] = ue4m3_to_fp32_build(i);
-    }
-#endif
     barrier();
 #endif
 

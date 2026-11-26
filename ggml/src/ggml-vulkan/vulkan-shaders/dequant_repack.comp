@@ -1,0 +1,133 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+#include "dequant_head.glsl"
+#include "repack_planar.glsl"
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A_U32 { uint data_a_u32[]; };
+layout (binding = 0) readonly buffer A_U4  { uvec4 data_a_u4[]; };
+layout (binding = 1) writeonly buffer D { D_TYPE data_b[]; };
+
+void main() {
+#if defined(DATA_A_NVFP4)
+    const uint s_blks = (p.K >> 6u) * p.M;
+    const uint n_blks = p.nel >> 6u;
+    const uint tid    = gl_LocalInvocationID.x;
+    const uint sub    = tid >> 3u;
+    const uint l      = tid & 7u;
+    for (uint wgy = 0u; wgy < 1024u; ++wgy) {
+        const uint ib = gl_WorkGroupID.x * 1024u + wgy;
+        if (ib >= n_blks) {
+            return;
+        }
+        const uint e          = ib / s_blks;
+        const uint b_in_slice = ib - e * s_blks;
+        const uint slice_u32  = e * s_blks * 9u;
+        const uint d_u32      = data_a_u32[slice_u32 + s_blks * 8u + b_in_slice];
+        const float d         = ue4m3_to_fp32(uint8_t((d_u32 >> (sub * 8u)) & 0xFFu));
+        const uint q_word     = data_a_u32[slice_u32 + b_in_slice * 8u + sub * 2u + (l >> 2u)];
+        const uint q_byte     = (q_word >> ((l & 3u) * 8u)) & 0xFFu;
+        const uint b_idx      = ib * 64u + sub * 16u + l;
+        data_b[b_idx + 0u]    = D_TYPE(d * 0.5f * float(mxfp4_kval(q_byte & 0xFu)));
+        data_b[b_idx + 8u]    = D_TYPE(d * 0.5f * float(mxfp4_kval(q_byte >> 4u)));
+    }
+    return;
+#endif
+#if defined(DATA_A_Q4_K)
+    const uint sb_u4 = REPACK_Q4_K_SB_U4;
+#elif defined(DATA_A_Q5_K)
+    const uint sb_u4 = REPACK_Q5_K_SB_U4;
+#else
+    const uint sb_u4 = REPACK_Q6_K_SB_U4;
+#endif
+
+    [[unroll]] for (uint wgy = 0u; wgy < 256u; ++wgy) {
+        const uint ib = gl_WorkGroupID.x * 256u + wgy;
+        if (ib >= p.nel / 256u) {
+            return;
+        }
+
+        const uint base_u4 = ib * sb_u4;
+        const uint base_u32 = base_u4 << 2u;
+
+        const uint tid = gl_LocalInvocationID.x; // 0..31: sub_pair (0..3) * 8 + itid8 (0..7)
+        const uint sub_pair = tid >> 3u;
+        const uint itid8 = tid & 7u;
+        const uint y_idx = ib * 256u + sub_pair * 64u + 4u * itid8;
+
+#if defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
+        const uvec4 hdr = data_a_u4[base_u4 + REPACK_HDR_OFF_U4];
+        const vec2 dm = unpackHalf2x16(hdr.x);
+        const uint is0 = sub_pair * 2u + 0u;
+        const uint is1 = sub_pair * 2u + 1u;
+        uint sc0, m0, sc1, m1;
+        if (sub_pair < 2u) {
+            const uint sh0 = is0 * 8u;
+            const uint sh1 = is1 * 8u;
+            sc0 = (hdr.y >> sh0) & 63u;
+            m0  = (hdr.z >> sh0) & 63u;
+            sc1 = (hdr.y >> sh1) & 63u;
+            m1  = (hdr.z >> sh1) & 63u;
+        } else {
+            const uint sh0 = (is0 - 4u) * 8u;
+            const uint sh1 = (is1 - 4u) * 8u;
+            sc0 = ((hdr.w >> sh0) & 0xFu) | (((hdr.y >> sh0) >> 2u) & 0x30u);
+            m0  = ((hdr.w >> (sh0 + 4u)) & 0xFu) | (((hdr.z >> sh0) >> 2u) & 0x30u);
+            sc1 = ((hdr.w >> sh1) & 0xFu) | (((hdr.y >> sh1) >> 2u) & 0x30u);
+            m1  = ((hdr.w >> (sh1 + 4u)) & 0xFu) | (((hdr.z >> sh1) >> 2u) & 0x30u);
+        }
+        const float d0 = dm.x * float(sc0);
+        const float n0 = -dm.y * float(m0);
+        const float d1 = dm.x * float(sc1);
+        const float n1 = -dm.y * float(m1);
+        const uint qs_word = data_a_u32[((base_u4 + REPACK_QS_OFF_U4 + itid8) << 2u) + sub_pair];
+#if defined(DATA_A_Q4_K)
+        const vec4 q_lo = repack_magic_u4(qs_word);
+        const vec4 q_hi = repack_magic_u4(qs_word >> 4u);
+#else
+        const uint qh_u32 = data_a_u32[base_u32 + REPACK_Q5_K_QH_OFF_U32 + itid8];
+        const uint hb0_02 = (is0 <= 4u ? (qh_u32 << (4u - is0)) : (qh_u32 >> (is0 - 4u))) & 0x00100010u;
+        const uint hb0_13 = (qh_u32 >> (is0 + 4u)) & 0x00100010u;
+        const uint hb1_02 = (is1 <= 4u ? (qh_u32 << (4u - is1)) : (qh_u32 >> (is1 - 4u))) & 0x00100010u;
+        const uint hb1_13 = (qh_u32 >> (is1 + 4u)) & 0x00100010u;
+        const vec4 q_lo = repack_magic_u5((qs_word & 0x000F000Fu) | hb0_02, ((qs_word >> 8u) & 0x000F000Fu) | hb0_13);
+        const vec4 q_hi = repack_magic_u5(((qs_word >> 4u) & 0x000F000Fu) | hb1_02, ((qs_word >> 12u) & 0x000F000Fu) | hb1_13);
+#endif
+        const vec4 r_lo = fma(vec4(d0), q_lo, vec4(n0));
+        const vec4 r_hi = fma(vec4(d1), q_hi, vec4(n1));
+        data_b[y_idx +  0u] = D_TYPE(r_lo.x); data_b[y_idx +  1u] = D_TYPE(r_lo.y);
+        data_b[y_idx +  2u] = D_TYPE(r_lo.z); data_b[y_idx +  3u] = D_TYPE(r_lo.w);
+        data_b[y_idx + 32u] = D_TYPE(r_hi.x); data_b[y_idx + 33u] = D_TYPE(r_hi.y);
+        data_b[y_idx + 34u] = D_TYPE(r_hi.z); data_b[y_idx + 35u] = D_TYPE(r_hi.w);
+#else
+        const uint h = sub_pair >> 1u;
+        const uint sb_b = sub_pair & 1u;
+        const uvec4 q_all = data_a_u4[base_u4 + REPACK_Q6_K_QL_OFF_U4 + itid8];
+        const uint ql_a = (h == 0u) ? q_all.x : q_all.z;
+        const uint ql_b = (h == 0u) ? q_all.y : q_all.w;
+        const uint qh   = data_a_u32[base_u32 + REPACK_Q6_K_QH_OFF_U32 + itid8 * 2u + h];
+        const uint sh_n = sb_b * 4u;
+        const uint qh_a_02 = (sb_b == 0u) ? ((qh & 0x00030003u) << 4u) : (qh & 0x00300030u);
+        const uint qh_a_13 = (sb_b == 0u) ? ((qh & 0x03000300u) >> 4u) : ((qh & 0x30003000u) >> 8u);
+        const uint qh_b_02 = (sb_b == 0u) ? ((qh & 0x000C000Cu) << 2u) : ((qh & 0x00C000C0u) >> 2u);
+        const uint qh_b_13 = (sb_b == 0u) ? ((qh & 0x0C000C00u) >> 6u) : ((qh & 0xC000C000u) >> 10u);
+        const vec4 q_a = repack_magic_q6(((ql_a >> sh_n) & 0x000F000Fu) | qh_a_02, ((ql_a >> (sh_n + 8u)) & 0x000F000Fu) | qh_a_13);
+        const vec4 q_b = repack_magic_q6(((ql_b >> sh_n) & 0x000F000Fu) | qh_b_02, ((ql_b >> (sh_n + 8u)) & 0x000F000Fu) | qh_b_13);
+        const uint sc_sel = itid8 >> 2u;
+        const float d_f = unpackHalf2x16(data_a_u32[base_u32 + REPACK_Q6_K_D_OFF_U32]).x;
+        const uint sc_word = data_a_u32[base_u32 + REPACK_Q6_K_SC_OFF_U32 + 2u * h + sb_b];
+        const float sc_a = d_f * float(bitfieldExtract(int(sc_word), int(sc_sel * 8u), 8));
+        const float sc_b = d_f * float(bitfieldExtract(int(sc_word), int((sc_sel + 2u) * 8u), 8));
+        const vec4 r_a = q_a * vec4(sc_a);
+        const vec4 r_b = q_b * vec4(sc_b);
+        const uint y6_idx = ib * 256u + 128u * h + 64u * sb_b + 4u * itid8;
+        data_b[y6_idx +  0u] = D_TYPE(r_a.x); data_b[y6_idx +  1u] = D_TYPE(r_a.y);
+        data_b[y6_idx +  2u] = D_TYPE(r_a.z); data_b[y6_idx +  3u] = D_TYPE(r_a.w);
+        data_b[y6_idx + 32u] = D_TYPE(r_b.x); data_b[y6_idx + 33u] = D_TYPE(r_b.y);
+        data_b[y6_idx + 34u] = D_TYPE(r_b.z); data_b[y6_idx + 35u] = D_TYPE(r_b.w);
+#endif
+    }
+}

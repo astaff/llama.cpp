@@ -24,13 +24,24 @@ layout (push_constant) uniform parameter
     uint with_norm;
     float output_scale;
     float output_bias;
+#ifdef TOPK_EMIT_COUNTS
+    uint count_bn;
+    uint row_ids_offset;
+#endif
 };
 
+#ifdef TOPK_EMIT_COUNTS
+layout(local_size_x_id = 0, local_size_y_id = 3, local_size_z = 1) in;
+#else
 layout(local_size_x_id = 0, local_size_y = 4, local_size_z = 1) in;
+#endif
 
 layout(constant_id = 0) const uint WARP_SIZE = 32;
 layout(constant_id = 1) const uint n_experts_spec = 512;
 layout(constant_id = 2) const bool nexperts_use_push = false;
+#ifdef TOPK_EMIT_COUNTS
+layout(constant_id = 3) const uint ROWS_PER_WG = 8;
+#endif
 
 uint n_experts = nexperts_use_push ? n_experts_push : n_experts_spec;
 
@@ -42,6 +53,13 @@ layout (binding = 0, std430) readonly buffer Logits {float logits[];};
 layout (binding = 1, std430) readonly buffer BiasProbs {float bias[];};
 layout (binding = 2, std430) writeonly buffer Weights {float weights[];};
 layout (binding = 3, std430) writeonly buffer Ids {uint ids[];};
+#ifdef TOPK_EMIT_COUNTS
+layout (binding = 4, std430) writeonly buffer ExpertCounts {uint data_exp_d[];};
+shared uint sh_sel_ids[16 * 32];
+shared uint sh_vals[256];
+shared uint sh_offsets[256];
+shared uint sh_cursors[256];
+#endif
 
 const float INFINITY = 1.0 / 0.0;
 
@@ -91,9 +109,13 @@ void softmax_warp_inplace(inout float vals[experts_per_thread], const uint limit
 
 void main() {
     const uint row = gl_WorkGroupID.x * gl_WorkGroupSize.y + gl_SubgroupID;
+#ifdef TOPK_EMIT_COUNTS
+    if (row < n_rows) {
+#else
     if (row >= n_rows) {
         return;
     }
+#endif
 
     const uint logits_offset = n_experts * row;
     const uint bias_offset = 0; // 1D
@@ -103,39 +125,34 @@ void main() {
 
     float probs[experts_per_thread];
     [[unroll]]
-    for (int i = 0; i < experts_per_thread; i++) {
-        probs[i] = -INFINITY;
-    }
-
-    [[unroll]]
-    for (uint i = 0; i < n_experts; i += WARP_SIZE) {
-        const uint expert = i + lane;
-        probs[i / WARP_SIZE] = (n_experts % WARP_SIZE == 0 || expert < n_experts) ? logits[logits_offset + expert] : -INFINITY;
+    for (uint idx = 0; idx < experts_per_thread; idx++) {
+        const uint expert = idx * WARP_SIZE + lane;
+        probs[idx] = ((!nexperts_use_push && (n_experts_spec % WARP_SIZE == 0)) || expert < n_experts) ? logits[logits_offset + expert] : -INFINITY;
     }
 
     if (gating_func == GATING_FUNC_SOFTMAX) {
         softmax_warp_inplace(probs, n_experts, lane, nexperts_use_push);
     } else if (gating_func == GATING_FUNC_SIGMOID) {
         [[unroll]]
-        for (uint i = 0; i < n_experts; i += WARP_SIZE) {
-            const uint expert = i + lane;
-            probs[i / WARP_SIZE] = (n_experts % WARP_SIZE == 0 || expert < n_experts) ? 1.f / (1.f + exp(-probs[i / WARP_SIZE])) : -INFINITY;
+        for (uint idx = 0; idx < experts_per_thread; idx++) {
+            const uint expert = idx * WARP_SIZE + lane;
+            probs[idx] = ((!nexperts_use_push && (n_experts_spec % WARP_SIZE == 0)) || expert < n_experts) ? 1.f / (1.f + exp(-probs[idx])) : -INFINITY;
         }
     } else if (gating_func == GATING_FUNC_SQRT_SOFTPLUS) {
         [[unroll]]
-        for (uint i = 0; i < n_experts; i += WARP_SIZE) {
-            const uint expert = i + lane;
-            const float val = probs[i / WARP_SIZE];
-            probs[i / WARP_SIZE] = (n_experts % WARP_SIZE == 0 || expert < n_experts) ? sqrt(val > 20.0f ? val : log(1.0f + exp(val))) : -INFINITY;
+        for (uint idx = 0; idx < experts_per_thread; idx++) {
+            const uint expert = idx * WARP_SIZE + lane;
+            const float val = probs[idx];
+            probs[idx] = ((!nexperts_use_push && (n_experts_spec % WARP_SIZE == 0)) || expert < n_experts) ? sqrt(val > 20.0f ? val : log(1.0f + exp(val))) : -INFINITY;
         }
     }
 
     float selection_probs[experts_per_thread];
     if (has_bias != 0) {
         [[unroll]]
-        for (uint i = 0; i < n_experts; i += WARP_SIZE) {
-            const uint expert = i + lane;
-            selection_probs[i / WARP_SIZE] = (n_experts % WARP_SIZE == 0 || expert < n_experts) ? probs[i / WARP_SIZE] + bias[bias_offset + expert] : -INFINITY;
+        for (uint idx = 0; idx < experts_per_thread; idx++) {
+            const uint expert = idx * WARP_SIZE + lane;
+            selection_probs[idx] = ((!nexperts_use_push && (n_experts_spec % WARP_SIZE == 0)) || expert < n_experts) ? probs[idx] + bias[bias_offset + expert] : -INFINITY;
         }
     } else {
         [[unroll]]
@@ -163,11 +180,11 @@ void main() {
         uint   max_expert = lane;
 
         [[unroll]]
-        for (uint i = WARP_SIZE; i < n_experts; i += WARP_SIZE) {
-            const uint expert = i + lane;
-            if ((n_experts % WARP_SIZE == 0 || expert < n_experts) && selection_probs[i / WARP_SIZE] > max_val_s) {
-                max_val    = probs[i / WARP_SIZE];
-                max_val_s  = selection_probs[i / WARP_SIZE];
+        for (uint idx = 1; idx < experts_per_thread; idx++) {
+            const uint expert = idx * WARP_SIZE + lane;
+            if (((!nexperts_use_push && (n_experts_spec % WARP_SIZE == 0)) || expert < n_experts) && selection_probs[idx] > max_val_s) {
+                max_val    = probs[idx];
+                max_val_s  = selection_probs[idx];
                 max_expert = expert;
             }
         }
@@ -184,26 +201,46 @@ void main() {
             }
         }
 
-        if ((k & (WARP_SIZE - 1)) == lane) {
-            output_weights[k / WARP_SIZE] = max_val;
+        [[unroll]]
+        for (uint idx = 0; idx < experts_per_thread; idx++) {
+            if (uint(k) == idx * WARP_SIZE + lane) {
+                output_weights[idx] = max_val;
+            }
+            if (max_expert == idx * WARP_SIZE + lane) {
+                selection_probs[idx] = -INFINITY;
+            }
         }
 
         if ((max_expert & (WARP_SIZE - 1)) == lane) {
-            selection_probs[max_expert / WARP_SIZE] = -INFINITY;
-
             ids[ids_offset + k] = max_expert;
             wt_sum += max_val;
         }
+#ifdef TOPK_EMIT_COUNTS
+        if (lane == 0u) {
+            sh_sel_ids[row * n_expert_used + uint(k)] = max_expert;
+        }
+#endif
     }
 
     if (with_norm != 0) {
-        wt_sum              = subgroupAdd(wt_sum);
-        wt_sum              = clamp(wt_sum, clamp_min, clamp_max);
-        const float inv_sum = 1.0f / wt_sum;
+        if (n_expert_used <= WARP_SIZE) {
+            // Series 18 (0-ULP): Match sum_rows.comp BLOCK_SIZE=32 strided halving tree in rank order k=0..n_expert_used-1
+            precise float lane_w = (lane < n_expert_used) ? (0.0f + output_weights[0]) : 0.0f;
+            [[unroll]] for (uint s = WARP_SIZE / 2; s > 0; s >>= 1) {
+                precise float shuf_w = subgroupShuffleXor(lane_w, s);
+                precise float next_w = lane_w + shuf_w;
+                lane_w = next_w;
+            }
+            wt_sum = subgroupShuffle(lane_w, 0u);
+        } else {
+            wt_sum = subgroupAdd(wt_sum);
+        }
+        precise float denom = (clamp_max < 0.0f) ? (wt_sum + clamp_min) : clamp(wt_sum, clamp_min, clamp_max);
 
         [[unroll]]
         for (uint i = 0; i < experts_per_thread; ++i) {
-            output_weights[i] *= inv_sum;
+            precise float wn = output_weights[i] / denom;
+            output_weights[i] = wn;
         }
     }
 
@@ -215,7 +252,65 @@ void main() {
     for (uint i = 0; i < experts_per_thread; ++i) {
         uint idx = i * WARP_SIZE + lane;
         if (idx < n_expert_used) {
-            weights[weights_offset + idx] = output_scale * output_weights[i] + output_bias;
+            precise float ws = output_scale * output_weights[i];
+            precise float wo = ws + output_bias;
+            weights[weights_offset + idx] = wo;
         }
     }
+#ifdef TOPK_EMIT_COUNTS
+    } // end if (row < n_rows)
+
+    const uint lane_e     = gl_SubgroupInvocationID;
+    const uint tid        = gl_SubgroupID * WARP_SIZE + lane_e;
+    const uint wg_threads = ROWS_PER_WG * WARP_SIZE;
+
+    for (uint e = tid; e < n_experts; e += wg_threads) {
+        sh_vals[e] = 0u;
+    }
+    barrier();
+
+    const uint num_sel = n_rows * n_expert_used;
+    for (uint idx = tid; idx < num_sel; idx += wg_threads) {
+        const uint exp_id = sh_sel_ids[idx];
+        if (exp_id < n_experts) {
+            atomicAdd(sh_vals[exp_id], 1u);
+        }
+    }
+    barrier();
+
+    if (gl_SubgroupID == 0u) {
+        const uint n_experts_padded = (n_experts + WARP_SIZE - 1u) & ~(WARP_SIZE - 1u);
+        uint base = 0u;
+        for (uint e = lane_e; e < n_experts_padded; e += WARP_SIZE) {
+            const bool in_range = e < n_experts;
+            const uint count = in_range ? sh_vals[e] : 0u;
+            const uint n_tiles = (count + count_bn - 1u) / count_bn;
+            const uint tile_begin = base + subgroupExclusiveAdd(n_tiles);
+            if (in_range) {
+                sh_offsets[e] = tile_begin * count_bn;
+                sh_cursors[e] = 0u;
+                for (uint t = 0u; t < n_tiles; ++t) {
+                    const uint desc = 1u + 2u * (tile_begin + t);
+                    data_exp_d[desc]      = e;
+                    data_exp_d[desc + 1u] = min(count_bn, count - t * count_bn);
+                }
+            }
+            base += subgroupAdd(n_tiles);
+        }
+        if (lane_e == 0u) {
+            data_exp_d[0] = base;
+        }
+    }
+    barrier();
+
+    for (uint idx = tid; idx < num_sel; idx += wg_threads) {
+        const uint i01 = idx / n_expert_used;
+        const uint i00 = idx - i01 * n_expert_used;
+        const uint exp_id = sh_sel_ids[idx];
+        if (exp_id < n_experts) {
+            const uint r = atomicAdd(sh_cursors[exp_id], 1u);
+            data_exp_d[row_ids_offset + sh_offsets[exp_id] + r] = (i01 << 16u) | i00;
+        }
+    }
+#endif
 }

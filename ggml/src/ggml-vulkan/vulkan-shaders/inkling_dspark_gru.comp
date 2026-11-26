@@ -1,0 +1,45 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer BufJoint { float data_joint[]; };
+layout(binding = 1) readonly  buffer BufState { float data_state[]; };
+layout(binding = 2) writeonly buffer BufDst   { float data_dst[];   };
+
+layout(push_constant) uniform PushConstants {
+    uint rank;
+    uint nb;
+    uint off_joint;
+    uint off_state;
+    uint off_dst;
+} p;
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    const uint slice_elems = p.rank * p.nb;
+    if (idx >= slice_elems) {
+        return;
+    }
+    const uint row = idx / p.rank;
+    const uint col = idx - row * p.rank;
+    const uint j_base = p.off_joint + row * (3u * p.rank);
+
+    const float j0 = data_joint[j_base + col];
+    const float j1 = data_joint[j_base + p.rank + col];
+    const float j2 = data_joint[j_base + 2u * p.rank + col];
+    const float st = data_state[p.off_state + idx];
+
+    // Series 18 (0-ULP): exact IEEE-754 rounding sequence of sigmoid, tanh, sub, mul, add, tanh
+    precise float neg_j0 = -j0;
+    precise float exp_j0 = exp(neg_j0);
+    precise float den_j0 = 1.0f + exp_j0;
+    precise float gate   = 1.0f / den_j0;
+    precise float cand   = tanh(j1);
+    precise float diff   = st - cand;
+    precise float prod   = gate * diff;
+    precise float st_new = cand + prod;
+    precise float latent = tanh(j2);
+
+    data_dst[p.off_dst + idx]               = st_new;
+    data_dst[p.off_dst + slice_elems + idx] = latent;
+}

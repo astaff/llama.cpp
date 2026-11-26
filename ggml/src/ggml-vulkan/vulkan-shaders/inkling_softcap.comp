@@ -1,0 +1,53 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer BufSrc   { float data_src[];    };
+layout(binding = 0) readonly  buffer BufSrcV4 { vec4  data_src_v4[]; };
+layout(binding = 1) writeonly buffer BufDst   { float data_dst[];    };
+layout(binding = 1) writeonly buffer BufDstV4 { vec4  data_dst_v4[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint  total;
+    uint  off_src;
+    uint  off_dst;
+    float inv_cap;
+    float cap;
+    uint  pad;
+} p;
+
+float exact_softcap(float x) {
+    precise float s0 = x * p.inv_cap + 0.0f;
+    precise float t  = tanh(s0);
+    precise float s1 = t * p.cap + 0.0f;
+    return s1;
+}
+
+void main() {
+    const uint wg_id = gl_WorkGroupID.y * 65535u + gl_WorkGroupID.x;
+    const uint tid   = gl_LocalInvocationID.x;
+
+    if ((p.off_src & 3u) == 0u && (p.off_dst & 3u) == 0u) {
+        const uint n4 = p.total >> 2u;
+        const uint i4 = wg_id * 256u + tid;
+        if (i4 < n4) {
+            const vec4 v = data_src_v4[(p.off_src >> 2u) + i4];
+            data_dst_v4[(p.off_dst >> 2u) + i4] = vec4(
+                exact_softcap(v.x),
+                exact_softcap(v.y),
+                exact_softcap(v.z),
+                exact_softcap(v.w)
+            );
+        } else {
+            const uint i = (n4 << 2u) + (i4 - n4);
+            if (i < p.total) {
+                data_dst[p.off_dst + i] = exact_softcap(data_src[p.off_src + i]);
+            }
+        }
+    } else {
+        const uint idx = wg_id * 256u + tid;
+        if (idx < p.total) {
+            data_dst[p.off_dst + idx] = exact_softcap(data_src[p.off_src + idx]);
+        }
+    }
+}

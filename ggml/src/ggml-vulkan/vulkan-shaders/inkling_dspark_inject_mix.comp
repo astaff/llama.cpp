@@ -1,0 +1,157 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer BufFeat { float data_feat[]; };
+layout(binding = 1) readonly  buffer BufFuse { float data_fuse[]; };
+layout(binding = 2) readonly  buffer BufN0   { float norm0[];     };
+layout(binding = 3) readonly  buffer BufN1   { float norm1[];     };
+layout(binding = 4) readonly  buffer BufN2   { float norm2[];     };
+layout(binding = 5) readonly  buffer BufN3   { float norm3[];     };
+layout(binding = 6) readonly  buffer BufPos  { int   data_pos[];  };
+layout(binding = 7)           buffer BufRing { float data_ring[]; };
+layout(binding = 8) writeonly buffer BufDst  { float data_dst[];  };
+
+layout(push_constant) uniform PushConstants {
+    uint  n_embd;
+    uint  n_tokens;
+    uint  has_ring;
+    uint  ring_seq_offset;
+    uint  ring_rows;
+    float eps;
+    uint  off_feat;
+    uint  off_fuse;
+    uint  off_n0;
+    uint  off_n1;
+    uint  off_n2;
+    uint  off_n3;
+    uint  off_pos;
+    uint  off_ring;
+    uint  off_dst;
+} p;
+
+shared float sumsh[16];
+
+float load_norm(uint row, uint col) {
+    switch (row) {
+        case 0u: return norm0[p.off_n0 + col];
+        case 1u: return norm1[p.off_n1 + col];
+        case 2u: return norm2[p.off_n2 + col];
+        default: return norm3[p.off_n3 + col];
+    }
+}
+
+void main() {
+    const uint tok = gl_WorkGroupID.x + gl_WorkGroupID.z * 65535u;
+    const uint row = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+    if (tok >= p.n_tokens || row >= 4u) {
+        return;
+    }
+
+    // 1. Exact 4-element softmax matching soft_max.comp shared-memory binary tree
+    const uint fb   = p.off_fuse + row * 4u;
+    const float f0  = data_fuse[fb + 0u];
+    const float f1  = data_fuse[fb + 1u];
+    const float f2  = data_fuse[fb + 2u];
+    const float f3  = data_fuse[fb + 3u];
+    const float mx  = max(max(f0, f1), max(f2, f3));
+    const float e0  = exp(f0 - mx);
+    const float e1  = exp(f1 - mx);
+    const float e2  = exp(f2 - mx);
+    const float e3  = exp(f3 - mx);
+    precise float es02 = e0 + e2;
+    precise float es13 = e1 + e3;
+    precise float esum = es02 + es13;
+    const float rcp = 1.0f / esum;
+    const float w0  = e0 * rcp;
+    const float w1  = e1 * rcp;
+    const float w2  = e2 * rcp;
+    const float w3  = e3 * rcp;
+
+    // 2. Weighted feature sum + 512-lane / 16-subgroup RMS_NORM_MUL matching sum_rows.comp & rms_norm.comp (0-ULP)
+    const uint feat_base = p.off_feat + tok * (4u * p.n_embd);
+    float y_reg[8];
+    float ss = 0.0f;
+    const uint num_blocks = (p.n_embd + 511u) >> 9u;
+
+    for (uint idx = 0u; idx < num_blocks; ++idx) {
+        const uint col = tid + idx * 512u;
+        float y = 0.0f;
+        if (col < p.n_embd) {
+            const float x0 = data_feat[feat_base + 0u * p.n_embd + col];
+            const float x1 = data_feat[feat_base + 1u * p.n_embd + col];
+            const float x2 = data_feat[feat_base + 2u * p.n_embd + col];
+            const float x3 = data_feat[feat_base + 3u * p.n_embd + col];
+            precise float m0  = x0 * w0;
+            precise float m1  = x1 * w1;
+            precise float m2  = x2 * w2;
+            precise float m3  = x3 * w3;
+            precise float s02 = m0 + m2;
+            precise float s13 = m1 + m3;
+            precise float s   = s02 + s13;
+            y = s;
+        }
+        if (idx < 8u) {
+            y_reg[idx] = y;
+        }
+        ss += y * y;
+    }
+
+    ss = subgroupAdd(ss);
+    if (subgroupElect()) {
+        sumsh[gl_SubgroupID] = ss;
+    }
+    barrier();
+    ss = 0.0f;
+    for (uint i = gl_SubgroupInvocationID; i < gl_NumSubgroups; i += gl_SubgroupSize) {
+        ss += sumsh[i];
+    }
+    ss = subgroupAdd(ss);
+
+    const float scale    = inversesqrt(ss / float(p.n_embd) + p.eps);
+    const uint  dst_base = p.off_dst + (row * p.n_tokens + tok) * p.n_embd;
+
+    const bool write_ring = (row == 3u) && (p.has_ring != 0u);
+    bool valid_ring_tok = false;
+    uint ring_base = 0u;
+    if (write_ring) {
+        const int pos_i = data_pos[p.off_pos + tok];
+        if (pos_i >= 0) {
+            valid_ring_tok = true;
+            const uint slot = p.ring_seq_offset + (uint(pos_i) % p.ring_rows);
+            ring_base = p.off_ring + slot * p.n_embd;
+        }
+    }
+
+    for (uint idx = 0u; idx < num_blocks; ++idx) {
+        const uint col = tid + idx * 512u;
+        if (col < p.n_embd) {
+            float y;
+            if (idx < 8u) {
+                y = y_reg[idx];
+            } else {
+                const float x0 = data_feat[feat_base + 0u * p.n_embd + col];
+                const float x1 = data_feat[feat_base + 1u * p.n_embd + col];
+                const float x2 = data_feat[feat_base + 2u * p.n_embd + col];
+                const float x3 = data_feat[feat_base + 3u * p.n_embd + col];
+                precise float m0  = x0 * w0;
+                precise float m1  = x1 * w1;
+                precise float m2  = x2 * w2;
+                precise float m3  = x3 * w3;
+                precise float s02 = m0 + m2;
+                precise float s13 = m1 + m3;
+                precise float s   = s02 + s13;
+                y = s;
+            }
+            const float out_v = (y * scale) * load_norm(row, col);
+            data_dst[dst_base + col] = out_v;
+            if (valid_ring_tok) {
+                data_ring[ring_base + col] = out_v;
+            }
+        }
+    }
+}
