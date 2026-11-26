@@ -1177,6 +1177,7 @@ void process_shaders() {
     string_to_spv("inkling_softcap",           "inkling_softcap.comp",           {});
     string_to_spv("inkling_dspark_joint_gru",  "inkling_dspark_joint_gru.comp",  {});
     string_to_spv("inkling_dspark_inject_mix", "inkling_dspark_inject_mix.comp", {});
+    string_to_spv("rms_norm_set_rows_q8_0",    "rms_norm_set_rows_q8_0.comp",    {});
 
     string_to_spv("timestep_embedding_f32", "timestep_embedding.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
 
