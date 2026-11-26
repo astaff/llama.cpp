@@ -367,7 +367,9 @@ struct common_sampler * common_sampler_init(
             ((params.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE && params.temp <= 0.0f && params.dynatemp_range == 0.0f) ||
              (params.samplers.back() == COMMON_SAMPLER_TYPE_TOP_K && params.top_k == 1));
 
-        bool pure_argmax_chain = greedy && !grmr && !rbudget && !getenv("GGML_VK_DISABLE_GREEDY_FAST");
+        const bool rbudget_unlimited = !rbudget || (params.reasoning_budget_tokens < 0 &&
+                                                    common_reasoning_budget_get_state(rbudget) != REASONING_BUDGET_FORCING);
+        bool pure_argmax_chain = greedy && !grmr && rbudget_unlimited && !getenv("GGML_VK_DISABLE_GREEDY_FAST");
         if (pure_argmax_chain) {
             for (const auto & cnstr : params.samplers) {
                 switch (cnstr) {
@@ -723,7 +725,10 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    if (gsmpl->pure_argmax_fast && !gsmpl->grmr && !gsmpl->rbudget) {
+    const bool can_pure_argmax = gsmpl->pure_argmax_fast && !gsmpl->grmr &&
+        (!gsmpl->rbudget || (gsmpl->params.reasoning_budget_tokens < 0 &&
+                             common_reasoning_budget_get_state(gsmpl->rbudget) != REASONING_BUDGET_FORCING));
+    if (can_pure_argmax) {
         const llama_token backend_id = llama_get_sampled_token_ith(ctx, idx);
         if (backend_id != LLAMA_TOKEN_NULL) {
             gsmpl->cur.resize(1);
@@ -733,7 +738,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         }
     }
 
-    if (gsmpl->pure_argmax_fast && !gsmpl->grmr && !gsmpl->rbudget &&
+    if (can_pure_argmax &&
         !llama_get_sampled_probs_ith(ctx, idx) &&
         !llama_get_sampled_logits_ith(ctx, idx)) {
         const float * logits = llama_get_logits_ith_ro(ctx, idx);
@@ -889,7 +894,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 }
 
 bool common_sampler_is_pure_argmax(const struct common_sampler * gsmpl) {
-    return gsmpl && gsmpl->pure_argmax_fast && !gsmpl->grmr && !gsmpl->rbudget;
+    return gsmpl && gsmpl->pure_argmax_fast && !gsmpl->grmr &&
+           (!gsmpl->rbudget || (gsmpl->params.reasoning_budget_tokens < 0 &&
+                                common_reasoning_budget_get_state(gsmpl->rbudget) != REASONING_BUDGET_FORCING));
 }
 
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {

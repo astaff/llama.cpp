@@ -1182,6 +1182,8 @@ struct vk_semaphore {
     uint64_t value;
 };
 
+struct ggml_backend_vk_context;
+
 struct vk_event {
     std::vector<vk::Event> events_free; // Events available for reuse
     std::vector<vk::Event> events_submitted; // Events that are fully submitted and can be reused on next synchronize
@@ -1191,6 +1193,11 @@ struct vk_event {
     vk_semaphore tl_semaphore;
     vk_command_buffer* cmd_buffer = nullptr;
     uint64_t cmd_buffer_use_counter = 0;
+
+    ggml_backend_vk_context * fence_ctx = nullptr;
+    std::weak_ptr<bool>       fence_ctx_alive;
+    uint64_t                  fence_target = 0;
+    bool                      has_fence_ref = false;
 };
 
 struct vk_submission {
@@ -1421,6 +1428,8 @@ struct ggml_backend_vk_context {
     bool submit_pending {};
     bool fence_submitted {};
     bool almost_ready_fence_pending {};
+    uint64_t fence_epoch {};
+    std::shared_ptr<bool> alive_token { std::make_shared<bool>(true) };
     // Set before op_add and unset after op_rms_norm to indicate that the add should
     // write partial sums to accumulate the square of the vector components
     bool do_add_rms_partials_offset_calculation;

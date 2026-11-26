@@ -32,8 +32,21 @@ static void s19_ensure_inkling2_norms(const llama_model & model) {
                w->ne[2] == 1 && w->ne[3] == 1 && ggml_is_contiguous(w) &&
                model.w_scales.find(w) == model.w_scales.end() && model.hdmd.rot.find(w) == model.hdmd.rot.end();
     };
+    auto can_coal_kvd_pair = [&](const llama_layer & li) -> bool {
+        const ggml_tensor * kc = li.attn_k_conv_proj;
+        const ggml_tensor * vc = li.attn_v_conv_proj;
+        return coal_attn_q8 && kc && vc && kc->type == vc->type &&
+               (kc->type == GGML_TYPE_BF16 || kc->type == GGML_TYPE_F32) &&
+               kc->ne[0] == ne && vc->ne[0] == ne && kc->ne[1] == vc->ne[1] &&
+               kc->ne[2] == 1 && vc->ne[2] == 1 && kc->ne[3] == 1 && vc->ne[3] == 1 &&
+               ggml_is_contiguous(kc) && ggml_is_contiguous(vc) &&
+               model.w_scales.find(kc) == model.w_scales.end() && model.w_scales.find(vc) == model.w_scales.end() &&
+               model.hdmd.rot.find(kc) == model.hdmd.rot.end() && model.hdmd.rot.find(vc) == model.hdmd.rot.end();
+    };
     int n_full = 0;
     int n_coal = 0;
+    int n_wkv  = 0;
+    int n_kvd  = 0;
     for (int i = 0; i < n_all; ++i) {
         if (!model.hparams.is_swa(i) && model.layers[i].attn_q_inp_norm) {
             ++n_full;
@@ -42,15 +55,25 @@ static void s19_ensure_inkling2_norms(const llama_model & model) {
             can_coal_q8_w(model.layers[i].wqkv_gate) && can_coal_q8_w(model.layers[i].attn_rel)) {
             ++n_coal;
         }
+        if (coal_attn_q8 && !model.hparams.is_swa(i) &&
+            can_coal_q8_w(model.layers[i].wk) && can_coal_q8_w(model.layers[i].wv) &&
+            model.layers[i].wk->ne[1] == model.layers[i].wv->ne[1]) {
+            ++n_wkv;
+        }
+        if (!model.hparams.is_swa(i) && can_coal_kvd_pair(model.layers[i])) {
+            ++n_kvd;
+        }
     }
-    if (n_full == 0 && n_coal == 0) {
+    if (n_full == 0 && n_coal == 0 && n_wkv == 0 && n_kvd == 0) {
         model.s19_inkling_ready = true;
         return;
     }
-    ggml_init_params params = { ggml_tensor_overhead() * (size_t)(n_full + n_coal + 4), nullptr, true };
+    ggml_init_params params = { ggml_tensor_overhead() * (size_t)(n_full + n_coal + n_wkv + n_kvd + 4), nullptr, true };
     ggml_context_ptr ctx(ggml_init(params));
     std::vector<std::pair<int, ggml_tensor *>> created;
     std::vector<std::tuple<int, ggml_tensor *, bool>> created_coal;
+    std::vector<std::pair<int, ggml_tensor *>> created_wkv;
+    std::vector<std::pair<int, ggml_tensor *>> created_kvd;
     for (int i = 0; i < n_all; ++i) {
         const auto & li = model.layers[i];
         if (!model.hparams.is_swa(i) && li.attn_q_inp_norm) {
@@ -86,6 +109,37 @@ static void s19_ensure_inkling2_norms(const llama_model & model) {
                 created_coal.emplace_back(i, t, inc_kv);
             }
         }
+        if (coal_attn_q8 && !model.hparams.is_swa(i) &&
+            can_coal_q8_w(li.wk) && can_coal_q8_w(li.wv) && li.wk->ne[1] == li.wv->ne[1]) {
+            bool dup = false;
+            for (const auto & wp : created_wkv) {
+                if (model.layers[wp.first].wk == li.wk) {
+                    const_cast<llama_layer &>(model.layers[i]).s19_attn_wk_wv_q8 = wp.second;
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) {
+                ggml_tensor * t = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_Q8_0, ne, li.wk->ne[1], 2);
+                const_cast<llama_layer &>(model.layers[i]).s19_attn_wk_wv_q8 = t;
+                created_wkv.push_back({ i, t });
+            }
+        }
+        if (!model.hparams.is_swa(i) && can_coal_kvd_pair(li)) {
+            bool dup = false;
+            for (const auto & kp : created_kvd) {
+                if (model.layers[kp.first].attn_k_conv_proj == li.attn_k_conv_proj) {
+                    const_cast<llama_layer &>(model.layers[i]).s19_attn_kv_conv_proj = kp.second;
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) {
+                ggml_tensor * t = ggml_new_tensor_3d(ctx.get(), li.attn_k_conv_proj->type, ne, li.attn_k_conv_proj->ne[1], 2);
+                const_cast<llama_layer &>(model.layers[i]).s19_attn_kv_conv_proj = t;
+                created_kvd.push_back({ i, t });
+            }
+        }
     }
     ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(ref->buffer);
     ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
@@ -93,6 +147,8 @@ static void s19_ensure_inkling2_norms(const llama_model & model) {
         for (int i = 0; i < n_all; ++i) {
             const_cast<llama_layer &>(model.layers[i]).s19_attn_qkv_inp_norm = nullptr;
             const_cast<llama_layer &>(model.layers[i]).s19_attn_in_proj_q8   = nullptr;
+            const_cast<llama_layer &>(model.layers[i]).s19_attn_wk_wv_q8     = nullptr;
+            const_cast<llama_layer &>(model.layers[i]).s19_attn_kv_conv_proj = nullptr;
         }
         return;
     }
@@ -122,6 +178,30 @@ static void s19_ensure_inkling2_norms(const llama_model & model) {
             ggml_backend_tensor_set(dst, stage.data(), dst_off, nb);
             dst_off += nb;
         }
+    }
+    for (const auto & wp : created_wkv) {
+        const auto & l    = model.layers[wp.first];
+        ggml_tensor * dst = wp.second;
+        const size_t nb   = ggml_nbytes(l.wk);
+        if (stage.size() < nb) {
+            stage.resize(nb);
+        }
+        ggml_backend_tensor_get(l.wk, stage.data(), 0, nb);
+        ggml_backend_tensor_set(dst,  stage.data(), 0, nb);
+        ggml_backend_tensor_get(l.wv, stage.data(), 0, nb);
+        ggml_backend_tensor_set(dst,  stage.data(), nb, nb);
+    }
+    for (const auto & kp : created_kvd) {
+        const auto & l    = model.layers[kp.first];
+        ggml_tensor * dst = kp.second;
+        const size_t nb   = ggml_nbytes(l.attn_k_conv_proj);
+        if (stage.size() < nb) {
+            stage.resize(nb);
+        }
+        ggml_backend_tensor_get(l.attn_k_conv_proj, stage.data(), 0, nb);
+        ggml_backend_tensor_set(dst,                stage.data(), 0, nb);
+        ggml_backend_tensor_get(l.attn_v_conv_proj, stage.data(), 0, nb);
+        ggml_backend_tensor_set(dst,                stage.data(), nb, nb);
     }
     model.s19_inkling_ctx   = std::move(ctx);
     model.s19_inkling_buf   = std::move(buf);
@@ -510,8 +590,21 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     };
 
     ggml_tensor * state   = recr->mctx->get_r_l(il);
-    ggml_tensor * history = build_rs(recr, state, hparams.n_embd_r(), ubatch.n_seqs);
-    history = ggml_reshape_3d(ctx0, history, hparams.n_shortconv_l_cache - 1, hparams.n_sconv_channels, ubatch.n_seqs);
+    ggml_tensor * history = nullptr;
+    const bool direct_scopy = recr && recr->s_copy && hparams.n_shortconv_l_cache == 4 && ubatch.n_seq_tokens <= 16 &&
+                              cparams.n_rs_seq > 0 && ubatch.n_seqs == 1 && recr->mctx->get_n_rs() == 1 &&
+                              !getenv("GGML_INKLING_NO_FUSE") && !getenv("S19_NO_SCOPY_BIND");
+    if (direct_scopy) {
+        ggml_tensor * states = ggml_reshape_2d(ctx0, state, hparams.n_embd_r(), state->ne[1]);
+        const int32_t rs_zero = recr->mctx->get_rs_z();
+        ggml_tensor * state_zero = ggml_view_1d(ctx0, states, hparams.n_embd_r() * (rs_zero >= 0), rs_zero * states->nb[1] * (rs_zero >= 0));
+        ggml_build_forward_expand(gf, ggml_fill_inplace(ctx0, state_zero, 0.0f));
+        history = ggml_view_3d(ctx0, state, hparams.n_shortconv_l_cache - 1, hparams.n_sconv_channels, 1,
+                               (hparams.n_shortconv_l_cache - 1) * sizeof(float), state->nb[1], 0);
+    } else {
+        history = build_rs(recr, state, hparams.n_embd_r(), ubatch.n_seqs);
+        history = ggml_reshape_3d(ctx0, history, hparams.n_shortconv_l_cache - 1, hparams.n_sconv_channels, ubatch.n_seqs);
+    }
 
     ggml_tensor * inpSA = cur;
 
@@ -523,6 +616,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
     // attention inputs: SWA layers mix one, full-attention layers one each for Q, K and V
     ggml_tensor * inputs[3] = {cur, cur, cur};
+    ggml_tensor * kv_in_3d  = nullptr;
     ggml_tensor * qkv_rms_w = is_swa ? layer.attn_norm : layer.s19_attn_qkv_inp_norm;
     if (!messages && fuse_mix_rms && layer.attn_res_query && qkv_rms_w) {
         ggml_tensor * mixed = s19_inkling_mix_rms(ctx0, blocks, cur, layer.attn_res_query, qkv_rms_w, hparams.f_norm_rms_eps);
@@ -533,6 +627,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             for (int j = 0; j < 3; ++j) {
                 inputs[j] = ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[1], j*mixed->nb[2]);
             }
+            kv_in_3d = ggml_view_3d(ctx0, mixed, n_embd, n_tokens, 2, mixed->nb[1], mixed->nb[2], mixed->nb[2]);
         }
     } else if (has_s19_loop && layer.attn_res_query && qkv_rms_w) {
         const auto & s19_l = model.s19_loop_layers[ip];
@@ -545,6 +640,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         for (int j = 0; j < 3; ++j) {
             inputs[j] = ggml_view_2d(ctx0, normed, n_embd, n_tokens, normed->nb[1], j*normed->nb[2]);
         }
+        kv_in_3d = ggml_view_3d(ctx0, normed, n_embd, n_tokens, 2, normed->nb[1], normed->nb[2], normed->nb[2]);
     } else {
         if (layer.attn_res_query) {
             ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query);
@@ -616,13 +712,25 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             if (coal_has_kv) {
                 Kraw = ggml_view_2d(ctx0, mm_in, m_k, n_tokens, mm_in->nb[1], (size_t)m_qgr * sizeof(float));
                 Vraw = ggml_view_2d(ctx0, mm_in, m_v, n_tokens, mm_in->nb[1], (size_t)(m_qgr + m_k) * sizeof(float));
+            } else if (kv_in_3d && layer.s19_attn_wk_wv_q8 && !getenv("GGML_INKLING_NO_COAL_WKV")) {
+                ggml_tensor * mm_kv = ggml_mul_mat(ctx0, layer.s19_attn_wk_wv_q8, kv_in_3d);
+                Kraw = ggml_view_2d(ctx0, mm_kv, m_k, n_tokens, mm_kv->nb[1], 0);
+                Vraw = ggml_view_2d(ctx0, mm_kv, m_v, n_tokens, mm_kv->nb[1], mm_kv->nb[2]);
             } else {
                 Kraw = build_lora_mm(layer.wk, inputs[1]);
                 Vraw = build_lora_mm(layer.wv, inputs[2]);
             }
             sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
-            Kdyn  = is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]);
-            Vdyn  = is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]);
+            if (!is_swa) {
+                if (kv_in_3d && layer.s19_attn_kv_conv_proj && !getenv("GGML_INKLING_NO_COAL_WKV")) {
+                    ggml_tensor * mm_kvd = ggml_mul_mat(ctx0, layer.s19_attn_kv_conv_proj, kv_in_3d);
+                    Kdyn = ggml_view_2d(ctx0, mm_kvd, layer.attn_k_conv_proj->ne[1], n_tokens, mm_kvd->nb[1], 0);
+                    Vdyn = ggml_view_2d(ctx0, mm_kvd, layer.attn_v_conv_proj->ne[1], n_tokens, mm_kvd->nb[1], mm_kvd->nb[2]);
+                } else {
+                    Kdyn = build_lora_mm(layer.attn_k_conv_proj, inputs[1]);
+                    Vdyn = build_lora_mm(layer.attn_v_conv_proj, inputs[2]);
+                }
+            }
         } else {
             Qcur = build_lora_mm(layer.wq, inputs[0]);
             ggml_tensor * Qgate_raw = build_lora_mm(layer.wqkv_gate, inputs[0]);
@@ -709,9 +817,17 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                 ? ggml_view_2d(ctx0, layer.attn_rel_bias, layer.attn_rel_bias->ne[0], eff_rows, layer.attn_rel_bias->nb[1], 0)
                 : layer.attn_rel_bias;
         }
+        auto mul_rel_bias = [&](ggml_tensor * rb, ggml_tensor * rc) -> ggml_tensor * {
+            if (rc->ne[2] >= 32 && ggml_is_contiguous(rc) && !getenv("GGML_INKLING_NO_FLAT_REL")) {
+                ggml_tensor * rc2 = ggml_reshape_2d(ctx0, rc, rc->ne[0], rc->ne[1] * rc->ne[2]);
+                ggml_tensor * tb2 = ggml_mul_mat(ctx0, rb, rc2);
+                return ggml_reshape_3d(ctx0, tb2, rb->ne[1], rc->ne[1], rc->ne[2]);
+            }
+            return ggml_mul_mat(ctx0, rb, rc);
+        };
 
         if (use_banded_fa) {
-            table = ggml_mul_mat(ctx0, rel_bias_v, Rcur);
+            table = mul_rel_bias(rel_bias_v, Rcur);
             cur = build_attn(inp,
                     nullptr, nullptr, nullptr,
                     Qcur, Kcur, Vcur, nullptr, sinks_raw, 1.0f/sqrtf(n_embd_head), il, 0,
@@ -734,7 +850,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                                      (eff_rows * n_head * n_tokens * (int64_t)sizeof(float) > (256LL << 20));
             if (fuse_rel) {
                 if (!chunk_table) {
-                    table = ggml_mul_mat(ctx0, rel_bias_v, Rcur);
+                    table = mul_rel_bias(rel_bias_v, Rcur);
                 }
             } else {
                 table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
@@ -906,8 +1022,10 @@ void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vec
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    // Series 19 (W1.3 / W6 / W10): Bind rs_s_copy (src[6]) onto mode=1 inkling_conv nodes when n_rs_seq == 0
-    if (recr && recr->s_copy && cparams.n_rs_seq == 0 && ubatch.n_seq_tokens <= 16 && !getenv("S19_NO_SCOPY_BIND")) {
+    // Series 19 (W1.3 / W6 / W10): Bind rs_s_copy (src[6]) onto mode=1 inkling_conv nodes when WAR-free
+    if (recr && recr->s_copy &&
+        (cparams.n_rs_seq == 0 || (ubatch.n_seqs == 1 && recr->mctx->get_n_rs() == 1)) &&
+        ubatch.n_seq_tokens <= 16 && !getenv("S19_NO_SCOPY_BIND")) {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx0); t != nullptr; t = ggml_get_next_tensor(ctx0, t)) {
             if (t->op == GGML_OP_INKLING_FUSED && t->op_params[0] == 1 &&
                 t->src[1] && t->src[4] && t->src[6] == nullptr) {

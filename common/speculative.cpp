@@ -1150,7 +1150,9 @@ protected:
 
     // LiliCorr and the Inkling2 DSpark keep context features from h_nextn; the other heads only need the KV cache
     // called after the injection of a chunk, while h_nextn still holds the context features of batch_inject
+    bool defer_context_features = false;
     virtual void store_context_features(llama_seq_id /*seq_id*/, int32_t /*n_chunk*/) {}
+    virtual void flush_context_features() const {}
     virtual void on_prefill_interrupt() {}
 
 public:
@@ -1169,6 +1171,7 @@ public:
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        flush_context_features();
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
@@ -1190,6 +1193,7 @@ public:
     int32_t         s19_row_map_n = 0;
 
     bool process(const common_batch & batch_in) override {
+        flush_context_features();
         if (batch_in.size() <= 0) {
             return true;
         }
@@ -1209,6 +1213,7 @@ public:
         // per-seq inclusive batch range (assumes each seq's tokens are contiguous in the batch)
         std::vector<int32_t> i_batch_beg(n_seq, -1);
         std::vector<int32_t> i_batch_end(n_seq, -1);
+        llama_seq_id last_active_seq = -1;
         for (int32_t k = 0; k < n_tokens; ++k) {
             const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
             if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
@@ -1217,6 +1222,9 @@ public:
             i_batch_end[seq_id] = k;
             if (i_batch_beg[seq_id] < 0) {
                 i_batch_beg[seq_id] = k;
+            }
+            if (seq_id > last_active_seq) {
+                last_active_seq = seq_id;
             }
         }
 
@@ -1256,6 +1264,7 @@ public:
 
             for (int32_t offset = start_offset; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
+                defer_context_features = (seq_id == last_active_seq) && (offset + n_chunk >= n_rows);
 
                 if (use_dev_features) {
                     // the features are the target batch rows in the target's device buffer
@@ -1435,6 +1444,8 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
     int32_t                                      calib_rem           = 0;
     int32_t                                      park_rem            = 0;
     int32_t                                      park_cooldown       = 128;
+    uint16_t                                     last_n_accepted     = 0;
+    int32_t                                      prev_drafted        = 0;
     double                                       ema_mean_len        = 2.35;
     std::vector<int32_t>                         last_draft_depth;
     std::vector<bool>                            skip_seq;
@@ -1460,10 +1471,6 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
     common_speculative_impl_draft_dspark(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl_draft_dflash(params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)
     {
-        if (!this->params.n_max_set) {
-            this->params.n_max = 5;
-        }
-
         const llama_model * model_dft = llama_get_model(this->params.ctx_dft);
 
         int32_t swa_win = 0;
@@ -1478,6 +1485,10 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
             if (llama_model_meta_val_str(model_dft, "dflash.attention.sliding_window", buf, sizeof(buf)) >= 0) {
                 swa_win = std::atoi(buf);
             }
+        }
+
+        if (!this->params.n_max_set) {
+            this->params.n_max = std::min<int32_t>(7, sample_from_anchor ? block_size : block_size - 1);
         }
 
         if (has_markov_context && swa_win > 0 && getenv("LLAMA_DSPARK_FORCE_ALL_SWA")) {
@@ -1538,28 +1549,53 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
     }
 
 protected:
+    mutable llama_seq_id                               pending_ctx_seq = -1;
+    mutable std::vector<std::pair<int32_t, llama_pos>> pending_ctx_rows;
+
+    void flush_context_features() const override {
+        if (pending_ctx_seq < 0) {
+            return;
+        }
+        const llama_seq_id seq_id = pending_ctx_seq;
+        pending_ctx_seq = -1;
+        const float * state = llama_get_embeddings_nextn(params.ctx_dft);
+        if (state) {
+            auto & embd_mut = const_cast<std::vector<float> &>(ctx_embd);
+            auto & pos_mut  = const_cast<std::vector<llama_pos> &>(ctx_pos);
+            for (const auto & pr : pending_ctx_rows) {
+                const size_t slot = (size_t) seq_id * ctx_rows + (size_t) pr.second % ctx_rows;
+                std::memcpy(embd_mut.data() + slot * (size_t) n_embd_dec, state + (size_t) pr.first * n_embd_dec, (size_t) n_embd_dec * sizeof(float));
+                pos_mut[slot] = pr.second;
+            }
+        }
+        pending_ctx_rows.clear();
+    }
+
     void store_context_features(llama_seq_id seq_id, int32_t n_chunk) override {
         if (!has_markov_context) {
             return;
         }
-        const float * state = llama_get_embeddings_nextn(params.ctx_dft);
-        if (!state) {
-            return;
-        }
+        flush_context_features();
         const llama_pos pos_min = std::max(0, batch_inject.tokens.back().pos[0] - block_size);
+        pending_ctx_rows.clear();
         for (int32_t i = 0; i < n_chunk; ++i) {
             const llama_pos pos = batch_inject.tokens[i].pos[0];
-            if (pos < pos_min) {
-                continue;
+            if (pos >= pos_min) {
+                pending_ctx_rows.emplace_back(i, pos);
             }
-            const size_t slot = (size_t) seq_id * ctx_rows + (size_t) pos % ctx_rows;
-            std::memcpy(ctx_embd.data() + slot * (size_t) n_embd_dec, state + (size_t) i * n_embd_dec, (size_t) n_embd_dec * sizeof(float));
-            ctx_pos[slot] = pos;
+        }
+        if (pending_ctx_rows.empty()) {
+            return;
+        }
+        pending_ctx_seq = seq_id;
+        if (!defer_context_features || getenv("LLAMA_DSPARK_SYNC_INJECT")) {
+            flush_context_features();
         }
     }
 
     // context state of the token before the block, nullptr if it was not injected
     const float * get_context_state(llama_seq_id seq_id, llama_pos pos) const {
+        flush_context_features();
         if (pos < 0) {
             return nullptr;
         }
@@ -1569,6 +1605,7 @@ protected:
 
 public:
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        flush_context_features();
         // the markov context draws: reseed per request rather than per round, or two identical requests differ
         if (has_markov_context && seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
             draw_seed[seq_id] = -1;
@@ -1586,6 +1623,8 @@ public:
             calib_rem           = 0;
             park_rem            = 0;
             park_cooldown       = 128;
+            last_n_accepted     = 0;
+            prev_drafted        = 0;
             ema_mean_len        = 2.35;
             skip_seq[seq_id]         = false;
             last_draft_depth[seq_id] = 0;
@@ -1606,11 +1645,14 @@ public:
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
         if (!is_other && adapt_enabled && seq_id >= 0 && seq_id < (llama_seq_id) last_draft_depth.size() &&
             last_draft_depth[seq_id] > 0) {
-            ema_mean_len += 0.14 * ((1.0 + (double) n_accepted) - ema_mean_len);
+            last_n_accepted = n_accepted;
+            prev_drafted    = last_draft_depth[seq_id];
+            ema_mean_len   += 0.14 * ((1.0 + (double) n_accepted) - ema_mean_len);
         }
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        flush_context_features();
         auto & ctx_dft = params.ctx_dft;
 
         const int64_t t_now = ggml_time_us();
@@ -1682,7 +1724,7 @@ public:
             const int32_t max_d = std::max<int32_t>(1, this->params.n_max);
             const double  e_max = ema_mean_len;
 
-            if (mtp_steps >= 5 && e_max < 1.95 && std_ms_cache[na_key].empty()) {
+            if (mtp_steps >= 5 && e_max < 1.75 && std_ms_cache[na_key].empty()) {
                 calib_rem           = 1;
                 plain_warmup_done   = false;
                 set_active_skip(false);
@@ -1693,7 +1735,8 @@ public:
             }
 
             if (mtp_steps >= 5 && !std_ms_cache[na_key].empty()) {
-                const double c_max  = median_of(mtp_ms_cache[na_key][max_d], 65.0);
+                const int32_t ref_d = (cur_depth > 0 && cur_depth <= max_d) ? cur_depth : max_d;
+                const double c_max  = median_of(mtp_ms_cache[na_key][ref_d], 65.0);
                 const double s_best = (n_active * e_max) / std::max(1e-3, c_max);
                 const double c_std  = median_of(std_ms_cache[na_key], 30.0);
                 const double s_std  = n_active / std::max(1e-3, c_std);
@@ -1718,7 +1761,17 @@ public:
                     return;
                 }
             }
-            cur_depth = max_d;
+            if (mtp_steps == 0 || cur_depth <= 0 || cur_depth > max_d) {
+                if (max_d >= 7 && n_active == 1) {
+                    llama_pos active_pos0 = 0;
+                    for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                        if (dparams[s].drafting) { active_pos0 = dparams[s].pos0; break; }
+                    }
+                    cur_depth = (active_pos0 >= 24576) ? max_d : 4;
+                } else {
+                    cur_depth = max_d;
+                }
+            }
 
             for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
                 if (dparams[s].drafting) {
@@ -1769,9 +1822,9 @@ public:
 
             const int32_t n = (int32_t) dp.pos0;
 
-            const int32_t n_draft = params.n_max;
+            const int32_t n_emit = adapt_enabled ? std::min<int32_t>(cur_depth, params.n_max) : params.n_max;
+            const int32_t n_draft = n_emit;
             const int32_t n_block_tokens = n_draft + (sample_from_anchor ? 0 : 1);
-            const int32_t n_emit = adapt_enabled ? std::min<int32_t>(cur_depth, n_draft) : n_draft;
 
             // all blocks share one decode: a block that does not fit in the draft context fails every sequence's draft
             if ((uint64_t) dp.pos0 + n_block_tokens > llama_n_ctx_seq(ctx_dft)) {
@@ -3309,10 +3362,8 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
-                n_max = std::max(n_max, std::max(0, spec->draft.n_max_set ? spec->draft.n_max : std::max<int32_t>(spec->draft.n_max, 7)));
-                break;
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
-                n_max = std::max(n_max, std::max(0, spec->draft.n_max_set ? spec->draft.n_max : 5));
+                n_max = std::max(n_max, std::max(0, spec->draft.n_max_set ? spec->draft.n_max : std::max<int32_t>(spec->draft.n_max, 7)));
                 break;
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2:
             case COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR:

@@ -680,6 +680,9 @@ struct llama_layer {
     struct ggml_tensor * s19_attn_qkv_inp_norm = nullptr;
     // Coalesced Q8_0 attention projections [wq | wqkv_gate | attn_rel (| wk | wv on SWA)]
     struct ggml_tensor * s19_attn_in_proj_q8   = nullptr;
+    // Coalesced 3D [wk; wv] [n_embd, m_kv, 2] Q8_0 and [attn_k_conv_proj; attn_v_conv_proj] [n_embd, m_dyn, 2]
+    struct ggml_tensor * s19_attn_wk_wv_q8     = nullptr;
+    struct ggml_tensor * s19_attn_kv_conv_proj = nullptr;
 
     // metis16 per-pass hyper-connection mixes, attention pass LoRA, expert route embeddings
     struct ggml_tensor * hc_attn_mix         = nullptr;

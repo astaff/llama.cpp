@@ -2549,6 +2549,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
     }
     const bool write_h_nextn = cparams.embeddings_nextn_dev && h_nextn_dev != nullptr;
+    bool       wrote_h_nextn = false;
     if (write_h_nextn && ev_h_nextn_read_recorded) {
         ggml_backend_event_wait(h_nextn_backend, ev_h_nextn_read.get());
     }
@@ -2767,6 +2768,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             std::fill_n(sampling.sampled.data + n_outputs_prev, n_outputs, LLAMA_TOKEN_NULL);
         }
 
+        if (write_h_nextn && res->get_h_nextn() != nullptr) {
+            wrote_h_nextn = true;
+        }
+
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
@@ -2774,7 +2779,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (layer_inp_dev && ev_layer_inp_written) {
         ggml_backend_event_record(ev_layer_inp_written.get(), layer_inp_backend);
     }
-    if (write_h_nextn) {
+    if (wrote_h_nextn) {
         ggml_backend_event_record(ev_h_nextn_written.get(), h_nextn_backend);
         ev_h_nextn_written_recorded = true;
     }

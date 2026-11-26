@@ -248,7 +248,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
 
     ggml_tensor * base = res->t_logits; // [n_vocab, n_tokens]
     const int64_t n_vocab = base->ne[0];
-    const int64_t n_tok   = base->ne[1];
+    const int64_t n_tok   = tokens->ne[0];
 
     const auto it = model.gguf_kv.find("dflash.block_size");
     GGML_ASSERT(it != model.gguf_kv.end() && "DSpark draft requires 'dflash.block_size' in GGUF metadata");
@@ -268,9 +268,12 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         return;
     }
 
+    const bool base_trimmed = !sample_from_anchor && base->ne[1] == n_blocks * (block_drafts - i_draft_beg);
+    GGML_ASSERT(base->ne[1] == n_tok || base_trimmed);
+
     // anchor (committed last) token of every block: token 0 of each block, i.e. a strided view
     const size_t token_stride = (size_t) block_drafts * tokens->nb[0];
-    const size_t base_stride = (size_t) block_drafts * base->nb[1];
+    const size_t base_stride  = (size_t) (base_trimmed ? (block_drafts - i_draft_beg) : block_drafts) * base->nb[1];
 
     ggml_tensor * prev_v = ggml_view_2d(ctx0, tokens, 1, n_blocks, token_stride, 0);
     ggml_tensor * prev   = (n_blocks == 1) ? ggml_reshape_1d(ctx0, prev_v, 1) : ggml_cont_1d(ctx0, prev_v, n_blocks);
@@ -434,10 +437,11 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         }
 
         // position i of every block: strided view [n_vocab, n_blocks]
-        ggml_tensor * base_i = ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, i*base->nb[1]);
+        const int64_t bi     = base_trimmed ? (i - i_draft_beg) : i;
+        ggml_tensor * base_i = ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, bi*base->nb[1]);
         ggml_tensor * col    = ggml_add(ctx0, base_i, bias);
         if (softcap > 0.0f) {
-            if (!getenv("GGML_INKLING_NO_FUSE") && ggml_is_contiguous(col)) {
+            if (!ids_only && !getenv("GGML_INKLING_NO_FUSE") && ggml_is_contiguous(col)) {
                 col = ggml_inkling_softcap(ctx0, col, 1.0f/softcap, softcap);
             } else {
                 col = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, col, 1.0f/softcap)), softcap);
@@ -551,7 +555,20 @@ llama_model_dflash::graph_dspark::graph_dspark(const llm_graph_params & params) 
 
     ggml_tensor * cur = build_layers(inp_tokens);
 
-    build_logits(cur);
+    const auto it_anchor          = model.gguf_kv.find("dflash.sample_from_anchor");
+    const bool sample_from_anchor = it_anchor == model.gguf_kv.end() || it_anchor->second == "true";
+    const bool trim_anchor_logits =
+        hparams.dspark_f_rnn && rnn_state != nullptr && !sample_from_anchor &&
+        model.dspark_conf_proj == nullptr && !model.dflash_selector_hidden &&
+        ubatch.n_seqs_unq == 1 && n_tokens > 1 &&
+        ubatch.output != nullptr && ubatch.output[0] == 0 &&
+        n_outputs > 0 && (int64_t) n_outputs == n_tokens - 1 &&
+        !getenv("GGML_INKLING_NO_FUSE") && ggml_is_contiguous(cur);
+    ggml_tensor * cur_logits = trim_anchor_logits
+        ? ggml_view_2d(ctx0, cur, cur->ne[0], n_tokens - 1, cur->nb[1], cur->nb[1])
+        : cur;
+
+    build_logits(cur_logits);
 
     // bias the draft logits with the Markov head
     if (!hparams.dspark_f_rnn) {
