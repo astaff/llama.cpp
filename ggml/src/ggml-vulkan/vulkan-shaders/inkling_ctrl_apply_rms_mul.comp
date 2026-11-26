@@ -3,14 +3,17 @@
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
 layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
 
-layout(binding = 0) readonly  buffer BufCur { float data_cur[]; };
-layout(binding = 1) readonly  buffer BufMsg { float data_msg[]; };
-layout(binding = 2) readonly  buffer BufUp  { float data_up[];  };
-layout(binding = 3) readonly  buffer BufW   { float data_w[];   };
-layout(binding = 4) writeonly buffer BufDst { float data_dst[]; };
+layout(binding = 0) readonly  buffer BufCur   { float     data_cur[];   };
+layout(binding = 1) readonly  buffer BufMsg   { float     data_msg[];   };
+layout(binding = 2) readonly  buffer BufUp    { float     data_up[];    };
+layout(binding = 3) readonly  buffer BufW     { float     data_w[];     };
+layout(binding = 4) writeonly buffer BufDst   { float     data_dst[];   };
+layout(binding = 5) writeonly buffer BufDst16 { float16_t data_dst16[]; };
 
 layout(push_constant) uniform PushConstants {
     uint  n_embd;
@@ -30,17 +33,20 @@ shared float sh_mix[2304];
 shared float sh_rms[16];
 
 void main() {
-    const uint tok = gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u;
-    const uint sl  = gl_WorkGroupID.z;
-    if (tok >= p.n_tokens || sl >= p.C) {
+    const uint tok    = gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u;
+    const uint sl     = gl_WorkGroupID.z;
+    const bool do_f16 = (p.C & 0x80000000u) != 0u;
+    const uint C_val  = p.C & 0x7FFFFFFFu;
+    if (tok >= p.n_tokens || sl >= C_val) {
         return;
     }
-    const uint tid = gl_LocalInvocationID.x;
-    const uint cb  = p.off_cur + sl * p.cur_s2 + tok * p.n_embd;
-    const uint mb  = p.off_msg + (sl * p.n_tokens + tok) * p.n_embd;
-    const uint ub  = p.off_up  + (sl * p.n_tokens + tok) * (2u * p.n_embd);
-    const uint wb  = p.off_w   + sl * p.w_s1;
-    const uint db  = p.off_dst + (sl * p.n_tokens + tok) * p.n_embd;
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint cb   = p.off_cur + sl * p.cur_s2 + tok * p.n_embd;
+    const uint mb   = p.off_msg + (sl * p.n_tokens + tok) * p.n_embd;
+    const uint ub   = p.off_up  + (sl * p.n_tokens + tok) * (2u * p.n_embd);
+    const uint wb   = p.off_w   + sl * p.w_s1;
+    const uint db16 = (sl * p.n_tokens + tok) * p.n_embd;
+    const uint db   = p.off_dst + db16;
 
     for (uint col = tid; col < p.n_embd; col += 512u) {
         const float c  = data_cur[cb + col];
@@ -72,6 +78,10 @@ void main() {
     const float scale = inversesqrt(mean + p.eps);
 
     for (uint col = tid; col < p.n_embd; col += 512u) {
-        data_dst[db + col] = scale * sh_mix[col] * data_w[wb + col];
+        const float val = scale * sh_mix[col] * data_w[wb + col];
+        data_dst[db + col] = val;
+        if (do_f16) {
+            data_dst16[db16 + col] = float16_t(val);
+        }
     }
 }

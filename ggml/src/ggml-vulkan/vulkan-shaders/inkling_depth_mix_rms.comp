@@ -3,18 +3,21 @@
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
-layout(binding = 0) readonly  buffer BufS0 { float s0[]; };
-layout(binding = 1) readonly  buffer BufS1 { float s1[]; };
-layout(binding = 2) readonly  buffer BufS2 { float s2[]; };
-layout(binding = 3) readonly  buffer BufS3 { float s3[]; };
-layout(binding = 4) readonly  buffer BufS4 { float s4[]; };
-layout(binding = 5) readonly  buffer BufS5 { float s5[]; };
-layout(binding = 6) readonly  buffer BufQ  { float data_q[];   };
-layout(binding = 7) writeonly buffer BufD  { float data_dst[]; };
-layout(binding = 8) readonly  buffer BufW  { float data_w[];   };
+layout(binding = 0) readonly  buffer BufS0  { float     s0[];         };
+layout(binding = 1) readonly  buffer BufS1  { float     s1[];         };
+layout(binding = 2) readonly  buffer BufS2  { float     s2[];         };
+layout(binding = 3) readonly  buffer BufS3  { float     s3[];         };
+layout(binding = 4) readonly  buffer BufS4  { float     s4[];         };
+layout(binding = 5) readonly  buffer BufS5  { float     s5[];         };
+layout(binding = 6) readonly  buffer BufQ   { float     data_q[];     };
+layout(binding = 7) writeonly buffer BufD   { float     data_dst[];   };
+layout(binding = 8) readonly  buffer BufW   { float     data_w[];     };
+layout(binding = 9) writeonly buffer BufD16 { float16_t data_dst16[]; };
 
 layout(push_constant) uniform PushConstants {
     uint  n_embd;
@@ -58,7 +61,7 @@ float load_state(uint b, uint idx) {
     }
 }
 
-void epilogue_rms512_from_shmem(uint tid, uint q, uint db) {
+void epilogue_rms512_from_shmem(uint tid, uint q, uint db, uint db16, bool do_f16) {
     barrier();
     const uint num_blocks = (p.n_embd + 511u) >> 9u;
     [[unroll]] for (uint vsg = 0u; vsg < 4u; ++vsg) {
@@ -83,7 +86,11 @@ void epilogue_rms512_from_shmem(uint tid, uint q, uint db) {
     const float scale = inversesqrt(mean + p.rms_eps);
     const uint wb = p.off_w + q * p.w_s1;
     for (uint col = tid; col < p.n_embd; col += 128u) {
-        data_dst[db + col] = scale * sh_mix[col] * data_w[wb + col];
+        const float val = scale * sh_mix[col] * data_w[wb + col];
+        data_dst[db + col] = val;
+        if (do_f16) {
+            data_dst16[db16 + col] = float16_t(val);
+        }
     }
 }
 
@@ -136,7 +143,8 @@ void main() {
         for (uint b = 0u; b < p.K; ++b) {
             scores[b] *= inv_ex;
         }
-        const uint db = p.off_dst + (q * p.n_tokens + tok) * 1280u;
+        const uint db16 = (q * p.n_tokens + tok) * 1280u;
+        const uint db   = p.off_dst + db16;
         [[unroll]] for (uint m = 0u; m < 10u; ++m) {
             float acc = 0.0f;
             for (uint b = 0u; b < p.K; ++b) {
@@ -149,7 +157,7 @@ void main() {
             }
         }
         if (p.has_rms_w != 0u) {
-            epilogue_rms512_from_shmem(tid, q, db);
+            epilogue_rms512_from_shmem(tid, q, db, db16, (p.has_rms_w & 2u) != 0u);
         }
         return;
     }
@@ -215,7 +223,8 @@ void main() {
                 default: { const uint sb = p.off_s[5] + tok_base + tid; [[unroll]] for (uint m = 0u; m < 18u; ++m) { precise float vn = s5[sb + m * 128u] * rinv; acc[m] += vn * sc; } break; }
             }
         }
-        const uint db = p.off_dst + (q * p.n_tokens + tok) * 2304u;
+        const uint db16 = (q * p.n_tokens + tok) * 2304u;
+        const uint db   = p.off_dst + db16;
         if (p.has_rms_w != 0u) {
             [[unroll]] for (uint m = 0u; m < 18u; ++m) {
                 sh_mix[tid + m * 128u] = acc[m];
@@ -226,7 +235,7 @@ void main() {
             }
         }
         if (p.has_rms_w != 0u) {
-            epilogue_rms512_from_shmem(tid, q, db);
+            epilogue_rms512_from_shmem(tid, q, db, db16, (p.has_rms_w & 2u) != 0u);
         }
         return;
     }
@@ -262,7 +271,8 @@ void main() {
     for (uint b = 0u; b < p.K; ++b) {
         scores[b] *= inv_ex;
     }
-    const uint db = p.off_dst + (q * p.n_tokens + tok) * p.n_embd;
+    const uint db16 = (q * p.n_tokens + tok) * p.n_embd;
+    const uint db   = p.off_dst + db16;
     if (p.has_rms_w != 0u && p.n_embd <= 2304u) {
         for (uint c = tid; c < p.n_embd; c += 128u) {
             float acc = 0.0f;
@@ -272,7 +282,7 @@ void main() {
             }
             sh_mix[c] = acc;
         }
-        epilogue_rms512_from_shmem(tid, q, db);
+        epilogue_rms512_from_shmem(tid, q, db, db16, (p.has_rms_w & 2u) != 0u);
     } else {
         for (uint c = tid; c < p.n_embd; c += 128u) {
             float acc = 0.0f;
