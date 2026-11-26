@@ -23,11 +23,28 @@
 #include "dot_product_funcs.glsl"
 #include "flash_attn_base.glsl"
 
-layout (binding = 0) readonly buffer Q   { float     data_q[];   };
-layout (binding = 0) readonly buffer QV4 { vec4      data_qv4[]; };
-layout (binding = 1) readonly buffer KV4 { f16vec4   data_kv4[]; };
-layout (binding = 2) readonly buffer VV4 { f16vec4   data_vv4[]; };
-layout (binding = 3) readonly buffer M   { float16_t data_m[];   };
+struct fa_block_q8_0 {
+    float16_t d;
+    uint16_t qs[16];
+};
+
+layout (binding = 0) readonly buffer Q    { float          data_q[];    };
+layout (binding = 0) readonly buffer QV4  { vec4           data_qv4[];  };
+layout (binding = 1) readonly buffer KV4  { f16vec4        data_kv4[];  };
+layout (binding = 1) readonly buffer K_Q8 { fa_block_q8_0  data_k_q8[]; };
+layout (binding = 2) readonly buffer VV4  { f16vec4        data_vv4[];  };
+layout (binding = 2) readonly buffer V_Q8 { fa_block_q8_0  data_v_q8[]; };
+layout (binding = 3) readonly buffer M    { float16_t      data_m[];    };
+
+f16vec4 fa_q8_0_decode_f16x4(const uint16_t q0, const uint16_t q1, const float16_t d) {
+    const uint32_t u0 = uint32_t(q0);
+    const uint32_t u1 = uint32_t(q1);
+    const uint32_t p0 = (((u0 & 0x00FFu) | ((u0 & 0xFF00u) << 8u)) ^ 0x00800080u) | 0x64006400u;
+    const uint32_t p1 = (((u1 & 0x00FFu) | ((u1 & 0xFF00u) << 8u)) ^ 0x00800080u) | 0x64006400u;
+    precise const f16vec2 f0 = unpackFloat2x16(p0) - f16vec2(1152.0);
+    precise const f16vec2 f1 = unpackFloat2x16(p1) - f16vec2(1152.0);
+    return f16vec4(f0 * d, f1 * d);
+}
 
 shared FLOAT_TYPEV4 Qf[3u * 33u];
 shared float        tmpsh_m[3u * 32u];
@@ -76,6 +93,8 @@ void main() {
     const uint32_t v_offset4 = ((iv2 * p.nb22 + iv3 * p.nb23) / 2u) >> 2u;
     const uint32_t k_stride4 = k_stride >> 2u;
     const uint32_t v_stride4 = v_stride >> 2u;
+    const uint32_t k_offset_q8 = (ik2 * p.nb12 + ik3 * p.nb13) / FaBlockBytesK;
+    const uint32_t v_offset_q8 = (iv2 * p.nb22 + iv3 * p.nb23) / FaBlockBytesV;
 
     const int32_t q_pos_val = REL_BIAS_ENABLE ? data_rel_pos[p.ne3 * KV + iq3 * p.ne2 + gqa_iq1 + (FA_REL_OFFSETS >> 16)] : 0;
     const uint32_t rel_t_len  = FA_REL_PARAMS & 0xFFFFu;
@@ -125,23 +144,49 @@ void main() {
             ACC_TYPE s0_0 = ACC_TYPE(0.0), s1_0 = ACC_TYPE(0.0), s2_0 = ACC_TYPE(0.0);
             ACC_TYPE s0_1 = ACC_TYPE(0.0), s1_1 = ACC_TYPE(0.0), s2_1 = ACC_TYPE(0.0);
             if (!KV_bounds_check || kcol0 < KV) {
-                const uint32_t kb0 = k_offset4 + kcol0 * k_stride4 + d_tid;
-                [[unroll]] for (uint32_t d = 0u; d < 4u; ++d) {
-                    const uint32_t qc = d * 8u + d_tid;
-                    const FLOAT_TYPEV4 K_Tf = FLOAT_TYPEV4(data_kv4[kb0 + d * 8u]);
-                    s0_0 = dot_product(Qf[0u * 33u + qc], K_Tf, s0_0);
-                    s1_0 = dot_product(Qf[1u * 33u + qc], K_Tf, s1_0);
-                    s2_0 = dot_product(Qf[2u * 33u + qc], K_Tf, s2_0);
+                if (FaTypeK == GGML_TYPE_Q8_0) {
+                    const uint32_t kb0_q8 = k_offset_q8 + kcol0 * k_stride;
+                    [[unroll]] for (uint32_t d = 0u; d < 4u; ++d) {
+                        const uint32_t qc = d * 8u + d_tid;
+                        const uint32_t ib = kb0_q8 + d;
+                        const FLOAT_TYPEV4 K_Tf = FLOAT_TYPEV4(fa_q8_0_decode_f16x4(
+                            data_k_q8[ib].qs[2u * d_tid], data_k_q8[ib].qs[2u * d_tid + 1u], data_k_q8[ib].d));
+                        s0_0 = dot_product(Qf[0u * 33u + qc], K_Tf, s0_0);
+                        s1_0 = dot_product(Qf[1u * 33u + qc], K_Tf, s1_0);
+                        s2_0 = dot_product(Qf[2u * 33u + qc], K_Tf, s2_0);
+                    }
+                } else {
+                    const uint32_t kb0 = k_offset4 + kcol0 * k_stride4 + d_tid;
+                    [[unroll]] for (uint32_t d = 0u; d < 4u; ++d) {
+                        const uint32_t qc = d * 8u + d_tid;
+                        const FLOAT_TYPEV4 K_Tf = FLOAT_TYPEV4(data_kv4[kb0 + d * 8u]);
+                        s0_0 = dot_product(Qf[0u * 33u + qc], K_Tf, s0_0);
+                        s1_0 = dot_product(Qf[1u * 33u + qc], K_Tf, s1_0);
+                        s2_0 = dot_product(Qf[2u * 33u + qc], K_Tf, s2_0);
+                    }
                 }
             }
             if (!KV_bounds_check || kcol1 < KV) {
-                const uint32_t kb1 = k_offset4 + kcol1 * k_stride4 + d_tid;
-                [[unroll]] for (uint32_t d = 0u; d < 4u; ++d) {
-                    const uint32_t qc = d * 8u + d_tid;
-                    const FLOAT_TYPEV4 K_Tf = FLOAT_TYPEV4(data_kv4[kb1 + d * 8u]);
-                    s0_1 = dot_product(Qf[0u * 33u + qc], K_Tf, s0_1);
-                    s1_1 = dot_product(Qf[1u * 33u + qc], K_Tf, s1_1);
-                    s2_1 = dot_product(Qf[2u * 33u + qc], K_Tf, s2_1);
+                if (FaTypeK == GGML_TYPE_Q8_0) {
+                    const uint32_t kb1_q8 = k_offset_q8 + kcol1 * k_stride;
+                    [[unroll]] for (uint32_t d = 0u; d < 4u; ++d) {
+                        const uint32_t qc = d * 8u + d_tid;
+                        const uint32_t ib = kb1_q8 + d;
+                        const FLOAT_TYPEV4 K_Tf = FLOAT_TYPEV4(fa_q8_0_decode_f16x4(
+                            data_k_q8[ib].qs[2u * d_tid], data_k_q8[ib].qs[2u * d_tid + 1u], data_k_q8[ib].d));
+                        s0_1 = dot_product(Qf[0u * 33u + qc], K_Tf, s0_1);
+                        s1_1 = dot_product(Qf[1u * 33u + qc], K_Tf, s1_1);
+                        s2_1 = dot_product(Qf[2u * 33u + qc], K_Tf, s2_1);
+                    }
+                } else {
+                    const uint32_t kb1 = k_offset4 + kcol1 * k_stride4 + d_tid;
+                    [[unroll]] for (uint32_t d = 0u; d < 4u; ++d) {
+                        const uint32_t qc = d * 8u + d_tid;
+                        const FLOAT_TYPEV4 K_Tf = FLOAT_TYPEV4(data_kv4[kb1 + d * 8u]);
+                        s0_1 = dot_product(Qf[0u * 33u + qc], K_Tf, s0_1);
+                        s1_1 = dot_product(Qf[1u * 33u + qc], K_Tf, s1_1);
+                        s2_1 = dot_product(Qf[2u * 33u + qc], K_Tf, s2_1);
+                    }
                 }
             }
             if (c2 == 0u) {
@@ -239,12 +284,24 @@ void main() {
                 Lf[0] += float(p0);
                 Lf[1] += float(p1);
                 Lf[2] += float(p2);
-                const uint32_t vb0 = v_offset4 + vcol0 * v_stride4 + d_tid;
-                [[unroll]] for (uint32_t d = 0u; d < 4u; ++d) {
-                    const FLOAT_TYPEV4 Vf = FLOAT_TYPEV4(data_vv4[vb0 + d * 8u]);
-                    Of[0][d] += FLOAT_TYPEV4(p0 * Vf);
-                    Of[1][d] += FLOAT_TYPEV4(p1 * Vf);
-                    Of[2][d] += FLOAT_TYPEV4(p2 * Vf);
+                if (FaTypeV == GGML_TYPE_Q8_0) {
+                    const uint32_t vb0_q8 = v_offset_q8 + vcol0 * v_stride;
+                    [[unroll]] for (uint32_t d = 0u; d < 4u; ++d) {
+                        const uint32_t ib = vb0_q8 + d;
+                        const FLOAT_TYPEV4 Vf = FLOAT_TYPEV4(fa_q8_0_decode_f16x4(
+                            data_v_q8[ib].qs[2u * d_tid], data_v_q8[ib].qs[2u * d_tid + 1u], data_v_q8[ib].d));
+                        Of[0][d] += FLOAT_TYPEV4(p0 * Vf);
+                        Of[1][d] += FLOAT_TYPEV4(p1 * Vf);
+                        Of[2][d] += FLOAT_TYPEV4(p2 * Vf);
+                    }
+                } else {
+                    const uint32_t vb0 = v_offset4 + vcol0 * v_stride4 + d_tid;
+                    [[unroll]] for (uint32_t d = 0u; d < 4u; ++d) {
+                        const FLOAT_TYPEV4 Vf = FLOAT_TYPEV4(data_vv4[vb0 + d * 8u]);
+                        Of[0][d] += FLOAT_TYPEV4(p0 * Vf);
+                        Of[1][d] += FLOAT_TYPEV4(p1 * Vf);
+                        Of[2][d] += FLOAT_TYPEV4(p2 * Vf);
+                    }
                 }
             }
             if (!KV_bounds_check || vcol1 < KV) {
@@ -254,12 +311,24 @@ void main() {
                 Lf[0] += float(p0);
                 Lf[1] += float(p1);
                 Lf[2] += float(p2);
-                const uint32_t vb1 = v_offset4 + vcol1 * v_stride4 + d_tid;
-                [[unroll]] for (uint32_t d = 0u; d < 4u; ++d) {
-                    const FLOAT_TYPEV4 Vf = FLOAT_TYPEV4(data_vv4[vb1 + d * 8u]);
-                    Of[0][d] += FLOAT_TYPEV4(p0 * Vf);
-                    Of[1][d] += FLOAT_TYPEV4(p1 * Vf);
-                    Of[2][d] += FLOAT_TYPEV4(p2 * Vf);
+                if (FaTypeV == GGML_TYPE_Q8_0) {
+                    const uint32_t vb1_q8 = v_offset_q8 + vcol1 * v_stride;
+                    [[unroll]] for (uint32_t d = 0u; d < 4u; ++d) {
+                        const uint32_t ib = vb1_q8 + d;
+                        const FLOAT_TYPEV4 Vf = FLOAT_TYPEV4(fa_q8_0_decode_f16x4(
+                            data_v_q8[ib].qs[2u * d_tid], data_v_q8[ib].qs[2u * d_tid + 1u], data_v_q8[ib].d));
+                        Of[0][d] += FLOAT_TYPEV4(p0 * Vf);
+                        Of[1][d] += FLOAT_TYPEV4(p1 * Vf);
+                        Of[2][d] += FLOAT_TYPEV4(p2 * Vf);
+                    }
+                } else {
+                    const uint32_t vb1 = v_offset4 + vcol1 * v_stride4 + d_tid;
+                    [[unroll]] for (uint32_t d = 0u; d < 4u; ++d) {
+                        const FLOAT_TYPEV4 Vf = FLOAT_TYPEV4(data_vv4[vb1 + d * 8u]);
+                        Of[0][d] += FLOAT_TYPEV4(p0 * Vf);
+                        Of[1][d] += FLOAT_TYPEV4(p1 * Vf);
+                        Of[2][d] += FLOAT_TYPEV4(p2 * Vf);
+                    }
                 }
             }
         }

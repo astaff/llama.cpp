@@ -1676,11 +1676,13 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     const uint32_t D = hsk | hsv;
 
     static const int env_fa_wg256 = getenv("GGML_VK_FA_WG256") ? atoi(getenv("GGML_VK_FA_WG256")) : 1;
+    const bool kv_f16_or_q8 = (k_type == GGML_TYPE_F16 || k_type == GGML_TYPE_Q8_0) &&
+                              (v_type == GGML_TYPE_F16 || v_type == GGML_TYPE_Q8_0);
     const bool use_agx_wg256 = !device->coopmat_support_16x16x16_f32acc &&
                                device->coopmat_support_8x8x8_f32acc &&
                                !ggml_vk_exact_s8_enabled() &&
                                !gen_batch_invariant_for_n(n_rows) &&
-                               k_type == GGML_TYPE_F16 && v_type == GGML_TYPE_F16 &&
+                               kv_f16_or_q8 &&
                                hsv >= 128 &&
                                env_fa_wg256 != 0;
 
@@ -1814,10 +1816,11 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
         } else if (!device->coopmat_support_16x16x16_f32acc && device->coopmat_support_8x8x8_f32acc) {
             static const int fa_8x8_min_rows = getenv("GGML_VK_FA_8X8_MIN_ROWS") ? atoi(getenv("GGML_VK_FA_8X8_MIN_ROWS")) : -1;
             const int eff_fa_min_rows = (fa_8x8_min_rows >= 0) ? fa_8x8_min_rows : (n_kv >= 64 ? 4 : 8);
-            const bool kv_fp16_bf16 = (k_type == GGML_TYPE_F16 || k_type == GGML_TYPE_BF16) &&
-                                      (v_type == GGML_TYPE_F16 || v_type == GGML_TYPE_BF16);
+            const bool kv_8x8_ok = (k_type == GGML_TYPE_BF16 && v_type == GGML_TYPE_BF16) ||
+                                   ((k_type == GGML_TYPE_F16 || k_type == GGML_TYPE_Q8_0) &&
+                                    (v_type == GGML_TYPE_F16 || v_type == GGML_TYPE_Q8_0));
             if (ggml_vk_exact_s8_enabled() || gen_batch_invariant_for_n(n_rows) ||
-                !kv_fp16_bf16 || (hsk % 16 != 0) || (hsv % 16 != 0) ||
+                !kv_8x8_ok || (hsk % 16 != 0) || (hsv % 16 != 0) ||
                 (int)n_rows < eff_fa_min_rows) {
                 path = FA_SCALAR;
             }
@@ -1853,7 +1856,8 @@ vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_
                                      params.path == FA_COOPMAT1 &&
                                      !device->coopmat_support_16x16x16_f32acc &&
                                      device->coopmat_support_8x8x8_f32acc &&
-                                     k_type == GGML_TYPE_F16 && v_type == GGML_TYPE_F16 &&
+                                     (k_type == GGML_TYPE_F16 || k_type == GGML_TYPE_Q8_0) &&
+                                     (v_type == GGML_TYPE_F16 || v_type == GGML_TYPE_Q8_0) &&
                                      !use_sparse &&
                                      !ggml_vk_exact_s8_enabled();
 
@@ -3010,6 +3014,15 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             spv_data = flash_attn_f32_f16_fp32_data;
             spv_size = flash_attn_f32_f16_fp32_len;
             name = aligned ? "flash_attn_f32_bf16_aligned" : "flash_attn_f32_bf16";
+        } else if ((fa.first.flags & 1024u) != 0u) {
+            if (device->dot2_f16) {
+                spv_data = flash_attn_vec_mhm_f32_f16_dot2_data;
+                spv_size = flash_attn_vec_mhm_f32_f16_dot2_len;
+            } else {
+                spv_data = flash_attn_vec_mhm_f32_f16_data;
+                spv_size = flash_attn_vec_mhm_f32_f16_len;
+            }
+            name = aligned ? "flash_attn_vec_mhm_f32_f16_aligned" : "flash_attn_vec_mhm_f32_f16";
         } else if (use_mmq) {
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
             if (device->fp16) {
@@ -3021,15 +3034,6 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             }
 #endif
             name = aligned ? "flash_attn_f32_f16_aligned" : "flash_attn_f32_f16";
-        } else if ((fa.first.flags & 1024u) != 0u) {
-            if (device->dot2_f16) {
-                spv_data = flash_attn_vec_mhm_f32_f16_dot2_data;
-                spv_size = flash_attn_vec_mhm_f32_f16_dot2_len;
-            } else {
-                spv_data = flash_attn_vec_mhm_f32_f16_data;
-                spv_size = flash_attn_vec_mhm_f32_f16_len;
-            }
-            name = aligned ? "flash_attn_vec_mhm_f32_f16_aligned" : "flash_attn_vec_mhm_f32_f16";
         } else {
             if (device->fp16) {
                 if (device->dot2_f16) {
@@ -12248,8 +12252,9 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
     const uint32_t f16vec4 = 8;
 
     if (!device->coopmat_support_16x16x16_f32acc && device->coopmat_support_8x8x8_f32acc &&
-        k_type == GGML_TYPE_F16 && v_type == GGML_TYPE_F16) {
-        // Series 13 COOPMAT_8X8 F16 layout (no iq_shmem, no pvsh, compact 1 KB kvsh[128], WG=128 or WG=256)
+        (k_type == GGML_TYPE_F16 || k_type == GGML_TYPE_Q8_0) &&
+        (v_type == GGML_TYPE_F16 || v_type == GGML_TYPE_Q8_0)) {
+        // Series 13/23A COOPMAT_8X8 F16/Q8_0 layout (no iq_shmem, no pvsh, compact 1 KB kvsh[128] only for F16 staging, WG=128 or WG=256)
         const uint32_t num_sg   = params.workgroup_size / params.subgroup_size;
         const uint32_t tmpsh    = num_sg * sizeof(float);
         const uint32_t sh_eMf   = Br * sizeof(float);
@@ -12259,8 +12264,9 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
         const uint32_t sfstride = (Br == 16u && hsk <= 128u) ? (Br / 4u + 1u) : (Br / 4u);
         const uint32_t ostride  = 16u;
         const uint32_t sfsh     = std::max(Bc * sfstride, Br * ostride) * (4 * acctype);
-        const bool need_kvsh    = (params.shmem_staging != 0) || ((hsk & 15u) != 0u) || ((hsv % (16u * num_sg)) != 0u);
-        const uint32_t kvsh     = (need_kvsh ? 128u : 1u) * f16vec4;
+        const bool need_kvsh_k  = (k_type != GGML_TYPE_Q8_0) && ((params.shmem_staging != 0) || ((hsk & 15u) != 0u));
+        const bool need_kvsh_v  = (v_type != GGML_TYPE_Q8_0) && ((params.shmem_staging != 0) || ((hsv % (16u * num_sg)) != 0u));
+        const uint32_t kvsh     = ((need_kvsh_k || need_kvsh_v) ? 128u : 1u) * f16vec4;
         const uint32_t total_size = tmpsh + sh_eMf + slope + Qf_T + Psh_s + sfsh + kvsh;
         const bool supported = total_size <= device->properties.limits.maxComputeSharedMemorySize;
         VK_LOG_DEBUG("ggml_vk_flash_attn_coopmat_shmem_support_8x8(WG=" << params.workgroup_size << ", HSK=" << hsk << ", HSV=" << hsv << ", total_size=" << total_size << ", supported=" << supported);
@@ -12437,7 +12443,13 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // On Apple AGX 8x8 coopmat, N >= 2 GQA verify (can_vrow_pack) and N >= 16 prefill execute in a single
     // CM1 pass over FP16 K/V, beating multi-workgroup scalar Q8_0 reads at both short and long context.
     const bool cm2_dequant_kv = KV >= 4096 && neq1 >= cm2_min_queries && (uint64_t) neq1 * qk_ratio >= cm2_min_reuse;
+    static const bool force_fa_q8_deq = getenv("GGML_VK_FORCE_FA_Q8_DEQ") != nullptr;
+    const bool agx_direct_q8_kv = !force_fa_q8_deq && f32acc &&
+                                  (HSK % 16 == 0) && (HSV % 16 == 0) &&
+                                  (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0) &&
+                                  (v->type == GGML_TYPE_F16 || v->type == GGML_TYPE_Q8_0);
     const bool agx_small_n_deq = !disable_fa_span_deq &&
+                                 !agx_direct_q8_kv &&
                                  ggml_vk_is_apple_agx_coopmat(ctx->device) &&
                                  !ggml_vk_exact_s8_enabled() &&
                                  !gen_batch_invariant_for_n(neq1) &&
@@ -12477,6 +12489,8 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const bool allow_vrow_pack = !force_disable_vrow && (force_enable_vrow || long_ctx_fa);
     const uint32_t vrow_check_n = (long_ctx_fa && !fa_exact_split3) ? (N_orig * qk_ratio) : N_orig;
 
+    const bool kv_f16_or_q8_eff = (k_type_eff == GGML_TYPE_F16 || k_type_eff == GGML_TYPE_Q8_0) &&
+                                  (v_type_eff == GGML_TYPE_F16 || v_type_eff == GGML_TYPE_Q8_0);
     const bool can_vec_mhm = !disable_fa_vec_mhm &&
                              !ggml_vk_exact_s8_enabled() &&
                              !ctx->device->xe_fa_support &&
@@ -12486,7 +12500,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                              qk_ratio * nek2 == neq2 && nek2 == nev2 &&
                              (nem2 == 1 || nem2 == neq2) && mask != nullptr && mask->type == GGML_TYPE_F16 && nem0 == KV &&
                              HSK == 128 && HSV == 128 &&
-                             k_type_eff == GGML_TYPE_F16 && v_type_eff == GGML_TYPE_F16 &&
+                             kv_f16_or_q8_eff &&
                              max_bias == 0.0f && logit_softcap == 0.0f && n_kv_max <= 0;
 
     const bool can_vrow_pack = allow_vrow_pack &&
@@ -12504,7 +12518,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                                qk_ratio * nek2 == neq2 && nek2 == nev2 &&
                                (nem2 == 1 || nem2 == neq2) && mask != nullptr && mask->type == GGML_TYPE_F16 && nem0 == KV &&
                                (HSK % 16 == 0) && (HSV % 16 == 0) &&
-                               k_type_eff == GGML_TYPE_F16 && v_type_eff == GGML_TYPE_F16 &&
+                               kv_f16_or_q8_eff &&
                                n_kv_max <= 0;
 
     bool gqa_multi_head_mask = false;
@@ -12592,17 +12606,21 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         nbv3_eff = (uint32_t)((uint64_t)HSV * KV_deq * nev2 * kv_scratch_ts);
     }
     auto fa_aligned = [&](const vk_fa_tuning_params & tp) {
-        // CM2 decoded K/V strides count whole blocks and do not need to be multiples of eight blocks.
-        const bool cm2_decode_k = tp.path == FA_COOPMAT2 &&
-                                 k_type_eff != GGML_TYPE_F16 && k_type_eff != GGML_TYPE_BF16;
-        const bool cm2_decode_v = tp.path == FA_COOPMAT2 &&
-                                 v_type_eff != GGML_TYPE_F16 && v_type_eff != GGML_TYPE_BF16;
+        // Decoded K/V strides count whole 32-element blocks and do not need to be multiples of eight blocks.
+        const bool cm1_8x8 = tp.path == FA_COOPMAT1 &&
+                             !ctx->device->coopmat_support_16x16x16_f32acc &&
+                             ctx->device->coopmat_support_8x8x8_f32acc;
+        const bool blk_decode_k = (tp.path == FA_COOPMAT2 && k_type_eff != GGML_TYPE_F16 && k_type_eff != GGML_TYPE_BF16) ||
+                                  ((cm1_8x8 || gqa_vec_mhm) && k_type_eff == GGML_TYPE_Q8_0);
+        const bool blk_decode_v = (tp.path == FA_COOPMAT2 && v_type_eff != GGML_TYPE_F16 && v_type_eff != GGML_TYPE_BF16) ||
+                                  ((cm1_8x8 || gqa_vec_mhm) && v_type_eff == GGML_TYPE_Q8_0);
         return (KV % tp.block_cols) == 0 && (q_stride_eff & 7) == 0 &&
-               (cm2_decode_k || (k_stride & 7) == 0) && (cm2_decode_v || (v_stride & 7) == 0);
+               (blk_decode_k || (k_stride & 7) == 0) && (blk_decode_v || (v_stride & 7) == 0);
     };
     uint32_t alignment = tuning_params.block_cols;
     bool aligned = fa_aligned(tuning_params);
-    if (!aligned && tuning_params.path == FA_COOPMAT1 && tuning_params.block_rows == 24u) {
+    if (!aligned && tuning_params.path == FA_COOPMAT1 && tuning_params.block_rows == 24u &&
+        !(k_type_eff == GGML_TYPE_Q8_0 && v_type_eff == GGML_TYPE_Q8_0)) {
         // Keep Br=24 strictly on aligned KV (need_kvsh == false) so shmem stays 15,976 B <= 16 KB
         tuning_params.block_rows = 16u;
         aligned = fa_aligned(tuning_params);

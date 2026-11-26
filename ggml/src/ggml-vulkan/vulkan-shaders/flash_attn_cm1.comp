@@ -43,6 +43,20 @@ layout (binding = 2) readonly buffer VV4 {FLOAT_TYPEV4 data_vv4[];};
 layout (binding = 3) readonly buffer M {float16_t data_m[];};
 
 #if defined(COOPMAT_8X8) && !defined(BFLOAT16)
+struct fa_block_q8_0 {
+    float16_t d;
+    uint16_t qs[16];
+};
+layout (binding = 1) readonly buffer K_Q8 { fa_block_q8_0 data_k_q8[]; };
+layout (binding = 2) readonly buffer V_Q8 { fa_block_q8_0 data_v_q8[]; };
+
+f16vec2 fa_q8_0_decode_f16x2(const uint16_t q16, const float16_t d) {
+    const uint32_t u = uint32_t(q16);
+    const uint32_t packed = (((u & 0x00FFu) | ((u & 0xFF00u) << 8u)) ^ 0x00800080u) | 0x64006400u;
+    precise const f16vec2 qf = unpackFloat2x16(packed) - f16vec2(1152.0);
+    return qf * d;
+}
+
 // Series 13: 15,776-byte <= 16 KB COOPMAT_8X8 layout for 2-WG/core occupancy on Apple AGX G17P
 // Supports both WG=128 (4 subgroups -> 256 threads/core) and WG=256 (8 subgroups -> 512 threads/core,
 // halving per-thread OfMat/SfMat GPRs from 80 -> 40 half-GPRs for zero register spills!):
@@ -67,8 +81,9 @@ const uint32_t sfshstride = (Br == 16u && HSK <= 128u) ? (Br / 4u + 1u) : (Br / 
 const uint32_t osh_stride = 16u;
 const uint32_t sfsh_elems = (Bc * sfshstride >= Br * osh_stride) ? (Bc * sfshstride) : (Br * osh_stride);
 shared ACC_TYPEV4 sfsh[sfsh_elems];
-const uint32_t need_kvsh_u = SHMEM_STAGING | (Flags & 16u) | Clamp | (HSK & 15u) | (HSV % (MatBc * num_sg));
-shared FLOAT_TYPEV4 kvsh[(need_kvsh_u != 0u) ? 128u : 1u];
+const uint32_t need_kvsh_k = (FaTypeK == GGML_TYPE_Q8_0) ? 0u : (SHMEM_STAGING | (Flags & 16u) | Clamp | (HSK & 15u));
+const uint32_t need_kvsh_v = (FaTypeV == GGML_TYPE_Q8_0) ? 0u : (SHMEM_STAGING | (Flags & 16u) | Clamp | (HSV % (MatBc * num_sg)));
+shared FLOAT_TYPEV4 kvsh[((need_kvsh_k | need_kvsh_v) != 0u) ? 128u : 1u];
 shared int32_t sh_q_pos[REL_BIAS_ENABLE ? Br : 1u];
 shared int32_t sh_q_mm[REL_BIAS_ENABLE ? 2u : 1u];
 
@@ -287,50 +302,90 @@ void main() {
         coopmat<FLOAT_TYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> KMatK[k_tiles_per_sg];
         coopmat<FLOAT_TYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> KMatP[q_tiles];
         coopmat<FLOAT_TYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> QMat[q_tiles];
+        coopmat<FLOAT_TYPE, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> VMat[2];
 
-        const bool stage_k_block = (SHMEM_STAGING != 0u) || USE_SPARSE ||
-                                   (KV_bounds_check && (j * Bc + Bc > KV || ((k_offset | k_stride) & 3u) != 0u));
-
-        [[unroll]] for (uint32_t d = 0u; d < HSK_pad / 16u; ++d) {
-            [[unroll]] for (uint32_t dk = 0u; dk < 2u; ++dk) {
-                const bool stage_k_now = stage_k_block || (d * 16u + dk * 8u + 8u > HSK);
-                if (stage_k_now) {
-                    barrier();
-                    if (tid < 128u) {
-                        const uint32_t row = tid >> 1u;
-                        const uint32_t col_vec = tid & 1u;
-                        FLOAT_TYPEV4 K_Tf = FLOAT_TYPEV4(0.0);
-                        uint32_t kcol;
-                        if (fa_kv_index(j * Bc + row, kcol) && (d * 16u + dk * 8u + col_vec * 4u < HSK)) {
-                            const uint32_t elem_idx = k_offset + kcol * k_stride + d * 16u + dk * 8u + col_vec * 4u;
-                            if ((elem_idx & 3u) == 0u) {
-                                K_Tf = data_kv4[elem_idx >> 2u];
-                            } else {
-                                K_Tf = FLOAT_TYPEV4(data_k[elem_idx + 0u], data_k[elem_idx + 1u],
-                                                    data_k[elem_idx + 2u], data_k[elem_idx + 3u]);
-                            }
+        if (FaTypeK == GGML_TYPE_Q8_0) {
+            const uint32_t k_lane = gl_SubgroupInvocationID;
+            const uint32_t k_cm_r = ((k_lane >> 1u) & 3u) | ((k_lane >> 2u) & 4u);
+            const uint32_t k_pair = (k_lane & 1u) | ((k_lane >> 2u) & 2u);
+            uint32_t k_row_blk[k_tiles_per_sg];
+            bool     k_row_ok[k_tiles_per_sg];
+            [[unroll]] for (uint32_t m = 0u; m < k_tiles_per_sg; ++m) {
+                const uint32_t kv_local_row = (gl_SubgroupID * k_tiles_per_sg + m) * 8u + k_cm_r;
+                uint32_t kcol;
+                k_row_ok[m]  = fa_kv_index(j * Bc + kv_local_row, kcol);
+                k_row_blk[m] = k_offset + kcol * k_stride;
+            }
+            [[unroll]] for (uint32_t d_blk = 0u; d_blk < HSK / 32u; ++d_blk) {
+                float16_t kd_arr[k_tiles_per_sg];
+                [[unroll]] for (uint32_t m = 0u; m < k_tiles_per_sg; ++m) {
+                    kd_arr[m] = k_row_ok[m] ? data_k_q8[k_row_blk[m] + d_blk].d : float16_t(0.0);
+                }
+                [[unroll]] for (uint32_t sub = 0u; sub < 4u; ++sub) {
+                    [[unroll]] for (uint32_t m = 0u; m < k_tiles_per_sg; ++m) {
+                        f16vec2 kv2 = f16vec2(0.0);
+                        if (k_row_ok[m]) {
+                            kv2 = fa_q8_0_decode_f16x2(data_k_q8[k_row_blk[m] + d_blk].qs[sub * 4u + k_pair], kd_arr[m]);
                         }
-                        kvsh[tid] = K_Tf;
+                        KMatK[m][0] = kv2.x;
+                        KMatK[m][1] = kv2.y;
                     }
-                    barrier();
-                }
-                [[unroll]] for (uint32_t m = 0u; m < k_tiles_per_sg; ++m) {
-                    const uint32_t kv_local_row = (gl_SubgroupID * k_tiles_per_sg + m) * 8u;
-                    if (!stage_k_now) {
-                        const uint32_t coord = k_offset / 4u + (j * Bc + kv_local_row) * (k_stride / 4u) + d * 4u + dk * 2u;
-                        coopMatLoad(KMatK[m], data_kv4, coord, k_stride / 4u, gl_CooperativeMatrixLayoutRowMajor);
-                    } else {
-                        const uint32_t coord = kv_local_row * 2u;
-                        coopMatLoad(KMatK[m], kvsh, coord, 2u, gl_CooperativeMatrixLayoutRowMajor);
-                    }
-                }
-                [[unroll]] for (uint32_t n = 0u; n < q_tiles; ++n) {
-                    const uint32_t q_coord = ((d * 2u + dk) * q_tiles + n) * 64u;
-                    coopMatLoad(QMat[n], Qf_T, q_coord, 8u, gl_CooperativeMatrixLayoutRowMajor);
-                }
-                [[unroll]] for (uint32_t m = 0u; m < k_tiles_per_sg; ++m) {
                     [[unroll]] for (uint32_t n = 0u; n < q_tiles; ++n) {
-                        SfMat[m][n] = coopMatMulAdd(KMatK[m], QMat[n], SfMat[m][n]);
+                        const uint32_t q_coord = ((d_blk * 4u + sub) * q_tiles + n) * 64u;
+                        coopMatLoad(QMat[n], Qf_T, q_coord, 8u, gl_CooperativeMatrixLayoutRowMajor);
+                    }
+                    [[unroll]] for (uint32_t m = 0u; m < k_tiles_per_sg; ++m) {
+                        [[unroll]] for (uint32_t n = 0u; n < q_tiles; ++n) {
+                            SfMat[m][n] = coopMatMulAdd(KMatK[m], QMat[n], SfMat[m][n]);
+                        }
+                    }
+                }
+            }
+        } else {
+            const bool stage_k_block = (SHMEM_STAGING != 0u) || USE_SPARSE ||
+                                       (KV_bounds_check && (j * Bc + Bc > KV || ((k_offset | k_stride) & 3u) != 0u));
+
+            [[unroll]] for (uint32_t d = 0u; d < HSK_pad / 16u; ++d) {
+                [[unroll]] for (uint32_t dk = 0u; dk < 2u; ++dk) {
+                    const bool stage_k_now = stage_k_block || (d * 16u + dk * 8u + 8u > HSK);
+                    if (stage_k_now) {
+                        barrier();
+                        if (tid < 128u) {
+                            const uint32_t row = tid >> 1u;
+                            const uint32_t col_vec = tid & 1u;
+                            FLOAT_TYPEV4 K_Tf = FLOAT_TYPEV4(0.0);
+                            uint32_t kcol;
+                            if (fa_kv_index(j * Bc + row, kcol) && (d * 16u + dk * 8u + col_vec * 4u < HSK)) {
+                                const uint32_t elem_idx = k_offset + kcol * k_stride + d * 16u + dk * 8u + col_vec * 4u;
+                                if ((elem_idx & 3u) == 0u) {
+                                    K_Tf = data_kv4[elem_idx >> 2u];
+                                } else {
+                                    K_Tf = FLOAT_TYPEV4(data_k[elem_idx + 0u], data_k[elem_idx + 1u],
+                                                        data_k[elem_idx + 2u], data_k[elem_idx + 3u]);
+                                }
+                            }
+                            kvsh[tid] = K_Tf;
+                        }
+                        barrier();
+                    }
+                    [[unroll]] for (uint32_t m = 0u; m < k_tiles_per_sg; ++m) {
+                        const uint32_t kv_local_row = (gl_SubgroupID * k_tiles_per_sg + m) * 8u;
+                        if (!stage_k_now) {
+                            const uint32_t coord = k_offset / 4u + (j * Bc + kv_local_row) * (k_stride / 4u) + d * 4u + dk * 2u;
+                            coopMatLoad(KMatK[m], data_kv4, coord, k_stride / 4u, gl_CooperativeMatrixLayoutRowMajor);
+                        } else {
+                            const uint32_t coord = kv_local_row * 2u;
+                            coopMatLoad(KMatK[m], kvsh, coord, 2u, gl_CooperativeMatrixLayoutRowMajor);
+                        }
+                    }
+                    [[unroll]] for (uint32_t n = 0u; n < q_tiles; ++n) {
+                        const uint32_t q_coord = ((d * 2u + dk) * q_tiles + n) * 64u;
+                        coopMatLoad(QMat[n], Qf_T, q_coord, 8u, gl_CooperativeMatrixLayoutRowMajor);
+                    }
+                    [[unroll]] for (uint32_t m = 0u; m < k_tiles_per_sg; ++m) {
+                        [[unroll]] for (uint32_t n = 0u; n < q_tiles; ++n) {
+                            SfMat[m][n] = coopMatMulAdd(KMatK[m], QMat[n], SfMat[m][n]);
+                        }
                     }
                 }
             }
@@ -508,61 +563,98 @@ void main() {
             }
         }
 
-        const bool stage_v_block = (SHMEM_STAGING != 0u) || USE_SPARSE ||
-                                   (KV_bounds_check && (j * Bc + Bc > KV || ((v_offset | v_stride) & 3u) != 0u));
-        const uint32_t n_sub_passes = (num_sg + 3u) / 4u;
-
-        [[unroll]] for (uint32_t bc_chunk = 0u; bc_chunk < Bc / MatBc; ++bc_chunk) {
-            [[unroll]] for (uint32_t dk = 0u; dk < 2u; ++dk) {
-                [[unroll]] for (uint32_t m = 0u; m < q_tiles; ++m) {
-                    coopMatLoad(KMatP[m], Psh_s, (m * 8u) * psh_s_stride + bc_chunk * MatBc + dk * 8u, psh_s_stride, gl_CooperativeMatrixLayoutRowMajor);
-                }
-                [[unroll]] for (uint32_t hsv_tile = 0u; hsv_tile < num_hsv_tiles; ++hsv_tile) {
-                    const uint32_t hsv_offset = (hsv_tile * num_sg + gl_SubgroupID) * 16u;
-                    const bool hsv_tile_partial = (hsv_tile * MatBc * num_sg + MatBc * num_sg) > HSV;
-                    const bool stage_v_now = stage_v_block || hsv_tile_partial;
-                    if (!stage_v_now) {
-                        if (hsv_offset < HSV_pad) {
-                            const uint32_t v_tile_row = j * Bc + bc_chunk * MatBc + dk * 8u;
-                            [[unroll]] for (uint32_t n = 0u; n < 2u; ++n) {
-                                const uint32_t v_tile_offset = v_offset / 4u + v_tile_row * (v_stride / 4u) + hsv_offset / 4u + n * 2u;
-                                coopMatLoad(QMat[n], data_vv4, v_tile_offset, v_stride / 4u, gl_CooperativeMatrixLayoutRowMajor);
+        if (FaTypeV == GGML_TYPE_Q8_0) {
+            const uint32_t cm_pair = (lane & 1u) | ((lane >> 2u) & 2u);
+            [[unroll]] for (uint32_t bc_chunk = 0u; bc_chunk < Bc / MatBc; ++bc_chunk) {
+                [[unroll]] for (uint32_t dk = 0u; dk < 2u; ++dk) {
+                    [[unroll]] for (uint32_t m = 0u; m < q_tiles; ++m) {
+                        coopMatLoad(KMatP[m], Psh_s, (m * 8u) * psh_s_stride + bc_chunk * MatBc + dk * 8u, psh_s_stride, gl_CooperativeMatrixLayoutRowMajor);
+                    }
+                    uint32_t v_row;
+                    const bool v_ok = fa_kv_index(j * Bc + bc_chunk * MatBc + dk * 8u + cm_r, v_row);
+                    const uint32_t v_row_blk = v_offset + v_row * v_stride;
+                    [[unroll]] for (uint32_t hsv_tile = 0u; hsv_tile < num_hsv_tiles; ++hsv_tile) {
+                        const uint32_t hsv_offset = (hsv_tile * num_sg + gl_SubgroupID) * 16u;
+                        if (hsv_offset < HSV) {
+                            f16vec2 vv0 = f16vec2(0.0);
+                            f16vec2 vv1 = f16vec2(0.0);
+                            if (v_ok) {
+                                const uint32_t ib    = v_row_blk + (hsv_offset >> 5u);
+                                const float16_t vd   = data_v_q8[ib].d;
+                                const uint32_t qbase = ((hsv_offset >> 4u) & 1u) * 8u + cm_pair;
+                                vv0 = fa_q8_0_decode_f16x2(data_v_q8[ib].qs[qbase + 0u], vd);
+                                vv1 = fa_q8_0_decode_f16x2(data_v_q8[ib].qs[qbase + 4u], vd);
                             }
+                            VMat[0][0] = vv0.x;
+                            VMat[0][1] = vv0.y;
+                            VMat[1][0] = vv1.x;
+                            VMat[1][1] = vv1.y;
                             [[unroll]] for (uint32_t m = 0u; m < q_tiles; ++m) {
                                 [[unroll]] for (uint32_t n = 0u; n < 2u; ++n) {
-                                    OfMat[hsv_tile][m][n] = coopMatMulAdd(KMatP[m], QMat[n], OfMat[hsv_tile][m][n]);
+                                    OfMat[hsv_tile][m][n] = coopMatMulAdd(KMatP[m], VMat[n], OfMat[hsv_tile][m][n]);
                                 }
                             }
                         }
-                    } else {
-                        [[unroll]] for (uint32_t sp = 0u; sp < n_sub_passes; ++sp) {
-                            barrier();
-                            if (tid < 128u) {
-                                const uint32_t r8  = tid >> 4u;
-                                const uint32_t c16 = tid & 15u;
-                                const uint32_t v_col = (hsv_tile * num_sg + sp * 4u) * 16u + c16 * 4u;
-                                FLOAT_TYPEV4 V_Tf = FLOAT_TYPEV4(0.0);
-                                uint32_t v_row;
-                                if (v_col < HSV && fa_kv_index(j * Bc + bc_chunk * MatBc + dk * 8u + r8, v_row)) {
-                                    const uint32_t elem_idx = v_offset + v_row * v_stride + v_col;
-                                    if ((elem_idx & 3u) == 0u) {
-                                        V_Tf = data_vv4[elem_idx >> 2u];
-                                    } else {
-                                        V_Tf = FLOAT_TYPEV4(data_v[elem_idx + 0u], data_v[elem_idx + 1u],
-                                                            data_v[elem_idx + 2u], data_v[elem_idx + 3u]);
-                                    }
-                                }
-                                kvsh[tid] = V_Tf;
-                            }
-                            barrier();
-                            if ((gl_SubgroupID / 4u) == sp && hsv_offset < HSV_pad) {
+                    }
+                }
+            }
+        } else {
+            const bool stage_v_block = (SHMEM_STAGING != 0u) || USE_SPARSE ||
+                                       (KV_bounds_check && (j * Bc + Bc > KV || ((v_offset | v_stride) & 3u) != 0u));
+            const uint32_t n_sub_passes = (num_sg + 3u) / 4u;
+
+            [[unroll]] for (uint32_t bc_chunk = 0u; bc_chunk < Bc / MatBc; ++bc_chunk) {
+                [[unroll]] for (uint32_t dk = 0u; dk < 2u; ++dk) {
+                    [[unroll]] for (uint32_t m = 0u; m < q_tiles; ++m) {
+                        coopMatLoad(KMatP[m], Psh_s, (m * 8u) * psh_s_stride + bc_chunk * MatBc + dk * 8u, psh_s_stride, gl_CooperativeMatrixLayoutRowMajor);
+                    }
+                    [[unroll]] for (uint32_t hsv_tile = 0u; hsv_tile < num_hsv_tiles; ++hsv_tile) {
+                        const uint32_t hsv_offset = (hsv_tile * num_sg + gl_SubgroupID) * 16u;
+                        const bool hsv_tile_partial = (hsv_tile * MatBc * num_sg + MatBc * num_sg) > HSV;
+                        const bool stage_v_now = stage_v_block || hsv_tile_partial;
+                        if (!stage_v_now) {
+                            if (hsv_offset < HSV_pad) {
+                                const uint32_t v_tile_row = j * Bc + bc_chunk * MatBc + dk * 8u;
                                 [[unroll]] for (uint32_t n = 0u; n < 2u; ++n) {
-                                    const uint32_t v_tile_offset = (gl_SubgroupID & 3u) * 4u + n * 2u;
-                                    coopMatLoad(QMat[n], kvsh, v_tile_offset, 16u, gl_CooperativeMatrixLayoutRowMajor);
+                                    const uint32_t v_tile_offset = v_offset / 4u + v_tile_row * (v_stride / 4u) + hsv_offset / 4u + n * 2u;
+                                    coopMatLoad(QMat[n], data_vv4, v_tile_offset, v_stride / 4u, gl_CooperativeMatrixLayoutRowMajor);
                                 }
                                 [[unroll]] for (uint32_t m = 0u; m < q_tiles; ++m) {
                                     [[unroll]] for (uint32_t n = 0u; n < 2u; ++n) {
                                         OfMat[hsv_tile][m][n] = coopMatMulAdd(KMatP[m], QMat[n], OfMat[hsv_tile][m][n]);
+                                    }
+                                }
+                            }
+                        } else {
+                            [[unroll]] for (uint32_t sp = 0u; sp < n_sub_passes; ++sp) {
+                                barrier();
+                                if (tid < 128u) {
+                                    const uint32_t r8  = tid >> 4u;
+                                    const uint32_t c16 = tid & 15u;
+                                    const uint32_t v_col = (hsv_tile * num_sg + sp * 4u) * 16u + c16 * 4u;
+                                    FLOAT_TYPEV4 V_Tf = FLOAT_TYPEV4(0.0);
+                                    uint32_t v_row;
+                                    if (v_col < HSV && fa_kv_index(j * Bc + bc_chunk * MatBc + dk * 8u + r8, v_row)) {
+                                        const uint32_t elem_idx = v_offset + v_row * v_stride + v_col;
+                                        if ((elem_idx & 3u) == 0u) {
+                                            V_Tf = data_vv4[elem_idx >> 2u];
+                                        } else {
+                                            V_Tf = FLOAT_TYPEV4(data_v[elem_idx + 0u], data_v[elem_idx + 1u],
+                                                                data_v[elem_idx + 2u], data_v[elem_idx + 3u]);
+                                        }
+                                    }
+                                    kvsh[tid] = V_Tf;
+                                }
+                                barrier();
+                                if ((gl_SubgroupID / 4u) == sp && hsv_offset < HSV_pad) {
+                                    [[unroll]] for (uint32_t n = 0u; n < 2u; ++n) {
+                                        const uint32_t v_tile_offset = (gl_SubgroupID & 3u) * 4u + n * 2u;
+                                        coopMatLoad(QMat[n], kvsh, v_tile_offset, 16u, gl_CooperativeMatrixLayoutRowMajor);
+                                    }
+                                    [[unroll]] for (uint32_t m = 0u; m < q_tiles; ++m) {
+                                        [[unroll]] for (uint32_t n = 0u; n < 2u; ++n) {
+                                            OfMat[hsv_tile][m][n] = coopMatMulAdd(KMatP[m], QMat[n], OfMat[hsv_tile][m][n]);
+                                        }
                                     }
                                 }
                             }
