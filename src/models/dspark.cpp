@@ -789,10 +789,14 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     ggml_tensor * cat      = nullptr;
     ggml_tensor * cat_conf = nullptr;
     ggml_tensor * cat_draw = nullptr;
+    const bool draws_only = !ids_only && rnn_state != nullptr && !sample_from_anchor && !has_conf &&
+                            !getenv("LLAMA_DSPARK_HOST_LOGITS");
 
     if (!sample_from_anchor && !ids_only) {
         // bonus anchor slot: pass the logits through unbiased, pad the (unread) confidence column
-        cat = ggml_cont(ctx0, ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, 0));
+        if (!draws_only) {
+            cat = ggml_cont(ctx0, ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, 0));
+        }
         if (has_conf) {
             cat_conf = ggml_sigmoid(ctx0, ggml_view_2d(ctx0, base, 1, n_blocks, base_stride, 0));
         }
@@ -885,7 +889,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
             }
         }
 
-        if (!ids_only) {
+        if (!ids_only && !draws_only) {
             cat = cat ? ggml_concat(ctx0, cat, col, 1) : col;
         }
 
@@ -938,6 +942,10 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         draws = ggml_cont(ctx0, ggml_permute(ctx0, draws, 0, 2, 1, 3));
         res->t_h_nextn = ggml_reshape_2d(ctx0, draws, n_embd, n_tok);
         ggml_build_forward_expand(g.gf, res->t_h_nextn);
+        if (draws_only) {
+            res->t_logits = nullptr;
+            return;
+        }
     }
 
     // cat is position-major; restore ubatch block-major order

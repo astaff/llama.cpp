@@ -4852,17 +4852,21 @@ private:
                     any_skipped     = true;
                     continue;
                 }
-                if (valid_slot && spec_win > 0 && slots[sid].task &&
+                if (valid_slot && slots[sid].task &&
                     (slots[sid].state == SLOT_STATE_PROCESSING_PROMPT || slots[sid].state == SLOT_STATE_DONE_PROMPT)) {
-                    const llama_pos min_pos = (llama_pos) slots[sid].task->n_tokens() - spec_win;
-                    if (batch.view.tokens[vr].pos[0] < min_pos) {
-                        any_skipped = true;
-                        continue;
+                    if (spec_win > 0) {
+                        const llama_pos min_pos = (llama_pos) slots[sid].task->n_tokens() - spec_win;
+                        if (batch.view.tokens[vr].pos[0] < min_pos) {
+                            any_skipped = true;
+                            continue;
+                        }
                     }
-                    if (ctx_dft) {
+                    if (ctx_dft && (keep_rows.empty() || batch.tokens[off + keep_rows.back()].id_slot != sid)) {
                         const llama_pos cur_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slots[sid].id);
-                        if (cur_max >= 0 && batch.view.tokens[vr].pos[0] != cur_max + 1 &&
-                            (keep_rows.empty() || batch.tokens[off + keep_rows.back()].id_slot != sid)) {
+                        const llama_pos row_pos = batch.view.tokens[vr].pos[0];
+                        if (cur_max >= row_pos) {
+                            llama_memory_seq_rm(llama_get_memory(ctx_dft), slots[sid].id, row_pos, -1);
+                        } else if (cur_max >= 0 && row_pos != cur_max + 1) {
                             llama_memory_seq_rm(llama_get_memory(ctx_dft), slots[sid].id, -1, -1);
                         }
                     }
@@ -5181,7 +5185,8 @@ private:
             }
 
             // add accepted tokens to the prompt
-            slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
+            const size_t n_prompt_base = slot.prompt.n_tokens() - n_draft;
+            slot.prompt.tokens.keep_first(n_prompt_base);
             slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
 
             slot.sampled = ids.back(); // last accepted token
@@ -5204,32 +5209,13 @@ private:
                 slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
             }
 
-            for (size_t i = 0; i < ids.size(); ++i) {
-                completion_token_output result;
-
-                result.tok          = ids[i];
-                result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
-                result.prob         = 1.0f; // set later
-
-                // post_sampling_probs is not supported with speculative decoding
-                if (slot.task->params.sampling.n_probs > 0 && !slot.task->params.post_sampling_probs) {
-                    populate_token_probs(slot, result, false, params_base.special, active_i_batch[i]);
-                }
-
-                slot.stats.n_gen += 1;
-
-                if (!process_token(result, slot)) {
-                    slot.print_timings();
-                    send_final_response(slot);
-                    slot.release();
-
+            auto flush_deferred_dft_rows = [&](size_t n_rows) {
+                if (n_rows == 0 || !spec || getenv("S19_NO_DEFER_DFT") ||
+                    ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
                     return;
                 }
-            }
-
-            if (spec && !getenv("S19_NO_DEFER_DFT") && ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
-                std::vector<int32_t> acc_view_rows(ids.size());
-                for (size_t r = 0; r < ids.size(); ++r) {
+                std::vector<int32_t> acc_view_rows(n_rows);
+                for (size_t r = 0; r < n_rows; ++r) {
                     const int32_t vr = active_i_batch[r] - off;
                     acc_view_rows[r] = vr;
                     if (has_tree && won_branch == 1) {
@@ -5245,7 +5231,44 @@ private:
                     SRV_ERR("%s", "failed to process accepted speculative rows\n");
                     throw std::runtime_error("failed to process accepted speculative rows");
                 }
+            };
+
+            for (size_t i = 0; i < ids.size(); ++i) {
+                completion_token_output result;
+
+                result.tok          = ids[i];
+                result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
+                result.prob         = 1.0f; // set later
+
+                // post_sampling_probs is not supported with speculative decoding
+                if (slot.task->params.sampling.n_probs > 0 && !slot.task->params.post_sampling_probs) {
+                    populate_token_probs(slot, result, false, params_base.special, active_i_batch[i]);
+                }
+
+                slot.stats.n_gen += 1;
+
+                if (!process_token(result, slot)) {
+                    if (i + 1 < ids.size()) {
+                        slot.prompt.tokens.keep_first(n_prompt_base + i);
+                        slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+                    }
+                    const bool will_clear_prompt =
+                        slot.task->is_child() || slot.task->is_stateless() ||
+                        slot.audio_stream || slot.task->type == SERVER_TASK_TYPE_REALTIME ||
+                        slot.task->type == SERVER_TASK_TYPE_TTS;
+                    if (!will_clear_prompt) {
+                        flush_deferred_dft_rows(i + 1);
+                    }
+
+                    slot.print_timings();
+                    send_final_response(slot);
+                    slot.release();
+
+                    return;
+                }
             }
+
+            flush_deferred_dft_rows(ids.size());
 
             slot.print_timings_tg();
 
