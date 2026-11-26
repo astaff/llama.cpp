@@ -494,7 +494,7 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
             (int32_t)(((size_t)mctx_cur->get_size() * row_size) / sizeof(float)),
             (int32_t)Kw, scale_out);
         const ggml_tensor * vs = history ? history->view_src : nullptr;
-        if (inp && inp->s_copy && !getenv("S19_NO_SCOPY_BIND") && vs == state) {
+        if (inp && inp->s_copy && n_seq_tokens <= 16 && !getenv("S19_NO_SCOPY_BIND") && vs == state) {
             conv->src[6] = inp->s_copy;
         }
         return conv;
@@ -596,10 +596,8 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
     ggml_tensor * state   = recr->mctx->get_r_l(il);
     ggml_tensor * history = nullptr;
-    const int64_t  rs_k  = cparams.n_rs_seq == 0 ? 1 : ((int64_t)cparams.n_rs_seq + 1);
-    const uint32_t rs_kw = (uint32_t)std::min<int64_t>(ubatch.n_seq_tokens, rs_k);
-    const bool direct_scopy = recr && recr->s_copy && hparams.n_shortconv_l_cache == 4 && ubatch.n_seq_tokens <= 16 &&
-                              recr->mctx->can_direct_scopy(ubatch.n_seqs, rs_kw) &&
+    const bool direct_scopy = recr && recr->s_copy && hparams.n_shortconv_l_cache == 4 &&
+                              recr->direct_scopy &&
                               !getenv("GGML_INKLING_NO_FUSE") && !getenv("S19_NO_SCOPY_BIND");
     if (direct_scopy) {
         ggml_tensor * states = ggml_reshape_2d(ctx0, state, hparams.n_embd_r(), state->ne[1]);

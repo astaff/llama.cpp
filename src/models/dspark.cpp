@@ -33,7 +33,7 @@ static void s23_ensure_dspark_w2_quant(const llama_model & model) {
         return;
     }
 
-    ggml_type qtype = GGML_TYPE_Q6_K;
+    ggml_type qtype = GGML_TYPE_Q8_0;
     if (const char * env_t = getenv("LLAMA_DSPARK_W2_TYPE")) {
         if (env_t[0] != '\0') {
             if (strcasecmp(env_t, "raw") == 0 || strcasecmp(env_t, "bf16") == 0 ||

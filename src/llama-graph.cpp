@@ -590,6 +590,15 @@ int llm_graph_input_rs::gen_compute_identity(const llama_memory_recurrent_contex
     return 1;
 }
 
+bool llm_graph_input_rs::compute_direct_scopy(const llama_memory_recurrent_context * mctx, const llama_ubatch & ubatch, const llama_cparams & cparams) {
+    if (!mctx || ubatch.n_seq_tokens > 16) {
+        return false;
+    }
+    const int64_t  rs_k  = cparams.n_rs_seq == 0 ? 1 : ((int64_t) cparams.n_rs_seq + 1);
+    const uint32_t rs_kw = (uint32_t) std::min<int64_t>(ubatch.n_seq_tokens, rs_k);
+    return mctx->can_direct_scopy(ubatch.n_seqs, rs_kw);
+}
+
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_memory_recurrent_context *>(params.mctx);
 
@@ -598,6 +607,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
     res &= gen_identity == gen_compute_identity(mctx, params.ubatch.n_seqs, params.cparams.n_rs_seq);
+    res &= direct_scopy == compute_direct_scopy(mctx, params.ubatch, params.cparams);
 
     res &= s_copy->ne[0] == mctx->get_n_rs();
 
@@ -1334,6 +1344,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
     res &= inp_rs->gen_identity == llm_graph_input_rs::gen_compute_identity(mctx->get_recr(), params.ubatch.n_seqs, params.cparams.n_rs_seq);
+    res &= inp_rs->direct_scopy == llm_graph_input_rs::compute_direct_scopy(mctx->get_recr(), params.ubatch, params.cparams);
 
     return res;
 }
@@ -1382,6 +1393,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
     res &= inp_rs->gen_identity == llm_graph_input_rs::gen_compute_identity(mctx->get_recr(), params.ubatch.n_seqs, params.cparams.n_rs_seq);
+    res &= inp_rs->direct_scopy == llm_graph_input_rs::compute_direct_scopy(mctx->get_recr(), params.ubatch, params.cparams);
 
     return res;
 }
@@ -1456,6 +1468,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
     res &= inp_rs->gen_identity == llm_graph_input_rs::gen_compute_identity(mctx->get_recr(), params.ubatch.n_seqs, params.cparams.n_rs_seq);
+    res &= inp_rs->direct_scopy == llm_graph_input_rs::compute_direct_scopy(mctx->get_recr(), params.ubatch, params.cparams);
 
     return res;
 }
@@ -1568,6 +1581,7 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
     res &= inp_rs->gen_identity == llm_graph_input_rs::gen_compute_identity(mctx->get_recr(), params.ubatch.n_seqs, params.cparams.n_rs_seq);
+    res &= inp_rs->direct_scopy == llm_graph_input_rs::compute_direct_scopy(mctx->get_recr(), params.ubatch, params.cparams);
 
     return res;
 }
@@ -4259,6 +4273,7 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
     inp->gen_identity = llm_graph_input_rs::gen_compute_identity(mctx_cur, n_seqs, cparams.n_rs_seq);
+    inp->direct_scopy = llm_graph_input_rs::compute_direct_scopy(mctx_cur, ubatch, cparams);
 
     inp->has_rep = mctx_cur->get_rs_replay();
     if (inp->has_rep) {

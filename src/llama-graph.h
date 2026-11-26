@@ -346,6 +346,9 @@ public:
     // so build_rs can view the cache instead of gathering; -1 when the feature is off
     int gen_identity = -1;
     static int gen_compute_identity(const llama_memory_recurrent_context * mctx, int64_t n_seqs, uint32_t n_rs_seq);
+
+    bool direct_scopy = false;
+    static bool compute_direct_scopy(const llama_memory_recurrent_context * mctx, const llama_ubatch & ubatch, const llama_cparams & cparams);
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
