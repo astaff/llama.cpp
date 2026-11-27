@@ -256,7 +256,10 @@ struct W5PassDesc {
     float    situ_beta;
     float    situ_linear_beta;
     uint     sink_proj_row_B;
-    uint     reserved[28];
+    uint     n_tokens;
+    uint     rollback_slots;
+    uint     rollback_stride_f32;
+    uint     reserved[25];
 };
 
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer W5PassDescBuf {

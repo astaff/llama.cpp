@@ -534,16 +534,20 @@ struct agx_inkling2_engine {
     const agx_kernel * k_w5_persist_moe[2][2]      = {};
     const agx_kernel * k_w5_persist_chunk[2][2][2] = {};
     const agx_kernel * k_w5_attn_in_b1             = nullptr;
-    const agx_kernel * k_w5_hybrid_qkv_flash[2]    = {};
-    const agx_kernel * k_w5_hybrid_post_attn_rtr[2]= {};
-    const agx_kernel * k_w5_hybrid_post_ffn_ctrl   = nullptr;
-    bool               w5_compiled                 = false;
-    bool               w5_chunk_tried[2]           = {};
-    bool               w5_chunk_ok[2]              = {};
-    bool               w5_split_tried[2]           = {};
-    bool               w5_split_ok[2]              = {};
-    bool               w5_hybrid_tried[2]          = {};
-    bool               w5_hybrid_ok[2]             = {};
+    const agx_kernel * k_w5_hybrid_qkv_flash[2]      = {};
+    const agx_kernel * k_w5_hybrid_post_attn_rtr[2]  = {};
+    const agx_kernel * k_w5_hybrid_post_ffn_ctrl     = nullptr;
+    const agx_kernel * k_w5_hybrid_post_attn_rtr_m[2]= {};
+    const agx_kernel * k_w5_hybrid_post_ffn_ctrl_m   = nullptr;
+    bool               w5_compiled                   = false;
+    bool               w5_chunk_tried[2]             = {};
+    bool               w5_chunk_ok[2]                = {};
+    bool               w5_split_tried[2]             = {};
+    bool               w5_split_ok[2]                = {};
+    bool               w5_hybrid_tried[2]            = {};
+    bool               w5_hybrid_ok[2]               = {};
+    bool               w5_hybrid_m_tried             = false;
+    bool               w5_hybrid_m_ok                = false;
 
     agx_w4_bound_model w4_model;
 
@@ -2123,16 +2127,31 @@ static bool ensure_w5_hybrid_kernels(agx_inkling2_engine * eng, uint32_t kv_q8) 
     return eng->w5_hybrid_ok[kv_q8];
 }
 
+static bool ensure_w5_hybrid_m_kernels(agx_inkling2_engine * eng) {
+    if (!eng || !eng->ctx || !eng->ctx->compiler) return false;
+    if (eng->w5_hybrid_m_tried) return eng->w5_hybrid_m_ok;
+    eng->w5_hybrid_m_tried = true;
+    agx_compiler * comp = eng->ctx->compiler;
+    eng->k_w5_hybrid_post_attn_rtr_m[0] = compile_w5_hybrid_kernel(comp, "agx_w5_hybrid_post_attn_rtr_m_nl", 3, 0, 0);
+    eng->k_w5_hybrid_post_attn_rtr_m[1] = compile_w5_hybrid_kernel(comp, "agx_w5_hybrid_post_attn_rtr_m_lp", 3, 1, 0);
+    eng->k_w5_hybrid_post_ffn_ctrl_m    = compile_w5_hybrid_kernel(comp, "agx_w5_hybrid_post_ffn_ctrl_m",    4, 1, 0);
+    eng->w5_hybrid_m_ok = eng->k_w5_hybrid_post_attn_rtr_m[0] &&
+                          eng->k_w5_hybrid_post_attn_rtr_m[1] &&
+                          eng->k_w5_hybrid_post_ffn_ctrl_m;
+    return eng->w5_hybrid_m_ok;
+}
+
 bool agx_inkling2_precompile_w5(agx_inkling2_engine * eng) {
     if (!eng || !eng->ctx || !eng->ctx->compiler) return false;
     if (eng->w5_compiled) return true;
     const bool h0 = ensure_w5_hybrid_kernels(eng, 0u);
     const bool h1 = ensure_w5_hybrid_kernels(eng, 1u);
+    const bool hm = ensure_w5_hybrid_m_kernels(eng);
     const bool s0 = ensure_w5_split_kernels(eng, 0u);
     const bool s1 = ensure_w5_split_kernels(eng, 1u);
     const bool c0 = ensure_w5_chunk_kernels(eng, 0u);
     const bool c1 = ensure_w5_chunk_kernels(eng, 1u);
-    eng->w5_compiled = h0 && h1 && s0 && s1 && c0 && c1;
+    eng->w5_compiled = h0 && h1 && hm && s0 && s1 && c0 && c1;
     return eng->w5_compiled;
 }
 
@@ -4174,8 +4193,166 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
     }
 
     // ------------------------------------------------------------------------
-    // Main 48-Pass Loop (v = 0..47) — Wave 4 Fallback (M > 1, n_kv > 4096, or GGML_AGX_NO_PERSISTENT=1)
+    // Wave 6 Task 6D: Multi-Token (M = 2..8 DSpark Verify) 40-WG SENSE_BARRIER
+    // Hybrid Super-Stages (`HYBRID_MODE = 3, 4` -> cuts -336 disp / -288 STRONG_USC!)
     // ------------------------------------------------------------------------
+    uint64_t w5m_descs_gpu_va = 0ull;
+    bool     use_w5_m_hybrid  = false;
+    if (!ran_w5_persistent && M >= 2u && M <= 4u &&
+        !(no_persist_env && no_persist_env[0] && no_persist_env[0] != '0') &&
+        D == 2304u && hp.gate_rank == 64u && hp.n_expert <= 256u && hp.n_expert_used == 8u &&
+        ensure_w5_hybrid_m_kernels(eng)) {
+        agx_w5_pass_desc mdescs[48]{};
+        bool m_ok = true;
+        std::vector<uint64_t> m_blocks;
+        m_blocks.reserve(6);
+        std::vector<uint64_t> m_bank;
+        m_bank.reserve(2);
+        uint64_t m_cur_va = va_h_0;
+        bool     m_attn_ready = true;
+
+        for (uint32_t v = 0u; v < 48u && m_ok; ++v) {
+            const auto & P     = G.passes[v];
+            const auto & layer = W.layers[P.ip];
+            const agx_inkling2_loop_tensors * loop = P.has_loop ? &W.loop_layers[P.ip - 6u] : nullptr;
+            if (P.has_loop) {
+                for (int c = 0; c < 4; ++c) {
+                    if (loop->ctrl_down[c]->type   != GGML_TYPE_F32 ||
+                        loop->ctrl_gain[c]->type   != GGML_TYPE_F32 ||
+                        loop->ctrl_forget[c]->type != GGML_TYPE_F32) {
+                        m_ok = false; break;
+                    }
+                }
+                if (!m_ok) break;
+            }
+            if (v == 18u || v == 30u) {
+                m_bank.clear();
+                m_bank.push_back((v == 18u) ? va_h12_even : va_h12_odd);
+                m_blocks.clear();
+                m_blocks.push_back(va_h_0);
+                m_cur_va = va_prelude;
+                m_attn_ready = false;
+            }
+            const bool need_qkv_mix = (P.has_loop && !m_attn_ready);
+            if (need_qkv_mix && !P.is_swa) { m_ok = false; break; }
+
+            auto & d = mdescs[v];
+            d.x_q_va           = L.x_q;
+            d.x_k_va           = (P.is_swa && !P.has_loop) ? L.x_q : L.x_k;
+            d.x_v_va           = (P.is_swa && !P.has_loop) ? L.x_q : L.x_v;
+            d.qkv_in_va[0]     = L.qkv_in_0;
+            d.qkv_in_va[1]     = L.qkv_in_1;
+            d.qkv_in_va[2]     = L.qkv_in_2;
+            d.wo_out_va        = L.x_k;
+            d.ffn_inp_va       = va_ffn_inp;
+            d.router_logits_va = L.router_logits;
+            d.router_topk_va   = slc->router_topk;
+            d.router_topk_w_va = slc->router_topk_w;
+            d.moe_out_va       = L.moe_out;
+            d.h_msg_va         = slc->h_msg;
+            for (int j = 0; j < 3; ++j) {
+                d.ctrl_cat_va[j]  = L.ctrl_cat[j];
+                d.ctrl_gate_va[j] = L.ctrl_gate[j];
+                d.ctrl_gain_va[j] = L.ctrl_gain[j];
+            }
+            if (P.has_loop) {
+                d.msg_state_va[0] = m_bank[0];
+                d.msg_state_va[1] = va_bank_out;
+                d.msg_query_va    = agx_tensor_gpu_va(loop->msg_query);
+                if (need_qkv_mix) {
+                    d.qkv_mix_cur_va   = m_cur_va;
+                    d.qkv_mix_bptrs_va = alloc_block_ptrs(m_blocks);
+                    d.qkv_mix_query_va = agx_tensor_gpu_va(layer.attn_res_query);
+                    d.qkv_mix_n_blocks = (uint32_t) m_blocks.size();
+                    if (!d.qkv_mix_bptrs_va) { m_ok = false; break; }
+                }
+                for (int c = 0; c < 4; ++c) {
+                    d.ctrl_down_w_va[c]   = agx_tensor_gpu_va(loop->ctrl_down[c]);
+                    d.ctrl_gain_w_va[c]   = agx_tensor_gpu_va(loop->ctrl_gain[c]);
+                    d.ctrl_forget_w_va[c] = agx_tensor_gpu_va(loop->ctrl_forget[c]);
+                }
+                d.attn_norm_w_va[0] = agx_tensor_gpu_va(P.is_swa ? layer.attn_norm : layer.attn_q_inp_norm);
+                d.attn_norm_w_va[1] = agx_tensor_gpu_va(P.is_swa ? layer.attn_norm : layer.attn_k_inp_norm);
+                d.attn_norm_w_va[2] = agx_tensor_gpu_va(P.is_swa ? layer.attn_norm : layer.attn_v_inp_norm);
+            }
+            d.ffn_norm_w_va = agx_tensor_gpu_va(layer.ffn_norm);
+            d.r_l_va        = P.r_l_va;
+            d.s_copy_va     = G.s_copy_va;
+            for (int c = 0; c < 4; ++c) d.cell_va[c] = P.cell_va[c];
+
+            const bool new_block = (P.ip % hp.attn_res_block_size == 0u);
+            if (new_block) m_blocks.push_back(m_cur_va);
+            d.attn_post_conv_w_va  = agx_tensor_gpu_va(layer.attn_post_conv);
+            d.attn_res_va          = new_block ? 0ull : m_cur_va;
+            d.attn_bptrs_va        = alloc_block_ptrs(m_blocks);
+            d.ffn_res_query_va     = agx_tensor_gpu_va(layer.ffn_res_query);
+            d.post_attn_mix_out_va = !P.has_loop ? L.x_q : L.qkv_in_0;
+            d.post_attn_n_blocks   = (uint32_t) m_blocks.size();
+            if (!d.attn_bptrs_va) { m_ok = false; break; }
+
+            d.router_w_va    = agx_tensor_gpu_va(layer.ffn_gate_inp);
+            d.router_wtype   = agx_inkling2_tensor_wtype(layer.ffn_gate_inp, &d.router_row_B);
+            d.exp_probs_b_va = layer.ffn_exp_probs_b ? agx_tensor_gpu_va(layer.ffn_exp_probs_b) : 0ull;
+            if (d.router_wtype > 2u) { m_ok = false; break; }
+
+            const uint64_t next_cur_va = target_l_out_va(v, m_cur_va);
+            const bool is_pass_reset   = (v == 17u || v == 29u);
+            const bool is_final_pass   = (v == 47u);
+            d.ffn_post_conv_w_va       = agx_tensor_gpu_va(layer.ffn_post_conv);
+            d.next_cur_va              = next_cur_va;
+            d.export_l_out_va          = P.export_l_out_va;
+
+            bool post_ffn_do_mix = false;
+            if (!is_final_pass && !is_pass_reset) {
+                const auto & Pn      = G.passes[v + 1u];
+                const auto & Ln      = W.layers[Pn.ip];
+                d.ffn_bptrs_va       = alloc_block_ptrs(m_blocks);
+                d.next_attn_query_va = agx_tensor_gpu_va(Ln.attn_res_query);
+                d.post_ffn_n_blocks  = (uint32_t) m_blocks.size();
+                d.post_ffn_n_queries = Pn.is_swa ? 1u : 3u;
+                post_ffn_do_mix      = true;
+                if (Pn.has_loop) {
+                    d.next_mix_out_va[0] = L.qkv_in_0;
+                    d.next_mix_out_va[1] = L.qkv_in_1;
+                    d.next_mix_out_va[2] = L.qkv_in_2;
+                }
+                m_attn_ready = true;
+                if (!d.ffn_bptrs_va) { m_ok = false; break; }
+            }
+
+            d.flags = (P.is_swa        ? AGX_W5_PFLAG_IS_SWA            : 0u) |
+                      (need_qkv_mix    ? AGX_W5_PFLAG_NEED_QKV_MIX      : 0u) |
+                      (!new_block      ? AGX_W5_PFLAG_POST_ATTN_ADD_RES : 0u) |
+                      (!P.has_loop     ? AGX_W5_PFLAG_POST_ATTN_DO_NORM : 0u) |
+                      (post_ffn_do_mix ? AGX_W5_PFLAG_POST_FFN_DO_MIX   : 0u);
+            d.r_nb1_f32           = P.r_nb1_f32;
+            d.n_expert            = hp.n_expert;
+            d.n_ff_exp            = hp.n_ff_exp;
+            d.post_conv_res_scale = 1.0f / std::sqrt(5.0f);
+            d.rms_eps             = hp.f_norm_rms_eps;
+            d.router_norm_eps     = hp.expert_weights_norm_eps;
+            d.router_w_scale      = (hp.expert_weights_scale != 0.0f) ? hp.expert_weights_scale : 1.0f;
+            d.n_tokens            = M;
+            d.rollback_slots      = P.rollback_slots;
+            d.rollback_stride_f32 = P.rollback_stride_f32;
+
+            m_cur_va = next_cur_va;
+        }
+        if (m_ok) {
+            void * md_cpu = nullptr;
+            w5m_descs_gpu_va = agx_cdm_alloc_args(stream, sizeof(mdescs), AGX_CACHE_LINE_BYTES, &md_cpu);
+            if (w5m_descs_gpu_va && md_cpu) {
+                std::memcpy(md_cpu, mdescs, sizeof(mdescs));
+                agx_slc_arena_reset_sense_barrier(slc, 40u);
+                use_w5_m_hybrid = true;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Main 48-Pass Loop (v = 0..47) — Wave 4 / Wave 6 M=2..8 Hybrid Path
+    // ------------------------------------------------------------------------
+    bool w5m_qkv_ctrl_done = false;
     for (uint32_t v = 0; !ran_w5_persistent && v < 48u; ++v) {
         const auto & P     = G.passes[v];
         const auto & layer = W.layers[P.ip];
@@ -4193,7 +4370,9 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
         }
 
         // ---- Stage 0a: Ensure Q/K/V inputs are ready (only needed for v==18,30 or looped ctrl_gates!) ----
-        if (P.has_loop) {
+        const bool skip_qkv_ctrl = w5m_qkv_ctrl_done;
+        w5m_qkv_ctrl_done = false;
+        if (P.has_loop && !skip_qkv_ctrl) {
             // Compute cross-pass messages = mix(bank, va_bank_out, loop->msg_query) -> slc->h_msg
             uint64_t msg_states[2] = { bank[0], va_bank_out };
             if (!agx_inkling2_dispatch_depth_mix(eng, stream, msg_states, 2u,
@@ -4608,13 +4787,24 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
             return false;
         }
 
-        // ---- Stage 2a: Fused attn_post_conv + state-store + block-res + ffn_depth_mix (+ ffn_norm if !has_loop) ----
+        // ---- Stage 2a + FFN Loop Ctrl + Stage 2b (Router): 1-dispatch M=2..8 Hybrid OR unfused ----
         const bool new_block = (P.ip % hp.attn_res_block_size == 0u);
         if (new_block) {
             // cur_va already resides in its permanent static res_blocks slot (va_h_0 / va_prelude / va_h12_* / va_cur_p2)!
             blocks.push_back(cur_va);
         }
 
+        if (use_w5_m_hybrid) {
+            agx_w5_persist_push ppc{};
+            ppc.descs_va   = w5m_descs_gpu_va + (uint64_t) v * sizeof(agx_w5_pass_desc);
+            ppc.barrier_va = slc->sense_barrier_va;
+            ppc.n_passes   = 1u;
+            ppc.n_wg       = 40u;
+            if (!agx_cdm_dispatch(stream, eng->k_w5_hybrid_post_attn_rtr_m[P.has_loop ? 1u : 0u],
+                                  40u, 1u, 1u, &ppc, sizeof(ppc), AGX_BARRIER_STRONG_USC)) {
+                return false;
+            }
+        } else {
         {
             agx_w4_stage_prep_desc sd{};
             sd.conv_src_va         = L.x_k;
@@ -4762,6 +4952,7 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
                 return false;
             }
         }
+        } // end else (!use_w5_m_hybrid)
 
         // ---- Stage 2c + Stage 3a: @w4-kv-moe Fused 2-Stage MoE (gate_up+SiTU -> slc->moe_inter -> down+wsum -> L.x_v) ----
         {
@@ -4828,12 +5019,27 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
             }
         }
 
-        // ---- Stage 3b -> NEXT PASS Stage 0a FUSED: ffn_post_conv + state-store + res_add + next depth_mix (+ norm)! ----
+        // ---- Stage 3b -> NEXT PASS Stage 0a FUSED: 1-dispatch M=2..8 Hybrid (v=17..40) OR lean stage_post_ffn ----
         const uint64_t next_cur_va = target_l_out_va(v, cur_va);
         const bool is_pass_reset   = (v == 17u || v == 29u);
         const bool is_final_pass   = (v == 47u);
 
-        {
+        if (use_w5_m_hybrid && v < 47u && G.passes[v + 1u].has_loop) {
+            agx_w5_persist_push ppc{};
+            ppc.descs_va   = w5m_descs_gpu_va + (uint64_t) v * sizeof(agx_w5_pass_desc);
+            ppc.barrier_va = slc->sense_barrier_va;
+            ppc.n_passes   = 1u;
+            ppc.n_wg       = 40u;
+            if (!agx_cdm_dispatch(stream, eng->k_w5_hybrid_post_ffn_ctrl_m,
+                                  40u, 1u, 1u, &ppc, sizeof(ppc), AGX_BARRIER_STRONG_USC)) {
+                return false;
+            }
+            if (!is_pass_reset) attn_inputs_ready = true;
+            w5m_qkv_ctrl_done = true;
+            if (!emit_layer_inp_stores(P.layer_inp_stores, next_cur_va)) {
+                return false;
+            }
+        } else {
             agx_w4_stage_prep_desc sd{};
             sd.conv_src_va         = L.moe_out;
             sd.res_va              = va_ffn_inp;

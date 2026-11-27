@@ -458,7 +458,10 @@ struct alignas(16) agx_w5_pass_desc {
     float    situ_beta;
     float    situ_linear_beta;
     uint32_t sink_proj_row_B;
-    uint32_t reserved[28]; // pad to 1152 B = exact 9 x 128B cache lines
+    uint32_t n_tokens;
+    uint32_t rollback_slots;
+    uint32_t rollback_stride_f32;
+    uint32_t reserved[25]; // pad to 1152 B = exact 9 x 128B cache lines
 };
 static_assert(sizeof(agx_w5_pass_desc) == 1152, "agx_w5_pass_desc must be 1152B (9 x 128B cache lines)");
 
