@@ -1,0 +1,625 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+// ============================================================================
+// Pillar 4: Fused Full-Attention Split-K Flash-Decoding (1M-Context Paged +
+//           External Contiguous KV) & Fused KV-Append Kernel
+// ============================================================================
+// Target: Apple Silicon AGX3B (M4 Max, 40 cores, 32-lane simdgroup)
+// Budget: <= 96 32-bit GPRs/lane, 0:0 spills
+//
+// Compile-time modes (single file keeps Phase 1, Phase 2, and KV-append in sync):
+//   PASS_MODE = 0 : Phase 1 Split-K Flash-Decoding across all 40 cores
+//                   (when n_splits == 1, writes final output + sink + FWHT64 + Qgate!)
+//   PASS_MODE = 1 : Phase 2 Split-K Reduction + single-application sink + FWHT64 + Qgate
+//   PASS_MODE = 2 : Fused KV-Append (quantizes F32/F16 K/V -> F8_E4M3 / Q8_0_PLANAR / F16
+//                   into SWA-1024 ring OR 64-token paged full-attn pool + pos table)
+//
+//   KV_DTYPE  = 0 (F8_E4M3), 1 (Q8_0_PLANAR), 2 (F16), 3 (F32), 4 (Q8_0_GGML)
+//   N_SG      = 4 (128 threads/WG for Phase 1; 1 simdgroup = 32 threads for Phase 2/Append)
+
+#ifndef PASS_MODE
+#define PASS_MODE 0
+#endif
+
+#ifndef KV_DTYPE
+#define KV_DTYPE 0
+#endif
+
+#ifndef N_SG
+#define N_SG 4
+#endif
+
+#if PASS_MODE == 0
+layout(local_size_x = 32, local_size_y = N_SG, local_size_z = 1) in;
+#else
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+#endif
+
+layout(buffer_reference, scalar, buffer_reference_align = 1) readonly  buffer BufU8    { uint8_t   d[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 1) writeonly buffer BufU8W   { uint8_t   d[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 2) readonly  buffer BufF16   { float16_t d[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 2) writeonly buffer BufF16W  { float16_t d[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly  buffer BufF32   { float     d[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) writeonly buffer BufF32W  { float     d[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly  buffer BufU32   { uint      d[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) writeonly buffer BufU32W  { uint      d[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly  buffer BufI32   { int       d[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) writeonly buffer BufI32W  { int       d[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly  buffer BufU64   { uint64_t  d[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly  buffer BufUvec2 { uvec2     d[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 8) writeonly buffer BufUvec2W{ uvec2     d[]; };
+
+// Flags matching agx_attn_flags in agx-kv-hybrid.h
+const uint FLAG_CAUSAL            = 1u << 0;
+const uint FLAG_SWA_WINDOW        = 1u << 1;
+const uint FLAG_HAS_REL_TABLE     = 1u << 2;
+const uint FLAG_REL_TABLE_SINK    = 1u << 3;
+const uint FLAG_SINK_PER_HEAD     = 1u << 4;
+const uint FLAG_SINK_PER_TOK_HEAD = 1u << 5;
+const uint FLAG_HAS_MASK_F16      = 1u << 6;
+const uint FLAG_HAS_MASK_F32      = 1u << 7;
+const uint FLAG_FWHT64            = 1u << 8;
+const uint FLAG_QGATE_F32         = 1u << 9;
+const uint FLAG_QGATE_F16         = 1u << 10;
+const uint FLAG_SOFTCAP           = 1u << 11;
+const uint FLAG_ALIBI             = 1u << 12;
+const uint FLAG_PAGED_KV          = 1u << 13;
+const uint FLAG_SWA_RING_KV       = 1u << 14;
+const uint FLAG_Q_F16             = 1u << 15;
+const uint FLAG_OUT_F16           = 1u << 16;
+
+// Common E4M3FN & FWHT64 helpers
+float decode_e4m3_byte(uint b) {
+    uint s = (b & 0x80u) << 24;
+    uint e = (b >> 3) & 0x0Fu;
+    uint m = b & 0x07u;
+    float sub = (s != 0u ? -1.0f : 1.0f) * float(m) * 0.001953125f;
+    float nrm = uintBitsToFloat(s | ((e + 120u) << 23) | (m << 20));
+    return (e == 0u) ? sub : nrm;
+}
+
+vec4 decode_e4m3_u32(uint packed) {
+    return vec4(
+        decode_e4m3_byte( packed        & 0xFFu),
+        decode_e4m3_byte((packed >>  8) & 0xFFu),
+        decode_e4m3_byte((packed >> 16) & 0xFFu),
+        decode_e4m3_byte((packed >> 24) & 0xFFu)
+    );
+}
+
+uint encode_e4m3_byte(float x) {
+    uint sign_bit = (floatBitsToUint(x) >> 24) & 0x80u;
+    float ax = min(abs(x), 448.0f);
+    if (ax < 0.015625f) {
+        // Subnormal range [0, 2^-6): step = 2^-9 = 1/512
+        uint m = uint(clamp(roundEven(ax * 512.0f), 0.0f, 8.0f));
+        if (m == 8u) {
+            return sign_bit | (1u << 3); // rounded up to min normal 2^-6
+        }
+        return sign_bit | m;
+    }
+    uint bits = floatBitsToUint(ax);
+    int  exp_unbiased = int((bits >> 23) & 0xFFu) - 127;
+    uint mant23       = bits & 0x7FFFFFu;
+    // Round-to-nearest-even from 23 bits to 3 bits (drop 20 bits)
+    uint rem = mant23 & 0xFFFFFu;
+    uint m3  = mant23 >> 20;
+    if (rem > 0x80000u || (rem == 0x80000u && (m3 & 1u) != 0u)) {
+        m3 += 1u;
+        if (m3 == 8u) {
+            m3 = 0u;
+            exp_unbiased += 1;
+        }
+    }
+    int e4 = exp_unbiased + 7;
+    if (e4 >= 15) {
+        // Clamp to finite E4M3FN max (e=15, m=6 -> 448.0; never emit 0x7F NaN!)
+        return sign_bit | (15u << 3) | 6u;
+    }
+    return sign_bit | (uint(e4) << 3) | m3;
+}
+
+vec4 fwht64_in_reg(vec4 v, uint lane) {
+    float a0 = v.x + v.y;
+    float a1 = v.x - v.y;
+    float a2 = v.z + v.w;
+    float a3 = v.z - v.w;
+    v = vec4(a0 + a2, a1 + a3, a0 - a2, a1 - a3);
+    vec4 p;
+    p = subgroupShuffleXor(v, 1u); v = ((lane & 1u) != 0u) ? (p - v) : (v + p);
+    p = subgroupShuffleXor(v, 2u); v = ((lane & 2u) != 0u) ? (p - v) : (v + p);
+    p = subgroupShuffleXor(v, 4u); v = ((lane & 4u) != 0u) ? (p - v) : (v + p);
+    p = subgroupShuffleXor(v, 8u); v = ((lane & 8u) != 0u) ? (p - v) : (v + p);
+    return v * 0.125f;
+}
+
+#if PASS_MODE == 0 || PASS_MODE == 1
+
+// Push constants for Phase 1 & Phase 2: 200 bytes (<= 256 B AGX push window!)
+layout(push_constant) uniform PushAttn {
+    uint64_t q_va;
+    uint64_t k_or_pt_va;      // paged: page_table_va[max_pages]; ext: ext_k_va
+    uint64_t v_va;            // ext: ext_v_va (paged uses page_va + page_v_off_B)
+    uint64_t pos_kv_va;       // int32_t pos_full[n_kv] (0 -> kv_idx)
+    uint64_t rel_table_va;    // [M, Hq, n_rel_extent+1] F32
+    uint64_t sinks_va;        // [Hq] or [M, Hq] F32
+    uint64_t q_gate_va;       // [M, Hq, D] F32/F16
+    uint64_t pos_q_va;        // [M] int32_t (0 -> pos_q_base + tok)
+    uint64_t kq_mask_va;      // optional [M, n_kv] F16/F32
+    uint64_t partial_va;      // SLC scratch: [M, Hq, n_splits, (128 + 2)] F32
+    uint64_t out_va;          // [M, Hq, D] F32/F16
+
+    uint     n_tokens;        // M
+    uint     n_kv;            // total KV entries
+    uint     n_splits;        // 1..64
+    uint     n_head_q;        // 24
+    uint     n_head_kv;       // 8
+    uint     head_dim;        // 128
+    uint     n_rel_extent;
+    uint     pos_q_base;
+    uint     flags;
+    uint     page_v_off_B;    // paged: byte offset to V data inside 64-tok page
+    uint     page_ks_off_B;   // paged Q8_0: byte offset to K scales
+    uint     page_vs_off_B;   // paged Q8_0: byte offset to V scales
+    uint     ext_k_nb1;       // ext: byte stride per KV token
+    uint     ext_k_nb2;       // ext: byte stride per KV head
+    uint     ext_v_nb1;
+    uint     ext_v_nb2;
+    uint     ext_mask_nb1;    // ext mask row byte stride
+    uint     ext_mask_nb2;    // ext mask head byte stride (0 = broadcast)
+    uint     q_nb1;           // Q token byte stride
+    uint     q_nb2;           // Q head byte stride
+    uint     mask_n_head_log2;
+    float    kq_scale;
+    float    logit_softcap;
+    float    m0;
+    float    m1;
+} pc;
+
+float compute_alibi_slope(uint h_q) {
+    if ((pc.flags & FLAG_ALIBI) == 0u) {
+        return 1.0f;
+    }
+    uint n_log2 = pc.mask_n_head_log2;
+    float base  = (h_q < n_log2) ? pc.m0 : pc.m1;
+    int   exph  = (h_q < n_log2) ? int(h_q + 1u) : int(2u * (h_q - n_log2) + 1u);
+    return pow(base, float(exph));
+}
+
+void apply_epilogue_and_store(vec4 out_v, uint tok, uint h_q, uint lane) {
+    const uint q_head_off = (tok * pc.n_head_q + h_q) * 128u + lane * 4u;
+
+    if ((pc.flags & FLAG_FWHT64) != 0u) {
+        out_v = fwht64_in_reg(out_v, lane);
+    }
+
+    if ((pc.flags & FLAG_QGATE_F32) != 0u && pc.q_gate_va != 0ul) {
+        BufF32 gb = BufF32(pc.q_gate_va);
+        vec4 g = vec4(gb.d[q_head_off + 0u], gb.d[q_head_off + 1u],
+                      gb.d[q_head_off + 2u], gb.d[q_head_off + 3u]);
+        out_v *= 1.0f / (1.0f + exp(-g));
+    } else if ((pc.flags & FLAG_QGATE_F16) != 0u && pc.q_gate_va != 0ul) {
+        uvec2 gp = BufUvec2(pc.q_gate_va).d[(tok * pc.n_head_q + h_q) * 32u + lane];
+        vec4 g = vec4(unpackHalf2x16(gp.x), unpackHalf2x16(gp.y));
+        out_v *= 1.0f / (1.0f + exp(-g));
+    }
+
+    if ((pc.flags & FLAG_OUT_F16) != 0u) {
+        BufF16W ob = BufF16W(pc.out_va);
+        ob.d[q_head_off + 0u] = float16_t(out_v.x);
+        ob.d[q_head_off + 1u] = float16_t(out_v.y);
+        ob.d[q_head_off + 2u] = float16_t(out_v.z);
+        ob.d[q_head_off + 3u] = float16_t(out_v.w);
+    } else {
+        BufF32W ob = BufF32W(pc.out_va);
+        ob.d[q_head_off + 0u] = out_v.x;
+        ob.d[q_head_off + 1u] = out_v.y;
+        ob.d[q_head_off + 2u] = out_v.z;
+        ob.d[q_head_off + 3u] = out_v.w;
+    }
+}
+
+void get_sink_info(uint tok, uint h_q, out bool has_sink, out float eff_sink) {
+    has_sink = false;
+    eff_sink = 0.0f;
+    if ((pc.flags & FLAG_REL_TABLE_SINK) != 0u) {
+        has_sink = true;
+        eff_sink = 0.0f;
+    } else if ((pc.flags & FLAG_SINK_PER_TOK_HEAD) != 0u && pc.sinks_va != 0ul) {
+        has_sink = true;
+        eff_sink = BufF32(pc.sinks_va).d[tok * pc.n_head_q + h_q];
+    } else if ((pc.flags & FLAG_SINK_PER_HEAD) != 0u && pc.sinks_va != 0ul) {
+        has_sink = true;
+        eff_sink = BufF32(pc.sinks_va).d[h_q];
+    }
+}
+
+#endif // PASS_MODE == 0 || PASS_MODE == 1
+
+#if PASS_MODE == 0
+
+shared float sh_m[N_SG];
+shared float sh_l[N_SG];
+shared vec4  sh_o[N_SG][32];
+
+vec4 load_paged_kv(uint64_t page_va, uint v_or_k_off_B, uint sc_off_B, uint in_page, uint h_kv, uint lane) {
+    const uint head_idx = in_page * pc.n_head_kv + h_kv;
+    const uint64_t data_va = page_va + uint64_t(v_or_k_off_B);
+#if KV_DTYPE == 0
+    uint packed = BufU32(data_va).d[head_idx * 32u + lane];
+    return decode_e4m3_u32(packed);
+#elif KV_DTYPE == 1
+    uint packed = BufU32(data_va).d[head_idx * 32u + lane];
+    float sc = float(BufF16(page_va + uint64_t(sc_off_B)).d[head_idx * 4u + (lane >> 3)]);
+    return vec4(
+        float(bitfieldExtract(int(packed),  0, 8)),
+        float(bitfieldExtract(int(packed),  8, 8)),
+        float(bitfieldExtract(int(packed), 16, 8)),
+        float(bitfieldExtract(int(packed), 24, 8))
+    ) * sc;
+#elif KV_DTYPE == 2
+    uvec2 p = BufUvec2(data_va).d[head_idx * 32u + lane];
+    return vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y));
+#else
+    BufF32 fb = BufF32(data_va);
+    uint off = head_idx * 128u + lane * 4u;
+    return vec4(fb.d[off + 0u], fb.d[off + 1u], fb.d[off + 2u], fb.d[off + 3u]);
+#endif
+}
+
+vec4 load_ext_kv(uint64_t base_va, uint nb1, uint nb2, uint kv_idx, uint h_kv, uint lane) {
+    const uint64_t row_va = base_va + uint64_t(kv_idx) * uint64_t(nb1) + uint64_t(h_kv) * uint64_t(nb2);
+#if KV_DTYPE == 0
+    uint packed = BufU32(row_va).d[lane];
+    return decode_e4m3_u32(packed);
+#elif KV_DTYPE == 2
+    uvec2 p = BufUvec2(row_va).d[lane];
+    return vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y));
+#elif KV_DTYPE == 3
+    BufF32 fb = BufF32(row_va);
+    uint o = lane * 4u;
+    return vec4(fb.d[o + 0u], fb.d[o + 1u], fb.d[o + 2u], fb.d[o + 3u]);
+#elif KV_DTYPE == 4
+    // Standard ggml block_q8_0: 34 bytes per 32 elements (2B fp16 d + 32B int8 qs)
+    uint blk = lane >> 3;        // 0..3
+    uint sub = (lane & 7u) * 4u; // 0..28
+    uint64_t blk_va = row_va + uint64_t(blk) * 34ul;
+    float sc = float(BufF16(blk_va).d[0]);
+    BufU8 qb = BufU8(blk_va + 2ul);
+    int q0 = bitfieldExtract(int(uint(qb.d[sub + 0u])), 0, 8);
+    int q1 = bitfieldExtract(int(uint(qb.d[sub + 1u])), 0, 8);
+    int q2 = bitfieldExtract(int(uint(qb.d[sub + 2u])), 0, 8);
+    int q3 = bitfieldExtract(int(uint(qb.d[sub + 3u])), 0, 8);
+    return vec4(float(q0), float(q1), float(q2), float(q3)) * sc;
+#else
+    uvec2 p = BufUvec2(row_va).d[lane];
+    return vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y));
+#endif
+}
+
+void main() {
+    const uint lane  = gl_LocalInvocationID.x;
+    const uint sg    = gl_LocalInvocationID.y;
+    const uint h_q   = gl_WorkGroupID.x;
+    const uint tok   = gl_WorkGroupID.y;
+    const uint split = gl_WorkGroupID.z;
+
+    if (h_q >= pc.n_head_q || tok >= pc.n_tokens || split >= pc.n_splits) {
+        return;
+    }
+
+    const uint     gqa_ratio = pc.n_head_q / pc.n_head_kv;
+    const uint     h_kv      = h_q / gqa_ratio;
+    const uint64_t q_row_va  = pc.q_va + uint64_t(tok) * uint64_t(pc.q_nb1) + uint64_t(h_q) * uint64_t(pc.q_nb2);
+
+    vec4 q_reg;
+    if ((pc.flags & FLAG_Q_F16) != 0u) {
+        uvec2 qp = BufUvec2(q_row_va).d[lane];
+        q_reg = vec4(unpackHalf2x16(qp.x), unpackHalf2x16(qp.y)) * pc.kq_scale;
+    } else {
+        BufF32 qb = BufF32(q_row_va);
+        uint o = lane * 4u;
+        q_reg = vec4(qb.d[o + 0u], qb.d[o + 1u], qb.d[o + 2u], qb.d[o + 3u]) * pc.kq_scale;
+    }
+
+    const uint k_start = uint((uint64_t(split)      * uint64_t(pc.n_kv)) / uint64_t(pc.n_splits));
+    const uint k_end   = uint((uint64_t(split + 1u) * uint64_t(pc.n_kv)) / uint64_t(pc.n_splits));
+
+    const int  pos_q        = (pc.pos_q_va != 0ul) ? BufI32(pc.pos_q_va).d[tok] : int(pc.pos_q_base + tok);
+    const bool is_paged     = (pc.flags & FLAG_PAGED_KV) != 0u;
+    const bool is_causal    = (pc.flags & FLAG_CAUSAL) != 0u;
+    const bool has_rel      = (pc.flags & FLAG_HAS_REL_TABLE) != 0u && (pc.rel_table_va != 0ul);
+    const bool has_mask_f16 = (pc.flags & FLAG_HAS_MASK_F16) != 0u && (pc.kq_mask_va != 0ul);
+    const bool has_mask_f32 = (pc.flags & FLAG_HAS_MASK_F32) != 0u && (pc.kq_mask_va != 0ul);
+    const bool has_softcap  = (pc.flags & FLAG_SOFTCAP) != 0u && (pc.logit_softcap != 0.0f);
+    const float slope       = compute_alibi_slope(h_q);
+
+    const uint rel_stride = pc.n_rel_extent + 1u;
+    const uint rel_base   = (tok * pc.n_head_q + h_q) * rel_stride;
+    const uint64_t mask_row_va = pc.kq_mask_va
+        + uint64_t(tok) * uint64_t(pc.ext_mask_nb1)
+        + uint64_t(h_q) * uint64_t(pc.ext_mask_nb2);
+
+    float m_i = -3.402823466e+38f * 0.5f;
+    float l_i = 0.0f;
+    vec4  o_i = vec4(0.0f);
+
+    for (uint kv = k_start + sg; kv < k_end; kv += N_SG) {
+        float mv = 0.0f;
+        if (has_mask_f16) {
+            mv = float(BufF16(mask_row_va).d[kv]) * slope;
+            if (isinf(mv) && mv < 0.0f) {
+                continue;
+            }
+        } else if (has_mask_f32) {
+            mv = BufF32(mask_row_va).d[kv] * slope;
+            if (isinf(mv) && mv < 0.0f) {
+                continue;
+            }
+        }
+
+        int pos_k = (pc.pos_kv_va != 0ul) ? BufI32(pc.pos_kv_va).d[kv] : int(kv);
+        int dist  = pos_q - pos_k;
+        if (is_causal && (pos_k < 0 || dist < 0)) {
+            continue;
+        }
+
+        vec4 k_reg;
+        vec4 v_reg;
+        if (is_paged) {
+            uint64_t page_va = BufU64(pc.k_or_pt_va).d[kv >> 6];
+            uint     in_page = kv & 63u;
+            k_reg = load_paged_kv(page_va, 0u,              pc.page_ks_off_B, in_page, h_kv, lane);
+            v_reg = load_paged_kv(page_va, pc.page_v_off_B, pc.page_vs_off_B, in_page, h_kv, lane);
+        } else {
+            k_reg = load_ext_kv(pc.k_or_pt_va, pc.ext_k_nb1, pc.ext_k_nb2, kv, h_kv, lane);
+            v_reg = load_ext_kv(pc.v_va,       pc.ext_v_nb1, pc.ext_v_nb2, kv, h_kv, lane);
+        }
+
+        float score = subgroupAdd(dot(q_reg, k_reg));
+        if (has_softcap) {
+            score = pc.logit_softcap * tanh(score);
+        }
+        score += mv;
+
+        if (has_rel) {
+            uint d_idx = (dist >= 0) ? min(uint(dist), pc.n_rel_extent) : pc.n_rel_extent;
+            score += BufF32(pc.rel_table_va).d[rel_base + d_idx];
+        }
+
+        float m_new = max(m_i, score);
+        float alpha = exp(m_i - m_new);
+        float p_w   = exp(score - m_new);
+        o_i = o_i * alpha + v_reg * p_w;
+        l_i = l_i * alpha + p_w;
+        m_i = m_new;
+    }
+
+    if (lane == 0u) {
+        sh_m[sg] = m_i;
+        sh_l[sg] = l_i;
+    }
+    sh_o[sg][lane] = o_i;
+    barrier();
+
+    if (sg == 0u) {
+        float m_wg = -3.402823466e+38f * 0.5f;
+        for (uint s = 0u; s < N_SG; ++s) {
+            if (sh_l[s] > 0.0f) {
+                m_wg = max(m_wg, sh_m[s]);
+            }
+        }
+
+        float l_wg = 0.0f;
+        vec4  o_wg = vec4(0.0f);
+        for (uint s = 0u; s < N_SG; ++s) {
+            if (sh_l[s] > 0.0f) {
+                float w = exp(sh_m[s] - m_wg);
+                l_wg += sh_l[s] * w;
+                o_wg += sh_o[s][lane] * w;
+            }
+        }
+
+        if (pc.n_splits == 1u) {
+            // Single-pass fastpath: apply sink ONCE + epilogue + store directly!
+            bool  has_sink;
+            float eff_sink;
+            get_sink_info(tok, h_q, has_sink, eff_sink);
+            if (has_sink) {
+                float m_fin = (l_wg > 0.0f) ? max(m_wg, eff_sink) : eff_sink;
+                float w_o   = (l_wg > 0.0f) ? exp(m_wg - m_fin) : 0.0f;
+                float w_s   = exp(eff_sink - m_fin);
+                o_wg = o_wg * w_o;
+                l_wg = l_wg * w_o + w_s;
+            }
+            vec4 out_v = (l_wg > 0.0f) ? (o_wg / l_wg) : vec4(0.0f);
+            apply_epilogue_and_store(out_v, tok, h_q, lane);
+        } else {
+            // Write partial (o_wg[128], m_wg, l_wg) into SLC-pinned partial scratch
+            // Layout: ((tok * Hq + h_q) * n_splits + split) * 130 floats
+            const uint base = ((tok * pc.n_head_q + h_q) * pc.n_splits + split) * 130u;
+            BufF32W pb = BufF32W(pc.partial_va);
+            pb.d[base + lane * 4u + 0u] = o_wg.x;
+            pb.d[base + lane * 4u + 1u] = o_wg.y;
+            pb.d[base + lane * 4u + 2u] = o_wg.z;
+            pb.d[base + lane * 4u + 3u] = o_wg.w;
+            if (lane == 0u) {
+                pb.d[base + 128u] = m_wg;
+                pb.d[base + 129u] = l_wg;
+            }
+        }
+    }
+}
+
+#elif PASS_MODE == 1
+
+// Phase 2: Split-K Reduction (1 simdgroup per (h_q, tok))
+// Applies the learned sink ONCE globally, then optional FWHT64 + sigmoid(Qgate).
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    const uint h_q  = gl_WorkGroupID.x;
+    const uint tok  = gl_WorkGroupID.y;
+
+    if (h_q >= pc.n_head_q || tok >= pc.n_tokens) {
+        return;
+    }
+
+    bool  has_sink;
+    float eff_sink;
+    get_sink_info(tok, h_q, has_sink, eff_sink);
+
+    BufF32 pb = BufF32(pc.partial_va);
+    const uint head_base = (tok * pc.n_head_q + h_q) * pc.n_splits * 130u;
+
+    float m_tot = has_sink ? eff_sink : (-3.402823466e+38f * 0.5f);
+    for (uint s = 0u; s < pc.n_splits; ++s) {
+        uint off = head_base + s * 130u;
+        float ls = pb.d[off + 129u];
+        if (ls > 0.0f) {
+            m_tot = max(m_tot, pb.d[off + 128u]);
+        }
+    }
+
+    float l_tot = has_sink ? exp(eff_sink - m_tot) : 0.0f;
+    vec4  o_tot = vec4(0.0f);
+    for (uint s = 0u; s < pc.n_splits; ++s) {
+        uint off = head_base + s * 130u;
+        float ls = pb.d[off + 129u];
+        if (ls > 0.0f) {
+            float ms = pb.d[off + 128u];
+            float w  = exp(ms - m_tot);
+            l_tot += ls * w;
+            uint d_off = off + lane * 4u;
+            o_tot += vec4(pb.d[d_off + 0u], pb.d[d_off + 1u],
+                          pb.d[d_off + 2u], pb.d[d_off + 3u]) * w;
+        }
+    }
+
+    vec4 out_v = (l_tot > 0.0f) ? (o_tot / l_tot) : vec4(0.0f);
+    apply_epilogue_and_store(out_v, tok, h_q, lane);
+}
+
+#elif PASS_MODE == 2
+
+// ============================================================================
+// Fused KV Append Kernel (1 simdgroup per (h_kv, tok))
+// Quantizes K_new & V_new [M, Hkv, 128] into either SWA-1024 ring OR 64-token
+// paged full-attention pool, and records token position in pos_va.
+// ============================================================================
+layout(push_constant) uniform PushAppend {
+    uint64_t k_src_va;
+    uint64_t v_src_va;
+    uint64_t dst_k_or_pt_va; // SWA: slot K base; Paged: page_table_va
+    uint64_t dst_v_va;       // SWA: slot V base (unused for Paged)
+    uint64_t dst_ks_va;      // SWA Q8_0: K scales base
+    uint64_t dst_vs_va;      // SWA Q8_0: V scales base
+    uint64_t pos_dst_va;     // int32_t pos_ring[W] or pos_full[max_tok]
+    uint64_t pos_src_va;     // optional [M] int32_t (0 -> kv_write_base + tok)
+    uint     n_tokens;
+    uint     n_head_kv;
+    uint     kv_write_base;
+    uint     ring_mask;      // swa_window - 1 (0 if paged)
+    uint     page_v_off_B;
+    uint     page_ks_off_B;
+    uint     page_vs_off_B;
+    uint     flags;          // bit 0: is_paged, bit 1: src_is_f16
+} pa;
+
+void store_quant_vec4(vec4 val, uint64_t data_va, uint64_t scale_va, uint head_idx, uint lane) {
+#if KV_DTYPE == 0
+    uint b0 = encode_e4m3_byte(val.x);
+    uint b1 = encode_e4m3_byte(val.y);
+    uint b2 = encode_e4m3_byte(val.z);
+    uint b3 = encode_e4m3_byte(val.w);
+    BufU32W(data_va).d[head_idx * 32u + lane] = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+#elif KV_DTYPE == 1
+    // 8 lanes = 32 elements = 1 Q8_0 block (subgroup-local 8-lane max reduction!)
+    float amax = max(max(abs(val.x), abs(val.y)), max(abs(val.z), abs(val.w)));
+    amax = max(amax, subgroupShuffleXor(amax, 1u));
+    amax = max(amax, subgroupShuffleXor(amax, 2u));
+    amax = max(amax, subgroupShuffleXor(amax, 4u));
+    float d     = amax / 127.0f;
+    float id    = (d != 0.0f) ? (1.0f / d) : 0.0f;
+    int q0 = int(clamp(roundEven(val.x * id), -127.0f, 127.0f));
+    int q1 = int(clamp(roundEven(val.y * id), -127.0f, 127.0f));
+    int q2 = int(clamp(roundEven(val.z * id), -127.0f, 127.0f));
+    int q3 = int(clamp(roundEven(val.w * id), -127.0f, 127.0f));
+    uint packed = (uint(q0) & 0xFFu)
+                | ((uint(q1) & 0xFFu) << 8)
+                | ((uint(q2) & 0xFFu) << 16)
+                | ((uint(q3) & 0xFFu) << 24);
+    BufU32W(data_va).d[head_idx * 32u + lane] = packed;
+    if ((lane & 7u) == 0u) {
+        BufF16W(scale_va).d[head_idx * 4u + (lane >> 3)] = float16_t(d);
+    }
+#else
+    uvec2 p = uvec2(packHalf2x16(val.xy), packHalf2x16(val.zw));
+    BufUvec2W(data_va).d[head_idx * 32u + lane] = p;
+#endif
+}
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    const uint h_kv = gl_WorkGroupID.x;
+    const uint tok  = gl_WorkGroupID.y;
+
+    if (h_kv >= pa.n_head_kv || tok >= pa.n_tokens) {
+        return;
+    }
+
+    const uint src_head = tok * pa.n_head_kv + h_kv;
+    const bool is_paged = (pa.flags & 1u) != 0u;
+    const bool is_f16   = (pa.flags & 2u) != 0u;
+
+    vec4 kv_k;
+    vec4 kv_v;
+    if (is_f16) {
+        uvec2 pk = BufUvec2(pa.k_src_va).d[src_head * 32u + lane];
+        uvec2 pv = BufUvec2(pa.v_src_va).d[src_head * 32u + lane];
+        kv_k = vec4(unpackHalf2x16(pk.x), unpackHalf2x16(pk.y));
+        kv_v = vec4(unpackHalf2x16(pv.x), unpackHalf2x16(pv.y));
+    } else {
+        BufF32 kf = BufF32(pa.k_src_va);
+        BufF32 vf = BufF32(pa.v_src_va);
+        uint o = src_head * 128u + lane * 4u;
+        kv_k = vec4(kf.d[o + 0u], kf.d[o + 1u], kf.d[o + 2u], kf.d[o + 3u]);
+        kv_v = vec4(vf.d[o + 0u], vf.d[o + 1u], vf.d[o + 2u], vf.d[o + 3u]);
+    }
+
+    const int pos = (pa.pos_src_va != 0ul)
+        ? BufI32(pa.pos_src_va).d[tok]
+        : int(pa.kv_write_base + tok);
+
+    if (is_paged) {
+        const uint kv_idx  = pa.kv_write_base + tok;
+        const uint64_t pg  = BufU64(pa.dst_k_or_pt_va).d[kv_idx >> 6];
+        const uint in_page = kv_idx & 63u;
+        const uint dst_hd  = in_page * pa.n_head_kv + h_kv;
+        store_quant_vec4(kv_k, pg,                           pg + uint64_t(pa.page_ks_off_B), dst_hd, lane);
+        store_quant_vec4(kv_v, pg + uint64_t(pa.page_v_off_B), pg + uint64_t(pa.page_vs_off_B), dst_hd, lane);
+        if (h_kv == 0u && lane == 0u && pa.pos_dst_va != 0ul) {
+            BufI32W(pa.pos_dst_va).d[kv_idx] = pos;
+        }
+    } else {
+        const uint ring_idx = uint(pos) & pa.ring_mask;
+        const uint dst_hd   = ring_idx * pa.n_head_kv + h_kv;
+        store_quant_vec4(kv_k, pa.dst_k_or_pt_va, pa.dst_ks_va, dst_hd, lane);
+        store_quant_vec4(kv_v, pa.dst_v_va,       pa.dst_vs_va, dst_hd, lane);
+        if (h_kv == 0u && lane == 0u && pa.pos_dst_va != 0ul) {
+            BufI32W(pa.pos_dst_va).d[ring_idx] = pos;
+        }
+    }
+}
+
+#endif // PASS_MODE

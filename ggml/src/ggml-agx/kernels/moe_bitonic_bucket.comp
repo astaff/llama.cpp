@@ -1,0 +1,325 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+// ============================================================================
+// Pillar 5a: GPU-Resident Bitonic Token-to-Expert Bucketing & Indirect Grid
+//            Emission (Zero CPU Sync, M=1..8 Bitonic + M>8 SRAM Histogram)
+// ============================================================================
+// Target: Apple Silicon AGX3B (M4 Max, 32-lane simdgroup, <= 48 GPRs, 0:0 spills)
+//
+// Compile-time modes:
+//   BUCKET_MODE = 0 : Single-simdgroup (32 lanes) 64-element bitonic sort for
+//                     M * top_k <= 64 (covers B=1 decode & M=5 DSpark verify = 40!)
+//                     Zero global atomics, ~150 cycles, 256B SRAM!
+//   BUCKET_MODE = 1 : 128-thread TG-SRAM histogram + prefix scan for prefill
+//                     M * top_k > 64 (up to M = 8192, E <= 256).
+//   BUCKET_MODE = 2 : Fast zero-fill of `moe_out[M * n_embd]` (F32) when
+//                     `accumulate_out == false` (fuses cleanly before scatter).
+
+#ifndef BUCKET_MODE
+#define BUCKET_MODE 0
+#endif
+
+#if BUCKET_MODE == 0
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+#else
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+#endif
+
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly  buffer BufI32R { int   d[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly  buffer BufF32R { float d[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) writeonly buffer BufU32W { uint  d[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) writeonly buffer BufF32W { float d[]; };
+
+struct AgxIndirectGrid {
+    uint global_x;
+    uint global_y;
+    uint global_z;
+    uint local_x;
+    uint local_y;
+    uint local_z;
+};
+
+struct AgxMoeBucket {
+    uint expert_id;
+    uint token_offset;
+    uint count;
+    uint pad0;
+};
+
+// Exact binary match with agx_moe_bucket_header (128 bytes)
+layout(buffer_reference, scalar, buffer_reference_align = 128) buffer BufBucketHeader {
+    uint            n_active_experts;
+    uint            n_vecmat_buckets;
+    uint            n_gemm_tiles;
+    uint            total_assignments;
+    uint            n_tokens;
+    uint            top_k;
+    uint            n_expert;
+    uint            pad0;
+    AgxIndirectGrid grid_gate_up_vecmat;
+    AgxIndirectGrid grid_down_vecmat;
+    AgxIndirectGrid grid_gate_up_gemm;
+    AgxIndirectGrid grid_down_gemm;
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) writeonly buffer BufBucketArr {
+    AgxMoeBucket b[];
+};
+
+const uint VECMAT_MAX_M = 5u;
+const uint GEMM_TILE_M  = 16u;
+
+layout(push_constant) uniform PushBucket {
+    uint64_t topk_ids_va;        // [M, top_k] int32_t
+    uint64_t topk_w_va;          // [M, top_k] float (optional, 0 -> 1.0f)
+    uint64_t header_va;          // agx_moe_bucket_header (128B)
+    uint64_t vecmat_buckets_va;  // agx_moe_bucket[256]
+    uint64_t gemm_tiles_va;      // agx_moe_bucket[max_gemm_tiles]
+    uint64_t sorted_tok_va;      // uint32_t[M * top_k]
+    uint64_t sorted_kslot_va;    // uint32_t[M * top_k]
+    uint64_t sorted_w_va;        // float[M * top_k]
+    uint64_t moe_out_va;         // [M, n_embd] F32 (for BUCKET_MODE == 2 zeroing)
+    uint     n_tokens;
+    uint     top_k;
+    uint     n_expert;
+    uint     n_ff;
+    uint     n_embd;
+    uint     wg_gate_up_vecmat;  // ceil(n_ff / 32)
+    uint     wg_down_vecmat;     // ceil(n_embd / 64)
+    uint     wg_gate_up_gemm;    // ceil(n_ff / 32)
+    uint     wg_down_gemm;       // ceil(n_embd / 64)
+    uint     max_gemm_tiles;
+    float    exp_scale0;         // hparams.expert_weights_scale (1.0f if already applied)
+    uint     zero_elems;         // M * n_embd (for BUCKET_MODE == 2)
+} pc;
+
+void write_indirect_grids(uint n_active, uint n_vm, uint n_gt, uint total_assign) {
+    BufBucketHeader hdr = BufBucketHeader(pc.header_va);
+    hdr.n_active_experts  = n_active;
+    hdr.n_vecmat_buckets  = n_vm;
+    hdr.n_gemm_tiles      = n_gt;
+    hdr.total_assignments = total_assign;
+    hdr.n_tokens          = pc.n_tokens;
+    hdr.top_k             = pc.top_k;
+    hdr.n_expert          = pc.n_expert;
+    hdr.pad0              = 0u;
+
+    // Emit safe non-zero dummy grid (1 WG that exits immediately) when count == 0
+    // so HAL200/G17P mode-2 indirect launch never sees global_y == 0.
+    const uint safe_vm = max(n_vm, 1u);
+    const uint safe_gt = max(n_gt, 1u);
+
+    // Vec-mat kernels use local_size = (128, 1, 1) (4 simdgroups/WG)
+    hdr.grid_gate_up_vecmat = AgxIndirectGrid(pc.wg_gate_up_vecmat * 128u, safe_vm, 1u, 128u, 1u, 1u);
+    hdr.grid_down_vecmat    = AgxIndirectGrid(pc.wg_down_vecmat    * 128u, safe_vm, 1u, 128u, 1u, 1u);
+    // 8x8 simdgroup_matrix GEMM kernels use local_size = (128, 1, 1) (4 simdgroups/WG)
+    hdr.grid_gate_up_gemm   = AgxIndirectGrid(pc.wg_gate_up_gemm   * 128u, safe_gt, 1u, 128u, 1u, 1u);
+    hdr.grid_down_gemm      = AgxIndirectGrid(pc.wg_down_gemm      * 128u, safe_gt, 1u, 128u, 1u, 1u);
+}
+
+#if BUCKET_MODE == 0
+
+// Single 32-lane simdgroup 64-element bitonic sort (M*K <= 64, e.g. M=5 DSpark verify = 40!)
+// Key encoding: (expert_id << 8) | orig_assign_idx; sentinel = 0xFFFFFFFFu
+shared uint s_keys[64];
+
+void main() {
+    const uint lane  = gl_LocalInvocationID.x; // 0..31
+    const uint total = pc.n_tokens * pc.top_k;
+
+    BufI32R ids = BufI32R(pc.topk_ids_va);
+
+    // Load 2 elements per lane (64 total)
+    uint idx0 = lane;
+    uint idx1 = lane + 32u;
+
+    uint k0 = 0xFFFFFFFFu;
+    if (idx0 < total) {
+        uint eid = uint(ids.d[idx0]);
+        k0 = (eid << 8) | idx0;
+    }
+    uint k1 = 0xFFFFFFFFu;
+    if (idx1 < total) {
+        uint eid = uint(ids.d[idx1]);
+        k1 = (eid << 8) | idx1;
+    }
+
+    s_keys[idx0] = k0;
+    s_keys[idx1] = k1;
+    subgroupMemoryBarrierShared();
+
+    // 64-element bitonic sort network: 6 outer stages x (1..6) inner steps = 21 steps.
+    // Exactly 32 compare-and-swap pairs per step -> 1 pair per lane, 100% SIMD utilization!
+    for (uint size = 2u; size <= 64u; size <<= 1) {
+        for (uint stride = size >> 1; stride >= 1u; stride >>= 1) {
+            // Map lane in [0..31] to pair (i, j) where (i & stride) == 0 and j = i | stride
+            uint low_mask = stride - 1u;
+            uint i        = ((lane & ~low_mask) << 1) | (lane & low_mask);
+            uint j        = i | stride;
+            bool asc      = ((i & size) == 0u);
+
+            uint a = s_keys[i];
+            uint b = s_keys[j];
+            bool swap_ab = asc ? (a > b) : (a < b);
+            s_keys[i] = swap_ab ? b : a;
+            s_keys[j] = swap_ab ? a : b;
+            subgroupMemoryBarrierShared();
+        }
+    }
+
+    // Write sorted (token_idx, k_slot, weight * exp_scale0) for all valid assignments
+    BufU32W out_tok  = BufU32W(pc.sorted_tok_va);
+    BufU32W out_ksl  = BufU32W(pc.sorted_kslot_va);
+    BufF32W out_w    = BufF32W(pc.sorted_w_va);
+    const bool has_w = (pc.topk_w_va != 0ul);
+    BufF32R in_w     = BufF32R(pc.topk_w_va);
+
+    for (uint pass = 0u; pass < 2u; ++pass) {
+        uint pos = lane + pass * 32u;
+        if (pos < total) {
+            uint orig = s_keys[pos] & 0xFFu;
+            out_tok.d[pos] = orig / pc.top_k;
+            out_ksl.d[pos] = orig % pc.top_k;
+            float w = has_w ? in_w.d[orig] : 1.0f;
+            out_w.d[pos] = w * pc.exp_scale0;
+        }
+    }
+
+    // Lane 0 compacts sorted runs into vecmat_buckets (count <= 5) & gemm_tiles (count >= 6)
+    // Total elements <= 64 -> ~64 integer compares in registers (< 40 cycles!)
+    if (lane == 0u) {
+        BufBucketArr vm_arr = BufBucketArr(pc.vecmat_buckets_va);
+        BufBucketArr gt_arr = BufBucketArr(pc.gemm_tiles_va);
+
+        uint n_active = 0u;
+        uint n_vm     = 0u;
+        uint n_gt     = 0u;
+
+        uint p = 0u;
+        while (p < total) {
+            uint eid = s_keys[p] >> 8;
+            uint end = p + 1u;
+            while (end < total && (s_keys[end] >> 8) == eid) {
+                end++;
+            }
+            uint cnt = end - p;
+            n_active++;
+
+            if (cnt <= VECMAT_MAX_M) {
+                vm_arr.b[n_vm++] = AgxMoeBucket(eid, p, cnt, 0u);
+            } else {
+                for (uint off = 0u; off < cnt; off += GEMM_TILE_M) {
+                    uint tlen = min(GEMM_TILE_M, cnt - off);
+                    if (n_gt < pc.max_gemm_tiles) {
+                        gt_arr.b[n_gt++] = AgxMoeBucket(eid, p + off, tlen, 0u);
+                    }
+                }
+            }
+            p = end;
+        }
+
+        write_indirect_grids(n_active, n_vm, n_gt, total);
+    }
+}
+
+#elif BUCKET_MODE == 1
+
+// Prefill bucketing (M * top_k > 64, up to M = 8192, E <= 256):
+// 128-thread TG-SRAM histogram + exclusive scan + parallel scatter!
+shared uint s_counts[256];
+shared uint s_offsets[256];
+shared uint s_cursor[256];
+
+void main() {
+    const uint tid   = gl_LocalInvocationID.x; // 0..127
+    const uint total = pc.n_tokens * pc.top_k;
+    const uint n_exp = min(pc.n_expert, 256u);
+
+    // Clear histogram bins (2 bins/thread)
+    s_counts[tid]        = 0u;
+    s_counts[tid + 128u] = 0u;
+    barrier();
+
+    BufI32R ids = BufI32R(pc.topk_ids_va);
+
+    // Pass 1: Parallel histogram into TG SRAM
+    for (uint i = tid; i < total; i += 128u) {
+        uint eid = uint(ids.d[i]);
+        if (eid < n_exp) {
+            atomicAdd(s_counts[eid], 1u);
+        }
+    }
+    barrier();
+
+    // Pass 2: Exclusive prefix sum + bucket classification (single thread over <= 256 bins)
+    if (tid == 0u) {
+        BufBucketArr vm_arr = BufBucketArr(pc.vecmat_buckets_va);
+        BufBucketArr gt_arr = BufBucketArr(pc.gemm_tiles_va);
+
+        uint sum      = 0u;
+        uint n_active = 0u;
+        uint n_vm     = 0u;
+        uint n_gt     = 0u;
+
+        for (uint e = 0u; e < n_exp; ++e) {
+            uint cnt     = s_counts[e];
+            s_offsets[e] = sum;
+            s_cursor[e]  = sum;
+            if (cnt > 0u) {
+                n_active++;
+                if (cnt <= VECMAT_MAX_M) {
+                    vm_arr.b[n_vm++] = AgxMoeBucket(e, sum, cnt, 0u);
+                } else {
+                    for (uint off = 0u; off < cnt; off += GEMM_TILE_M) {
+                        uint tlen = min(GEMM_TILE_M, cnt - off);
+                        if (n_gt < pc.max_gemm_tiles) {
+                            gt_arr.b[n_gt++] = AgxMoeBucket(e, sum + off, tlen, 0u);
+                        }
+                    }
+                }
+            }
+            sum += cnt;
+        }
+
+        write_indirect_grids(n_active, n_vm, n_gt, sum);
+    }
+    barrier();
+
+    // Pass 3: Parallel scatter into sorted_token_idx / sorted_k_slot / sorted_weight
+    BufU32W out_tok  = BufU32W(pc.sorted_tok_va);
+    BufU32W out_ksl  = BufU32W(pc.sorted_kslot_va);
+    BufF32W out_w    = BufF32W(pc.sorted_w_va);
+    const bool has_w = (pc.topk_w_va != 0ul);
+    BufF32R in_w     = BufF32R(pc.topk_w_va);
+
+    for (uint i = tid; i < total; i += 128u) {
+        uint eid = uint(ids.d[i]);
+        if (eid < n_exp) {
+            uint dst = atomicAdd(s_cursor[eid], 1u);
+            out_tok.d[dst] = i / pc.top_k;
+            out_ksl.d[dst] = i % pc.top_k;
+            float w = has_w ? in_w.d[i] : 1.0f;
+            out_w.d[dst] = w * pc.exp_scale0;
+        }
+    }
+}
+
+#elif BUCKET_MODE == 2
+
+// Fast coalesced zero-fill of moe_out[M * n_embd] (F32) in SLC
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx < pc.zero_elems) {
+        BufF32W(pc.moe_out_va).d[idx] = 0.0f;
+    }
+}
+
+#endif
