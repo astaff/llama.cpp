@@ -2,8 +2,24 @@
 #include "agx-compiler.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 #include <vector>
+
+struct agx_ioto_reloc {
+    uint16_t byte_off;
+    uint16_t dest_half;
+    uint32_t root_delta;
+};
+
+struct agx_ioto_template {
+    uint64_t                    shader_va = 0;
+    uint64_t                    rodata_va = 0;
+    std::vector<uint8_t>        bytes;
+    std::vector<agx_ioto_reloc> relocs;
+};
 
 namespace {
 
@@ -201,6 +217,8 @@ struct uniform_range {
     uint16_t start_halfs;
     uint16_t size_halfs;
     uint64_t address;
+    bool     is_root_rel;
+    uint32_t root_delta;
 };
 
 struct queued_load {
@@ -211,13 +229,18 @@ struct queued_load {
     uint16_t dest_uniform_half;
 };
 
-static bool compose_g17p_ioto_program(const agx_kernel *            kernel,
-                                      const uniform_range *         ranges,
-                                      size_t                        range_count,
-                                      bool                          is_indirect,
-                                      uint8_t *                     out_buf,
-                                      size_t                        out_cap,
-                                      size_t *                      out_len) {
+static bool compose_g17p_ioto_template(const agx_kernel *    kernel,
+                                       const uniform_range * ranges,
+                                       size_t                range_count,
+                                       bool                  is_indirect,
+                                       agx_ioto_template &   out_tmpl) {
+    out_tmpl.shader_va = kernel->shader_va;
+    out_tmpl.rodata_va = (kernel->rodata_size_16 != 0 && kernel->code_bo)
+                             ? (kernel->code_bo->gpu_va + kernel->rodata_offset)
+                             : 0ULL;
+    out_tmpl.bytes.clear();
+    out_tmpl.relocs.clear();
+
     uint8_t tail[AGX_IOTO_STATE_TAIL_SIZE];
     if (!pack_g17p_state_tail(kernel->shader_va,
                               is_indirect ? AGX_IOTO_LDSHDR_F1_INDIRECT : AGX_IOTO_LDSHDR_F1_DIRECT,
@@ -232,22 +255,18 @@ static bool compose_g17p_ioto_program(const agx_kernel *            kernel,
     if (range_count == 0) {
         const size_t total = sizeof(tail) + sizeof(k_g17p_profile_prefix) +
                              sizeof(k_g17p_profile_suffix) + AGX_IOTO_TERMINATE_SIZE;
-        if (total > out_cap) {
-            return false;
-        }
+        out_tmpl.bytes.resize(total);
         size_t off = 0;
-        std::memcpy(out_buf + off, tail, sizeof(tail));
+        std::memcpy(out_tmpl.bytes.data() + off, tail, sizeof(tail));
         off += sizeof(tail);
-        std::memcpy(out_buf + off, k_g17p_profile_prefix, sizeof(k_g17p_profile_prefix));
+        std::memcpy(out_tmpl.bytes.data() + off, k_g17p_profile_prefix, sizeof(k_g17p_profile_prefix));
         off += sizeof(k_g17p_profile_prefix);
-        std::memcpy(out_buf + off, k_g17p_profile_suffix, sizeof(k_g17p_profile_suffix));
+        std::memcpy(out_tmpl.bytes.data() + off, k_g17p_profile_suffix, sizeof(k_g17p_profile_suffix));
         off += sizeof(k_g17p_profile_suffix);
-        out_buf[off + 0] = 0x0e;
-        out_buf[off + 1] = 0x00;
-        out_buf[off + 2] = 0x00;
-        out_buf[off + 3] = 0x00;
-        off += 4;
-        *out_len = off;
+        out_tmpl.bytes[off + 0] = 0x0e;
+        out_tmpl.bytes[off + 1] = 0x00;
+        out_tmpl.bytes[off + 2] = 0x00;
+        out_tmpl.bytes[off + 3] = 0x00;
         return true;
     }
 
@@ -259,10 +278,11 @@ static bool compose_g17p_ioto_program(const agx_kernel *            kernel,
     final_copies.reserve(256);
 
     std::vector<queued_load> pending;
-    uint8_t cur_gpr_dwords = 0;
-    uint64_t cached_base_va = 0;
-    uint16_t cached_base_half = 0;
-    bool has_cached_base = false;
+    uint8_t  cur_gpr_dwords      = 0;
+    uint64_t cached_base_va      = 0;
+    uint16_t cached_base_half    = 0;
+    bool     has_cached_base     = false;
+    bool     cached_base_is_root = false;
 
     auto flush_round = [&](bool into_final_copies) -> bool {
         for (const auto & ld : pending) {
@@ -294,8 +314,9 @@ static bool compose_g17p_ioto_program(const agx_kernel *            kernel,
             }
         }
         pending.clear();
-        cur_gpr_dwords = 0;
-        has_cached_base = false;
+        cur_gpr_dwords      = 0;
+        has_cached_base     = false;
+        cached_base_is_root = false;
         return true;
     };
 
@@ -308,9 +329,10 @@ static bool compose_g17p_ioto_program(const agx_kernel *            kernel,
         const uint32_t total_dwords = rng.size_halfs / 2u;
         uint32_t dw = 0;
         while (dw < total_dwords) {
-            const uint8_t cnt = static_cast<uint8_t>(std::min<uint32_t>(4u, total_dwords - dw));
+            const uint8_t  cnt = static_cast<uint8_t>(std::min<uint32_t>(4u, total_dwords - dw));
             const uint64_t addr = rng.address + static_cast<uint64_t>(dw) * 4u;
-            const uint8_t reserve_dwords = static_cast<uint8_t>(cnt + 2u); // 2 dwords base + cnt data
+            const uint32_t root_delta = rng.root_delta + dw * 4u;
+            const uint8_t  reserve_dwords = static_cast<uint8_t>(cnt + 2u); // 2 dwords base + cnt data
 
             // GPU0 limit is 97 GPR dwords per round
             if (static_cast<unsigned>(cur_gpr_dwords) + reserve_dwords >= 97u) {
@@ -325,19 +347,32 @@ static bool compose_g17p_ioto_program(const agx_kernel *            kernel,
 
             uint16_t use_base_half = base_temp_half;
             int16_t  delta = 0;
-            if (has_cached_base && addr >= cached_base_va && (addr - cached_base_va) <= 32767ULL) {
+            if (has_cached_base && (rng.is_root_rel == cached_base_is_root) &&
+                addr >= cached_base_va && (addr - cached_base_va) <= 32767ULL) {
                 use_base_half = cached_base_half;
                 delta = static_cast<int16_t>(addr - cached_base_va);
             } else {
+                const size_t ldimm_off = pre_copy.size();
+                if (rng.is_root_rel) {
+                    if (ldimm_off > UINT16_MAX) {
+                        return false;
+                    }
+                    out_tmpl.relocs.push_back({
+                        static_cast<uint16_t>(ldimm_off),
+                        base_temp_half,
+                        root_delta,
+                    });
+                }
                 uint8_t lo[8], hi[8];
                 pack_ldimm_long(base_temp_half, static_cast<uint32_t>(addr), lo);
                 pack_ldimm_long(static_cast<uint16_t>(base_temp_half + 2u),
                                 static_cast<uint32_t>(addr >> 32), hi);
                 pre_copy.insert(pre_copy.end(), lo, lo + 8);
                 pre_copy.insert(pre_copy.end(), hi, hi + 8);
-                cached_base_va   = addr;
-                cached_base_half = base_temp_half;
-                has_cached_base  = true;
+                cached_base_va      = addr;
+                cached_base_half    = base_temp_half;
+                has_cached_base     = true;
+                cached_base_is_root = rng.is_root_rel;
             }
 
             pending.push_back({
@@ -357,29 +392,32 @@ static bool compose_g17p_ioto_program(const agx_kernel *            kernel,
 
     const size_t total = pre_copy.size() + sizeof(tail) + sizeof(k_g17p_profile_prefix) +
                          final_copies.size() + sizeof(k_g17p_profile_suffix) + AGX_IOTO_TERMINATE_SIZE;
-    if (total > out_cap) {
-        return false;
-    }
+    out_tmpl.bytes.resize(total);
 
     size_t off = 0;
-    std::memcpy(out_buf + off, pre_copy.data(), pre_copy.size());
+    std::memcpy(out_tmpl.bytes.data() + off, pre_copy.data(), pre_copy.size());
     off += pre_copy.size();
-    std::memcpy(out_buf + off, tail, sizeof(tail));
+    std::memcpy(out_tmpl.bytes.data() + off, tail, sizeof(tail));
     off += sizeof(tail);
-    std::memcpy(out_buf + off, k_g17p_profile_prefix, sizeof(k_g17p_profile_prefix));
+    std::memcpy(out_tmpl.bytes.data() + off, k_g17p_profile_prefix, sizeof(k_g17p_profile_prefix));
     off += sizeof(k_g17p_profile_prefix);
-    std::memcpy(out_buf + off, final_copies.data(), final_copies.size());
+    std::memcpy(out_tmpl.bytes.data() + off, final_copies.data(), final_copies.size());
     off += final_copies.size();
-    std::memcpy(out_buf + off, k_g17p_profile_suffix, sizeof(k_g17p_profile_suffix));
+    std::memcpy(out_tmpl.bytes.data() + off, k_g17p_profile_suffix, sizeof(k_g17p_profile_suffix));
     off += sizeof(k_g17p_profile_suffix);
-    out_buf[off + 0] = 0x0e;
-    out_buf[off + 1] = 0x00;
-    out_buf[off + 2] = 0x00;
-    out_buf[off + 3] = 0x00;
-    off += 4;
-
-    *out_len = off;
+    out_tmpl.bytes[off + 0] = 0x0e;
+    out_tmpl.bytes[off + 1] = 0x00;
+    out_tmpl.bytes[off + 2] = 0x00;
+    out_tmpl.bytes[off + 3] = 0x00;
     return true;
+}
+
+static bool g_agx_stats_enabled() {
+    static const bool enabled = []() {
+        const char * v = std::getenv("GGML_AGX_STATS");
+        return v && v[0] && v[0] != '0';
+    }();
+    return enabled;
 }
 
 } // namespace
@@ -489,6 +527,16 @@ struct agx_cdm_stream {
 
     uint64_t         in_flight_point  = 0;
     agx_cdm_stats    stats            = {};
+
+    // Per-(shader_va, is_indirect) pre-templated G17P Ioto programs (zero heap allocs/dispatch!)
+    std::unordered_map<uint64_t, agx_ioto_template> ioto_templates;
+    uint64_t            last_tmpl_key = 0;
+    agx_ioto_template * last_tmpl_ptr = nullptr;
+
+    // Lightweight GGML_AGX_STATS=1 telemetry (CPU encode vs GPU execute split)
+    std::chrono::steady_clock::time_point reset_tp{};
+    agx_cdm_stats       stats_at_reset{};
+    bool                has_reset_tp = false;
 };
 
 agx_cdm_stream * agx_cdm_stream_create(agx_drm_device * dev,
@@ -551,6 +599,11 @@ void agx_cdm_stream_reset(agx_cdm_stream * s) {
     s->last_launch_elidable = false;
     s->terminated           = false;
     s->has_external_args    = false;
+    if (g_agx_stats_enabled()) {
+        s->reset_tp       = std::chrono::steady_clock::now();
+        s->stats_at_reset = s->stats;
+        s->has_reset_tp   = true;
+    }
 }
 
 static uint64_t alloc_args_internal(agx_cdm_stream * s, size_t bytes, size_t align, void ** out_cpu_ptr) {
@@ -601,6 +654,98 @@ static bool maybe_auto_flush_chunk(agx_cdm_stream * s,
     return true;
 }
 
+static const agx_ioto_template * get_or_build_ioto_template(agx_cdm_stream *   s,
+                                                            const agx_kernel * kernel,
+                                                            bool               is_indirect) {
+    const uint64_t key = (kernel->shader_va << 1) | (is_indirect ? 1ULL : 0ULL);
+    const uint64_t rodata_va = (kernel->rodata_size_16 != 0 && kernel->code_bo)
+                                   ? (kernel->code_bo->gpu_va + kernel->rodata_offset)
+                                   : 0ULL;
+
+    if (s->last_tmpl_ptr && s->last_tmpl_key == key &&
+        s->last_tmpl_ptr->shader_va == kernel->shader_va &&
+        s->last_tmpl_ptr->rodata_va == rodata_va) {
+        return s->last_tmpl_ptr;
+    }
+
+    auto it = s->ioto_templates.find(key);
+    if (it != s->ioto_templates.end() &&
+        it->second.shader_va == kernel->shader_va &&
+        it->second.rodata_va == rodata_va) {
+        s->last_tmpl_key = key;
+        s->last_tmpl_ptr = &it->second;
+        return s->last_tmpl_ptr;
+    }
+
+    // Build Ioto uniform range list in optimal base-sharing order:
+    //   1. `uses_root` (root_va + 0)
+    //   2. `uniform_dma` spans sorted by `offset_B` ascending (all reuse root_va base -> 1 LDIMM pair!)
+    //   3. `rodata` (static code_bo VA baked into template -> 0 runtime relocations!)
+    constexpr uint64_t kDummyRootVa = 0x4000000000ULL;
+    uniform_range ranges[32];
+    size_t range_count = 0;
+
+    if (kernel->uses_root) {
+        ranges[range_count++] = {
+            kernel->root_uniform_half,
+            4u,
+            kDummyRootVa,
+            true,
+            0u,
+        };
+    }
+
+    const size_t dma_start = range_count;
+    for (const auto & span : kernel->uniform_dma) {
+        if (span.set != -1 || range_count >= 31) {
+            continue;
+        }
+        const uint16_t aligned_halfs = static_cast<uint16_t>((span.halfs + 1u) & ~1u);
+        ranges[range_count++] = {
+            span.dest_half,
+            aligned_halfs,
+            kDummyRootVa + span.offset_B,
+            true,
+            span.offset_B,
+        };
+    }
+    if (range_count > dma_start + 1u) {
+        std::sort(ranges + dma_start, ranges + range_count,
+                  [](const uniform_range & a, const uniform_range & b) {
+                      return a.root_delta < b.root_delta;
+                  });
+    }
+
+    if (kernel->rodata_size_16 != 0 && kernel->code_bo) {
+        const uint16_t aligned_halfs = static_cast<uint16_t>((kernel->rodata_size_16 + 1u) & ~1u);
+        const size_t ro_bytes = static_cast<size_t>(aligned_halfs) * 2u;
+        if (static_cast<size_t>(kernel->rodata_offset) + ro_bytes > kernel->code_bo->alloc_size) {
+            AGX_LOG_ERROR("Kernel '%s' rodata [0x%x + %zu] exceeds code_bo (%zu B)",
+                          kernel->name.c_str(), kernel->rodata_offset, ro_bytes, kernel->code_bo->alloc_size);
+            return nullptr;
+        }
+        ranges[range_count++] = {
+            kernel->rodata_base_half,
+            aligned_halfs,
+            rodata_va,
+            false,
+            0u,
+        };
+    }
+
+    agx_ioto_template tmpl;
+    if (!compose_g17p_ioto_template(kernel, ranges, range_count, is_indirect, tmpl)) {
+        AGX_LOG_ERROR("Failed to compose G17P Ioto template for kernel '%s'", kernel->name.c_str());
+        return nullptr;
+    }
+
+    auto & slot = s->ioto_templates[key];
+    slot = std::move(tmpl);
+    s->last_tmpl_key = key;
+    s->last_tmpl_ptr = &slot;
+    return s->last_tmpl_ptr;
+}
+
 static bool prepare_launch_ioto(agx_cdm_stream *   s,
                                 const agx_kernel * kernel,
                                 const void *       push_args,
@@ -622,78 +767,47 @@ static bool prepare_launch_ioto(agx_cdm_stream *   s,
         const size_t root_size = std::max<size_t>(
             kernel->root_size_bytes,
             static_cast<size_t>(kernel->push_offset_bytes) + agx_align_up(push_bytes, 16u));
+        const size_t alloc_root = std::max<size_t>(root_size, 64u);
         void * root_cpu = nullptr;
-        root_va = alloc_args_internal(s, std::max<size_t>(root_size, 64u), 16u, &root_cpu);
+        root_va = alloc_args_internal(s, alloc_root, 16u, &root_cpu);
         if (root_va == 0) {
             return false;
         }
-        std::memset(root_cpu, 0, std::max<size_t>(root_size, 64u));
+        auto * rbytes = static_cast<uint8_t *>(root_cpu);
+        std::memset(rbytes, 0, alloc_root);
         // Field 0 of hk_root_descriptor_table is always its own GPU VA (reflection)
-        std::memcpy(root_cpu, &root_va, sizeof(root_va));
+        std::memcpy(rbytes, &root_va, sizeof(root_va));
         // If shader has immutable NIR constant data, place at cs.constant_data_addr (offset 136 = 8 + 16*8)
-        if (kernel->const_data_va != 0 && root_size >= 144u) {
-            std::memcpy(static_cast<uint8_t *>(root_cpu) + 136u, &kernel->const_data_va, sizeof(uint64_t));
+        if (kernel->const_data_va != 0 && alloc_root >= 144u) {
+            std::memcpy(rbytes + 136u, &kernel->const_data_va, sizeof(uint64_t));
         }
         // Copy push constants into root.push[]
         if (push_args && push_bytes > 0) {
-            std::memcpy(static_cast<uint8_t *>(root_cpu) + kernel->push_offset_bytes,
-                        push_args, push_bytes);
+            std::memcpy(rbytes + kernel->push_offset_bytes, push_args, push_bytes);
         }
     }
 
-    // Build Ioto uniform range list
-    uniform_range ranges[32];
-    size_t range_count = 0;
-
-    if (kernel->uses_root) {
-        ranges[range_count++] = {
-            kernel->root_uniform_half,
-            4u, // 64-bit root_desc_addr (4 x 16-bit halves)
-            root_va,
-        };
-    }
-
-    if (kernel->rodata_size_16 != 0 && kernel->code_bo) {
-        const uint16_t aligned_halfs = static_cast<uint16_t>((kernel->rodata_size_16 + 1u) & ~1u);
-        const size_t ro_bytes = static_cast<size_t>(aligned_halfs) * 2u;
-        if (static_cast<size_t>(kernel->rodata_offset) + ro_bytes > kernel->code_bo->alloc_size) {
-            AGX_LOG_ERROR("Kernel '%s' rodata [0x%x + %zu] exceeds code_bo (%zu B)",
-                          kernel->name.c_str(), kernel->rodata_offset, ro_bytes, kernel->code_bo->alloc_size);
-            return false;
-        }
-        ranges[range_count++] = {
-            kernel->rodata_base_half,
-            aligned_halfs,
-            kernel->code_bo->gpu_va + kernel->rodata_offset,
-        };
-    }
-
-    for (const auto & span : kernel->uniform_dma) {
-        if (span.set != -1 || range_count >= 32) {
-            continue;
-        }
-        const uint16_t aligned_halfs = static_cast<uint16_t>((span.halfs + 1u) & ~1u);
-        ranges[range_count++] = {
-            span.dest_half,
-            aligned_halfs,
-            root_va + span.offset_B,
-        };
+    const agx_ioto_template * tmpl = get_or_build_ioto_template(s, kernel, is_indirect);
+    if (!tmpl) {
+        return false;
     }
 
     // Reserve 64B-aligned slot in the stream's USC Ioto arena (bit 40 set!)
     const size_t ioto_off = agx_align_up(s->ioto_offset, AGX_IOTO_PROGRAM_ALIGN);
-    if (ioto_off + 4096u > s->ioto_bo->alloc_size) {
-        AGX_LOG_ERROR("CDM USC Ioto arena overflow (%zu / %zu)", ioto_off, s->ioto_bo->alloc_size);
+    const size_t written  = tmpl->bytes.size();
+    if (ioto_off + written > s->ioto_bo->alloc_size) {
+        AGX_LOG_ERROR("CDM USC Ioto arena overflow (%zu + %zu / %zu)",
+                      ioto_off, written, s->ioto_bo->alloc_size);
         return false;
     }
 
     uint8_t * dst = static_cast<uint8_t *>(s->ioto_bo->cpu_ptr) + ioto_off;
-    size_t written = 0;
-    if (!compose_g17p_ioto_program(kernel, ranges, range_count, is_indirect,
-                                   dst, s->ioto_bo->alloc_size - ioto_off, &written)) {
-        AGX_LOG_ERROR("Failed to compose G17P Ioto compute program for kernel '%s'",
-                      kernel->name.c_str());
-        return false;
+    std::memcpy(dst, tmpl->bytes.data(), written);
+    for (const auto & rel : tmpl->relocs) {
+        const uint64_t addr = root_va + rel.root_delta;
+        pack_ldimm_long(rel.dest_half, static_cast<uint32_t>(addr), dst + rel.byte_off);
+        pack_ldimm_long(static_cast<uint16_t>(rel.dest_half + 2u),
+                        static_cast<uint32_t>(addr >> 32), dst + rel.byte_off + 8u);
     }
 
     s->ioto_offset = ioto_off + written;
@@ -954,7 +1068,38 @@ int agx_cdm_submit(agx_cdm_stream * s, bool wait, uint64_t * out_gpu_ns) {
         s->terminated = true;
     }
 
-    return agx_cdm_submit_recorded(s, wait, out_gpu_ns);
+    const bool emit_stats = g_agx_stats_enabled();
+    const auto t_sub = emit_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
+    uint64_t gpu_ns_local = 0;
+    const int ret = agx_cdm_submit_recorded(s, wait, &gpu_ns_local);
+    if (out_gpu_ns) {
+        *out_gpu_ns = gpu_ns_local;
+    }
+
+    if (emit_stats && ret == 0) {
+        const auto t_done = std::chrono::steady_clock::now();
+        const double encode_ms = s->has_reset_tp
+            ? std::chrono::duration<double, std::milli>(t_sub - s->reset_tp).count()
+            : 0.0;
+        const double wait_ms = std::chrono::duration<double, std::milli>(t_done - t_sub).count();
+        const double gpu_ms  = static_cast<double>(gpu_ns_local) * 1e-6;
+        const uint64_t disp  = s->stats.dispatches           - s->stats_at_reset.dispatches;
+        const uint64_t ind   = s->stats.indirect_dispatches  - s->stats_at_reset.indirect_dispatches;
+        const uint64_t usc_b = s->stats.strong_usc_barriers  - s->stats_at_reset.strong_usc_barriers;
+        const uint64_t elid  = s->stats.elided_barriers      - s->stats_at_reset.elided_barriers;
+        AGX_LOG_INFO("stats submit=#%llu | cpu_encode=%.3fms gpu=%.3fms wait=%.3fms (drm_oh=%.3fms) | "
+                     "disp=%llu (ind=%llu) strong_usc=%llu elided=%llu | ring(cmd=%.1fK ioto=%.1fK arg=%.1fK tmpl=%zu)",
+                     (unsigned long long) s->stats.submits,
+                     encode_ms, gpu_ms, wait_ms, std::max(0.0, wait_ms - gpu_ms),
+                     (unsigned long long) disp, (unsigned long long) ind,
+                     (unsigned long long) usc_b, (unsigned long long) elid,
+                     static_cast<double>(s->cmd_offset) / 1024.0,
+                     static_cast<double>(s->ioto_offset) / 1024.0,
+                     static_cast<double>(s->arg_offset) / 1024.0,
+                     s->ioto_templates.size());
+    }
+    return ret;
 }
 
 int agx_cdm_wait(agx_cdm_stream * s, uint64_t * out_gpu_ns) {
