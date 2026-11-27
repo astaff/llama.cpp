@@ -1,0 +1,247 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+#include "dequant_supertile.glsl"
+
+// ============================================================================
+// Pillar 2: Predicated Remainder-Free NVFP4 B=1..5 Simdgroup Vec-Mat Kernel
+// ============================================================================
+// Compile-time specializations (all <= 64 GPRs, 0:0 spills):
+//   - REPACKED (1 = AGX_NVFP4_32x16 128B super-tile; 0 = raw GGML block_nvfp4)
+//   - BATCH_M  (1..5; M=1 uses 1 FP32 accumulator/lane -> ~28 GPRs, 32 sg/core!)
+//   - K_SGS    (1 = each simdgroup owns 16 rows independently, 0 shared mem;
+//               4 = 4 simdgroups in 128T WG split K across 16 rows + 256B SRAM reduce)
+//
+// In REPACKED=1 mode, every 32-lane simdgroup issues:
+//   - 1 coalesced uint16_t load (64B) for 2x UE4M3 scales
+//   - 1 coalesced uvec4 load (512B = 4 x 128B cache lines) for 32 E2M1 weights
+//   - Branchless FTZ-safe normal-exponent E2M1 -> FP16 decode in GPRs
+//   - Single 1-cycle subgroupShuffleXor(acc, 1u) reduction across K-halves!
+
+#ifndef REPACKED
+#define REPACKED 1
+#endif
+
+#ifndef BATCH_M
+#define BATCH_M 1
+#endif
+
+#ifndef K_SGS
+#define K_SGS 4
+#endif
+
+#if K_SGS == 1
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+#else
+layout(local_size_x = 32 * K_SGS, local_size_y = 1, local_size_z = 1) in;
+#endif
+
+layout(push_constant, scalar) uniform PushArgs {
+    uint64_t w_va;
+    uint64_t x_va;
+    uint64_t y_va;
+    uint     M;
+    uint     N;
+    uint     K;
+    uint     x_stride;
+    uint     y_stride;
+    uint     w_slice_bytes;
+    uint     x_slice_elems;
+    uint     y_slice_elems;
+    uint     w_bcast_div;
+    uint     _pad;
+} pc;
+
+#if K_SGS > 1
+shared float sh_reduce[K_SGS][BATCH_M][16];
+#endif
+
+void main() {
+    const uint lane  = gl_SubgroupInvocationID; // 0..31
+    const uint sg_id = gl_SubgroupID;           // 0..3 (or 0..K_SGS-1)
+    const uint slice = gl_WorkGroupID.z;
+
+    const uint w_slice = slice / max(1u, pc.w_bcast_div);
+    const uint64_t w_base = pc.w_va + uint64_t(w_slice) * uint64_t(pc.w_slice_bytes);
+    const uint64_t x_base = pc.x_va + uint64_t(slice)   * uint64_t(pc.x_slice_elems) * 4ul;
+    const uint64_t y_base = pc.y_va + uint64_t(slice)   * uint64_t(pc.y_slice_elems) * 4ul;
+
+    AgxBufVec4R x_buf4 = AgxBufVec4R(x_base);
+    AgxBufF32RW y_buf = AgxBufF32RW(y_base);
+
+    const uint nb_k = pc.K >> 6; // K / 64
+
+#if K_SGS == 1
+    // Each simdgroup independently owns one 16-row half-tile
+    const uint half_idx = gl_WorkGroupID.x * 4u + sg_id;
+    const uint tn       = half_idx >> 1;
+    const uint sub_s    = half_idx & 1u;
+    const uint row_in_h = lane >> 1;          // 0..15
+    const uint kh       = lane & 1u;          // 0 or 1
+    const uint row      = half_idx * 16u + row_in_h;
+    const uint tk_start = 0u;
+    const uint tk_step  = 1u;
+#else
+    // All K_SGS simdgroups in this workgroup collaborate on the SAME 16-row half-tile
+    const uint half_idx = gl_WorkGroupID.x;
+    const uint tn       = half_idx >> 1;
+    const uint sub_s    = half_idx & 1u;
+    const uint row_in_h = lane >> 1;          // 0..15
+    const uint kh       = lane & 1u;          // 0 or 1
+    const uint row      = half_idx * 16u + row_in_h;
+    const uint tk_start = sg_id;
+    const uint tk_step  = uint(K_SGS);
+#endif
+
+    // Predicated guard for out-of-range half-tiles (no divergent remainder kernel!)
+    const bool tile_valid = (half_idx * 16u < pc.N);
+
+    float acc[BATCH_M];
+    for (uint m = 0u; m < uint(BATCH_M); ++m) {
+        acc[m] = 0.0;
+    }
+
+#if REPACKED == 1
+    if (tile_valid) {
+        AgxBufNvfp4ST st_buf = AgxBufNvfp4ST(w_base);
+        const uint st_row_base = tn * nb_k;
+        const uint l_idx       = sub_s * 32u + lane;
+        const uint x_stride4   = pc.x_stride >> 2;
+
+        for (uint tk = tk_start; tk < nb_k; tk += tk_step) {
+            const uint st_idx = st_row_base + tk;
+            const uint16_t d_pair = st_buf.st[st_idx].d[l_idx];
+            const uvec4    qs     = st_buf.st[st_idx].qs[l_idx];
+
+            const f16vec2 scales = agx_ue4m3_pair_to_f16vec2(d_pair);
+            const float sc0 = float(scales.x);
+            const float sc1 = float(scales.y);
+
+            // Sub-block 0 (weights 0..15 -> qs.x, qs.y)
+            f16vec4 w0, w1, w2, w3;
+            agx_e2m1_u32_to_f16x8(qs.x, w0, w1);
+            agx_e2m1_u32_to_f16x8(qs.y, w2, w3);
+
+            const uint col4_base = (tk * 64u + kh * 32u) >> 2;
+
+            for (uint m = 0u; m < uint(BATCH_M); ++m) {
+                if (m < pc.M) {
+                    const uint x_off4 = m * x_stride4 + col4_base;
+                    float dot0 = dot(vec4(w0), x_buf4.v[x_off4 + 0u])
+                               + dot(vec4(w1), x_buf4.v[x_off4 + 1u])
+                               + dot(vec4(w2), x_buf4.v[x_off4 + 2u])
+                               + dot(vec4(w3), x_buf4.v[x_off4 + 3u]);
+                    acc[m] = fma(dot0, sc0, acc[m]);
+                }
+            }
+
+            // Sub-block 1 (weights 16..31 -> qs.z, qs.w), reusing w0..w3 GPRs!
+            agx_e2m1_u32_to_f16x8(qs.z, w0, w1);
+            agx_e2m1_u32_to_f16x8(qs.w, w2, w3);
+
+            for (uint m = 0u; m < uint(BATCH_M); ++m) {
+                if (m < pc.M) {
+                    const uint x_off4 = m * x_stride4 + col4_base + 4u;
+                    float dot1 = dot(vec4(w0), x_buf4.v[x_off4 + 0u])
+                               + dot(vec4(w1), x_buf4.v[x_off4 + 1u])
+                               + dot(vec4(w2), x_buf4.v[x_off4 + 2u])
+                               + dot(vec4(w3), x_buf4.v[x_off4 + 3u]);
+                    acc[m] = fma(dot1, sc1, acc[m]);
+                }
+            }
+        }
+    }
+#else
+    // Raw GGML block_nvfp4 fallback (still uses branchless FTZ-safe E2M1/UE4M3 decode!)
+    if (tile_valid && row < pc.N) {
+        AgxBufNvfp4Raw raw_buf = AgxBufNvfp4Raw(w_base);
+        const uint row_blk_base = row * nb_k;
+        const uint x_stride4    = pc.x_stride >> 2;
+
+        for (uint tk = tk_start; tk < nb_k; tk += tk_step) {
+            const uint blk_idx = row_blk_base + tk;
+            for (uint s = 0u; s < 2u; ++s) {
+                const uint sub = kh * 2u + s;
+                const float sc = float(agx_ue4m3_to_f16(uint(raw_buf.blk[blk_idx].d[sub])));
+                // GGML block_nvfp4 stores low nibbles = j+0..7, high nibbles = j+8..15
+                uint b0 = uint(raw_buf.blk[blk_idx].qs[sub * 8u + 0u]);
+                uint b1 = uint(raw_buf.blk[blk_idx].qs[sub * 8u + 1u]);
+                uint b2 = uint(raw_buf.blk[blk_idx].qs[sub * 8u + 2u]);
+                uint b3 = uint(raw_buf.blk[blk_idx].qs[sub * 8u + 3u]);
+                uint b4 = uint(raw_buf.blk[blk_idx].qs[sub * 8u + 4u]);
+                uint b5 = uint(raw_buf.blk[blk_idx].qs[sub * 8u + 5u]);
+                uint b6 = uint(raw_buf.blk[blk_idx].qs[sub * 8u + 6u]);
+                uint b7 = uint(raw_buf.blk[blk_idx].qs[sub * 8u + 7u]);
+
+                vec4 w0 = vec4(agx_e2m1_to_f16(b0 & 0xFu), agx_e2m1_to_f16(b1 & 0xFu),
+                               agx_e2m1_to_f16(b2 & 0xFu), agx_e2m1_to_f16(b3 & 0xFu));
+                vec4 w1 = vec4(agx_e2m1_to_f16(b4 & 0xFu), agx_e2m1_to_f16(b5 & 0xFu),
+                               agx_e2m1_to_f16(b6 & 0xFu), agx_e2m1_to_f16(b7 & 0xFu));
+                vec4 w2 = vec4(agx_e2m1_to_f16(b0 >> 4), agx_e2m1_to_f16(b1 >> 4),
+                               agx_e2m1_to_f16(b2 >> 4), agx_e2m1_to_f16(b3 >> 4));
+                vec4 w3 = vec4(agx_e2m1_to_f16(b4 >> 4), agx_e2m1_to_f16(b5 >> 4),
+                               agx_e2m1_to_f16(b6 >> 4), agx_e2m1_to_f16(b7 >> 4));
+
+                const uint col4 = (tk * 64u + sub * 16u) >> 2;
+                for (uint m = 0u; m < uint(BATCH_M); ++m) {
+                    if (m < pc.M) {
+                        const uint x_off4 = m * x_stride4 + col4;
+                        float d_sub = dot(w0, x_buf4.v[x_off4 + 0u])
+                                    + dot(w1, x_buf4.v[x_off4 + 1u])
+                                    + dot(w2, x_buf4.v[x_off4 + 2u])
+                                    + dot(w3, x_buf4.v[x_off4 + 3u]);
+                        acc[m] = fma(d_sub, sc, acc[m]);
+                    }
+                }
+            }
+        }
+    }
+#endif
+
+    // 1-cycle simdgroup reduction across K-halves (lane ^ 1)
+    for (uint m = 0u; m < uint(BATCH_M); ++m) {
+        acc[m] += subgroupShuffleXor(acc[m], 1u);
+    }
+
+#if K_SGS == 1
+    if (kh == 0u && row < pc.N) {
+        for (uint m = 0u; m < uint(BATCH_M); ++m) {
+            if (m < pc.M) {
+                y_buf.v[m * pc.y_stride + row] = acc[m];
+            }
+        }
+    }
+#else
+    if (kh == 0u) {
+        for (uint m = 0u; m < uint(BATCH_M); ++m) {
+            sh_reduce[sg_id][m][row_in_h] = acc[m];
+        }
+    }
+    barrier();
+
+    if (sg_id == 0u && lane < 16u) {
+        const uint out_row = half_idx * 16u + lane;
+        if (out_row < pc.N) {
+            for (uint m = 0u; m < uint(BATCH_M); ++m) {
+                if (m < pc.M) {
+                    float total = 0.0;
+                    for (uint s = 0u; s < uint(K_SGS); ++s) {
+                        total += sh_reduce[s][m][lane];
+                    }
+                    y_buf.v[m * pc.y_stride + out_row] = total;
+                }
+            }
+        }
+    }
+#endif
+}
