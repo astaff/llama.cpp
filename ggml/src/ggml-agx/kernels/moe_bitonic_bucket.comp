@@ -353,10 +353,12 @@ void main() {
 
 #elif BUCKET_MODE == 2
 
+// Fast zero-fill OR residual copy (`res_va` passed via `pc.topk_w_va` when non-zero) into `moe_out[M * n_embd]`
 void main() {
     const uint idx = gl_GlobalInvocationID.x;
     if (idx < pc.zero_elems) {
-        BufF32W(pc.moe_out_va).d[idx] = 0.0f;
+        float v = (pc.topk_w_va != 0ul) ? BufF32R(pc.topk_w_va).d[idx] : 0.0f;
+        BufF32W(pc.moe_out_va).d[idx] = v;
     }
 }
 

@@ -41,11 +41,11 @@
 
 #define AGX_MOE_MAX_EXPERTS      256u
 #define AGX_MOE_DIRECT_MAX_M     1u  // M=1 direct fastpath (M>=2 deduplicates shared experts via bitonic bucket!)
-#define AGX_MOE_VECMAT_MAX_M     5u
-#define AGX_MOE_GEMM_MIN_M       6u
+#define AGX_MOE_VECMAT_MAX_M     4u  // Lean 4-scalar BATCH_CAP=4 (<=52 GPR32, 0:0 spills, 2x+ occupancy!)
+#define AGX_MOE_GEMM_MIN_M       5u  // M_bucket >= 5 -> 8x8 MMA gemm32 (1x weight DRAM for ALL M=1..8 experts!)
 #define AGX_MOE_GEMM_TILE_M      32u
-#define AGX_MOE_VECMAT_WG_PAIRS  32u // 32 (gate,up) pairs/WG for gate_up vec-mat
-#define AGX_MOE_VECMAT_WG_OUT    64u // 64 output rows/WG for down vec-mat
+#define AGX_MOE_VECMAT_WG_PAIRS  32u // 32 (gate,up) pairs/WG for gate_up vec-mat (Q8_0_8BLK uses 4 pairs/WG)
+#define AGX_MOE_VECMAT_WG_OUT    64u // 64 output rows/WG for down vec-mat (Q8_0_8BLK uses 8 rows/WG)
 #define AGX_MOE_GEMM_WG_PAIRS    32u // 32 (gate,up) pairs/WG for gate_up 8x8 MMA GEMM
 #define AGX_MOE_GEMM_WG_OUT      64u // 64 output rows/WG for down 8x8 MMA GEMM
 
@@ -113,8 +113,16 @@ struct agx_moe_stage_args {
     agx_weight_layout gate_up_layout;    // e.g. AGX_WEIGHT_NVFP4_REPACKED (blk 0..19), AGX_WEIGHT_Q8_0_REPACKED (blk 20..23)
     agx_weight_layout down_layout;
 
-    bool              x_is_f16;          // optional F16 input activation
-    bool              accumulate_out;    // false = zero moe_out before scatter; true = add into existing moe_out
+    bool              x_is_f16       = false; // optional F16 input activation
+    bool              accumulate_out = false; // false = zero moe_out before scatter; true = add into existing moe_out
+
+    // Wave 4 (Theorem W4.3) optional fused 2-stage SLC scratch & residual add:
+    uint64_t          moe_inter_va     = 0;   // optional SLC-pinned [M, top_k, n_ff] F32 scratch (0 -> internal hidden_bo)
+    uint64_t          res_va           = 0;   // optional [M, n_embd] F32 residual added to down+wsum -> moe_out (0 = none)
+
+    // Optional per-expert FP32 2nd-level scale vectors [n_expert] (NVFP4 blk.<i>.ffn_*_exps.scale; 0 = 1.0f):
+    uint64_t          gate_up_scale_va = 0;   // multiplied into (gate, up) before SiTU/SwiGLU/GeGLU
+    uint64_t          down_scale_va    = 0;   // multiplied into down output before router weight
 };
 
 struct agx_moe_runner;
@@ -140,6 +148,16 @@ bool agx_moe_dispatch(agx_moe_runner *           runner,
                       agx_cdm_stream *           stream,
                       const agx_moe_stage_args & args,
                       agx_barrier_mode           post_barrier = AGX_BARRIER_STRONG_USC);
+
+// Wave 4 (Theorem W4.3): Fused 2-Stage MoE (`gate_up + SiTU -> SLC moe_inter -> down + wsum [+ res_va]`)
+//   - M == 1: strictly 2 dispatches + 1 STRONG_USC barrier (PASS_STAGE=5 -> PASS_STAGE=6),
+//             zero bucketing, zero zero-fill, zero atomics, exact 0-ULP sequential FP32 wsum!
+//   - M >= 2: deduplicated bitonic/histogram bucketing + lean BATCH_CAP=4 vecmat + gemm32 (count >= 5),
+//             using args.moe_inter_va (or internal hidden_bo) and optional args.res_va.
+bool agx_moe_dispatch_fused_situ_down(agx_moe_runner *           runner,
+                                      agx_cdm_stream *           stream,
+                                      const agx_moe_stage_args & args,
+                                      agx_barrier_mode           post_barrier = AGX_BARRIER_STRONG_USC);
 
 // Generic ggml `GGML_OP_MUL_MAT_ID` dispatch helper for `agx-graph-exec.cpp` / `test-backend-ops`.
 bool agx_moe_supports_mul_mat_id(const struct ggml_tensor * dst);

@@ -736,7 +736,7 @@ bool agx_kv_hybrid_dispatch_swa_attn(agx_kv_hybrid_pool *        pool,
 }
 
 static uint32_t choose_flash_decode_splits(uint32_t n_kv, uint32_t n_head_q, uint32_t n_tokens) {
-    if (n_kv <= 128u) {
+    if (n_kv <= 256u) {
         return 1u;
     }
     // Saturate all 40 M4 Max cores (target >= 160 WGs when n_kv is large, >= 128 keys/split)
@@ -853,7 +853,7 @@ bool agx_kv_hybrid_dispatch_full_attn(agx_kv_hybrid_pool *        pool,
             const uint32_t grid_y   = (args.n_tokens + 7u) / 8u;
             const uint32_t base_wgs = std::max<uint32_t>(1u, args.n_head_q * grid_y);
             uint32_t pf4_splits = 1u;
-            if (args.n_kv > 128u) {
+            if (args.n_kv > 256u) {
                 const uint32_t max_by_kv = std::max<uint32_t>(1u, (args.n_kv + 63u) / 64u);
                 const uint32_t want      = (base_wgs >= 160u) ? 1u : ((160u + base_wgs - 1u) / base_wgs);
                 pf4_splits = std::max<uint32_t>(want, (args.n_kv + 255u) / 256u);
