@@ -32,9 +32,14 @@ struct agx_graph_exec_stats {
     uint64_t fused_ctrl_gate_hits;
     uint64_t fused_softcap_hits;
     uint64_t fused_dspark_hits;
+    uint64_t fused_rms_mul_hits;
+    uint64_t fused_situ_hits;
+    uint64_t fused_add_scale_hits;
+    uint64_t fused_sig_mul_hits;
     uint64_t inkling2_fastpath_hits;
     uint64_t barriers_elided;
     uint64_t total_gpu_ns;
+    uint64_t total_cpu_encode_ns;
 };
 
 struct agx_inkling2_engine;
