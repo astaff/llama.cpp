@@ -1,0 +1,1955 @@
+#include "agx-graph-exec.h"
+#include "agx-inkling2.h"
+#include "agx-gemm.h"
+#include "agx-kv-hybrid.h"
+#include "agx-moe.h"
+#include "ggml-impl.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <vector>
+
+// ============================================================================
+// Pillar 3: Generic ggml_cgraph Lowering, Subgraph Fusion & Barrier Elision
+// ============================================================================
+// Every generic GLSL 450 shader below is compiled once via Borealis (`0:0`
+// spills, `<= 48` GPRs) and launched over ONE `agx_cdm_stream` submission per
+// `ggml_backend_graph_compute` call with interval-based RAW hazard tracking
+// (TLA+-verified `AGX_BARRIER_NONE` vs `AGX_BARRIER_STRONG_USC`).
+
+// ----------------------------------------------------------------------------
+// 1. Generic 4D Strided Binary Elementwise Kernel (ADD, SUB, MUL, DIV)
+// ----------------------------------------------------------------------------
+static const char * k_glsl_bin_op = R"GLSL(
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufF32 { float v[]; };
+
+layout(push_constant) uniform PushArgs {
+    uint64_t a_va;
+    uint64_t b_va;
+    uint64_t d_va;
+    uint     ne0, ne1, ne2, ne3;
+    uint     ne00, ne01, ne02, ne03;
+    uint     ne10, ne11, ne12, ne13;
+    uint     nb00, nb01, nb02, nb03; // in floats (bytes / 4)
+    uint     nb10, nb11, nb12, nb13; // in floats
+    uint     nb0,  nb1,  nb2,  nb3;  // in floats
+    uint     op_kind; // 0=ADD, 1=SUB, 2=MUL, 3=DIV
+    uint     total;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.total) return;
+
+    uint i0 = idx % pc.ne0;
+    uint t1 = idx / pc.ne0;
+    uint i1 = t1 % pc.ne1;
+    uint t2 = t1 / pc.ne1;
+    uint i2 = t2 % pc.ne2;
+    uint i3 = t2 / pc.ne2;
+
+    uint a_idx = (i0 % pc.ne00) * pc.nb00 + (i1 % pc.ne01) * pc.nb01 +
+                 (i2 % pc.ne02) * pc.nb02 + (i3 % pc.ne03) * pc.nb03;
+    uint b_idx = (i0 % pc.ne10) * pc.nb10 + (i1 % pc.ne11) * pc.nb11 +
+                 (i2 % pc.ne12) * pc.nb12 + (i3 % pc.ne13) * pc.nb13;
+    uint d_idx = i0 * pc.nb0 + i1 * pc.nb1 + i2 * pc.nb2 + i3 * pc.nb3;
+
+    float a = ConstBufF32(pc.a_va).v[a_idx];
+    float b = ConstBufF32(pc.b_va).v[b_idx];
+    float r;
+    if      (pc.op_kind == 0u) r = a + b;
+    else if (pc.op_kind == 1u) r = a - b;
+    else if (pc.op_kind == 2u) r = a * b;
+    else                       r = a / b;
+    BufF32(pc.d_va).v[d_idx] = r;
+}
+)GLSL";
+
+struct bin_op_push {
+    uint64_t a_va, b_va, d_va;
+    uint32_t ne0, ne1, ne2, ne3;
+    uint32_t ne00, ne01, ne02, ne03;
+    uint32_t ne10, ne11, ne12, ne13;
+    uint32_t nb00, nb01, nb02, nb03;
+    uint32_t nb10, nb11, nb12, nb13;
+    uint32_t nb0, nb1, nb2, nb3;
+    uint32_t op_kind, total;
+};
+static_assert(sizeof(bin_op_push) <= AGX_MAX_PUSH_BYTES, "bin_op_push > 256B");
+
+// ----------------------------------------------------------------------------
+// 2. Generic 4D Strided Unary / Scale / Clamp / Fill Kernel
+// ----------------------------------------------------------------------------
+static const char * k_glsl_unary_op = R"GLSL(
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufF32 { float v[]; };
+
+layout(push_constant) uniform PushArgs {
+    uint64_t a_va;
+    uint64_t d_va;
+    uint     ne0, ne1, ne2, ne3;
+    uint     nb00, nb01, nb02, nb03;
+    uint     nb0,  nb1,  nb2,  nb3;
+    uint     op_kind;
+    uint     total;
+    float    p0;
+    float    p1;
+} pc;
+
+// op_kind codes:
+// 0=SCALE(x*p0+p1), 1=CLAMP(p0,p1), 2=SQR, 3=SQRT, 4=LOG, 5=SIN, 6=COS, 7=FILL(p0),
+// 10=ABS, 11=SGN, 12=NEG, 13=STEP, 14=TANH, 15=ELU, 16=RELU, 17=SIGMOID,
+// 18=GELU, 19=GELU_QUICK, 20=SILU, 21=EXP, 22=EXPM1, 23=SOFTPLUS, 24=GELU_ERF,
+// 25=FLOOR, 26=CEIL, 27=ROUND, 28=TRUNC, 29=HARDSWISH, 30=HARDSIGMOID
+float erf_approx(float x) {
+    float s = (x < 0.0) ? -1.0 : 1.0;
+    float a = abs(x);
+    float t = 1.0 / (1.0 + 0.3275911 * a);
+    float y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * exp(-a * a);
+    return s * y;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.total) return;
+
+    uint i0 = idx % pc.ne0;
+    uint t1 = idx / pc.ne0;
+    uint i1 = t1 % pc.ne1;
+    uint t2 = t1 / pc.ne1;
+    uint i2 = t2 % pc.ne2;
+    uint i3 = t2 / pc.ne2;
+
+    uint d_idx = i0 * pc.nb0 + i1 * pc.nb1 + i2 * pc.nb2 + i3 * pc.nb3;
+    if (pc.op_kind == 7u) {
+        BufF32(pc.d_va).v[d_idx] = pc.p0;
+        return;
+    }
+
+    uint a_idx = i0 * pc.nb00 + i1 * pc.nb01 + i2 * pc.nb02 + i3 * pc.nb03;
+    float x = ConstBufF32(pc.a_va).v[a_idx];
+    float r = x;
+
+    switch (pc.op_kind) {
+        case 0u:  r = x * pc.p0 + pc.p1; break;
+        case 1u:  r = clamp(x, pc.p0, pc.p1); break;
+        case 2u:  r = x * x; break;
+        case 3u:  r = sqrt(x); break;
+        case 4u:  r = log(x); break;
+        case 5u:  r = sin(x); break;
+        case 6u:  r = cos(x); break;
+        case 10u: r = abs(x); break;
+        case 11u: r = (x > 0.0) ? 1.0 : ((x < 0.0) ? -1.0 : 0.0); break;
+        case 12u: r = -x; break;
+        case 13u: r = (x > 0.0) ? 1.0 : 0.0; break;
+        case 14u: r = tanh(x); break;
+        case 15u: r = (x > 0.0) ? x : exp(x) - 1.0; break;
+        case 16u: r = max(x, 0.0); break;
+        case 17u: r = 1.0 / (1.0 + exp(-x)); break;
+        case 18u: r = 0.5 * x * (1.0 + tanh(0.7978845608028654 * x * (1.0 + 0.044715 * x * x))); break;
+        case 19u: r = x / (1.0 + exp(-1.702 * x)); break;
+        case 20u: r = x / (1.0 + exp(-x)); break;
+        case 21u: r = exp(x); break;
+        case 22u: r = exp(x) - 1.0; break;
+        case 23u: r = (x > 20.0) ? x : log(1.0 + exp(x)); break;
+        case 24u: r = 0.5 * x * (1.0 + erf_approx(x * 0.7071067811865475)); break;
+        case 25u: r = floor(x); break;
+        case 26u: r = ceil(x); break;
+        case 27u: r = roundEven(x); break;
+        case 28u: r = trunc(x); break;
+        case 29u: r = x * clamp(x + 3.0, 0.0, 6.0) / 6.0; break;
+        case 30u: r = clamp(x + 3.0, 0.0, 6.0) / 6.0; break;
+        default:  r = x; break;
+    }
+    BufF32(pc.d_va).v[d_idx] = r;
+}
+)GLSL";
+
+struct unary_op_push {
+    uint64_t a_va, d_va;
+    uint32_t ne0, ne1, ne2, ne3;
+    uint32_t nb00, nb01, nb02, nb03;
+    uint32_t nb0, nb1, nb2, nb3;
+    uint32_t op_kind, total;
+    float    p0, p1;
+};
+static_assert(sizeof(unary_op_push) <= AGX_MAX_PUSH_BYTES, "unary_op_push > 256B");
+
+// ----------------------------------------------------------------------------
+// 3. Generic Strided Copy / Cast / Contiguous Kernel (F32/F16/BF16/I32)
+// ----------------------------------------------------------------------------
+static const char * k_glsl_cpy_cast = R"GLSL(
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufI32 { int v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufI32 { int v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer BufU16 { uint16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) readonly buffer ConstBufU16 { uint16_t v[]; };
+
+layout(push_constant) uniform PushArgs {
+    uint64_t src_va;
+    uint64_t dst_va;
+    uint     ne0, ne1, ne2, ne3;       // src logical shape (or dst shape)
+    uint     s_nb0, s_nb1, s_nb2, s_nb3; // byte strides
+    uint     d_nb0, d_nb1, d_nb2, d_nb3; // byte strides
+    uint     src_type; // 0=F32, 1=F16, 2=BF16, 3=I32
+    uint     dst_type; // 0=F32, 1=F16, 2=BF16, 3=I32
+    uint     total;
+    uint     d_is_linear; // 1 = write linearly by idx (supports reshape-on-cpy)
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.total) return;
+
+    uint i0 = idx % pc.ne0;
+    uint t1 = idx / pc.ne0;
+    uint i1 = t1 % pc.ne1;
+    uint t2 = t1 / pc.ne1;
+    uint i2 = t2 % pc.ne2;
+    uint i3 = t2 / pc.ne2;
+
+    uint64_t s_off = uint64_t(i0) * pc.s_nb0 + uint64_t(i1) * pc.s_nb1 +
+                     uint64_t(i2) * pc.s_nb2 + uint64_t(i3) * pc.s_nb3;
+    uint64_t d_off = (pc.d_is_linear != 0u)
+        ? uint64_t(idx) * uint64_t(pc.d_nb0)
+        : (uint64_t(i0) * pc.d_nb0 + uint64_t(i1) * pc.d_nb1 +
+           uint64_t(i2) * pc.d_nb2 + uint64_t(i3) * pc.d_nb3);
+
+    // Exact bit-preserving copy when I32 -> I32
+    if (pc.src_type == 3u && pc.dst_type == 3u) {
+        BufI32(pc.dst_va + d_off).v[0] = ConstBufI32(pc.src_va + s_off).v[0];
+        return;
+    }
+
+    float val = 0.0;
+    if      (pc.src_type == 0u) val = ConstBufF32(pc.src_va + s_off).v[0];
+    else if (pc.src_type == 1u) val = unpackHalf2x16(uint(ConstBufU16(pc.src_va + s_off).v[0])).x;
+    else if (pc.src_type == 2u) val = uintBitsToFloat(uint(ConstBufU16(pc.src_va + s_off).v[0]) << 16u);
+    else                        val = float(ConstBufI32(pc.src_va + s_off).v[0]);
+
+    if      (pc.dst_type == 0u) BufF32(pc.dst_va + d_off).v[0] = val;
+    else if (pc.dst_type == 1u) BufU16(pc.dst_va + d_off).v[0] = uint16_t(packHalf2x16(vec2(val, 0.0)) & 0xFFFFu);
+    else if (pc.dst_type == 2u) {
+        uint bits = floatBitsToUint(val);
+        uint rbit = 0x7FFFu + ((bits >> 16u) & 1u);
+        BufU16(pc.dst_va + d_off).v[0] = uint16_t((bits + rbit) >> 16u);
+    } else {
+        BufI32(pc.dst_va + d_off).v[0] = int(val);
+    }
+}
+)GLSL";
+
+struct cpy_cast_push {
+    uint64_t src_va, dst_va;
+    uint32_t ne0, ne1, ne2, ne3;
+    uint32_t s_nb0, s_nb1, s_nb2, s_nb3;
+    uint32_t d_nb0, d_nb1, d_nb2, d_nb3;
+    uint32_t src_type, dst_type, total, d_is_linear;
+};
+static_assert(sizeof(cpy_cast_push) <= AGX_MAX_PUSH_BYTES, "cpy_cast_push > 256B");
+
+// ----------------------------------------------------------------------------
+// 4. Generic Row-wise Norms & Reductions (RMS_NORM, NORM, L2_NORM, SUM_ROWS, MEAN, CUMSUM, ARGMAX)
+// ----------------------------------------------------------------------------
+static const char * k_glsl_row_reduce = R"GLSL(
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufI32 { int v[]; };
+
+layout(push_constant) uniform PushArgs {
+    uint64_t a_va;
+    uint64_t d_va;
+    uint     ne0, ne1, ne2, ne3;
+    uint     nb01, nb02, nb03; // floats
+    uint     nb1,  nb2,  nb3;  // floats
+    uint     op_kind; // 0=RMS_NORM, 1=LAYER_NORM, 2=L2_NORM(exact 1/max(||x||,eps)), 3=SUM_ROWS, 4=MEAN, 5=CUMSUM, 6=ARGMAX
+    float    eps;
+} pc;
+
+shared float s_red[8];
+shared int   s_idx[8];
+
+float wg_sum(float val, uint sg_id, uint lane_id) {
+    float s = subgroupAdd(val);
+    if (lane_id == 0u) s_red[sg_id] = s;
+    barrier();
+    if (sg_id == 0u) {
+        float v = (lane_id < 8u) ? s_red[lane_id] : 0.0;
+        float t = subgroupAdd(v);
+        if (lane_id == 0u) s_red[0] = t;
+    }
+    barrier();
+    return s_red[0];
+}
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint n_rows = pc.ne1 * pc.ne2 * pc.ne3;
+    if (row >= n_rows) return;
+
+    const uint i1 = row % pc.ne1;
+    const uint t2 = row / pc.ne1;
+    const uint i2 = t2 % pc.ne2;
+    const uint i3 = t2 / pc.ne2;
+
+    const uint a_base = i1 * pc.nb01 + i2 * pc.nb02 + i3 * pc.nb03;
+    const uint d_base = i1 * pc.nb1  + i2 * pc.nb2  + i3 * pc.nb3;
+
+    const uint tid     = gl_LocalInvocationID.x;
+    const uint sg_id   = tid >> 5u;
+    const uint lane_id = tid & 31u;
+    const uint D       = pc.ne0;
+
+    if (pc.op_kind == 0u) {
+        // RMS_NORM
+        float ss = 0.0;
+        for (uint i = tid; i < D; i += 256u) {
+            float x = ConstBufF32(pc.a_va).v[a_base + i];
+            ss += x * x;
+        }
+        float sc = inversesqrt(wg_sum(ss, sg_id, lane_id) / float(D) + pc.eps);
+        for (uint i = tid; i < D; i += 256u) {
+            BufF32(pc.d_va).v[d_base + i] = ConstBufF32(pc.a_va).v[a_base + i] * sc;
+        }
+    } else if (pc.op_kind == 1u) {
+        // LAYER_NORM
+        float s = 0.0;
+        for (uint i = tid; i < D; i += 256u) s += ConstBufF32(pc.a_va).v[a_base + i];
+        float mean = wg_sum(s, sg_id, lane_id) / float(D);
+        float ss = 0.0;
+        for (uint i = tid; i < D; i += 256u) {
+            float d = ConstBufF32(pc.a_va).v[a_base + i] - mean;
+            ss += d * d;
+        }
+        float sc = inversesqrt(wg_sum(ss, sg_id, lane_id) / float(D) + pc.eps);
+        for (uint i = tid; i < D; i += 256u) {
+            BufF32(pc.d_va).v[d_base + i] = (ConstBufF32(pc.a_va).v[a_base + i] - mean) * sc;
+        }
+    } else if (pc.op_kind == 2u) {
+        // Exact L2_NORM: x / max(||x||, eps) (no +eps bias when ||x|| == eps!)
+        float ss = 0.0;
+        for (uint i = tid; i < D; i += 256u) {
+            float x = ConstBufF32(pc.a_va).v[a_base + i];
+            ss += x * x;
+        }
+        float sc = 1.0 / max(sqrt(wg_sum(ss, sg_id, lane_id)), pc.eps);
+        for (uint i = tid; i < D; i += 256u) {
+            BufF32(pc.d_va).v[d_base + i] = ConstBufF32(pc.a_va).v[a_base + i] * sc;
+        }
+    } else if (pc.op_kind == 3u || pc.op_kind == 4u) {
+        // SUM_ROWS / MEAN
+        float s = 0.0;
+        for (uint i = tid; i < D; i += 256u) s += ConstBufF32(pc.a_va).v[a_base + i];
+        float tot = wg_sum(s, sg_id, lane_id);
+        if (tid == 0u) {
+            BufF32(pc.d_va).v[d_base] = (pc.op_kind == 4u) ? (tot / float(D)) : tot;
+        }
+    } else if (pc.op_kind == 5u) {
+        // CUMSUM (exact sequential in FP32 on thread 0 — D is small, e.g. 64 in DSpark)
+        if (tid == 0u) {
+            float acc = 0.0;
+            for (uint i = 0u; i < D; ++i) {
+                acc += ConstBufF32(pc.a_va).v[a_base + i];
+                BufF32(pc.d_va).v[d_base + i] = acc;
+            }
+        }
+    } else if (pc.op_kind == 6u) {
+        // ARGMAX (lower index wins ties)
+        float bv = uintBitsToFloat(0xFF800000u);
+        int   bi = 0x7FFFFFFF;
+        for (uint i = tid; i < D; i += 256u) {
+            float v = ConstBufF32(pc.a_va).v[a_base + i];
+            int  ii = int(i);
+            if (v > bv || (v == bv && ii < bi)) { bv = v; bi = ii; }
+        }
+        for (uint off = 16u; off > 0u; off >>= 1u) {
+            float ov = subgroupShuffleXor(bv, off);
+            int   oi = subgroupShuffleXor(bi, off);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if (lane_id == 0u) { s_red[sg_id] = bv; s_idx[sg_id] = bi; }
+        barrier();
+        if (sg_id == 0u) {
+            float v = (lane_id < 8u) ? s_red[lane_id] : uintBitsToFloat(0xFF800000u);
+            int   i = (lane_id < 8u) ? s_idx[lane_id] : 0x7FFFFFFF;
+            for (uint off = 16u; off > 0u; off >>= 1u) {
+                float ov = subgroupShuffleXor(v, off);
+                int   oi = subgroupShuffleXor(i, off);
+                if (ov > v || (ov == v && oi < i)) { v = ov; i = oi; }
+            }
+            if (lane_id == 0u) BufI32(pc.d_va).v[d_base] = i;
+        }
+    }
+}
+)GLSL";
+
+struct row_reduce_push {
+    uint64_t a_va, d_va;
+    uint32_t ne0, ne1, ne2, ne3;
+    uint32_t nb01, nb02, nb03;
+    uint32_t nb1, nb2, nb3;
+    uint32_t op_kind;
+    float    eps;
+};
+static_assert(sizeof(row_reduce_push) <= AGX_MAX_PUSH_BYTES, "row_reduce_push > 256B");
+
+// ----------------------------------------------------------------------------
+// 5. Generic Softmax (with optional F16/F32 mask, scale, ALiBi max_bias, sinks)
+// ----------------------------------------------------------------------------
+static const char * k_glsl_softmax = R"GLSL(
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) readonly buffer ConstBufU16 { uint16_t v[]; };
+
+layout(push_constant) uniform PushArgs {
+    uint64_t src_va;
+    uint64_t mask_va;
+    uint64_t sinks_va;
+    uint64_t dst_va;
+    uint     ne0, ne1, ne2, ne3;
+    uint     m_ne1, m_ne2, m_ne3;
+    uint     mask_is_f16;
+    float    scale;
+    float    max_bias;
+    float    m0, m1;
+    uint     n_head_log2;
+    uint     pad0;
+} pc;
+
+shared float s_red[8];
+
+float wg_max(float val, uint sg, uint ln) {
+    float m = subgroupMax(val);
+    if (ln == 0u) s_red[sg] = m;
+    barrier();
+    if (sg == 0u) {
+        float v = (ln < 8u) ? s_red[ln] : uintBitsToFloat(0xFF800000u);
+        float t = subgroupMax(v);
+        if (ln == 0u) s_red[0] = t;
+    }
+    barrier();
+    return s_red[0];
+}
+
+float wg_sum(float val, uint sg, uint ln) {
+    float s = subgroupAdd(val);
+    if (ln == 0u) s_red[sg] = s;
+    barrier();
+    if (sg == 0u) {
+        float v = (ln < 8u) ? s_red[ln] : 0.0;
+        float t = subgroupAdd(v);
+        if (ln == 0u) s_red[0] = t;
+    }
+    barrier();
+    return s_red[0];
+}
+
+float load_mask(uint m_base, uint i) {
+    if (pc.mask_va == 0ul) return 0.0;
+    if (pc.mask_is_f16 != 0u) {
+        return unpackHalf2x16(uint(ConstBufU16(pc.mask_va).v[m_base + i])).x;
+    }
+    return ConstBufF32(pc.mask_va).v[m_base + i];
+}
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint n_rows = pc.ne1 * pc.ne2 * pc.ne3;
+    if (row >= n_rows) return;
+
+    const uint i1 = row % pc.ne1;
+    const uint t2 = row / pc.ne1;
+    const uint i2 = t2 % pc.ne2;
+    const uint i3 = t2 / pc.ne2;
+
+    const uint base = row * pc.ne0;
+    const uint m_base = ((i3 % pc.m_ne3) * pc.m_ne2 + (i2 % pc.m_ne2)) * pc.m_ne1 * pc.ne0 + (i1 % pc.m_ne1) * pc.ne0;
+
+    float slope = 1.0;
+    if (pc.max_bias > 0.0) {
+        uint h = i2;
+        float b = (h < pc.n_head_log2) ? pc.m0 : pc.m1;
+        uint  e = (h < pc.n_head_log2) ? (h + 1u) : (2u * (h - pc.n_head_log2) + 1u);
+        slope = pow(b, float(e));
+    }
+
+    const uint tid = gl_LocalInvocationID.x;
+    const uint sg  = tid >> 5u;
+    const uint ln  = tid & 31u;
+
+    float maxv = uintBitsToFloat(0xFF800000u);
+    if (pc.sinks_va != 0ul) {
+        maxv = ConstBufF32(pc.sinks_va).v[i2];
+    }
+    for (uint i = tid; i < pc.ne0; i += 256u) {
+        float x = ConstBufF32(pc.src_va).v[base + i] * pc.scale + slope * load_mask(m_base, i);
+        maxv = max(maxv, x);
+    }
+    maxv = wg_max(maxv, sg, ln);
+
+    float sum_e = 0.0;
+    for (uint i = tid; i < pc.ne0; i += 256u) {
+        float x = ConstBufF32(pc.src_va).v[base + i] * pc.scale + slope * load_mask(m_base, i);
+        float e = exp(x - maxv);
+        BufF32(pc.dst_va).v[base + i] = e;
+        sum_e += e;
+    }
+    sum_e = wg_sum(sum_e, sg, ln);
+    if (pc.sinks_va != 0ul) {
+        sum_e += exp(ConstBufF32(pc.sinks_va).v[i2] - maxv);
+    }
+    float inv_s = (sum_e > 0.0) ? (1.0 / sum_e) : 0.0;
+    for (uint i = tid; i < pc.ne0; i += 256u) {
+        BufF32(pc.dst_va).v[base + i] *= inv_s;
+    }
+}
+)GLSL";
+
+struct softmax_push {
+    uint64_t src_va, mask_va, sinks_va, dst_va;
+    uint32_t ne0, ne1, ne2, ne3;
+    uint32_t m_ne1, m_ne2, m_ne3, mask_is_f16;
+    float    scale, max_bias, m0, m1;
+    uint32_t n_head_log2, pad0;
+};
+static_assert(sizeof(softmax_push) <= AGX_MAX_PUSH_BYTES, "softmax_push > 256B");
+
+// ----------------------------------------------------------------------------
+// 6. Generic GET_ROWS / SET_ROWS / ADD_ID / CONCAT / PAD / REPEAT / SSM_CONV / ROPE / ARGSORT / TOP_K / GLU
+// ----------------------------------------------------------------------------
+static const char * k_glsl_get_rows = R"GLSL(
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufI32 { int v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) readonly buffer ConstBufU16 { uint16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 1) readonly buffer ConstBufI8 { int8_t v[]; };
+
+layout(push_constant) uniform PushArgs {
+    uint64_t src_va;
+    uint64_t ids_va;
+    uint64_t dst_va;
+    uint     ne0, ne1, ne2, ne3;       // dst shape
+    uint     s_nb1, s_nb2, s_nb3;      // bytes
+    uint     i_nb0, i_nb1, i_nb2;      // bytes
+    uint     d_nb1, d_nb2, d_nb3;      // bytes
+    uint     wtype;                    // 0=F32, 1=F16, 2=BF16, 3=Q8_0_RAW, 4=Q8_0_8BLK, 5=I32
+    uint     pad0;
+} pc;
+
+void main() {
+    uint col = gl_GlobalInvocationID.x;
+    uint r1  = gl_WorkGroupID.y;
+    uint r23 = gl_WorkGroupID.z;
+    if (col >= pc.ne0 || r1 >= pc.ne1 || r23 >= pc.ne2 * pc.ne3) return;
+
+    uint i2 = r23 % pc.ne2;
+    uint i3 = r23 / pc.ne2;
+
+    uint64_t id_off = uint64_t(r1) * pc.i_nb0 + uint64_t(i2) * pc.i_nb1 + uint64_t(i3) * pc.i_nb2;
+    int row_id = ConstBufI32(pc.ids_va + id_off).v[0];
+    uint64_t s_row = pc.src_va + uint64_t(max(row_id, 0)) * pc.s_nb1 + uint64_t(i2) * pc.s_nb2 + uint64_t(i3) * pc.s_nb3;
+    uint64_t d_row = pc.dst_va + uint64_t(r1) * pc.d_nb1 + uint64_t(i2) * pc.d_nb2 + uint64_t(i3) * pc.d_nb3;
+
+    float v = 0.0;
+    if      (pc.wtype == 0u) v = ConstBufF32(s_row).v[col];
+    else if (pc.wtype == 1u) v = unpackHalf2x16(uint(ConstBufU16(s_row).v[col])).x;
+    else if (pc.wtype == 2u) v = uintBitsToFloat(uint(ConstBufU16(s_row).v[col]) << 16u);
+    else if (pc.wtype == 3u) {
+        uint blk = col >> 5u, off = col & 31u;
+        uint64_t bva = s_row + uint64_t(blk) * 34ul;
+        v = unpackHalf2x16(uint(ConstBufU16(bva).v[0])).x * float(ConstBufI8(bva + 2ul).v[off]);
+    } else if (pc.wtype == 4u) {
+        uint ch = col >> 8u, rem = col & 255u, blk = rem >> 5u;
+        uint64_t cva = s_row + uint64_t(ch) * 272ul;
+        v = unpackHalf2x16(uint(ConstBufU16(cva).v[blk])).x * float(ConstBufI8(cva + 16ul).v[rem]);
+    } else {
+        BufF32(d_row).v[col] = intBitsToFloat(ConstBufI32(s_row).v[col]);
+        return;
+    }
+    BufF32(d_row).v[col] = v;
+}
+)GLSL";
+
+struct get_rows_push {
+    uint64_t src_va, ids_va, dst_va;
+    uint32_t ne0, ne1, ne2, ne3;
+    uint32_t s_nb1, s_nb2, s_nb3;
+    uint32_t i_nb0, i_nb1, i_nb2;
+    uint32_t d_nb1, d_nb2, d_nb3;
+    uint32_t wtype, pad0;
+};
+static_assert(sizeof(get_rows_push) <= AGX_MAX_PUSH_BYTES, "get_rows_push > 256B");
+
+static const char * k_glsl_set_rows = R"GLSL(
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer ConstBufI64 { int64_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufI32 { int v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer BufU16 { uint16_t v[]; };
+
+layout(push_constant) uniform PushArgs {
+    uint64_t src_va;
+    uint64_t ids_va;
+    uint64_t dst_va;
+    uint     ne0, ne1, ne2, ne3; // src shape
+    uint     s_nb1, s_nb2, s_nb3;
+    uint     i_nb0, i_nb1, i_nb2;
+    uint     i_ne1, i_ne2;
+    uint     d_nb1, d_nb2, d_nb3;
+    uint     dst_type;   // 0=F32, 1=F16
+    uint     ids_is_i64; // 1=I64, 0=I32
+} pc;
+
+void main() {
+    uint col = gl_GlobalInvocationID.x;
+    uint r1  = gl_WorkGroupID.y;
+    uint r23 = gl_WorkGroupID.z;
+    if (col >= pc.ne0 || r1 >= pc.ne1 || r23 >= pc.ne2 * pc.ne3) return;
+
+    uint i2 = r23 % pc.ne2;
+    uint i3 = r23 / pc.ne2;
+    uint64_t id_off = uint64_t(r1) * pc.i_nb0 + uint64_t(i2 % pc.i_ne1) * pc.i_nb1 + uint64_t(i3 % pc.i_ne2) * pc.i_nb2;
+    int64_t dst_row = (pc.ids_is_i64 != 0u)
+        ? ConstBufI64(pc.ids_va + id_off).v[0]
+        : int64_t(ConstBufI32(pc.ids_va + id_off).v[0]);
+    if (dst_row < 0l) return;
+
+    uint64_t s_row = pc.src_va + uint64_t(r1) * pc.s_nb1 + uint64_t(i2) * pc.s_nb2 + uint64_t(i3) * pc.s_nb3;
+    uint64_t d_row = pc.dst_va + uint64_t(dst_row) * pc.d_nb1 + uint64_t(i2) * pc.d_nb2 + uint64_t(i3) * pc.d_nb3;
+    float val = ConstBufF32(s_row).v[col];
+    if (pc.dst_type == 0u) {
+        BufF32(d_row).v[col] = val;
+    } else {
+        BufU16(d_row).v[col] = uint16_t(packHalf2x16(vec2(val, 0.0)) & 0xFFFFu);
+    }
+}
+)GLSL";
+
+struct set_rows_push {
+    uint64_t src_va, ids_va, dst_va;
+    uint32_t ne0, ne1, ne2, ne3;
+    uint32_t s_nb1, s_nb2, s_nb3;
+    uint32_t i_nb0, i_nb1, i_nb2;
+    uint32_t i_ne1, i_ne2;
+    uint32_t d_nb1, d_nb2, d_nb3;
+    uint32_t dst_type, ids_is_i64;
+};
+static_assert(sizeof(set_rows_push) <= AGX_MAX_PUSH_BYTES, "set_rows_push > 256B");
+
+static const char * k_glsl_concat_pad = R"GLSL(
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufU32 { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufU32 { uint v[]; };
+
+layout(push_constant) uniform PushArgs {
+    uint64_t a_va;
+    uint64_t b_va;
+    uint64_t d_va;
+    uint     ne0, ne1, ne2, ne3; // dst shape
+    uint     a_ne0, a_ne1, a_ne2, a_ne3;
+    uint     a_nb0, a_nb1, a_nb2, a_nb3; // in 32-bit words
+    uint     b_nb0, b_nb1, b_nb2, b_nb3; // in 32-bit words
+    uint     mode; // 0=CONCAT(dim=param0), 1=PAD(lp0=param0,lp1=param1,lp2=param2,lp3=param3), 2=REPEAT
+    uint     p0, p1, p2, p3;
+    uint     total;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.total) return;
+
+    uint i0 = idx % pc.ne0;
+    uint t1 = idx / pc.ne0;
+    uint i1 = t1 % pc.ne1;
+    uint t2 = t1 / pc.ne1;
+    uint i2 = t2 % pc.ne2;
+    uint i3 = t2 / pc.ne2;
+
+    if (pc.mode == 0u) {
+        // CONCAT along dim pc.p0
+        uint c[4] = uint[4](i0, i1, i2, i3);
+        uint an[4] = uint[4](pc.a_ne0, pc.a_ne1, pc.a_ne2, pc.a_ne3);
+        if (c[pc.p0] < an[pc.p0]) {
+            uint off = c[0] * pc.a_nb0 + c[1] * pc.a_nb1 + c[2] * pc.a_nb2 + c[3] * pc.a_nb3;
+            BufU32(pc.d_va).v[idx] = ConstBufU32(pc.a_va).v[off];
+        } else {
+            c[pc.p0] -= an[pc.p0];
+            uint off = c[0] * pc.b_nb0 + c[1] * pc.b_nb1 + c[2] * pc.b_nb2 + c[3] * pc.b_nb3;
+            BufU32(pc.d_va).v[idx] = ConstBufU32(pc.b_va).v[off];
+        }
+    } else if (pc.mode == 1u) {
+        // PAD with left-pad (p0,p1,p2,p3)
+        if (i0 >= pc.p0 && i0 < pc.p0 + pc.a_ne0 &&
+            i1 >= pc.p1 && i1 < pc.p1 + pc.a_ne1 &&
+            i2 >= pc.p2 && i2 < pc.p2 + pc.a_ne2 &&
+            i3 >= pc.p3 && i3 < pc.p3 + pc.a_ne3) {
+            uint off = (i0 - pc.p0) * pc.a_nb0 + (i1 - pc.p1) * pc.a_nb1 +
+                       (i2 - pc.p2) * pc.a_nb2 + (i3 - pc.p3) * pc.a_nb3;
+            BufU32(pc.d_va).v[idx] = ConstBufU32(pc.a_va).v[off];
+        } else {
+            BufU32(pc.d_va).v[idx] = 0u;
+        }
+    } else {
+        // REPEAT
+        uint off = (i0 % pc.a_ne0) * pc.a_nb0 + (i1 % pc.a_ne1) * pc.a_nb1 +
+                   (i2 % pc.a_ne2) * pc.a_nb2 + (i3 % pc.a_ne3) * pc.a_nb3;
+        BufU32(pc.d_va).v[idx] = ConstBufU32(pc.a_va).v[off];
+    }
+}
+)GLSL";
+
+struct concat_pad_push {
+    uint64_t a_va, b_va, d_va;
+    uint32_t ne0, ne1, ne2, ne3;
+    uint32_t a_ne0, a_ne1, a_ne2, a_ne3;
+    uint32_t a_nb0, a_nb1, a_nb2, a_nb3;
+    uint32_t b_nb0, b_nb1, b_nb2, b_nb3;
+    uint32_t mode, p0, p1, p2, p3, total;
+};
+static_assert(sizeof(concat_pad_push) <= AGX_MAX_PUSH_BYTES, "concat_pad_push > 256B");
+
+static const char * k_glsl_ssm_conv = R"GLSL(
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufF32 { float v[]; };
+
+layout(push_constant) uniform PushArgs {
+    uint64_t src0_va;
+    uint64_t src1_va;
+    uint64_t dst_va;
+    uint     nb01, nb02; // floats
+    uint     nb11;       // floats
+    uint     d_nb1, d_nb2; // floats
+    uint     nc, nr, n_t, n_s;
+} pc;
+
+void main() {
+    uint i1 = gl_GlobalInvocationID.x;
+    uint i2 = gl_GlobalInvocationID.y;
+    uint i3 = gl_WorkGroupID.z;
+    if (i1 >= pc.nr || i2 >= pc.n_t || i3 >= pc.n_s) return;
+
+    uint s0 = i3 * pc.nb02 + i1 * pc.nb01 + i2;
+    uint s1 = i1 * pc.nb11;
+    float sum = 0.0;
+    for (uint i0 = 0u; i0 < pc.nc; ++i0) {
+        sum += ConstBufF32(pc.src0_va).v[s0 + i0] * ConstBufF32(pc.src1_va).v[s1 + i0];
+    }
+    BufF32(pc.dst_va).v[i3 * pc.d_nb2 + i2 * pc.d_nb1 + i1] = sum;
+}
+)GLSL";
+
+struct ssm_conv_push {
+    uint64_t src0_va, src1_va, dst_va;
+    uint32_t nb01, nb02, nb11, d_nb1, d_nb2;
+    uint32_t nc, nr, n_t, n_s;
+};
+static_assert(sizeof(ssm_conv_push) <= AGX_MAX_PUSH_BYTES, "ssm_conv_push > 256B");
+
+static const char * k_glsl_rope = R"GLSL(
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufI32 { int v[]; };
+
+layout(push_constant) uniform PushArgs {
+    uint64_t src_va;
+    uint64_t pos_va;
+    uint64_t freq_va;
+    uint64_t dst_va;
+    uint     ne0, ne1, ne2, ne3;
+    uint     s_nb1, s_nb2, s_nb3; // floats
+    uint     d_nb1, d_nb2, d_nb3; // floats
+    uint     n_dims;
+    uint     mode; // bit 1 = NEOX
+    float    theta_scale;
+    float    freq_scale;
+    float    attn_factor;
+    uint     pad0;
+} pc;
+
+void main() {
+    uint pair = gl_GlobalInvocationID.x;
+    uint h    = gl_WorkGroupID.y;
+    uint t3   = gl_WorkGroupID.z;
+    uint half_d = pc.ne0 >> 1u;
+    if (pair >= half_d || h >= pc.ne1 || t3 >= pc.ne2 * pc.ne3) return;
+
+    uint i2 = t3 % pc.ne2;
+    uint i3 = t3 / pc.ne2;
+    uint s_base = h * pc.s_nb1 + i2 * pc.s_nb2 + i3 * pc.s_nb3;
+    uint d_base = h * pc.d_nb1 + i2 * pc.d_nb2 + i3 * pc.d_nb3;
+
+    bool is_neox = (pc.mode & 2u) != 0u;
+    uint i0 = is_neox ? pair : (2u * pair);
+    uint i1 = is_neox ? (pair + (pc.n_dims >> 1u)) : (2u * pair + 1u);
+
+    if (pair * 2u >= pc.n_dims) {
+        if (is_neox) {
+            uint k0 = pair * 2u;
+            BufF32(pc.dst_va).v[d_base + k0]      = ConstBufF32(pc.src_va).v[s_base + k0];
+            BufF32(pc.dst_va).v[d_base + k0 + 1u] = ConstBufF32(pc.src_va).v[s_base + k0 + 1u];
+        } else {
+            BufF32(pc.dst_va).v[d_base + i0] = ConstBufF32(pc.src_va).v[s_base + i0];
+            BufF32(pc.dst_va).v[d_base + i1] = ConstBufF32(pc.src_va).v[s_base + i1];
+        }
+        return;
+    }
+
+    float pos   = float(ConstBufI32(pc.pos_va).v[i2]);
+    float freq  = pow(pc.theta_scale, float(pair)) * pc.freq_scale;
+    if (pc.freq_va != 0ul) {
+        freq /= ConstBufF32(pc.freq_va).v[pair];
+    }
+    float theta = pos * freq;
+    float ct    = cos(theta) * pc.attn_factor;
+    float st    = sin(theta) * pc.attn_factor;
+
+    float x0 = ConstBufF32(pc.src_va).v[s_base + i0];
+    float x1 = ConstBufF32(pc.src_va).v[s_base + i1];
+    BufF32(pc.dst_va).v[d_base + i0] = x0 * ct - x1 * st;
+    BufF32(pc.dst_va).v[d_base + i1] = x0 * st + x1 * ct;
+}
+)GLSL";
+
+struct rope_push {
+    uint64_t src_va, pos_va, freq_va, dst_va;
+    uint32_t ne0, ne1, ne2, ne3;
+    uint32_t s_nb1, s_nb2, s_nb3;
+    uint32_t d_nb1, d_nb2, d_nb3;
+    uint32_t n_dims, mode;
+    float    theta_scale, freq_scale, attn_factor;
+    uint32_t pad0;
+};
+static_assert(sizeof(rope_push) <= AGX_MAX_PUSH_BYTES, "rope_push > 256B");
+
+static const char * k_glsl_topk_argsort = R"GLSL(
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufI32 { int v[]; };
+
+layout(push_constant) uniform PushArgs {
+    uint64_t src_va;
+    uint64_t dst_va;
+    uint     ne0;      // row length
+    uint     k_out;    // top-k count (or ne0 for full argsort)
+    uint     n_rows;
+    uint     desc;     // 1 = descending, 0 = ascending
+} pc;
+
+shared int s_picked[256];
+
+void main() {
+    const uint row  = gl_WorkGroupID.x;
+    const uint lane = gl_LocalInvocationID.x;
+    if (row >= pc.n_rows) return;
+
+    const uint s_base = row * pc.ne0;
+    const uint d_base = row * pc.k_out;
+    const uint K      = pc.k_out;
+    const bool is_desc = (pc.desc != 0u);
+
+    for (uint k = 0u; k < K; ++k) {
+        float bv = is_desc ? uintBitsToFloat(0xFF800000u) : uintBitsToFloat(0x7F800000u);
+        int   bi = 0x7FFFFFFF;
+
+        for (uint i = lane; i < pc.ne0; i += 32u) {
+            int ii = int(i);
+            bool used = false;
+            uint chk = min(k, 256u);
+            for (uint p = 0u; p < chk; ++p) {
+                if (s_picked[p] == ii) { used = true; break; }
+            }
+            if (!used) {
+                float v = ConstBufF32(pc.src_va).v[s_base + i];
+                bool better = is_desc ? (v > bv || (v == bv && ii < bi))
+                                      : (v < bv || (v == bv && ii < bi));
+                if (better) { bv = v; bi = ii; }
+            }
+        }
+        for (uint off = 16u; off > 0u; off >>= 1u) {
+            float ov = subgroupShuffleXor(bv, off);
+            int   oi = subgroupShuffleXor(bi, off);
+            bool better = is_desc ? (ov > bv || (ov == bv && oi < bi))
+                                  : (ov < bv || (ov == bv && oi < bi));
+            if (better) { bv = ov; bi = oi; }
+        }
+        if (lane == 0u) {
+            if (k < 256u) s_picked[k] = bi;
+            BufI32(pc.dst_va).v[d_base + k] = bi;
+        }
+        subgroupBarrier();
+    }
+}
+)GLSL";
+
+struct topk_argsort_push {
+    uint64_t src_va, dst_va;
+    uint32_t ne0, k_out, n_rows, desc;
+};
+static_assert(sizeof(topk_argsort_push) <= AGX_MAX_PUSH_BYTES, "topk_argsort_push > 256B");
+
+static const char * k_glsl_glu = R"GLSL(
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufF32 { float v[]; };
+
+layout(push_constant) uniform PushArgs {
+    uint64_t g_va;
+    uint64_t u_va;
+    uint64_t d_va;
+    uint     ne0, n_rows;
+    uint     g_nb1, u_nb1, d_nb1; // floats
+    uint     glu_op; // 0=REGLU, 1=GEGLU, 2=SWIGLU, 3=SWIGLU_OAI, 6=SWIGLU_CLAMP
+    uint     swapped;
+    float    alpha, limit;
+} pc;
+
+void main() {
+    uint col = gl_GlobalInvocationID.x;
+    uint row = gl_WorkGroupID.y;
+    if (col >= pc.ne0 || row >= pc.n_rows) return;
+
+    float g = ConstBufF32(pc.g_va).v[row * pc.g_nb1 + col];
+    float u = ConstBufF32(pc.u_va).v[row * pc.u_nb1 + col];
+    if (pc.swapped != 0u) { float tmp = g; g = u; u = tmp; }
+
+    float r = 0.0;
+    if (pc.glu_op == 0u) {
+        r = max(g, 0.0) * u;
+    } else if (pc.glu_op == 1u) {
+        float act = 0.5 * g * (1.0 + tanh(0.7978845608028654 * g * (1.0 + 0.044715 * g * g)));
+        r = act * u;
+    } else if (pc.glu_op == 2u) {
+        r = (g / (1.0 + exp(-g))) * u;
+    } else if (pc.glu_op == 3u) {
+        float cg = min(g, pc.limit);
+        float cu = clamp(u, -pc.limit, pc.limit);
+        r = (cg / (1.0 + exp(-pc.alpha * cg))) * (cu + 1.0);
+    } else {
+        float cg = min(g / (1.0 + exp(-g)), pc.limit);
+        float cu = clamp(u, -pc.limit, pc.limit);
+        r = cg * cu;
+    }
+    BufF32(pc.d_va).v[row * pc.d_nb1 + col] = r;
+}
+)GLSL";
+
+struct glu_push {
+    uint64_t g_va, u_va, d_va;
+    uint32_t ne0, n_rows, g_nb1, u_nb1, d_nb1;
+    uint32_t glu_op, swapped;
+    float    alpha, limit;
+};
+static_assert(sizeof(glu_push) <= AGX_MAX_PUSH_BYTES, "glu_push > 256B");
+
+static const char * k_glsl_add_id = R"GLSL(
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufI32 { int v[]; };
+
+layout(push_constant) uniform PushArgs {
+    uint64_t a_va;
+    uint64_t b_va;
+    uint64_t ids_va;
+    uint64_t d_va;
+    uint     ne0, ne1, ne2;
+    uint     a_nb1, a_nb2; // floats
+    uint     b_nb1;        // floats
+    uint     i_nb1;        // ints
+    uint     d_nb1, d_nb2; // floats
+} pc;
+
+void main() {
+    uint i0 = gl_GlobalInvocationID.x;
+    uint i1 = gl_WorkGroupID.y;
+    uint i2 = gl_WorkGroupID.z;
+    if (i0 >= pc.ne0 || i1 >= pc.ne1 || i2 >= pc.ne2) return;
+
+    int eid = ConstBufI32(pc.ids_va).v[i2 * pc.i_nb1 + i1];
+    float a = ConstBufF32(pc.a_va).v[i2 * pc.a_nb2 + i1 * pc.a_nb1 + i0];
+    float b = ConstBufF32(pc.b_va).v[uint(max(eid, 0)) * pc.b_nb1 + i0];
+    BufF32(pc.d_va).v[i2 * pc.d_nb2 + i1 * pc.d_nb1 + i0] = a + b;
+}
+)GLSL";
+
+struct add_id_push {
+    uint64_t a_va, b_va, ids_va, d_va;
+    uint32_t ne0, ne1, ne2;
+    uint32_t a_nb1, a_nb2, b_nb1, i_nb1, d_nb1, d_nb2;
+};
+static_assert(sizeof(add_id_push) <= AGX_MAX_PUSH_BYTES, "add_id_push > 256B");
+
+// ============================================================================
+// Graph Executor State & Lazy Kernel Compilation
+// ============================================================================
+
+struct agx_va_range {
+    uint64_t beg;
+    uint64_t end;
+};
+
+struct agx_graph_exec_state {
+    const agx_kernel * k_bin_op       = nullptr;
+    const agx_kernel * k_unary_op     = nullptr;
+    const agx_kernel * k_cpy_cast     = nullptr;
+    const agx_kernel * k_row_reduce   = nullptr;
+    const agx_kernel * k_softmax      = nullptr;
+    const agx_kernel * k_get_rows     = nullptr;
+    const agx_kernel * k_set_rows     = nullptr;
+    const agx_kernel * k_concat_pad   = nullptr;
+    const agx_kernel * k_ssm_conv     = nullptr;
+    const agx_kernel * k_rope         = nullptr;
+    const agx_kernel * k_topk_argsort = nullptr;
+    const agx_kernel * k_glu          = nullptr;
+    const agx_kernel * k_add_id       = nullptr;
+
+    agx_inkling2_engine * inkling2    = nullptr;
+    agx_graph_exec_stats  stats       = {};
+    bool                  initialized = false;
+};
+
+static agx_graph_exec_state * get_exec_state(agx_backend_context * ctx) {
+    if (!ctx) return nullptr;
+    if (!ctx->graph_exec_state) {
+        ctx->graph_exec_state = new agx_graph_exec_state();
+    }
+    auto * st = static_cast<agx_graph_exec_state *>(ctx->graph_exec_state);
+    if (!st->initialized && ctx->compiler) {
+        agx_compile_opts opts;
+        opts.is_hot_kernel     = true;
+        opts.strict_zero_spill = true;
+        st->k_bin_op       = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_bin_op",       k_glsl_bin_op,       opts);
+        st->k_unary_op     = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_unary_op",     k_glsl_unary_op,     opts);
+        st->k_cpy_cast     = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_cpy_cast",     k_glsl_cpy_cast,     opts);
+        st->k_row_reduce   = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_row_reduce",   k_glsl_row_reduce,   opts);
+        st->k_softmax      = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_softmax",      k_glsl_softmax,      opts);
+        st->k_get_rows     = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_get_rows",     k_glsl_get_rows,     opts);
+        st->k_set_rows     = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_set_rows",     k_glsl_set_rows,     opts);
+        st->k_concat_pad   = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_concat_pad",   k_glsl_concat_pad,   opts);
+        st->k_ssm_conv     = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_ssm_conv",     k_glsl_ssm_conv,     opts);
+        st->k_rope         = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_rope",         k_glsl_rope,         opts);
+        st->k_topk_argsort = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_topk_argsort", k_glsl_topk_argsort, opts);
+        st->k_glu          = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_glu",          k_glsl_glu,          opts);
+        st->k_add_id       = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_add_id",       k_glsl_add_id,       opts);
+        st->initialized    = (st->k_bin_op && st->k_unary_op && st->k_cpy_cast && st->k_row_reduce &&
+                              st->k_softmax && st->k_get_rows && st->k_set_rows && st->k_concat_pad &&
+                              st->k_ssm_conv && st->k_rope && st->k_topk_argsort && st->k_glu && st->k_add_id);
+    }
+    return st;
+}
+
+agx_inkling2_engine * agx_graph_exec_get_inkling2(agx_backend_context * ctx) {
+    auto * st = get_exec_state(ctx);
+    if (!st) return nullptr;
+    if (!st->inkling2) {
+        agx_inkling2_hparams hp;
+        agx_inkling2_fill_default_hparams(&hp);
+        st->inkling2 = agx_inkling2_engine_create(ctx, hp, 8u);
+    }
+    return st->inkling2;
+}
+
+void agx_graph_exec_get_stats(const agx_backend_context * ctx, agx_graph_exec_stats * out) {
+    if (!out) return;
+    if (!ctx || !ctx->graph_exec_state) {
+        std::memset(out, 0, sizeof(*out));
+        return;
+    }
+    *out = static_cast<const agx_graph_exec_state *>(ctx->graph_exec_state)->stats;
+}
+
+void agx_graph_exec_reset_stats(agx_backend_context * ctx) {
+    if (ctx && ctx->graph_exec_state) {
+        static_cast<agx_graph_exec_state *>(ctx->graph_exec_state)->stats = {};
+    }
+}
+
+// ============================================================================
+// Helper Utilities for TLA+-Verified Hazard Tracking & Type Mapping
+// ============================================================================
+
+static bool is_view_only_op(enum ggml_op op) {
+    return op == GGML_OP_NONE || op == GGML_OP_VIEW || op == GGML_OP_RESHAPE ||
+           op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
+}
+
+static bool cpy_type_code(enum ggml_type t, uint32_t * out) {
+    switch (t) {
+        case GGML_TYPE_F32:  *out = 0u; return true;
+        case GGML_TYPE_F16:  *out = 1u; return true;
+        case GGML_TYPE_BF16: *out = 2u; return true;
+        case GGML_TYPE_I32:  *out = 3u; return true;
+        default: return false;
+    }
+}
+
+static agx_va_range tensor_va_range(const struct ggml_tensor * t) {
+    uint64_t va = agx_tensor_gpu_va(t);
+    if (!va) return { 0, 0 };
+    const struct ggml_tensor * root = t->view_src ? t->view_src : t;
+    size_t sz = ggml_nbytes(root);
+    if (sz == 0) sz = 4;
+    uint64_t rva = agx_tensor_gpu_va(root);
+    return { rva ? rva : va, (rva ? rva : va) + sz };
+}
+
+static bool ranges_overlap(const std::vector<agx_va_range> & dirty, agx_va_range q) {
+    if (q.beg == q.end) return false;
+    for (const auto & r : dirty) {
+        if (q.beg < r.end && r.beg < q.end) return true;
+    }
+    return false;
+}
+
+static uint32_t map_unary_op_code(enum ggml_unary_op u) {
+    switch (u) {
+        case GGML_UNARY_OP_ABS:         return 10u;
+        case GGML_UNARY_OP_SGN:         return 11u;
+        case GGML_UNARY_OP_NEG:         return 12u;
+        case GGML_UNARY_OP_STEP:        return 13u;
+        case GGML_UNARY_OP_TANH:        return 14u;
+        case GGML_UNARY_OP_ELU:         return 15u;
+        case GGML_UNARY_OP_RELU:        return 16u;
+        case GGML_UNARY_OP_SIGMOID:     return 17u;
+        case GGML_UNARY_OP_GELU:        return 18u;
+        case GGML_UNARY_OP_GELU_QUICK:  return 19u;
+        case GGML_UNARY_OP_SILU:        return 20u;
+        case GGML_UNARY_OP_EXP:         return 21u;
+        case GGML_UNARY_OP_EXPM1:       return 22u;
+        case GGML_UNARY_OP_SOFTPLUS:    return 23u;
+        case GGML_UNARY_OP_GELU_ERF:    return 24u;
+        case GGML_UNARY_OP_FLOOR:       return 25u;
+        case GGML_UNARY_OP_CEIL:        return 26u;
+        case GGML_UNARY_OP_ROUND:       return 27u;
+        case GGML_UNARY_OP_TRUNC:       return 28u;
+        case GGML_UNARY_OP_HARDSWISH:   return 29u;
+        case GGML_UNARY_OP_HARDSIGMOID: return 30u;
+        default:                        return 0xFFFFFFFFu;
+    }
+}
+
+// ============================================================================
+// Cross-Module Entrypoints (`agx-common.h` extern "C")
+// ============================================================================
+
+extern "C" {
+
+bool agx_supports_op(const agx_drm_device * dev, const struct ggml_tensor * op) {
+    (void) dev;
+    if (!op) return false;
+
+    const struct ggml_tensor * s0 = op->src[0];
+    const struct ggml_tensor * s1 = op->src[1];
+    uint32_t tc0 = 0, tc1 = 0;
+
+    switch (op->op) {
+        case GGML_OP_NONE:
+        case GGML_OP_VIEW:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+            return true;
+
+        case GGML_OP_ADD:
+        case GGML_OP_SUB:
+        case GGML_OP_MUL:
+        case GGML_OP_DIV:
+            return s0 && s1 && s0->type == GGML_TYPE_F32 && s1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+
+        case GGML_OP_SCALE:
+        case GGML_OP_CLAMP:
+        case GGML_OP_SQR:
+        case GGML_OP_SQRT:
+        case GGML_OP_LOG:
+        case GGML_OP_SIN:
+        case GGML_OP_COS:
+        case GGML_OP_RMS_NORM:
+        case GGML_OP_NORM:
+        case GGML_OP_L2_NORM:
+        case GGML_OP_SUM_ROWS:
+        case GGML_OP_MEAN:
+        case GGML_OP_CUMSUM:
+            return s0 && s0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   s0->nb[0] == sizeof(float) && op->nb[0] == sizeof(float);
+
+        case GGML_OP_FILL:
+            return op->type == GGML_TYPE_F32;
+
+        case GGML_OP_ARGMAX:
+            return s0 && s0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I32 &&
+                   s0->nb[0] == sizeof(float) && op->nb[0] == sizeof(int32_t);
+
+        case GGML_OP_UNARY:
+            return s0 && s0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   map_unary_op_code(ggml_get_unary_op(op)) != 0xFFFFFFFFu;
+
+        case GGML_OP_GLU: {
+            const enum ggml_glu_op gop = ggml_get_glu_op(op);
+            return s0 && s0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   (!s1 || (s1->type == GGML_TYPE_F32 && ggml_is_contiguous(s1))) &&
+                   ggml_is_contiguous(s0) && ggml_is_contiguous(op) &&
+                   (gop == GGML_GLU_OP_REGLU || gop == GGML_GLU_OP_GEGLU ||
+                    gop == GGML_GLU_OP_SWIGLU || gop == GGML_GLU_OP_SWIGLU_OAI ||
+                    gop == GGML_GLU_OP_SWIGLU_CLAMP);
+        }
+
+        case GGML_OP_CPY:
+        case GGML_OP_CONT:
+        case GGML_OP_DUP:
+            return s0 && cpy_type_code(s0->type, &tc0) && cpy_type_code(op->type, &tc1);
+
+        case GGML_OP_REPEAT:
+            return s0 && (s0->type == GGML_TYPE_F32 || s0->type == GGML_TYPE_I32) &&
+                   op->type == s0->type && ggml_is_contiguous(op);
+
+        case GGML_OP_PAD:
+            return s0 && (s0->type == GGML_TYPE_F32 || s0->type == GGML_TYPE_I32) &&
+                   op->type == s0->type && ggml_is_contiguous(op) &&
+                   ggml_get_op_params_i32(op, 8) == 0; // non-circular pad
+
+        case GGML_OP_CONCAT:
+            return s0 && s1 && (s0->type == GGML_TYPE_F32 || s0->type == GGML_TYPE_I32) &&
+                   s1->type == s0->type && op->type == s0->type && ggml_is_contiguous(op);
+
+        case GGML_OP_SOFT_MAX:
+            return s0 && s0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(s0) && ggml_is_contiguous(op) &&
+                   (!s1 || ((s1->type == GGML_TYPE_F16 || s1->type == GGML_TYPE_F32) && ggml_is_contiguous(s1))) &&
+                   (!op->src[2] || (op->src[2]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[2])));
+
+        case GGML_OP_GET_ROWS:
+            return s0 && s1 && s1->type == GGML_TYPE_I32 &&
+                   (op->type == GGML_TYPE_F32 || (op->type == GGML_TYPE_I32 && s0->type == GGML_TYPE_I32)) &&
+                   (s0->type == GGML_TYPE_F32 || s0->type == GGML_TYPE_F16 ||
+                    s0->type == GGML_TYPE_BF16 || s0->type == GGML_TYPE_Q8_0 || s0->type == GGML_TYPE_I32) &&
+                   s0->nb[0] == ggml_type_size(s0->type) && op->nb[0] == ggml_type_size(op->type);
+
+        case GGML_OP_SET_ROWS:
+            return s0 && s1 && s0->type == GGML_TYPE_F32 &&
+                   (s1->type == GGML_TYPE_I64 || s1->type == GGML_TYPE_I32) &&
+                   (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
+                   s0->nb[0] == sizeof(float) && op->nb[0] == ggml_type_size(op->type);
+
+        case GGML_OP_ADD_ID:
+            return s0 && s1 && op->src[2] && s0->type == GGML_TYPE_F32 && s1->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_F32 &&
+                   s0->nb[0] == sizeof(float) && s1->nb[0] == sizeof(float) &&
+                   op->src[2]->nb[0] == sizeof(int32_t) && op->nb[0] == sizeof(float) && op->ne[3] == 1;
+
+        case GGML_OP_SSM_CONV:
+            return s0 && s1 && s0->type == GGML_TYPE_F32 && s1->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32 && ggml_is_contiguous(s0) && ggml_is_contiguous(s1) &&
+                   ggml_is_contiguous(op) && s0->ne[3] == 1 && op->ne[3] == 1;
+
+        case GGML_OP_ROPE: {
+            float ext_factor = 0.0f;
+            std::memcpy(&ext_factor, (const char *) op->op_params + 28, sizeof(float));
+            const int n_dims = ggml_get_op_params_i32(op, 1);
+            return s0 && s1 && s0->type == GGML_TYPE_F32 && s1->type == GGML_TYPE_I32 &&
+                   op->type == GGML_TYPE_F32 && s0->nb[0] == sizeof(float) && op->nb[0] == sizeof(float) &&
+                   ggml_is_contiguous(s1) &&
+                   (!op->src[2] || (op->src[2]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[2]))) &&
+                   (ggml_get_op_params_i32(op, 2) & ~2) == 0 && ext_factor == 0.0f &&
+                   n_dims > 0 && n_dims <= s0->ne[0] && (n_dims & 1) == 0;
+        }
+
+        case GGML_OP_ARGSORT:
+        case GGML_OP_TOP_K:
+            return s0 && s0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I32 &&
+                   ggml_is_contiguous(s0) && ggml_is_contiguous(op) &&
+                   s0->ne[0] <= 262144 && op->ne[0] <= 256;
+
+        case GGML_OP_MUL_MAT:
+            if (ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+                s1 && s1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(s1) && (s1->ne[0] == 64 || s1->ne[0] == 128)) {
+                return true;
+            }
+            return agx_gemm_supports_mul_mat(op);
+
+        case GGML_OP_MUL_MAT_ID:
+            return agx_moe_supports_mul_mat_id(op);
+
+        case GGML_OP_FLASH_ATTN_EXT:
+            return s0 && s0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   (s0->ne[0] == 64 || s0->ne[0] == 128);
+
+        default:
+            return false;
+    }
+}
+
+void agx_graph_optimize(agx_backend_context *                       ctx,
+                        struct ggml_cgraph *                        cgraph,
+                        struct ggml_backend_graph_optimize_params * params) {
+    (void) ctx;
+    (void) cgraph;
+    (void) params;
+}
+
+void agx_graph_exec_cleanup(agx_backend_context * ctx) {
+    if (!ctx) return;
+    if (ctx->graph_exec_state) {
+        auto * st = static_cast<agx_graph_exec_state *>(ctx->graph_exec_state);
+        if (st->inkling2) {
+            agx_inkling2_engine_destroy(st->inkling2);
+            st->inkling2 = nullptr;
+        }
+        delete st;
+        ctx->graph_exec_state = nullptr;
+    }
+    if (ctx->kv_hybrid_state) {
+        agx_kv_hybrid_destroy(static_cast<agx_kv_hybrid_pool *>(ctx->kv_hybrid_state));
+        ctx->kv_hybrid_state = nullptr;
+    }
+    if (ctx->moe_state) {
+        agx_moe_destroy(static_cast<agx_moe_runner *>(ctx->moe_state));
+        ctx->moe_state = nullptr;
+    }
+    if (ctx->gemm_state) {
+        agx_gemm_cleanup(ctx);
+    }
+}
+
+// ============================================================================
+// Single-CDM-Stream Generic + Fused ggml_cgraph Execution
+// ============================================================================
+
+enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph * cgraph) {
+    if (!ctx || !ctx->drm || !ctx->stream || !cgraph) {
+        return GGML_STATUS_FAILED;
+    }
+    if (cgraph->n_nodes == 0) {
+        return GGML_STATUS_SUCCESS;
+    }
+
+    auto * st = get_exec_state(ctx);
+    if (!st || !st->initialized) {
+        AGX_LOG_ERROR("agx_graph_compute: failed to initialize generic compute kernels");
+        return GGML_STATUS_FAILED;
+    }
+
+    agx_cdm_stream * stream = ctx->stream;
+    agx_cdm_stream_reset(stream);
+
+    std::vector<agx_va_range> dirty_vas;
+    dirty_vas.reserve(64);
+    bool has_dispatched = false;
+
+    auto ensure_inputs_ready = [&](const struct ggml_tensor * const * srcs, int n_srcs) {
+        bool hazard = false;
+        for (int s = 0; s < n_srcs; ++s) {
+            if (!srcs[s]) continue;
+            if (ranges_overlap(dirty_vas, tensor_va_range(srcs[s]))) {
+                hazard = true;
+                break;
+            }
+        }
+        if (hazard && has_dispatched) {
+            agx_cdm_barrier_usc(stream);
+            dirty_vas.clear();
+        } else if (has_dispatched) {
+            st->stats.barriers_elided++;
+        }
+    };
+
+    auto record_output = [&](const struct ggml_tensor * dst) {
+        has_dispatched = true;
+        dirty_vas.push_back(tensor_va_range(dst));
+    };
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        struct ggml_tensor * node = cgraph->nodes[i];
+        if (!node || is_view_only_op(node->op)) {
+            st->stats.view_nodes_elided++;
+            continue;
+        }
+        if (ggml_nelements(node) == 0) {
+            continue;
+        }
+        // Never submit a kernel referencing a null / non-AGX GPU VA (prevents G17 page faults)
+        if (agx_tensor_gpu_va(node) == 0) {
+            AGX_LOG_ERROR("agx_graph_compute: node %d (%s) dst has null GPU VA", i, ggml_op_name(node->op));
+            return GGML_STATUS_FAILED;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (node->src[s] && ggml_nelements(node->src[s]) > 0 && agx_tensor_gpu_va(node->src[s]) == 0) {
+                AGX_LOG_ERROR("agx_graph_compute: node %d (%s) src[%d] has null GPU VA", i, ggml_op_name(node->op), s);
+                return GGML_STATUS_FAILED;
+            }
+        }
+
+        // --------------------------------------------------------------------
+        // Fastpath Fusion 1: Inkling 2 Exact L2 Clip (`L2_NORM(t) -> SCALE(t)`)
+        // --------------------------------------------------------------------
+        if (node->op == GGML_OP_L2_NORM && i + 1 < cgraph->n_nodes &&
+            ggml_can_fuse(cgraph, i, { GGML_OP_L2_NORM, GGML_OP_SCALE })) {
+            struct ggml_tensor * sc_node = cgraph->nodes[i + 1];
+            float thresh = 0.0f, sc = 0.0f, bias = 0.0f;
+            std::memcpy(&thresh, node->op_params, sizeof(float));
+            std::memcpy(&sc,     sc_node->op_params, sizeof(float));
+            std::memcpy(&bias,   (const char *) sc_node->op_params + 4, sizeof(float));
+            if (bias == 0.0f && std::fabs(thresh - sc) < 1e-6f && thresh > 0.0f &&
+                ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(sc_node) &&
+                node->src[0]->ne[0] <= 128) {
+                auto * eng = agx_graph_exec_get_inkling2(ctx);
+                if (eng) {
+                    const struct ggml_tensor * srcs[1] = { node->src[0] };
+                    ensure_inputs_ready(srcs, 1);
+
+                    agx_conv_clip_fwht_push cpc{};
+                    cpc.src_va       = agx_tensor_gpu_va(node->src[0]);
+                    cpc.dst_va       = agx_tensor_gpu_va(sc_node);
+                    cpc.head_dim     = (uint32_t) node->src[0]->ne[0];
+                    cpc.n_head       = (uint32_t) node->src[0]->ne[1];
+                    cpc.n_seq_tokens = (uint32_t) (node->src[0]->ne[2] * node->src[0]->ne[3]);
+                    cpc.n_seqs       = 1u;
+                    cpc.flags        = AGX_PREP_FLAG_L2_CLIP;
+                    cpc.clip_thresh  = thresh;
+                    if (!agx_inkling2_dispatch_conv_clip_fwht(eng, stream, cpc, AGX_BARRIER_NONE)) {
+                        return GGML_STATUS_FAILED;
+                    }
+                    record_output(sc_node);
+                    st->stats.fused_l2_clip_hits++;
+                    st->stats.nodes_executed += 2;
+                    ++i; // consumed SCALE node
+                    continue;
+                }
+            }
+        }
+
+        // --------------------------------------------------------------------
+        // Fastpath Fusion 2: Inkling 2 Logit Softcap (`SCALE(1/c) -> TANH -> SCALE(c)`)
+        // --------------------------------------------------------------------
+        if (node->op == GGML_OP_SCALE && i + 2 < cgraph->n_nodes &&
+            ggml_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE })) {
+            struct ggml_tensor * u_node  = cgraph->nodes[i + 1];
+            struct ggml_tensor * s2_node = cgraph->nodes[i + 2];
+            float s1 = 0.0f, b1 = 0.0f, s2 = 0.0f, b2 = 0.0f;
+            std::memcpy(&s1, node->op_params, sizeof(float));
+            std::memcpy(&b1, (const char *) node->op_params + 4, sizeof(float));
+            std::memcpy(&s2, s2_node->op_params, sizeof(float));
+            std::memcpy(&b2, (const char *) s2_node->op_params + 4, sizeof(float));
+            if (ggml_get_unary_op(u_node) == GGML_UNARY_OP_TANH &&
+                b1 == 0.0f && b2 == 0.0f && s2 > 0.0f && std::fabs(s1 * s2 - 1.0f) < 1e-4f &&
+                ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(s2_node)) {
+                auto * eng = agx_graph_exec_get_inkling2(ctx);
+                if (eng) {
+                    const struct ggml_tensor * srcs[1] = { node->src[0] };
+                    ensure_inputs_ready(srcs, 1);
+
+                    const uint32_t ne0 = (uint32_t) s2_node->ne[0];
+                    const uint32_t nr  = (uint32_t) ggml_nrows(s2_node);
+                    if (!agx_inkling2_dispatch_softcap_argmax(eng, stream,
+                            agx_tensor_gpu_va(node->src[0]),
+                            agx_tensor_gpu_va(s2_node),
+                            0ull, ne0, ne0, nr, s2, false, AGX_BARRIER_NONE)) {
+                        return GGML_STATUS_FAILED;
+                    }
+                    record_output(s2_node);
+                    st->stats.fused_softcap_hits++;
+                    st->stats.nodes_executed += 3;
+                    i += 2; // consumed TANH + SCALE
+                    continue;
+                }
+            }
+        }
+
+        // Standard RAW hazard check across all node inputs
+        ensure_inputs_ready(node->src, GGML_MAX_SRC);
+
+        bool ok = false;
+        switch (node->op) {
+            case GGML_OP_ADD:
+            case GGML_OP_SUB:
+            case GGML_OP_MUL:
+            case GGML_OP_DIV: {
+                const auto * a = node->src[0];
+                const auto * b = node->src[1];
+                bin_op_push pc{};
+                pc.a_va = agx_tensor_gpu_va(a);
+                pc.b_va = agx_tensor_gpu_va(b);
+                pc.d_va = agx_tensor_gpu_va(node);
+                pc.ne0  = (uint32_t) node->ne[0]; pc.ne1  = (uint32_t) node->ne[1];
+                pc.ne2  = (uint32_t) node->ne[2]; pc.ne3  = (uint32_t) node->ne[3];
+                pc.ne00 = (uint32_t) a->ne[0];    pc.ne01 = (uint32_t) a->ne[1];
+                pc.ne02 = (uint32_t) a->ne[2];    pc.ne03 = (uint32_t) a->ne[3];
+                pc.ne10 = (uint32_t) b->ne[0];    pc.ne11 = (uint32_t) b->ne[1];
+                pc.ne12 = (uint32_t) b->ne[2];    pc.ne13 = (uint32_t) b->ne[3];
+                pc.nb00 = (uint32_t) (a->nb[0] / 4); pc.nb01 = (uint32_t) (a->nb[1] / 4);
+                pc.nb02 = (uint32_t) (a->nb[2] / 4); pc.nb03 = (uint32_t) (a->nb[3] / 4);
+                pc.nb10 = (uint32_t) (b->nb[0] / 4); pc.nb11 = (uint32_t) (b->nb[1] / 4);
+                pc.nb12 = (uint32_t) (b->nb[2] / 4); pc.nb13 = (uint32_t) (b->nb[3] / 4);
+                pc.nb0  = (uint32_t) (node->nb[0] / 4); pc.nb1 = (uint32_t) (node->nb[1] / 4);
+                pc.nb2  = (uint32_t) (node->nb[2] / 4); pc.nb3 = (uint32_t) (node->nb[3] / 4);
+                pc.op_kind = (node->op == GGML_OP_ADD) ? 0u :
+                             (node->op == GGML_OP_SUB) ? 1u :
+                             (node->op == GGML_OP_MUL) ? 2u : 3u;
+                pc.total = (uint32_t) ggml_nelements(node);
+                ok = agx_cdm_dispatch(stream, st->k_bin_op, (pc.total + 255u) / 256u, 1, 1,
+                                      &pc, sizeof(pc), AGX_BARRIER_NONE);
+            } break;
+
+            case GGML_OP_SCALE:
+            case GGML_OP_CLAMP:
+            case GGML_OP_SQR:
+            case GGML_OP_SQRT:
+            case GGML_OP_LOG:
+            case GGML_OP_SIN:
+            case GGML_OP_COS:
+            case GGML_OP_FILL:
+            case GGML_OP_UNARY: {
+                const auto * a = node->src[0];
+                unary_op_push pc{};
+                pc.a_va = a ? agx_tensor_gpu_va(a) : 0ull;
+                pc.d_va = agx_tensor_gpu_va(node);
+                pc.ne0  = (uint32_t) node->ne[0]; pc.ne1 = (uint32_t) node->ne[1];
+                pc.ne2  = (uint32_t) node->ne[2]; pc.ne3 = (uint32_t) node->ne[3];
+                if (a) {
+                    pc.nb00 = (uint32_t) (a->nb[0] / 4); pc.nb01 = (uint32_t) (a->nb[1] / 4);
+                    pc.nb02 = (uint32_t) (a->nb[2] / 4); pc.nb03 = (uint32_t) (a->nb[3] / 4);
+                }
+                pc.nb0 = (uint32_t) (node->nb[0] / 4); pc.nb1 = (uint32_t) (node->nb[1] / 4);
+                pc.nb2 = (uint32_t) (node->nb[2] / 4); pc.nb3 = (uint32_t) (node->nb[3] / 4);
+                pc.total = (uint32_t) ggml_nelements(node);
+
+                if (node->op == GGML_OP_SCALE) {
+                    pc.op_kind = 0u;
+                    std::memcpy(&pc.p0, node->op_params, sizeof(float));
+                    std::memcpy(&pc.p1, (const char *) node->op_params + 4, sizeof(float));
+                } else if (node->op == GGML_OP_CLAMP) {
+                    pc.op_kind = 1u;
+                    std::memcpy(&pc.p0, node->op_params, sizeof(float));
+                    std::memcpy(&pc.p1, (const char *) node->op_params + 4, sizeof(float));
+                } else if (node->op == GGML_OP_SQR)  { pc.op_kind = 2u; }
+                else if   (node->op == GGML_OP_SQRT) { pc.op_kind = 3u; }
+                else if   (node->op == GGML_OP_LOG)  { pc.op_kind = 4u; }
+                else if   (node->op == GGML_OP_SIN)  { pc.op_kind = 5u; }
+                else if   (node->op == GGML_OP_COS)  { pc.op_kind = 6u; }
+                else if   (node->op == GGML_OP_FILL) {
+                    pc.op_kind = 7u;
+                    std::memcpy(&pc.p0, node->op_params, sizeof(float));
+                } else {
+                    pc.op_kind = map_unary_op_code(ggml_get_unary_op(node));
+                }
+                ok = agx_cdm_dispatch(stream, st->k_unary_op, (pc.total + 255u) / 256u, 1, 1,
+                                      &pc, sizeof(pc), AGX_BARRIER_NONE);
+            } break;
+
+            case GGML_OP_CPY:
+            case GGML_OP_CONT:
+            case GGML_OP_DUP: {
+                const auto * s = node->src[0];
+                cpy_cast_push pc{};
+                pc.src_va = agx_tensor_gpu_va(s);
+                pc.dst_va = agx_tensor_gpu_va(node);
+                pc.ne0    = (uint32_t) s->ne[0]; pc.ne1 = (uint32_t) s->ne[1];
+                pc.ne2    = (uint32_t) s->ne[2]; pc.ne3 = (uint32_t) s->ne[3];
+                pc.s_nb0  = (uint32_t) s->nb[0]; pc.s_nb1 = (uint32_t) s->nb[1];
+                pc.s_nb2  = (uint32_t) s->nb[2]; pc.s_nb3 = (uint32_t) s->nb[3];
+                pc.d_nb0  = (uint32_t) node->nb[0]; pc.d_nb1 = (uint32_t) node->nb[1];
+                pc.d_nb2  = (uint32_t) node->nb[2]; pc.d_nb3 = (uint32_t) node->nb[3];
+                cpy_type_code(s->type,    &pc.src_type);
+                cpy_type_code(node->type, &pc.dst_type);
+                pc.total = (uint32_t) ggml_nelements(s);
+                pc.d_is_linear = ggml_is_contiguous(node) ? 1u : 0u;
+                ok = agx_cdm_dispatch(stream, st->k_cpy_cast, (pc.total + 255u) / 256u, 1, 1,
+                                      &pc, sizeof(pc), AGX_BARRIER_NONE);
+            } break;
+
+            case GGML_OP_RMS_NORM:
+            case GGML_OP_NORM:
+            case GGML_OP_L2_NORM:
+            case GGML_OP_SUM_ROWS:
+            case GGML_OP_MEAN:
+            case GGML_OP_CUMSUM:
+            case GGML_OP_ARGMAX: {
+                const auto * a = node->src[0];
+                row_reduce_push pc{};
+                pc.a_va = agx_tensor_gpu_va(a);
+                pc.d_va = agx_tensor_gpu_va(node);
+                pc.ne0  = (uint32_t) a->ne[0]; pc.ne1 = (uint32_t) a->ne[1];
+                pc.ne2  = (uint32_t) a->ne[2]; pc.ne3 = (uint32_t) a->ne[3];
+                pc.nb01 = (uint32_t) (a->nb[1] / 4); pc.nb02 = (uint32_t) (a->nb[2] / 4); pc.nb03 = (uint32_t) (a->nb[3] / 4);
+                pc.nb1  = (uint32_t) (node->nb[1] / 4); pc.nb2 = (uint32_t) (node->nb[2] / 4); pc.nb3 = (uint32_t) (node->nb[3] / 4);
+                if (node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_NORM || node->op == GGML_OP_L2_NORM) {
+                    std::memcpy(&pc.eps, node->op_params, sizeof(float));
+                }
+                pc.op_kind = (node->op == GGML_OP_RMS_NORM) ? 0u :
+                             (node->op == GGML_OP_NORM)     ? 1u :
+                             (node->op == GGML_OP_L2_NORM)  ? 2u :
+                             (node->op == GGML_OP_SUM_ROWS) ? 3u :
+                             (node->op == GGML_OP_MEAN)     ? 4u :
+                             (node->op == GGML_OP_CUMSUM)   ? 5u : 6u;
+                const uint32_t n_rows = pc.ne1 * pc.ne2 * pc.ne3;
+                ok = agx_cdm_dispatch(stream, st->k_row_reduce, n_rows, 1, 1,
+                                      &pc, sizeof(pc), AGX_BARRIER_NONE);
+            } break;
+
+            case GGML_OP_SOFT_MAX: {
+                const auto * s     = node->src[0];
+                const auto * mask  = node->src[1];
+                const auto * sinks = node->src[2];
+                softmax_push pc{};
+                pc.src_va      = agx_tensor_gpu_va(s);
+                pc.mask_va     = mask  ? agx_tensor_gpu_va(mask)  : 0ull;
+                pc.sinks_va    = sinks ? agx_tensor_gpu_va(sinks) : 0ull;
+                pc.dst_va      = agx_tensor_gpu_va(node);
+                pc.ne0         = (uint32_t) s->ne[0]; pc.ne1 = (uint32_t) s->ne[1];
+                pc.ne2         = (uint32_t) s->ne[2]; pc.ne3 = (uint32_t) s->ne[3];
+                pc.m_ne1       = mask ? (uint32_t) mask->ne[1] : 1u;
+                pc.m_ne2       = mask ? (uint32_t) mask->ne[2] : 1u;
+                pc.m_ne3       = mask ? (uint32_t) mask->ne[3] : 1u;
+                pc.mask_is_f16 = (mask && mask->type == GGML_TYPE_F16) ? 1u : 0u;
+                std::memcpy(&pc.scale,    node->op_params, sizeof(float));
+                std::memcpy(&pc.max_bias, (const char *) node->op_params + 4, sizeof(float));
+                const uint32_t n_head = pc.ne2;
+                const uint32_t n_log2 = 1u << (uint32_t) std::floor(std::log2((double) std::max<uint32_t>(n_head, 1u)));
+                pc.n_head_log2 = n_log2;
+                pc.m0 = (pc.max_bias > 0.0f) ? std::pow(2.0f, -pc.max_bias / (float) n_log2) : 1.0f;
+                pc.m1 = (pc.max_bias > 0.0f) ? std::pow(2.0f, -pc.max_bias / (float) (2u * n_log2)) : 1.0f;
+                const uint32_t n_rows = pc.ne1 * pc.ne2 * pc.ne3;
+                ok = agx_cdm_dispatch(stream, st->k_softmax, n_rows, 1, 1, &pc, sizeof(pc), AGX_BARRIER_NONE);
+            } break;
+
+            case GGML_OP_GET_ROWS: {
+                const auto * s   = node->src[0];
+                const auto * ids = node->src[1];
+                uint32_t rb = 0;
+                get_rows_push pc{};
+                pc.src_va = agx_tensor_gpu_va(s);
+                pc.ids_va = agx_tensor_gpu_va(ids);
+                pc.dst_va = agx_tensor_gpu_va(node);
+                pc.ne0    = (uint32_t) node->ne[0]; pc.ne1 = (uint32_t) node->ne[1];
+                pc.ne2    = (uint32_t) node->ne[2]; pc.ne3 = (uint32_t) node->ne[3];
+                pc.wtype  = (s->type == GGML_TYPE_I32) ? 5u : agx_inkling2_tensor_wtype(s, &rb);
+                pc.s_nb1  = (pc.wtype == AGX_WTYPE_Q8_0_8BLK) ? rb : (uint32_t) s->nb[1];
+                pc.s_nb2  = (uint32_t) s->nb[2];
+                pc.s_nb3  = (uint32_t) s->nb[3];
+                pc.i_nb0  = (uint32_t) ids->nb[0]; pc.i_nb1 = (uint32_t) ids->nb[1]; pc.i_nb2 = (uint32_t) ids->nb[2];
+                pc.d_nb1  = (uint32_t) node->nb[1]; pc.d_nb2 = (uint32_t) node->nb[2]; pc.d_nb3 = (uint32_t) node->nb[3];
+                ok = agx_cdm_dispatch(stream, st->k_get_rows, (pc.ne0 + 255u) / 256u, pc.ne1, pc.ne2 * pc.ne3,
+                                      &pc, sizeof(pc), AGX_BARRIER_NONE);
+            } break;
+
+            case GGML_OP_SET_ROWS: {
+                const auto * s   = node->src[0];
+                const auto * ids = node->src[1];
+                set_rows_push pc{};
+                pc.src_va     = agx_tensor_gpu_va(s);
+                pc.ids_va     = agx_tensor_gpu_va(ids);
+                pc.dst_va     = agx_tensor_gpu_va(node);
+                pc.ne0        = (uint32_t) s->ne[0]; pc.ne1 = (uint32_t) s->ne[1];
+                pc.ne2        = (uint32_t) s->ne[2]; pc.ne3 = (uint32_t) s->ne[3];
+                pc.s_nb1      = (uint32_t) s->nb[1]; pc.s_nb2 = (uint32_t) s->nb[2]; pc.s_nb3 = (uint32_t) s->nb[3];
+                pc.i_nb0      = (uint32_t) ids->nb[0]; pc.i_nb1 = (uint32_t) ids->nb[1]; pc.i_nb2 = (uint32_t) ids->nb[2];
+                pc.i_ne1      = (uint32_t) ids->ne[1]; pc.i_ne2 = (uint32_t) ids->ne[2];
+                pc.d_nb1      = (uint32_t) node->nb[1]; pc.d_nb2 = (uint32_t) node->nb[2]; pc.d_nb3 = (uint32_t) node->nb[3];
+                pc.dst_type   = (node->type == GGML_TYPE_F16) ? 1u : 0u;
+                pc.ids_is_i64 = (ids->type == GGML_TYPE_I64) ? 1u : 0u;
+                ok = agx_cdm_dispatch(stream, st->k_set_rows, (pc.ne0 + 255u) / 256u, pc.ne1, pc.ne2 * pc.ne3,
+                                      &pc, sizeof(pc), AGX_BARRIER_NONE);
+            } break;
+
+            case GGML_OP_ADD_ID: {
+                const auto * a   = node->src[0];
+                const auto * b   = node->src[1];
+                const auto * ids = node->src[2];
+                add_id_push pc{};
+                pc.a_va   = agx_tensor_gpu_va(a);
+                pc.b_va   = agx_tensor_gpu_va(b);
+                pc.ids_va = agx_tensor_gpu_va(ids);
+                pc.d_va   = agx_tensor_gpu_va(node);
+                pc.ne0    = (uint32_t) node->ne[0]; pc.ne1 = (uint32_t) node->ne[1]; pc.ne2 = (uint32_t) node->ne[2];
+                pc.a_nb1  = (uint32_t) (a->nb[1] / 4); pc.a_nb2 = (uint32_t) (a->nb[2] / 4);
+                pc.b_nb1  = (uint32_t) (b->nb[1] / 4);
+                pc.i_nb1  = (uint32_t) (ids->nb[1] / 4);
+                pc.d_nb1  = (uint32_t) (node->nb[1] / 4); pc.d_nb2 = (uint32_t) (node->nb[2] / 4);
+                ok = agx_cdm_dispatch(stream, st->k_add_id, (pc.ne0 + 255u) / 256u, pc.ne1, pc.ne2,
+                                      &pc, sizeof(pc), AGX_BARRIER_NONE);
+            } break;
+
+            case GGML_OP_CONCAT:
+            case GGML_OP_PAD:
+            case GGML_OP_REPEAT: {
+                const auto * a = node->src[0];
+                const auto * b = node->src[1];
+                concat_pad_push pc{};
+                pc.a_va  = agx_tensor_gpu_va(a);
+                pc.b_va  = b ? agx_tensor_gpu_va(b) : 0ull;
+                pc.d_va  = agx_tensor_gpu_va(node);
+                pc.ne0   = (uint32_t) node->ne[0]; pc.ne1   = (uint32_t) node->ne[1];
+                pc.ne2   = (uint32_t) node->ne[2]; pc.ne3   = (uint32_t) node->ne[3];
+                pc.a_ne0 = (uint32_t) a->ne[0];    pc.a_ne1 = (uint32_t) a->ne[1];
+                pc.a_ne2 = (uint32_t) a->ne[2];    pc.a_ne3 = (uint32_t) a->ne[3];
+                pc.a_nb0 = (uint32_t) (a->nb[0] / 4); pc.a_nb1 = (uint32_t) (a->nb[1] / 4);
+                pc.a_nb2 = (uint32_t) (a->nb[2] / 4); pc.a_nb3 = (uint32_t) (a->nb[3] / 4);
+                if (b) {
+                    pc.b_nb0 = (uint32_t) (b->nb[0] / 4); pc.b_nb1 = (uint32_t) (b->nb[1] / 4);
+                    pc.b_nb2 = (uint32_t) (b->nb[2] / 4); pc.b_nb3 = (uint32_t) (b->nb[3] / 4);
+                }
+                if (node->op == GGML_OP_CONCAT) {
+                    pc.mode = 0u;
+                    pc.p0   = (uint32_t) ggml_get_op_params_i32(node, 0);
+                } else if (node->op == GGML_OP_PAD) {
+                    pc.mode = 1u;
+                    pc.p0   = (uint32_t) ggml_get_op_params_i32(node, 0);
+                    pc.p1   = (uint32_t) ggml_get_op_params_i32(node, 2);
+                    pc.p2   = (uint32_t) ggml_get_op_params_i32(node, 4);
+                    pc.p3   = (uint32_t) ggml_get_op_params_i32(node, 6);
+                } else {
+                    pc.mode = 2u;
+                }
+                pc.total = (uint32_t) ggml_nelements(node);
+                ok = agx_cdm_dispatch(stream, st->k_concat_pad, (pc.total + 255u) / 256u, 1, 1,
+                                      &pc, sizeof(pc), AGX_BARRIER_NONE);
+            } break;
+
+            case GGML_OP_SSM_CONV: {
+                const auto * s0 = node->src[0];
+                const auto * s1 = node->src[1];
+                ssm_conv_push pc{};
+                pc.src0_va = agx_tensor_gpu_va(s0);
+                pc.src1_va = agx_tensor_gpu_va(s1);
+                pc.dst_va  = agx_tensor_gpu_va(node);
+                pc.nb01    = (uint32_t) (s0->nb[1] / 4);
+                pc.nb02    = (uint32_t) (s0->nb[2] / 4);
+                pc.nb11    = (uint32_t) (s1->nb[1] / 4);
+                pc.d_nb1   = (uint32_t) (node->nb[1] / 4);
+                pc.d_nb2   = (uint32_t) (node->nb[2] / 4);
+                pc.nc      = (uint32_t) s1->ne[0];
+                pc.nr      = (uint32_t) s0->ne[1];
+                pc.n_t     = (uint32_t) node->ne[1];
+                pc.n_s     = (uint32_t) node->ne[2];
+                ok = agx_cdm_dispatch(stream, st->k_ssm_conv,
+                                      (pc.nr + 31u) / 32u, (pc.n_t + 7u) / 8u, pc.n_s,
+                                      &pc, sizeof(pc), AGX_BARRIER_NONE);
+            } break;
+
+            case GGML_OP_ROPE: {
+                const auto * s    = node->src[0];
+                const auto * pos  = node->src[1];
+                const auto * freq = node->src[2];
+                rope_push pc{};
+                pc.src_va  = agx_tensor_gpu_va(s);
+                pc.pos_va  = agx_tensor_gpu_va(pos);
+                pc.freq_va = freq ? agx_tensor_gpu_va(freq) : 0ull;
+                pc.dst_va  = agx_tensor_gpu_va(node);
+                pc.ne0     = (uint32_t) s->ne[0]; pc.ne1 = (uint32_t) s->ne[1];
+                pc.ne2     = (uint32_t) s->ne[2]; pc.ne3 = (uint32_t) s->ne[3];
+                pc.s_nb1   = (uint32_t) (s->nb[1] / 4); pc.s_nb2 = (uint32_t) (s->nb[2] / 4); pc.s_nb3 = (uint32_t) (s->nb[3] / 4);
+                pc.d_nb1   = (uint32_t) (node->nb[1] / 4); pc.d_nb2 = (uint32_t) (node->nb[2] / 4); pc.d_nb3 = (uint32_t) (node->nb[3] / 4);
+                pc.n_dims  = (uint32_t) ggml_get_op_params_i32(node, 1);
+                pc.mode    = (uint32_t) ggml_get_op_params_i32(node, 2);
+                float freq_base = 10000.0f, freq_scale = 1.0f, attn_factor = 1.0f;
+                std::memcpy(&freq_base,   (const char *) node->op_params + 20, sizeof(float));
+                std::memcpy(&freq_scale,  (const char *) node->op_params + 24, sizeof(float));
+                std::memcpy(&attn_factor, (const char *) node->op_params + 32, sizeof(float));
+                pc.theta_scale = std::pow(freq_base, -2.0f / (float) pc.n_dims);
+                pc.freq_scale  = freq_scale;
+                pc.attn_factor = attn_factor;
+                ok = agx_cdm_dispatch(stream, st->k_rope,
+                                      ((pc.ne0 >> 1u) + 63u) / 64u, pc.ne1, pc.ne2 * pc.ne3,
+                                      &pc, sizeof(pc), AGX_BARRIER_NONE);
+            } break;
+
+            case GGML_OP_ARGSORT:
+            case GGML_OP_TOP_K: {
+                const auto * s = node->src[0];
+                topk_argsort_push pc{};
+                pc.src_va = agx_tensor_gpu_va(s);
+                pc.dst_va = agx_tensor_gpu_va(node);
+                pc.ne0    = (uint32_t) s->ne[0];
+                pc.k_out  = (uint32_t) node->ne[0];
+                pc.n_rows = (uint32_t) ggml_nrows(s);
+                pc.desc   = (node->op == GGML_OP_TOP_K) ? 1u :
+                            (ggml_get_op_params_i32(node, 0) == GGML_SORT_ORDER_DESC ? 1u : 0u);
+                ok = agx_cdm_dispatch(stream, st->k_topk_argsort, pc.n_rows, 1, 1,
+                                      &pc, sizeof(pc), AGX_BARRIER_NONE);
+            } break;
+
+            case GGML_OP_GLU: {
+                const auto * s0 = node->src[0];
+                const auto * s1 = node->src[1];
+                glu_push pc{};
+                pc.g_va   = agx_tensor_gpu_va(s0);
+                pc.u_va   = s1 ? agx_tensor_gpu_va(s1) : (pc.g_va + (uint64_t) node->ne[0] * sizeof(float));
+                pc.d_va   = agx_tensor_gpu_va(node);
+                pc.ne0    = (uint32_t) node->ne[0];
+                pc.n_rows = (uint32_t) ggml_nrows(node);
+                pc.g_nb1  = (uint32_t) (s0->nb[1] / 4);
+                pc.u_nb1  = s1 ? (uint32_t) (s1->nb[1] / 4) : pc.g_nb1;
+                pc.d_nb1  = (uint32_t) (node->nb[1] / 4);
+                pc.glu_op  = (uint32_t) ggml_get_glu_op(node);
+                pc.swapped = (uint32_t) ggml_get_op_params_i32(node, 1);
+                std::memcpy(&pc.alpha, (const char *) node->op_params + 8,  sizeof(float));
+                std::memcpy(&pc.limit, (const char *) node->op_params + 12, sizeof(float));
+                ok = agx_cdm_dispatch(stream, st->k_glu, (pc.ne0 + 255u) / 256u, pc.n_rows, 1,
+                                      &pc, sizeof(pc), AGX_BARRIER_NONE);
+            } break;
+
+            case GGML_OP_MUL_MAT: {
+                // Fastpath: in-register FWHT_{64,128} when GGML_HINT_SRC0_IS_HADAMARD is set!
+                if (ggml_get_op_params_i32(node, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+                    node->src[1] && node->src[1]->type == GGML_TYPE_F32 &&
+                    ggml_is_contiguous(node->src[1]) &&
+                    (node->src[1]->ne[0] == 64 || node->src[1]->ne[0] == 128)) {
+                    auto * eng = agx_graph_exec_get_inkling2(ctx);
+                    if (eng) {
+                        agx_conv_clip_fwht_push fpc{};
+                        fpc.src_va       = agx_tensor_gpu_va(node->src[1]);
+                        fpc.dst_va       = agx_tensor_gpu_va(node);
+                        fpc.head_dim     = (uint32_t) node->src[1]->ne[0];
+                        fpc.n_head       = (uint32_t) ggml_nrows(node->src[1]);
+                        fpc.n_seq_tokens = 1u;
+                        fpc.n_seqs       = 1u;
+                        fpc.flags        = (fpc.head_dim == 128u) ? AGX_PREP_FLAG_FWHT_128 : AGX_PREP_FLAG_FWHT_64;
+                        ok = agx_inkling2_dispatch_conv_clip_fwht(eng, stream, fpc, AGX_BARRIER_NONE);
+                        if (ok) st->stats.fused_fwht_hits++;
+                        break;
+                    }
+                }
+                if (!agx_gemm_init(ctx)) return GGML_STATUS_FAILED;
+                ok = agx_gemm_mul_mat(ctx, stream, node, AGX_BARRIER_NONE);
+            } break;
+
+            case GGML_OP_MUL_MAT_ID: {
+                if (!ctx->moe_state) {
+                    ctx->moe_state = agx_moe_create(ctx->drm, ctx->compiler);
+                    if (!ctx->moe_state) return GGML_STATUS_FAILED;
+                }
+                ok = agx_moe_dispatch_mul_mat_id(static_cast<agx_moe_runner *>(ctx->moe_state),
+                                                 stream, node, AGX_BARRIER_NONE);
+            } break;
+
+            case GGML_OP_FLASH_ATTN_EXT: {
+                if (!ctx->kv_hybrid_state) {
+                    agx_kv_hybrid_config kcfg;
+                    kcfg.n_slots = 48;
+                    kcfg.max_full_tokens = 4096;
+                    ctx->kv_hybrid_state = agx_kv_hybrid_create(ctx->drm, ctx->compiler, kcfg);
+                    if (!ctx->kv_hybrid_state) return GGML_STATUS_FAILED;
+                }
+                ok = agx_kv_hybrid_dispatch_ggml_flash_attn(static_cast<agx_kv_hybrid_pool *>(ctx->kv_hybrid_state),
+                                                            stream, node, AGX_BARRIER_NONE);
+            } break;
+
+            default:
+                AGX_LOG_ERROR("agx_graph_compute: unsupported op %s (%d)", ggml_op_name(node->op), (int) node->op);
+                return GGML_STATUS_FAILED;
+        }
+
+        if (!ok) {
+            AGX_LOG_ERROR("agx_graph_compute: dispatch failed for node %d (%s)", i, ggml_op_name(node->op));
+            return GGML_STATUS_FAILED;
+        }
+        record_output(node);
+        st->stats.nodes_executed++;
+    }
+
+    if (has_dispatched) {
+        // Single memory-scope host visibility barrier at end of entire graph!
+        agx_cdm_barrier_host(stream);
+        uint64_t gpu_ns = 0;
+        if (agx_cdm_submit(stream, true, &gpu_ns) != 0) {
+            AGX_LOG_ERROR("agx_graph_compute: CDM submit failed");
+            return GGML_STATUS_FAILED;
+        }
+        st->stats.total_gpu_ns += gpu_ns;
+    }
+
+    st->stats.graphs_executed++;
+    return GGML_STATUS_SUCCESS;
+}
+
+} // extern "C"

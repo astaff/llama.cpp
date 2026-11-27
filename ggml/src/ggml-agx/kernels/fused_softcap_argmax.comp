@@ -1,0 +1,186 @@
+#version 450
+
+// ============================================================================
+// Pillar 3: fused_softcap_argmax.comp
+// Fused Final Logit Softcap + Padded Vocab Truncation + 40-Core Parallel Argmax
+// ============================================================================
+// Compiled with -DSOFTCAP_MODE=0 (trunc/softcap), =1 (stage1), =2 (stage2).
+// Target: <= 32 GPRs, 0:0 spills.
+
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+#ifndef SOFTCAP_MODE
+#define SOFTCAP_MODE 1
+#endif
+
+#define SOFTCAP_FLAG_WRITE_LOGITS 1u
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufF32 {
+    float v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufF32 {
+    float v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufI32 {
+    int v[];
+};
+
+layout(push_constant) uniform PushArgs {
+    uint64_t src_va;
+    uint64_t dst_logits_va;
+    uint64_t partial_val_va;
+    uint64_t partial_idx_va;
+    uint64_t out_token_va;
+    uint     n_vocab_unpadded;
+    uint     src_stride_f32;
+    uint     dst_stride_f32;
+    uint     n_tokens;
+    uint     n_splits;
+    uint     flags;
+    float    softcap;
+    float    inv_softcap;
+} pc;
+
+float apply_softcap(float x) {
+    if (pc.softcap > 0.0) {
+        return pc.softcap * tanh(x * pc.inv_softcap);
+    }
+    return x;
+}
+
+#if SOFTCAP_MODE == 0
+// ============================================================================
+// Mode 0: Softcap + Padded Vocab Truncation
+// Grid: (ceil(n_vocab_unpadded / 256), n_tokens, 1), Local: (256, 1, 1)
+// ============================================================================
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    const uint tok = gl_WorkGroupID.y;
+    if (idx >= pc.n_vocab_unpadded || tok >= pc.n_tokens) {
+        return;
+    }
+    float x = ConstBufF32(pc.src_va).v[tok * pc.src_stride_f32 + idx];
+    BufF32(pc.dst_logits_va).v[tok * pc.dst_stride_f32 + idx] = apply_softcap(x);
+}
+
+#elif SOFTCAP_MODE == 1
+// ============================================================================
+// Mode 1: Fused Softcap (+ Optional Logit Store) + 40-WG Partial Argmax
+// Grid: (n_splits, n_tokens, 1), Local: (256, 1, 1)
+// ============================================================================
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+shared float s_max_val[8];
+shared int   s_max_idx[8];
+
+void sg_argmax_reduce(inout float best_v, inout int best_i) {
+    for (uint off = 16u; off > 0u; off >>= 1u) {
+        float ov = subgroupShuffleXor(best_v, off);
+        int   oi = subgroupShuffleXor(best_i, off);
+        if (ov > best_v || (ov == best_v && oi < best_i)) {
+            best_v = ov;
+            best_i = oi;
+        }
+    }
+}
+
+void main() {
+    const uint split_id = gl_WorkGroupID.x;
+    const uint tok      = gl_WorkGroupID.y;
+    if (split_id >= pc.n_splits || tok >= pc.n_tokens) {
+        return;
+    }
+
+    const uint tid     = gl_LocalInvocationID.x;
+    const uint sg_id   = tid >> 5u;
+    const uint lane_id = tid & 31u;
+
+    const uint n_vocab   = pc.n_vocab_unpadded;
+    const uint chunk     = (n_vocab + pc.n_splits - 1u) / pc.n_splits;
+    const uint beg       = split_id * chunk;
+    const uint end       = min(beg + chunk, n_vocab);
+    const uint src_base  = tok * pc.src_stride_f32;
+    const uint dst_base  = tok * pc.dst_stride_f32;
+    const bool do_write  = ((pc.flags & SOFTCAP_FLAG_WRITE_LOGITS) != 0u) && (pc.dst_logits_va != 0ul);
+
+    float best_v = uintBitsToFloat(0xFF800000u); // -INFINITY
+    int   best_i = 0x7FFFFFFF;
+
+    for (uint i = beg + tid; i < end; i += 256u) {
+        float x = apply_softcap(ConstBufF32(pc.src_va).v[src_base + i]);
+        if (do_write) {
+            BufF32(pc.dst_logits_va).v[dst_base + i] = x;
+        }
+        int ii = int(i);
+        if (x > best_v || (x == best_v && ii < best_i)) {
+            best_v = x;
+            best_i = ii;
+        }
+    }
+
+    sg_argmax_reduce(best_v, best_i);
+    if (lane_id == 0u) {
+        s_max_val[sg_id] = best_v;
+        s_max_idx[sg_id] = best_i;
+    }
+    barrier();
+
+    if (sg_id == 0u) {
+        float v = (lane_id < 8u) ? s_max_val[lane_id] : uintBitsToFloat(0xFF800000u);
+        int   idx = (lane_id < 8u) ? s_max_idx[lane_id] : 0x7FFFFFFF;
+        sg_argmax_reduce(v, idx);
+        if (lane_id == 0u) {
+            uint out_slot = tok * pc.n_splits + split_id;
+            BufF32(pc.partial_val_va).v[out_slot] = v;
+            BufI32(pc.partial_idx_va).v[out_slot] = idx;
+        }
+    }
+}
+
+#else
+// ============================================================================
+// Mode 2: Final 1-Simdgroup Argmax Reduction -> Exact Greedy Token ID in SLC
+// Grid: (n_tokens, 1, 1), Local: (32, 1, 1)
+// ============================================================================
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint tok  = gl_WorkGroupID.x;
+    const uint lane = gl_LocalInvocationID.x;
+    if (tok >= pc.n_tokens) {
+        return;
+    }
+
+    const uint base = tok * pc.n_splits;
+    float best_v = uintBitsToFloat(0xFF800000u);
+    int   best_i = 0x7FFFFFFF;
+
+    for (uint s = lane; s < pc.n_splits; s += 32u) {
+        float v = ConstBufF32(pc.partial_val_va).v[base + s];
+        int   i = BufI32(pc.partial_idx_va).v[base + s];
+        if (v > best_v || (v == best_v && i < best_i)) {
+            best_v = v;
+            best_i = i;
+        }
+    }
+
+    for (uint off = 16u; off > 0u; off >>= 1u) {
+        float ov = subgroupShuffleXor(best_v, off);
+        int   oi = subgroupShuffleXor(best_i, off);
+        if (ov > best_v || (ov == best_v && oi < best_i)) {
+            best_v = ov;
+            best_i = oi;
+        }
+    }
+
+    if (lane == 0u) {
+        BufI32(pc.out_token_va).v[tok] = best_i;
+    }
+}
+#endif

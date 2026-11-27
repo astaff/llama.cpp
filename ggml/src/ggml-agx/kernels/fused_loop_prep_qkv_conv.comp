@@ -1,0 +1,796 @@
+#version 450
+
+// ============================================================================
+// Pillar 3: fused_loop_prep_qkv_conv.comp
+// Specialized AGX3B Kernels for Inkling 2 Mini Loop Prep, Conv/Clip/FWHT & Router
+// ============================================================================
+// Compiled with -DPREP_MODE=0..5:
+//   0: Depth-mix residual attention (mix(blocks, cur, query)) in native FP32
+//   1: Fused K/V shortconv (+ dynamic conv) + exact L2 clip / V RMSNorm + tau + in-reg FWHT_{64,128}
+//   2: Fused attn_post_conv / ffn_post_conv + residual add + history store
+//   3: Fused 2304->128 router matvec + sigmoid + bias + top-8 + norm(1e-20) -> SLC
+//   4: Fused Rcur @ pad(attn_rel_bias) - sinks -> rel_table[n_extent+1, Hq, M]
+//   5: TLA+-verified device-scope sense-reversing atomic barrier primitive
+//
+// Target: <= 64 32-bit GPRs, 0:0 spills across every mode.
+
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_control_flow_attributes : require
+#pragma use_vulkan_memory_model
+
+#ifndef PREP_MODE
+#define PREP_MODE 0
+#endif
+
+#define WTYPE_F32       0u
+#define WTYPE_F16       1u
+#define WTYPE_BF16      2u
+#define WTYPE_Q8_0_RAW  3u
+#define WTYPE_Q8_0_8BLK 4u
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufI32 { int v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufI32 { int v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufU32 { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufU32 { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer ConstBufU64 { uint64_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) readonly buffer ConstBufU16 { uint16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 1) readonly buffer ConstBufI8 { int8_t v[]; };
+
+#if PREP_MODE == 0
+// ============================================================================
+// Mode 0: Cross-Pass / Block-Residual Depth-Mix Attention (Native FP32)
+// Exact match to `llama_model_inkling2::graph::mix` (inkling2.cpp L176-206):
+//   states[s] = rms_norm(src[s], 1e-6f)
+//   scores[q, s] = dot(states[s], query[q]) / sqrt(n_embd)
+//   probs[q, :]  = softmax(scores[q, :])
+//   out[q, i]    = sum_s probs[q, s] * states[s][i]
+// Optional fused trailing RMSNorm * norm_w when n_queries == 1 && norm_w_va != 0.
+// Grid: (n_tokens, 1, 1), Local: (256, 1, 1)
+// ============================================================================
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushArgs {
+    uint64_t states_ptrs_va;
+    uint64_t query_va;
+    uint64_t norm_w_va;
+    uint64_t out_va;
+    uint64_t out_pre_va;
+    uint     n_embd;
+    uint     n_states;
+    uint     n_queries;
+    uint     n_tokens;
+    float    inv_sqrt_d;
+    float    eps_mix;
+    float    eps_norm;
+    uint     pad0;
+} pc;
+
+shared float s_red[8];
+shared float s_inv_rms[16];
+shared float s_w[4][16];      // probs[q][s] * inv_rms[s]
+shared float s_tmp_out[3840]; // only used when fused trailing norm_w_va != 0
+
+float wg_sum(float val, uint sg_id, uint lane_id) {
+    float s = subgroupAdd(val);
+    if (lane_id == 0u) s_red[sg_id] = s;
+    barrier();
+    if (sg_id == 0u) {
+        float v = (lane_id < 8u) ? s_red[lane_id] : 0.0;
+        float tot = subgroupAdd(v);
+        if (lane_id == 0u) s_red[0] = tot;
+    }
+    barrier();
+    return s_red[0];
+}
+
+void main() {
+    const uint tok = gl_WorkGroupID.x;
+    if (tok >= pc.n_tokens) return;
+
+    const uint tid     = gl_LocalInvocationID.x;
+    const uint sg_id   = tid >> 5u;
+    const uint lane_id = tid & 31u;
+    const uint D       = pc.n_embd;
+    const uint S       = pc.n_states;
+    const uint Q       = pc.n_queries;
+    const float inv_D  = 1.0 / float(D);
+    const uint64_t tok_off_B = uint64_t(tok) * uint64_t(D) * 4ul;
+
+    // 1. For each state s: compute inv_rms[s] and raw dot(src[s], query[q]) in a single pass!
+    //    Since dot(rms_norm(x), q) == inv_rms * dot(x, q), we avoid reading x twice for scores!
+    for (uint s = 0u; s < S; ++s) {
+        uint64_t x_va = ConstBufU64(pc.states_ptrs_va).v[s] + tok_off_B;
+        float ss = 0.0;
+        float d0 = 0.0, d1 = 0.0, d2 = 0.0, d3 = 0.0;
+
+        for (uint i = tid; i < D; i += 256u) {
+            float xv = ConstBufF32(x_va).v[i];
+            ss += xv * xv;
+            if (Q >= 1u) d0 += xv * ConstBufF32(pc.query_va).v[0u * D + i];
+            if (Q >= 2u) d1 += xv * ConstBufF32(pc.query_va).v[1u * D + i];
+            if (Q >= 3u) d2 += xv * ConstBufF32(pc.query_va).v[2u * D + i];
+            if (Q >= 4u) d3 += xv * ConstBufF32(pc.query_va).v[3u * D + i];
+        }
+
+        float inv_rms = inversesqrt(wg_sum(ss, sg_id, lane_id) * inv_D + pc.eps_mix);
+        if (tid == 0u) s_inv_rms[s] = inv_rms;
+
+        float scale = inv_rms * pc.inv_sqrt_d;
+        if (Q >= 1u) {
+            float r = wg_sum(d0, sg_id, lane_id) * scale;
+            if (tid == 0u) s_w[0][s] = r;
+        }
+        if (Q >= 2u) {
+            float r = wg_sum(d1, sg_id, lane_id) * scale;
+            if (tid == 0u) s_w[1][s] = r;
+        }
+        if (Q >= 3u) {
+            float r = wg_sum(d2, sg_id, lane_id) * scale;
+            if (tid == 0u) s_w[2][s] = r;
+        }
+        if (Q >= 4u) {
+            float r = wg_sum(d3, sg_id, lane_id) * scale;
+            if (tid == 0u) s_w[3][s] = r;
+        }
+    }
+    barrier();
+
+    // 2. Numerically stable softmax over s in [0..S-1] per query q, folded with inv_rms[s]
+    if (tid < Q) {
+        float m = s_w[tid][0];
+        for (uint s = 1u; s < S; ++s) {
+            m = max(m, s_w[tid][s]);
+        }
+        float sum_e = 0.0;
+        for (uint s = 0u; s < S; ++s) {
+            float e = exp(s_w[tid][s] - m);
+            s_w[tid][s] = e;
+            sum_e += e;
+        }
+        float inv_sum = 1.0 / sum_e;
+        for (uint s = 0u; s < S; ++s) {
+            s_w[tid][s] = (s_w[tid][s] * inv_sum) * s_inv_rms[s];
+        }
+    }
+    barrier();
+
+    // 3. Weighted sum of states: out[q, i] = sum_s s_w[q][s] * src[s][i]
+    const bool do_norm = (Q == 1u && pc.norm_w_va != 0ul);
+    float ss_out = 0.0;
+
+    for (uint i = tid; i < D; i += 256u) {
+        float y0 = 0.0, y1 = 0.0, y2 = 0.0, y3 = 0.0;
+        for (uint s = 0u; s < S; ++s) {
+            uint64_t x_va = ConstBufU64(pc.states_ptrs_va).v[s] + tok_off_B;
+            float xv = ConstBufF32(x_va).v[i];
+            if (Q >= 1u) y0 += s_w[0][s] * xv;
+            if (Q >= 2u) y1 += s_w[1][s] * xv;
+            if (Q >= 3u) y2 += s_w[2][s] * xv;
+            if (Q >= 4u) y3 += s_w[3][s] * xv;
+        }
+
+        if (do_norm) {
+            if (pc.out_pre_va != 0ul) {
+                BufF32(pc.out_pre_va + tok_off_B).v[i] = y0;
+            }
+            s_tmp_out[i] = y0;
+            ss_out += y0 * y0;
+        } else {
+            uint64_t base = pc.out_va + uint64_t(tok) * uint64_t(Q) * uint64_t(D) * 4ul;
+            if (Q >= 1u) BufF32(base + uint64_t(0u * D) * 4ul).v[i] = y0;
+            if (Q >= 2u) BufF32(base + uint64_t(1u * D) * 4ul).v[i] = y1;
+            if (Q >= 3u) BufF32(base + uint64_t(2u * D) * 4ul).v[i] = y2;
+            if (Q >= 4u) BufF32(base + uint64_t(3u * D) * 4ul).v[i] = y3;
+        }
+    }
+
+    if (do_norm) {
+        float rms_out = inversesqrt(wg_sum(ss_out, sg_id, lane_id) * inv_D + pc.eps_norm);
+        uint64_t dst_va = pc.out_va + tok_off_B;
+        for (uint i = tid; i < D; i += 256u) {
+            BufF32(dst_va).v[i] = (s_tmp_out[i] * rms_out) * ConstBufF32(pc.norm_w_va).v[i];
+        }
+    }
+}
+
+#elif PREP_MODE == 1
+// ============================================================================
+// Mode 1: Fused K/V ShortConv (+ Dynamic) + Exact L2 Clip / V RMSNorm + Tau + FWHT_{64,128}
+// Grid:  (ceil(n_head / 4), n_seq_tokens, n_seqs)
+// Local: (32, 4, 1) -> 1 simdgroup (32 lanes) per head, 100% in-register (ZERO SRAM!)
+// ============================================================================
+layout(local_size_x = 32, local_size_y = 4, local_size_z = 1) in;
+
+#define FLAG_DO_CONV        (1u << 0)
+#define FLAG_DYNAMIC_CONV   (1u << 1)
+#define FLAG_PER_CHAN_SCALE (1u << 2)
+#define FLAG_L2_CLIP        (1u << 3)
+#define FLAG_RMS_NORM       (1u << 4)
+#define FLAG_TAU_SCALE      (1u << 5)
+#define FLAG_FWHT_64        (1u << 6)
+#define FLAG_FWHT_128       (1u << 7)
+#define FLAG_UPDATE_STATE   (1u << 8)
+
+layout(push_constant) uniform PushArgs {
+    uint64_t src_va;
+    uint64_t dst_va;
+    uint64_t conv_w_va;
+    uint64_t dyn_va;
+    uint64_t history_va;
+    uint64_t state_out_va;
+    uint64_t clip_scale_va;
+    uint64_t inp_pos_va;
+    uint     head_dim;
+    uint     n_head;
+    uint     n_seq_tokens;
+    uint     n_seqs;
+    uint     n_conv;
+    uint     n_sconv_ch;
+    uint     conv_ch_offset;
+    uint     flags;
+    float    conv_res_scale;
+    float    clip_thresh;
+    float    rms_eps;
+    float    log_scale_alpha;
+    float    inv_log_floor;
+    uint     pad0;
+} pc;
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    const uint head = gl_WorkGroupID.x * 4u + gl_LocalInvocationID.y;
+    const uint t    = gl_WorkGroupID.y; // token within sequence [0..n_seq_tokens-1]
+    const uint seq  = gl_WorkGroupID.z; // sequence index [0..n_seqs-1]
+
+    if (head >= pc.n_head || t >= pc.n_seq_tokens || seq >= pc.n_seqs) {
+        return;
+    }
+
+    const uint D          = pc.head_dim; // <= 128 (up to 4 elements per lane)
+    const uint n_channels = pc.n_head * D;
+    const uint tok        = seq * pc.n_seq_tokens + t;
+    const uint flags      = pc.flags;
+    const uint n_hist     = (pc.n_conv > 0u) ? (pc.n_conv - 1u) : 0u;
+
+    float reg[4];
+    [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+        reg[k] = 0.0;
+    }
+
+    // 1. Load source (and optionally apply causal static + dynamic shortconv + residual scale)
+    const bool do_conv  = (flags & FLAG_DO_CONV) != 0u;
+    const bool do_dyn   = (flags & FLAG_DYNAMIC_CONV) != 0u;
+    const bool do_state = (flags & FLAG_UPDATE_STATE) != 0u && (t == pc.n_seq_tokens - 1u);
+
+    [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+        const uint d = k * 32u + lane;
+        if (d >= D) break;
+
+        const uint ch = head * D + d;
+        float x_cur = ConstBufF32(pc.src_va).v[tok * n_channels + ch];
+
+        if (do_conv) {
+            const uint n_conv  = pc.n_conv;
+            const uint s_ch    = pc.conv_ch_offset + ch;
+            const uint hist_base = (seq * pc.n_sconv_ch + s_ch) * n_hist;
+            const uint w_base    = ch * n_conv;
+            const uint dyn_base  = (tok * pc.n_head + head) * n_conv;
+
+            float conv_sum = 0.0;
+            for (uint lag = 0u; lag < n_conv; ++lag) {
+                float x_lag;
+                if (t >= lag) {
+                    x_lag = ConstBufF32(pc.src_va).v[(tok - lag) * n_channels + ch];
+                } else {
+                    // lag > t: pull from history slot n_hist - (lag - t)
+                    uint h_slot = n_hist - (lag - t);
+                    x_lag = ConstBufF32(pc.history_va).v[hist_base + h_slot];
+                }
+                // Static weight: i0 = 0 is oldest (lag = n_conv - 1), i0 = n_conv - 1 is newest (lag = 0)
+                float w_stat = ConstBufF32(pc.conv_w_va).v[w_base + (n_conv - 1u - lag)];
+                conv_sum += x_lag * w_stat;
+                if (do_dyn) {
+                    // Dynamic tap: lag = 0 is newest, lag = n_conv - 1 is oldest (inkling2.cpp L238-248)
+                    float w_dyn = ConstBufF32(pc.dyn_va).v[dyn_base + lag];
+                    conv_sum += x_lag * w_dyn;
+                }
+            }
+            x_cur = (x_cur + conv_sum) * pc.conv_res_scale;
+
+            // Store updated conv history (last n_conv - 1 raw pre-conv inputs)
+            if (do_state) {
+                // Save oldest -> newest: slot s in [0..n_hist-1] holds lag = n_hist - 1 - s
+                float new_h[8];
+                uint lim = min(n_hist, 8u);
+                for (uint s = 0u; s < lim; ++s) {
+                    uint lag = (n_hist - 1u) - s;
+                    if (t >= lag) {
+                        new_h[s] = ConstBufF32(pc.src_va).v[(tok - lag) * n_channels + ch];
+                    } else {
+                        new_h[s] = ConstBufF32(pc.history_va).v[hist_base + (n_hist - (lag - t))];
+                    }
+                }
+                for (uint s = 0u; s < lim; ++s) {
+                    BufF32(pc.state_out_va).v[hist_base + s] = new_h[s];
+                }
+            }
+        }
+
+        if ((flags & FLAG_PER_CHAN_SCALE) != 0u) {
+            x_cur *= ConstBufF32(pc.clip_scale_va).v[ch];
+        }
+        reg[k] = x_cur;
+    }
+
+    // 2. Exact L2 clip: min(t / max(||x||, t), 1.0f) — ZERO +eps bias when ||x|| == t!
+    //    OR per-head RMSNorm (for Vcur)
+    if ((flags & (FLAG_L2_CLIP | FLAG_RMS_NORM)) != 0u) {
+        float ss = 0.0;
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+            if (k * 32u + lane < D) {
+                ss += reg[k] * reg[k];
+            }
+        }
+        float sum_sq = subgroupAdd(ss);
+        float sc;
+        if ((flags & FLAG_L2_CLIP) != 0u) {
+            float norm = sqrt(sum_sq);
+            sc = min(pc.clip_thresh / max(norm, pc.clip_thresh), 1.0);
+        } else {
+            sc = inversesqrt(sum_sq / float(D) + pc.rms_eps);
+        }
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+            reg[k] *= sc;
+        }
+    }
+
+    // 3. Optional full-attention log-position scale tau = 1 + alpha * log(max(1, (pos+1)/floor))
+    if ((flags & FLAG_TAU_SCALE) != 0u) {
+        float pos_p1 = float(ConstBufI32(pc.inp_pos_va).v[tok]) + 1.0;
+        float tau    = 1.0 + pc.log_scale_alpha * log(max(1.0, pos_p1 * pc.inv_log_floor));
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+            reg[k] *= tau;
+        }
+    }
+
+    // 4. Optional in-register orthonormal FWHT_{64,128} (exact match to ggml_gen_hadamard)
+    if ((flags & (FLAG_FWHT_64 | FLAG_FWHT_128)) != 0u) {
+        const bool is_128 = (flags & FLAG_FWHT_128) != 0u;
+        const float fwht_scale = is_128 ? 0.08838834764831845 : 0.125; // 1/sqrt(128) or 1/sqrt(64)
+        const uint el_w = is_128 ? 4u : 2u;
+
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+            if (k < el_w) reg[k] *= fwht_scale;
+        }
+        // Intra-simdgroup butterfly stages h = 1, 2, 4, 8, 16
+        [[unroll]] for (uint h = 1u; h < 32u; h <<= 1u) {
+            [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+                if (k < el_w) {
+                    float a = reg[k];
+                    float b = subgroupShuffleXor(a, h);
+                    reg[k] = ((lane & h) == 0u) ? (a + b) : (b - a);
+                }
+            }
+        }
+        // Inter-register stage h = 32
+        {
+            float a0 = reg[0], a1 = reg[1];
+            reg[0] = a0 + a1;
+            reg[1] = a0 - a1;
+        }
+        if (is_128) {
+            float a2 = reg[2], a3 = reg[3];
+            reg[2] = a2 + a3;
+            reg[3] = a2 - a3;
+            // Stage h = 64
+            float b0 = reg[0], b1 = reg[1], b2 = reg[2], b3 = reg[3];
+            reg[0] = b0 + b2;
+            reg[1] = b1 + b3;
+            reg[2] = b0 - b2;
+            reg[3] = b1 - b3;
+        }
+    }
+
+    // 5. Write output [D, n_head, n_tokens]
+    [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+        const uint d = k * 32u + lane;
+        if (d < D) {
+            BufF32(pc.dst_va).v[tok * n_channels + head * D + d] = reg[k];
+        }
+    }
+}
+
+#elif PREP_MODE == 2
+// ============================================================================
+// Mode 2: Fused attn_post_conv / ffn_post_conv + Residual Add + History Store
+// Grid:  (ceil(n_channels / 256), n_seq_tokens, n_seqs)
+// Local: (256, 1, 1)
+// ============================================================================
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#define POST_FLAG_ADD_RESIDUAL (1u << 0)
+#define POST_FLAG_UPDATE_STATE (1u << 1)
+
+layout(push_constant) uniform PushArgs {
+    uint64_t src_va;
+    uint64_t res_va;
+    uint64_t dst_va;
+    uint64_t conv_w_va;
+    uint64_t history_va;
+    uint64_t state_out_va;
+    uint     n_channels;
+    uint     n_seq_tokens;
+    uint     n_seqs;
+    uint     n_conv;
+    uint     n_sconv_ch;
+    uint     conv_ch_offset;
+    uint     flags;
+    float    conv_res_scale;
+} pc;
+
+void main() {
+    const uint ch  = gl_GlobalInvocationID.x;
+    const uint t   = gl_WorkGroupID.y;
+    const uint seq = gl_WorkGroupID.z;
+    if (ch >= pc.n_channels || t >= pc.n_seq_tokens || seq >= pc.n_seqs) {
+        return;
+    }
+
+    const uint tok       = seq * pc.n_seq_tokens + t;
+    const uint n_conv    = pc.n_conv;
+    const uint n_hist    = n_conv - 1u;
+    const uint s_ch      = pc.conv_ch_offset + ch;
+    const uint hist_base = (seq * pc.n_sconv_ch + s_ch) * n_hist;
+    const uint w_base    = ch * n_conv;
+
+    float x_cur = ConstBufF32(pc.src_va).v[tok * pc.n_channels + ch];
+    float sum   = 0.0;
+    for (uint lag = 0u; lag < n_conv; ++lag) {
+        float x_lag;
+        if (t >= lag) {
+            x_lag = ConstBufF32(pc.src_va).v[(tok - lag) * pc.n_channels + ch];
+        } else {
+            x_lag = ConstBufF32(pc.history_va).v[hist_base + (n_hist - (lag - t))];
+        }
+        sum += x_lag * ConstBufF32(pc.conv_w_va).v[w_base + (n_conv - 1u - lag)];
+    }
+
+    float out_v = (x_cur + sum) * pc.conv_res_scale;
+    if ((pc.flags & POST_FLAG_ADD_RESIDUAL) != 0u && pc.res_va != 0ul) {
+        out_v += ConstBufF32(pc.res_va).v[tok * pc.n_channels + ch];
+    }
+    BufF32(pc.dst_va).v[tok * pc.n_channels + ch] = out_v;
+
+    if ((pc.flags & POST_FLAG_UPDATE_STATE) != 0u && t == pc.n_seq_tokens - 1u) {
+        float new_h[8];
+        uint lim = min(n_hist, 8u);
+        for (uint s = 0u; s < lim; ++s) {
+            uint lag = (n_hist - 1u) - s;
+            if (t >= lag) {
+                new_h[s] = ConstBufF32(pc.src_va).v[(tok - lag) * pc.n_channels + ch];
+            } else {
+                new_h[s] = ConstBufF32(pc.history_va).v[hist_base + (n_hist - (lag - t))];
+            }
+        }
+        for (uint s = 0u; s < lim; ++s) {
+            BufF32(pc.state_out_va).v[hist_base + s] = new_h[s];
+        }
+    }
+}
+
+#elif PREP_MODE == 3
+// ============================================================================
+// Mode 3: Fused 2304 -> 128 MoE Router + Sigmoid + Bias + Top-8 + Norm -> SLC
+// Grid:  (n_tokens, 1, 1), Local: (128, 1, 1) -> 1 thread per expert (4 simdgroups)
+// ============================================================================
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushArgs {
+    uint64_t x_va;
+    uint64_t w_va;
+    uint64_t bias_va;
+    uint64_t out_ids_va;
+    uint64_t out_w_va;
+    uint     n_embd;
+    uint     n_experts;
+    uint     top_k;
+    uint     n_tokens;
+    uint     wtype;
+    uint     w_row_bytes;
+    float    norm_eps;
+    float    weights_scale;
+} pc;
+
+shared float s_x[3840];    // 9,216 B for n_embd=2304
+shared float s_sel[256];   // selection score (prob + optional bias)
+shared float s_prob[256];  // raw sigmoid prob
+
+float dot_row_sram(uint64_t row_va, uint wtype, uint D) {
+    float acc = 0.0;
+    if (wtype == WTYPE_Q8_0_8BLK) {
+        const uint n_chunks = (D + 255u) >> 8u;
+        for (uint c = 0u; c < n_chunks; ++c) {
+            uint64_t cva = row_va + uint64_t(c) * 272ul;
+            uint blk_end = min(8u, (D - c * 256u + 31u) >> 5u);
+            for (uint b = 0u; b < blk_end; ++b) {
+                float d = unpackHalf2x16(uint(ConstBufU16(cva).v[b])).x;
+                float p = 0.0;
+                uint base_k = c * 256u + b * 32u;
+                for (uint w = 0u; w < 8u; ++w) {
+                    uint packed = ConstBufU32(cva + 16ul).v[b * 8u + w];
+                    uint kk = base_k + w * 4u;
+                    if (kk < D) {
+                        p += float(bitfieldExtract(int(packed),  0, 8)) * s_x[kk + 0u];
+                        p += float(bitfieldExtract(int(packed),  8, 8)) * s_x[kk + 1u];
+                        p += float(bitfieldExtract(int(packed), 16, 8)) * s_x[kk + 2u];
+                        p += float(bitfieldExtract(int(packed), 24, 8)) * s_x[kk + 3u];
+                    }
+                }
+                acc += d * p;
+            }
+        }
+    } else if (wtype == WTYPE_Q8_0_RAW) {
+        const uint n_blks = D >> 5u;
+        for (uint b = 0u; b < n_blks; ++b) {
+            uint64_t bva = row_va + uint64_t(b) * 34ul;
+            float d = unpackHalf2x16(uint(ConstBufU16(bva).v[0])).x;
+            float p = 0.0;
+            uint base_k = b << 5u;
+            for (uint j = 0u; j < 32u; ++j) {
+                p += float(ConstBufI8(bva + 2ul).v[j]) * s_x[base_k + j];
+            }
+            acc += d * p;
+        }
+    } else if (wtype == WTYPE_F32) {
+        for (uint k = 0u; k < D; ++k) {
+            acc += ConstBufF32(row_va).v[k] * s_x[k];
+        }
+    } else if (wtype == WTYPE_BF16) {
+        for (uint k = 0u; k < D; ++k) {
+            float w = uintBitsToFloat(uint(ConstBufU16(row_va).v[k]) << 16u);
+            acc += w * s_x[k];
+        }
+    } else {
+        for (uint k = 0u; k < D; ++k) {
+            float w = unpackHalf2x16(uint(ConstBufU16(row_va).v[k])).x;
+            acc += w * s_x[k];
+        }
+    }
+    return acc;
+}
+
+void main() {
+    const uint tok = gl_WorkGroupID.x;
+    if (tok >= pc.n_tokens) return;
+
+    const uint tid = gl_LocalInvocationID.x;
+    const uint D   = pc.n_embd;
+    const uint E   = pc.n_experts;
+    const uint K   = pc.top_k;
+
+    // 1. Stage x[0..D-1] into SRAM (FP32)
+    uint64_t x_tok_va = pc.x_va + uint64_t(tok) * uint64_t(D) * 4ul;
+    for (uint i = tid; i < D; i += 128u) {
+        s_x[i] = ConstBufF32(x_tok_va).v[i];
+    }
+    barrier();
+
+    // 2. Each thread computes its expert(s): logit -> sigmoid -> optional bias
+    for (uint e = tid; e < E; e += 128u) {
+        uint64_t row_va = pc.w_va + uint64_t(e) * uint64_t(pc.w_row_bytes);
+        float logit = dot_row_sram(row_va, pc.wtype, D);
+        float prob  = 1.0 / (1.0 + exp(-logit));
+        float sel   = prob;
+        if (pc.bias_va != 0ul) {
+            sel += ConstBufF32(pc.bias_va).v[e];
+        }
+        s_prob[e] = prob;
+        s_sel[e]  = sel;
+    }
+    barrier();
+
+    // 3. Single simdgroup (lanes 0..31) performs exact top-K extraction + eps=1e-20 norm
+    if (tid < 32u) {
+        int   chosen_id[16];
+        float chosen_p[16];
+        float sum_p = 0.0;
+
+        for (uint k = 0u; k < K; ++k) {
+            float best_s = uintBitsToFloat(0xFF800000u); // -INFINITY
+            int   best_e = 0x7FFFFFFF;
+
+            for (uint e = tid; e < E; e += 32u) {
+                float s = s_sel[e];
+                int  ei = int(e);
+                if (s > best_s || (s == best_s && ei < best_e)) {
+                    best_s = s;
+                    best_e = ei;
+                }
+            }
+            // Subgroup argmax reduction (lower expert ID wins ties)
+            for (uint off = 16u; off > 0u; off >>= 1u) {
+                float os = subgroupShuffleXor(best_s, off);
+                int   oe = subgroupShuffleXor(best_e, off);
+                if (os > best_s || (os == best_s && oe < best_e)) {
+                    best_s = os;
+                    best_e = oe;
+                }
+            }
+            if (tid == 0u) {
+                chosen_id[k] = best_e;
+                float p      = s_prob[uint(best_e)];
+                chosen_p[k]  = p;
+                sum_p       += p;
+                s_sel[uint(best_e)] = uintBitsToFloat(0xFF800000u); // mask out selected
+            }
+            subgroupBarrier();
+        }
+
+        if (tid == 0u) {
+            float scale = 1.0 / (sum_p + pc.norm_eps);
+            if (pc.weights_scale != 0.0 && pc.weights_scale != 1.0) {
+                scale *= pc.weights_scale;
+            }
+            uint out_base = tok * K;
+            for (uint k = 0u; k < K; ++k) {
+                BufI32(pc.out_ids_va).v[out_base + k] = chosen_id[k];
+                BufF32(pc.out_w_va).v[out_base + k]   = chosen_p[k] * scale;
+            }
+        }
+    }
+}
+
+#elif PREP_MODE == 4
+// ============================================================================
+// Mode 4: Fused Relative-Position Bias Table: Rcur @ pad(rel_bias) - sinks
+// Exact match to inkling2.cpp L374-377:
+//   out[e, h, tok] = (e < n_extent ? dot(rel_bias[:, e], Rcur[:, h, tok]) : 0.0) - sinks[h, tok]
+// Grid:  (ceil((n_extent + 1) / 64), n_head, n_tokens)
+// Local: (64, 1, 1)
+// ============================================================================
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushArgs {
+    uint64_t rcur_va;
+    uint64_t rel_bias_va;
+    uint64_t sinks_va;
+    uint64_t out_table_va;
+    uint     n_rel;
+    uint     n_extent;
+    uint     n_head;
+    uint     n_tokens;
+    uint     bias_wtype;
+    uint     pad0;
+} pc;
+
+void main() {
+    const uint e   = gl_GlobalInvocationID.x;
+    const uint h   = gl_WorkGroupID.y;
+    const uint tok = gl_WorkGroupID.z;
+    const uint n_rows = pc.n_extent + 1u;
+    if (e >= n_rows || h >= pc.n_head || tok >= pc.n_tokens) {
+        return;
+    }
+
+    float sink = ConstBufF32(pc.sinks_va).v[tok * pc.n_head + h];
+    float acc  = 0.0;
+
+    if (e < pc.n_extent) {
+        const uint r_base = (tok * pc.n_head + h) * pc.n_rel;
+        const uint b_base = e * pc.n_rel;
+        if (pc.bias_wtype == WTYPE_F32) {
+            for (uint k = 0u; k < pc.n_rel; ++k) {
+                acc += ConstBufF32(pc.rel_bias_va).v[b_base + k] * ConstBufF32(pc.rcur_va).v[r_base + k];
+            }
+        } else if (pc.bias_wtype == WTYPE_F16) {
+            for (uint k = 0u; k < pc.n_rel; ++k) {
+                float bw = unpackHalf2x16(uint(ConstBufU16(pc.rel_bias_va).v[b_base + k])).x;
+                acc += bw * ConstBufF32(pc.rcur_va).v[r_base + k];
+            }
+        } else {
+            for (uint k = 0u; k < pc.n_rel; ++k) {
+                float bw = uintBitsToFloat(uint(ConstBufU16(pc.rel_bias_va).v[b_base + k]) << 16u);
+                acc += bw * ConstBufF32(pc.rcur_va).v[r_base + k];
+            }
+        }
+    }
+
+    // Output layout: [n_extent + 1, n_head, n_tokens] contiguous
+    uint out_idx = (tok * pc.n_head + h) * n_rows + e;
+    BufF32(pc.out_table_va).v[out_idx] = acc - sink;
+}
+
+#else
+// ============================================================================
+// Mode 5: TLA+-Verified Device-Scope Sense-Reversing Atomic Barrier Primitive
+// Matches formal/AgxBarrier.tla & struct agx_sense_barrier_state (128B SLC)
+// Grid:  (n_workgroups, 1, 1) (e.g. 40 on M4 Max), Local: (32, 1, 1)
+// ============================================================================
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) coherent buffer SenseBarrierBuf {
+    uint arrived;
+    uint sense;
+    uint epoch;
+    uint n_workgroups;
+    uint stage;
+    uint pass;
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 4) coherent buffer CoherentBufU32 {
+    uint v[];
+};
+
+layout(push_constant) uniform PushArgs {
+    uint64_t barrier_va;
+    uint64_t scratch_va;
+    uint     n_workgroups;
+    uint     n_iters;
+} pc;
+
+void agx_device_sense_barrier(uint64_t bar_va, uint n_wg, inout uint local_sense) {
+    barrier();
+    if (gl_LocalInvocationID.x == 0u) {
+        SenseBarrierBuf bar = SenseBarrierBuf(bar_va);
+        // Make all prior buffer writes by this workgroup visible to the whole GPU device (SLC)
+        memoryBarrier(gl_ScopeDevice, gl_StorageSemanticsBuffer,
+                      gl_SemanticsRelease | gl_SemanticsMakeAvailable);
+
+        uint next_sense = local_sense ^ 1u;
+        uint prev = atomicAdd(bar.arrived, 1u);
+        if (prev + 1u == n_wg) {
+            // Last workgroup resets arrived, advances epoch, and flips sense with release semantics
+            atomicStore(bar.arrived, 0u, gl_ScopeDevice, gl_StorageSemanticsNone,
+                        gl_SemanticsRelaxed);
+            atomicAdd(bar.epoch, 1u);
+            atomicStore(bar.sense, next_sense, gl_ScopeDevice, gl_StorageSemanticsBuffer,
+                        gl_SemanticsRelease | gl_SemanticsMakeAvailable);
+        } else {
+            // Spin-wait on SLC-coherent sense word until last WG flips it
+            while (atomicLoad(bar.sense, gl_ScopeDevice, gl_StorageSemanticsBuffer,
+                              gl_SemanticsAcquire | gl_SemanticsMakeVisible) != next_sense) {
+            }
+        }
+        // Acquire visibility for writes performed by peer workgroups before the barrier
+        memoryBarrier(gl_ScopeDevice, gl_StorageSemanticsBuffer,
+                      gl_SemanticsAcquire | gl_SemanticsMakeVisible);
+        local_sense = next_sense;
+    }
+    barrier();
+}
+
+void main() {
+    const uint wg   = gl_WorkGroupID.x;
+    const uint lane = gl_LocalInvocationID.x;
+    if (wg >= pc.n_workgroups) return;
+
+    uint local_sense = 0u;
+    CoherentBufU32 scratch = CoherentBufU32(pc.scratch_va);
+
+    for (uint it = 0u; it < pc.n_iters; ++it) {
+        if (lane == 0u) {
+            scratch.v[wg] = it + 1u;
+        }
+        agx_device_sense_barrier(pc.barrier_va, pc.n_workgroups, local_sense);
+        // Verify peer workgroup visibility across SLC after barrier
+        if (lane == 0u) {
+            uint peer = (wg + 1u) % pc.n_workgroups;
+            uint seen = atomicLoad(scratch.v[peer], gl_ScopeDevice, gl_StorageSemanticsBuffer,
+                                   gl_SemanticsAcquire | gl_SemanticsMakeVisible);
+            if (seen != it + 1u) {
+                scratch.v[pc.n_workgroups] = 0xBAD00000u | it;
+            }
+        }
+        agx_device_sense_barrier(pc.barrier_va, pc.n_workgroups, local_sense);
+    }
+}
+#endif
