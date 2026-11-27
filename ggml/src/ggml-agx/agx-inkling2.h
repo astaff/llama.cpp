@@ -289,6 +289,9 @@ bool agx_inkling2_run_sense_barrier_probe(agx_inkling2_engine * eng,
 // Precompile all Wave 4 megakernel + DSpark shaders (for Borealis shaderdb audit)
 bool agx_inkling2_precompile_w4(agx_inkling2_engine * eng);
 
+// Precompile all Wave 5 persistent 40-WG SENSE_BARRIER B=1 shaders (for Borealis shaderdb audit)
+bool agx_inkling2_precompile_w5(agx_inkling2_engine * eng);
+
 // High-BW 40-core fused DSpark Markov Head dispatcher (writes directly into
 // [n_vocab, block_drafts, n_blocks] out_logits and [n_embd, block_drafts, n_blocks] out_h_nextn)
 bool agx_dspark_dispatch_markov_head_w4(agx_inkling2_engine *          eng,

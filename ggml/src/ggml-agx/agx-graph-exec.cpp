@@ -4994,7 +4994,8 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                             ggml_nelements(sinks) == n_head * n_tokens &&
                             rel_pos->ne[1] == n_tokens && rel_pos->ne[2] == 1 && rel_pos->ne[3] == 1 &&
                             c2->ne[0] == n_kv && c2->ne[2] == n_head && n_t * n_stream == n_tokens &&
-                            (n_kv <= n_extent + 1 || n_tokens <= 8) &&
+                            ((n_kv + 63) / 64) <= 65535 && n_head <= 65535 && n_tokens <= 65535 &&
+                            (uint64_t) n_tokens * (uint64_t) n_head * (uint64_t) n_kv <= 0xFFFFFFFFull &&
                             va_disjoint(orig_bias, c2) && va_disjoint(rcur, c2) &&
                             va_disjoint(sinks, c2) && va_disjoint(rel_pos, c2)) {
                             int32_t fset[6] = {

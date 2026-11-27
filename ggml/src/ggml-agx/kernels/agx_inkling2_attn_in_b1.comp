@@ -1,0 +1,167 @@
+#version 450
+
+// ============================================================================
+// Wave 5 Pillar 3 (Pass-5): agx_inkling2_attn_in_b1.comp
+// Single-Dispatch 517 GB/s Full-Occupancy (0B SRAM, ~44 GPR32, 32 SGs/core)
+// Coalesced Attention Input Projection for B=1 Decode:
+//   Fuses W_attn_in (wq + wqkv_gate + attn_rel + wk + wv in Q8_0_8BLK, with
+//   independent x_q / x_k / x_v pointers!) + BF16/F16/F32 attn_sink_proj (24)
+//   + full-attn k_conv_proj / v_conv_proj (64) into ONE single CDM dispatch!
+//   Collapses 168 attention-input dispatches -> 48 (-120 CDM dispatches/tok)!
+// ============================================================================
+
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+#include "dequant_supertile.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant, scalar) uniform PushArgs {
+    uint64_t w_attn_in_va;
+    uint64_t x_q_va;
+    uint64_t x_k_va;
+    uint64_t x_v_va;
+    uint64_t qkv_buf_va;
+    uint64_t k_raw_va;
+    uint64_t v_raw_va;
+    uint64_t sink_proj_va;
+    uint64_t sinks_va;
+    uint64_t k_conv_proj_va;
+    uint64_t v_conv_proj_va;
+    uint64_t k_dyn_va;
+    uint64_t v_dyn_va;
+    uint     q_prefix_rows;
+    uint     wk_rows;
+    uint     wv_rows;
+    uint     total_coal_rows;
+    uint     sink_wtype;
+    uint     sink_row_B;
+    uint     dyn_k_wtype;
+    uint     dyn_k_row_B;
+    uint     dyn_v_wtype;
+    uint     dyn_v_row_B;
+    uint     pad0;
+} pc;
+
+float dot_small_row_16(uint64_t row_va, uint wtype, uint64_t x_va, uint lane16) {
+    AgxBufVec4R xb = AgxBufVec4R(x_va);
+    const uint K4 = 2304u >> 2u; // 576
+    float acc = 0.0;
+    if (wtype == 2u) {
+        // BF16 (uvec2 = 4 BF16s)
+        AgxBufU32x2R wb = AgxBufU32x2R(row_va);
+        for (uint i4 = lane16; i4 < K4; i4 += 16u) {
+            uvec2 p = wb.v[i4];
+            vec4 w = vec4(
+                uintBitsToFloat((p.x & 0xFFFFu) << 16u),
+                uintBitsToFloat(p.x & 0xFFFF0000u),
+                uintBitsToFloat((p.y & 0xFFFFu) << 16u),
+                uintBitsToFloat(p.y & 0xFFFF0000u));
+            acc += dot(w, xb.v[i4]);
+        }
+    } else if (wtype == 0u) {
+        // F32
+        AgxBufVec4R wb = AgxBufVec4R(row_va);
+        for (uint i4 = lane16; i4 < K4; i4 += 16u) {
+            acc += dot(wb.v[i4], xb.v[i4]);
+        }
+    } else {
+        // F16 (wtype == 1)
+        AgxBufU32x2R wb = AgxBufU32x2R(row_va);
+        for (uint i4 = lane16; i4 < K4; i4 += 16u) {
+            uvec2 p = wb.v[i4];
+            acc += dot(vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y)), xb.v[i4]);
+        }
+    }
+    acc += subgroupShuffleXor(acc, 1u);
+    acc += subgroupShuffleXor(acc, 2u);
+    acc += subgroupShuffleXor(acc, 4u);
+    acc += subgroupShuffleXor(acc, 8u);
+    return acc;
+}
+
+void main() {
+    const uint lane   = gl_SubgroupInvocationID; // 0..31
+    const uint sg_id  = gl_SubgroupID;           // 0..3
+    const uint row    = (gl_WorkGroupID.x * 4u + sg_id) * 2u + (lane >> 4u);
+    const uint lane16 = lane & 15u;
+
+    // 1. Primary 517 GB/s Q8_0_8BLK W_attn_in path (99% of all WGs!)
+    if (row < pc.total_coal_rows) {
+        uint64_t x_va = pc.x_q_va;
+        uint64_t y_va = pc.qkv_buf_va;
+        uint     y_i  = row;
+        if (row >= pc.q_prefix_rows) {
+            const uint rem = row - pc.q_prefix_rows;
+            if (rem < pc.wk_rows) {
+                x_va = pc.x_k_va;
+                y_va = pc.k_raw_va;
+                y_i  = rem;
+            } else {
+                x_va = pc.x_v_va;
+                y_va = pc.v_raw_va;
+                y_i  = rem - pc.wk_rows;
+            }
+        }
+
+        AgxBufQ8_8Blk w_buf  = AgxBufQ8_8Blk(pc.w_attn_in_va);
+        AgxBufVec4R   x_buf4 = AgxBufVec4R(x_va);
+        const uint row_chk0  = row * 9u; // K = 2304 = 9 * 256
+        const uint d_slot    = lane16 >> 1u;
+
+        float acc = 0.0;
+        for (uint c = 0u; c < 9u; ++c) {
+            const uint  chk = row_chk0 + c;
+            const uvec4 qv  = w_buf.blk[chk].qs[lane16];
+            const float d   = float(unpackFloat2x16(uint(w_buf.blk[chk].d[d_slot])).x);
+            const uint  c4  = c * 64u + lane16 * 4u;
+            float dp = dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.x)), x_buf4.v[c4 + 0u])
+                     + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.y)), x_buf4.v[c4 + 1u])
+                     + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.z)), x_buf4.v[c4 + 2u])
+                     + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.w)), x_buf4.v[c4 + 3u]);
+            acc = fma(dp, d, acc);
+        }
+
+        acc += subgroupShuffleXor(acc, 1u);
+        acc += subgroupShuffleXor(acc, 2u);
+        acc += subgroupShuffleXor(acc, 4u);
+        acc += subgroupShuffleXor(acc, 8u);
+        if (lane16 == 0u) {
+            AgxBufF32RW(y_va).v[y_i] = acc;
+        }
+        return;
+    }
+
+    // 2. Tail WGs: BF16/F16/F32 attn_sink_proj (24 rows) + full-attn k_dyn / v_dyn (64 rows)
+    const uint tail    = row - pc.total_coal_rows;
+    const uint n_sinks = (pc.sink_proj_va != 0ul) ? 24u : 0u;
+    if (tail < n_sinks) {
+        float v = dot_small_row_16(pc.sink_proj_va + uint64_t(tail) * uint64_t(pc.sink_row_B),
+                                   pc.sink_wtype, pc.x_q_va, lane16);
+        if (lane16 == 0u) AgxBufF32RW(pc.sinks_va).v[tail] = v;
+        return;
+    }
+    const uint d_idx = tail - n_sinks;
+    if (pc.k_conv_proj_va != 0ul && d_idx < 64u) {
+        if (d_idx < 32u) {
+            float v = dot_small_row_16(pc.k_conv_proj_va + uint64_t(d_idx) * uint64_t(pc.dyn_k_row_B),
+                                       pc.dyn_k_wtype, pc.x_k_va, lane16);
+            if (lane16 == 0u) AgxBufF32RW(pc.k_dyn_va).v[d_idx] = v;
+        } else {
+            const uint vr = d_idx - 32u;
+            float v = dot_small_row_16(pc.v_conv_proj_va + uint64_t(vr) * uint64_t(pc.dyn_v_row_B),
+                                       pc.dyn_v_wtype, pc.x_v_va, lane16);
+            if (lane16 == 0u) AgxBufF32RW(pc.v_dyn_va).v[vr] = v;
+        }
+    }
+}

@@ -122,6 +122,12 @@ struct agx_device_state {
 static agx_device_state * g_agx_dev0 = nullptr;
 static std::mutex         g_agx_global_mtx;
 
+// Wave 5 Fail-Loud AGX0_Repack startup telemetry & regression guard (#120-proof)
+static std::atomic<uint64_t> g_agx_repack_tensors_loaded{0};
+static std::atomic<uint64_t> g_agx_repack_bytes_loaded{0};
+static std::atomic<uint64_t> g_agx_unrepacked_large_eligible{0};
+static std::atomic<bool>     g_agx_repack_startup_logged{false};
+
 static agx_drm_device * agx_dev_ensure_open(agx_device_state * st) {
     if (!st) {
         return nullptr;
@@ -207,7 +213,17 @@ static void agx_buf_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor 
     }
     if (bctx && bctx->is_repacked && agx_repack_supports_tensor(tensor)) {
         agx_repack_set_tensor(tensor, data, offset, size);
+        if (offset == 0) {
+            g_agx_repack_tensors_loaded.fetch_add(1, std::memory_order_relaxed);
+        }
+        g_agx_repack_bytes_loaded.fetch_add(size, std::memory_order_relaxed);
         return;
+    }
+    if (bctx && !bctx->is_repacked && !bctx->is_host_import && offset == 0 &&
+        bctx->size >= 256ULL * 1024ULL * 1024ULL &&
+        ggml_nbytes(tensor) >= 4ULL * 1024ULL * 1024ULL &&
+        agx_repack_supports_tensor(tensor)) {
+        g_agx_unrepacked_large_eligible.fetch_add(1, std::memory_order_relaxed);
     }
     std::memcpy(static_cast<uint8_t *>(tensor->data) + offset, data, size);
 }
@@ -484,6 +500,30 @@ static enum ggml_status agx_backend_graph_compute(ggml_backend_t backend, struct
     }
     if (!cgraph || cgraph->n_nodes == 0) {
         return GGML_STATUS_SUCCESS;
+    }
+
+    // Wave 5 Fail-Loud AGX0_Repack startup verification: log active repacked count once
+    // and hard-fail if a large (>64 MiB) model buffer loaded repackable weights without
+    // AGX0_Repack while GGML_AGX_NO_REPACK is unset (#120 zero-size probe regression guard).
+    if (!g_agx_repack_startup_logged.load(std::memory_order_acquire)) {
+        const uint64_t n_rep   = g_agx_repack_tensors_loaded.load(std::memory_order_relaxed);
+        const uint64_t b_rep   = g_agx_repack_bytes_loaded.load(std::memory_order_relaxed);
+        const uint64_t n_unrep = g_agx_unrepacked_large_eligible.load(std::memory_order_relaxed);
+        const bool no_repack   = (std::getenv("GGML_AGX_NO_REPACK") != nullptr);
+        if (n_rep > 0 || n_unrep > 0) {
+            if (!g_agx_repack_startup_logged.exchange(true, std::memory_order_acq_rel)) {
+                AGX_LOG_INFO("AGX0_Repack startup audit: repacked=%llu tensors (%.2f MiB), unrepacked_large_eligible=%llu (GGML_AGX_NO_REPACK=%d)",
+                             (unsigned long long) n_rep,
+                             static_cast<double>(b_rep) / (1024.0 * 1024.0),
+                             (unsigned long long) n_unrep,
+                             no_repack ? 1 : 0);
+            }
+            if (!no_repack && n_rep == 0 && n_unrep >= 8) {
+                AGX_LOG_ERROR("FAIL-LOUD: AGX0_Repack active count is 0 despite %llu large repack-eligible weight tensors (GGML_AGX_NO_REPACK unset)!",
+                              (unsigned long long) n_unrep);
+                return GGML_STATUS_FAILED;
+            }
+        }
     }
 
     const bool use_megakernel = agx_megakernel_enabled();

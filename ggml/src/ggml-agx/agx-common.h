@@ -168,6 +168,96 @@ static_assert((AGX_SLC_ARENA_OFF_EXTRA_SCRATCH % AGX_CACHE_LINE_BYTES) == 0, "ex
 static_assert(AGX_SLC_ARENA_USED_BYTES <= AGX_SLC_ARENA_TOTAL_BYTES,         "arena fits inside 8 MiB BO");
 static_assert(AGX_SLC_ARENA_TOTAL_BYTES < (AGX_SLC_BYTES / 2ULL),            "arena strictly < 24 MiB (< 50% SLC)");
 
+// Wave 5 Theorem W5.1 (Wave5Roofline.lean `arena_128b_disjoint_all_m`):
+// Machine-checked C++ mirror proving 128B alignment (0 mod 128) & pairwise disjointness
+// across all static SLC_PIN arena slices for M = 1..8 (eliminates USC L1 false sharing).
+struct agx_slc_arena_layout {
+    static constexpr size_t align128(size_t x) {
+        return ((x + 127u) / 128u) * 128u;
+    }
+
+    static constexpr bool verify_top_level_disjoint() {
+        constexpr uint64_t starts[] = {
+            AGX_SLC_ARENA_OFF_SENSE_BARRIER,
+            AGX_SLC_ARENA_OFF_H_CUR,
+            AGX_SLC_ARENA_OFF_H_MSG,
+            AGX_SLC_ARENA_OFF_RES_BLOCKS,
+            AGX_SLC_ARENA_OFF_QKV_BUF,
+            AGX_SLC_ARENA_OFF_ATTN_OUT,
+            AGX_SLC_ARENA_OFF_CTRL_SCRATCH,
+            AGX_SLC_ARENA_OFF_MOE_INTER,
+            AGX_SLC_ARENA_OFF_ROUTER_TOPK,
+            AGX_SLC_ARENA_OFF_SCONV_STATE,
+            AGX_SLC_ARENA_OFF_EXTRA_SCRATCH,
+        };
+        constexpr uint64_t sizes[] = {
+            AGX_SLC_ARENA_SENSE_BYTES,
+            AGX_SLC_ARENA_H_CUR_BYTES,
+            AGX_SLC_ARENA_H_MSG_BYTES,
+            AGX_SLC_ARENA_RES_BLOCKS * AGX_SLC_ARENA_RES_BLOCK_BYTES,
+            AGX_SLC_ARENA_QKV_BUF_BYTES,
+            AGX_SLC_ARENA_ATTN_OUT_BYTES,
+            AGX_SLC_ARENA_CTRL_BYTES,
+            AGX_SLC_ARENA_MOE_INTER_BYTES,
+            AGX_SLC_ARENA_ROUTER_TOPK_BYTES,
+            AGX_SLC_ARENA_SCONV_STATE_BYTES,
+            AGX_SLC_ARENA_TOTAL_BYTES - AGX_SLC_ARENA_OFF_EXTRA_SCRATCH,
+        };
+        constexpr size_t N = sizeof(starts) / sizeof(starts[0]);
+        for (size_t i = 0; i < N; ++i) {
+            if ((starts[i] % AGX_CACHE_LINE_BYTES) != 0u) return false;
+            if ((sizes[i]  % AGX_CACHE_LINE_BYTES) != 0u) return false;
+            if (sizes[i] == 0u) return false;
+            if (starts[i] + sizes[i] > AGX_SLC_ARENA_TOTAL_BYTES) return false;
+            if (i + 1u < N && starts[i] + sizes[i] > starts[i + 1u]) return false;
+        }
+        return true;
+    }
+
+    static constexpr bool verify_theorem_w5_1_all_m() {
+        for (size_t m = 1u; m <= AGX_SLC_ARENA_MAX_M; ++m) {
+            const size_t sz_h_cur    = align128(m * 2304u * 4u);
+            const size_t sz_h_msg    = align128(m * 2304u * 4u);
+            const size_t sz_res_blk  = align128(8u * m * 2304u * 4u);
+            const size_t sz_qkv_buf  = align128(m * AGX_SLC_ARENA_ATTN_IN_ROWS * 4u);
+            const size_t sz_attn_out = align128(m * 3072u * 4u);
+            const size_t sz_moe_int  = align128(m * 8u * 1152u * 4u);
+            const size_t sz_moe_out  = align128(m * 2304u * 4u);
+            const size_t sz_sconv    = align128(48u * 4u * 2304u * 4u);
+            const size_t sz_router   = align128(m * 128u * 4u * 2u);
+            const size_t sz_ctrl     = align128(m * 2304u * 4u * 4u);
+            const size_t sz_sense    = AGX_CACHE_LINE_BYTES;
+            const size_t slices[]    = {
+                sz_h_cur, sz_h_msg, sz_res_blk, sz_qkv_buf, sz_attn_out,
+                sz_moe_int, sz_moe_out, sz_sconv, sz_router, sz_ctrl, sz_sense
+            };
+            size_t total = 0u;
+            for (size_t sz : slices) {
+                if ((sz % AGX_CACHE_LINE_BYTES) != 0u) return false;
+                total += sz;
+            }
+            if (m == 1u && total >= 6ULL * 1024ULL * 1024ULL) return false;
+            if (total >= AGX_SLC_ARENA_TOTAL_BYTES)           return false;
+            if (total >= AGX_SLC_BYTES / 2ULL)                return false;
+            // Verify allocated arena slots cover every M=1..8 requirement
+            if (sz_h_cur    > AGX_SLC_ARENA_H_CUR_BYTES)      return false;
+            if (sz_h_msg    > AGX_SLC_ARENA_H_MSG_BYTES)      return false;
+            if (sz_res_blk  > AGX_SLC_ARENA_RES_BLOCKS * AGX_SLC_ARENA_RES_BLOCK_BYTES) return false;
+            if (sz_qkv_buf  > AGX_SLC_ARENA_QKV_BUF_BYTES)    return false;
+            if (sz_attn_out > AGX_SLC_ARENA_ATTN_OUT_BYTES)   return false;
+            if (sz_moe_int  > AGX_SLC_ARENA_MOE_INTER_BYTES)  return false;
+            if (sz_router   > AGX_SLC_ARENA_ROUTER_TOPK_BYTES) return false;
+            if (sz_ctrl     > AGX_SLC_ARENA_CTRL_BYTES)       return false;
+        }
+        return true;
+    }
+};
+
+static_assert(agx_slc_arena_layout::verify_top_level_disjoint(),
+              "Wave 5 Theorem W5.1: SLC_PIN arena slots must be 128B-aligned and pairwise disjoint");
+static_assert(agx_slc_arena_layout::verify_theorem_w5_1_all_m(),
+              "Wave 5 Theorem W5.1: arena slices must be 0 mod 128, disjoint, and < 8 MiB (< 50% SLC) for M=1..8");
+
 struct agx_slc_arena {
     agx_bo * bo          = nullptr;
     uint64_t base_va     = 0;

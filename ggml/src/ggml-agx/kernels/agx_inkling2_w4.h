@@ -296,3 +296,204 @@ struct agx_w4_dspark_merge_push {
     uint32_t has_rnn_state;
 };
 static_assert(sizeof(agx_w4_dspark_merge_push) <= 256, "agx_w4_dspark_merge_push > 256B");
+
+// ============================================================================
+// Wave 5 Pillar 3: Persistent 40-WG SENSE_BARRIER B=1 Megakernel Descriptors
+// Matches kernels/agx_inkling2_persist_b1.comp (PERSIST_MODE=0,1,2)
+// Formally verified in formal/AgxPersistentW5.tla & Wave5Roofline.lean (W5.1/W5.4)
+// ============================================================================
+
+#define AGX_W5_PFLAG_IS_SWA            (1u << 0)
+#define AGX_W5_PFLAG_SAME_QKV_INP      (1u << 1)
+#define AGX_W5_PFLAG_NEED_QKV_MIX      (1u << 2)
+#define AGX_W5_PFLAG_HAS_K_ROT         (1u << 3)
+#define AGX_W5_PFLAG_HAS_V_ROT         (1u << 4)
+#define AGX_W5_PFLAG_K_IDS_I64         (1u << 5)
+#define AGX_W5_PFLAG_V_IDS_I64         (1u << 6)
+#define AGX_W5_PFLAG_BMASK_F16         (1u << 7)
+#define AGX_W5_PFLAG_POST_ATTN_ADD_RES (1u << 8)
+#define AGX_W5_PFLAG_POST_ATTN_DO_NORM (1u << 9)
+#define AGX_W5_PFLAG_POST_FFN_DO_MIX   (1u << 10)
+#define AGX_W5_PFLAG_POST_FFN_DO_NORM  (1u << 11)
+#define AGX_W5_PFLAG_NEXT_IS_SWA       (1u << 12)
+
+struct alignas(16) agx_w5_pass_desc {
+    // 1. SLC Arena / Activation VAs (30 x u64)
+    uint64_t x_q_va;
+    uint64_t x_k_va;
+    uint64_t x_v_va;
+    uint64_t qkv_in_va[3];
+    uint64_t qkv_buf_va;
+    uint64_t k_raw_va;
+    uint64_t v_raw_va;
+    uint64_t q_out_va;
+    uint64_t attn_out_va;
+    uint64_t wo_out_va;
+    uint64_t ffn_inp_va;
+    uint64_t k_dyn_va;
+    uint64_t v_dyn_va;
+    uint64_t router_logits_va;
+    uint64_t router_topk_va;
+    uint64_t router_topk_w_va;
+    uint64_t moe_inter_va;
+    uint64_t moe_out_va;
+    uint64_t h_msg_va;
+    uint64_t ctrl_cat_va[3];
+    uint64_t ctrl_gate_va[3];
+    uint64_t ctrl_gain_va[3];
+
+    // 2. Loop Controller Weights & Mix Inputs (22 x u64 -> 52)
+    uint64_t msg_state_va[2];
+    uint64_t msg_query_va;
+    uint64_t qkv_mix_cur_va;
+    uint64_t qkv_mix_bptrs_va;
+    uint64_t qkv_mix_query_va;
+    uint64_t ctrl_down_w_va[4];
+    uint64_t ctrl_gain_w_va[4];
+    uint64_t ctrl_forget_w_va[4];
+    uint64_t attn_norm_w_va[3];
+    uint64_t ffn_norm_w_va;
+
+    // 3. Attention Weights, KV Cache & Mask (29 x u64 -> 81)
+    uint64_t w_attn_in_va;
+    uint64_t wk_byte_off;
+    uint64_t wv_byte_off;
+    uint64_t sink_proj_va;   // non-zero when attn_sink_proj is not coalesced into w_attn_in (e.g. BF16)
+    uint64_t sinks_va;       // output/read VA for sinks[0..23]
+    uint64_t k_conv_proj_va;
+    uint64_t v_conv_proj_va;
+    uint64_t q_clip_va;
+    uint64_t r_clip_va;
+    uint64_t k_conv_w_va;
+    uint64_t v_conv_w_va;
+    uint64_t rel_bias_va;
+    uint64_t inp_pos_va;
+    uint64_t r_l_va;
+    uint64_t s_copy_va;
+    uint64_t cell_va[4];
+    uint64_t k_va;
+    uint64_t v_va;
+    uint64_t k_store_va;
+    uint64_t v_store_va;
+    uint64_t k_idxs_va;
+    uint64_t v_idxs_va;
+    uint64_t rel_pos_va;
+    uint64_t base_mask_va;
+    uint64_t kq_mask_va;
+    uint64_t wo_va;
+
+    // 4. Post-Attn Stage Prep (5 x u64 -> 84)
+    uint64_t attn_post_conv_w_va;
+    uint64_t attn_res_va;
+    uint64_t attn_bptrs_va;
+    uint64_t ffn_res_query_va;
+    uint64_t post_attn_mix_out_va;
+
+    // 5. Router & MoE Weights (8 x u64 -> 92)
+    uint64_t router_w_va;
+    uint64_t exp_probs_b_va;
+    uint64_t gu_exps_va;
+    uint64_t dn_exps_va;
+    uint64_t gu_slice_B;
+    uint64_t dn_slice_B;
+    uint64_t gu_scale_va;
+    uint64_t dn_scale_va;
+
+    // 6. Post-FFN Stage Prep (12 x u64 -> 104)
+    uint64_t ffn_post_conv_w_va;
+    uint64_t next_cur_va;
+    uint64_t export_l_out_va;
+    uint64_t ffn_bptrs_va;
+    uint64_t next_attn_query_va;
+    uint64_t next_norm_w_va[3];
+    uint64_t next_mix_out_va[3];
+    uint64_t next_mix_export_va;
+
+    // 7. Scalar 32-bit Parameters (48 x u32/f32 = 192 B -> total 1024 B = 8 x 128B lines)
+    uint32_t flags;
+    uint32_t total_coal_rows;
+    uint32_t q_prefix_rows;
+    uint32_t wk_rows;
+    uint32_t wv_rows;
+    uint32_t q_row_off;
+    uint32_t qgate_row_off;
+    uint32_t r_row_off;
+    uint32_t sink_proj_wtype;
+    uint32_t qkv_mix_n_blocks;
+    uint32_t k_proj_wtype;
+    uint32_t k_proj_row_B;
+    uint32_t v_proj_wtype;
+    uint32_t v_proj_row_B;
+    uint32_t r_nb1_f32;
+    uint32_t k_nb1;
+    uint32_t k_nb2;
+    uint32_t v_nb1;
+    uint32_t v_nb2;
+    uint32_t k_store_nb1;
+    uint32_t v_store_nb1;
+    uint32_t k_ids_nb0;
+    uint32_t v_ids_nb0;
+    uint32_t n_rel;
+    uint32_t n_extent;
+    uint32_t n_kv;
+    uint32_t kq_mask_stride;
+    uint32_t bias_wtype;
+    uint32_t bias_nb1_B;
+    uint32_t post_attn_n_blocks;
+    uint32_t post_ffn_n_blocks;
+    uint32_t post_ffn_n_queries;
+    uint32_t router_wtype;
+    uint32_t router_row_B;
+    uint32_t n_expert;
+    uint32_t n_ff_exp;
+    float    kv_conv_res_scale;
+    float    post_conv_res_scale;
+    float    qk_clip;
+    float    rel_clip;
+    float    rms_eps;
+    float    log_scale_alpha;
+    float    inv_log_floor;
+    float    router_norm_eps;
+    float    router_w_scale;
+    float    situ_beta;
+    float    situ_linear_beta;
+    uint32_t sink_proj_row_B;
+    uint32_t reserved[28]; // pad to 1152 B = exact 9 x 128B cache lines
+};
+static_assert(sizeof(agx_w5_pass_desc) == 1152, "agx_w5_pass_desc must be 1152B (9 x 128B cache lines)");
+
+struct agx_w5_persist_push {
+    uint64_t descs_va;
+    uint64_t barrier_va;
+    uint32_t n_passes;
+    uint32_t n_wg;
+};
+static_assert(sizeof(agx_w5_persist_push) == 24, "agx_w5_persist_push must be 24B");
+
+struct agx_w5_attn_in_push {
+    uint64_t w_attn_in_va;
+    uint64_t x_q_va;
+    uint64_t x_k_va;
+    uint64_t x_v_va;
+    uint64_t qkv_buf_va;
+    uint64_t k_raw_va;
+    uint64_t v_raw_va;
+    uint64_t sink_proj_va;
+    uint64_t sinks_va;
+    uint64_t k_conv_proj_va;
+    uint64_t v_conv_proj_va;
+    uint64_t k_dyn_va;
+    uint64_t v_dyn_va;
+    uint32_t q_prefix_rows;
+    uint32_t wk_rows;
+    uint32_t wv_rows;
+    uint32_t total_coal_rows;
+    uint32_t sink_wtype;
+    uint32_t sink_row_B;
+    uint32_t dyn_k_wtype;
+    uint32_t dyn_k_row_B;
+    uint32_t dyn_v_wtype;
+    uint32_t dyn_v_row_B;
+    uint32_t pad0;
+};
+static_assert(sizeof(agx_w5_attn_in_push) == 152, "agx_w5_attn_in_push must be 152B (<= 256B)");
