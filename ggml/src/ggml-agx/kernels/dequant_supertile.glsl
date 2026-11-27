@@ -140,8 +140,20 @@ vec4 agx_e2m1_u16_to_vec4(uint w16) {
     );
 }
 
+// SWAR2 branchless E2M1 -> f16vec2 (zero compares, zero multiplies, zero denormals, zero LUT!):
+// Expects nibble 0 in bits [3:0] and nibble 1 in bits [19:16] of `p`.
+f16vec2 agx_e2m1_swar2_to_f16vec2(uint p) {
+    uint s2   = (p & 0x00080008u) << 12;
+    uint m2   = p & 0x00070007u;
+    uint nz   = (m2 + 0x00070007u) & 0x00080008u; // 0x0008 iff mag >= 1
+    uint ge2  = (m2 + 0x00060006u) & 0x00080008u; // 0x0008 iff mag >= 2
+    uint base = (nz << 11) - (nz << 8);           // 0x3800 iff mag >= 1, else 0
+    uint adj  = m2 & ((ge2 >> 3) | 0xFFFEFFFEu);  // clears mag==1 -> 0, keeps 2..7
+    return unpackFloat2x16(s2 | (base + (adj << 9)));
+}
+
 f16vec2 agx_e2m1_byte_to_f16vec2(uint b) {
-    return f16vec2(agx_e2m1_to_f16(b & 0xFu), agx_e2m1_to_f16((b >> 4) & 0xFu));
+    return agx_e2m1_swar2_to_f16vec2((b & 0xFu) | ((b & 0xF0u) << 12));
 }
 
 vec2 agx_e2m1_byte_to_vec2(uint b) {
@@ -196,6 +208,13 @@ vec2 agx_ue4m3_pair_to_vec2(uint16_t d_pair) {
 // ----------------------------------------------------------------------------
 // 3. Branchless Q8_0 Magic-Bias Decode (0 LUT, 0 denormals, 2 ops/weight)
 // ----------------------------------------------------------------------------
+// Decodes 2 packed signed int8 bytes in low 16 bits of `w16` -> exact f16vec2
+f16vec2 agx_q8_u16_magic_to_f16vec2(uint w16) {
+    uint u = w16 ^ 0x8080u;
+    uint p = (u & 0x00FFu) | ((u & 0xFF00u) << 8) | 0x64006400u;
+    return unpackFloat2x16(p) - f16vec2(float16_t(1152.0));
+}
+
 // Decodes 4 packed signed int8 bytes in `w` -> exact f16vec4 via
 //   as_f16(0x6400 | (b ^ 0x80)) - 1152.0hf
 f16vec4 agx_q8_u32_magic_to_f16vec4(uint w) {

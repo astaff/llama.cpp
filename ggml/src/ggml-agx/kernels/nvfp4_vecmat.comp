@@ -78,10 +78,15 @@ float dot_e2m1_u32_x2(uint w32, vec4 x0, vec4 x1) {
 }
 
 #if PREC_F32 == 0
-// 2x-rate AGX3B FP16 FMA dot of 8 E2M1 weights against pre-cast f16vec4 activations
+// SWAR2 + 2x-rate AGX3B FP16 FMA dot of 8 sequential E2M1 weights in `w32`
+// against two pre-cast f16vec4 activations (zero compares, zero multiplies, zero LUT!)
 float dot_e2m1_u32_f16x2(uint w32, f16vec4 hx0, f16vec4 hx1) {
-    float16_t s = dot(agx_e2m1_u16_to_f16vec4(w32 & 0xFFFFu), hx0);
-    s += dot(agx_e2m1_u16_to_f16vec4(w32 >> 16), hx1);
+    f16vec2 v04 = agx_e2m1_swar2_to_f16vec2( w32        & 0x000F000Fu);
+    f16vec2 v15 = agx_e2m1_swar2_to_f16vec2((w32 >> 4)  & 0x000F000Fu);
+    f16vec2 v26 = agx_e2m1_swar2_to_f16vec2((w32 >> 8)  & 0x000F000Fu);
+    f16vec2 v37 = agx_e2m1_swar2_to_f16vec2((w32 >> 12) & 0x000F000Fu);
+    float16_t s = dot(f16vec4(v04.x, v15.x, v26.x, v37.x), hx0);
+    s += dot(f16vec4(v04.y, v15.y, v26.y, v37.y), hx1);
     return float(s);
 }
 #endif
@@ -240,7 +245,24 @@ void main() {
             const vec2 scales = agx_ue4m3_pair_to_vec2(d_pair);
             const uint col4_base = (tk * 64u + kh * 32u) >> 2;
 
-            // Stream 8 weights at a time (keeps GPRs low for BATCH_M=1..5)
+            // Stream 8 weights at a time (SWAR2 + ffma16 when PREC_F32==0!)
+#if PREC_F32 == 0 && BATCH_M == 1
+            f16vec4 hx0 = f16vec4(x_buf4.v[col4_base + 0u]);
+            f16vec4 hx1 = f16vec4(x_buf4.v[col4_base + 1u]);
+            float d0 = dot_e2m1_u32_f16x2(qs.x, hx0, hx1);
+            hx0 = f16vec4(x_buf4.v[col4_base + 2u]);
+            hx1 = f16vec4(x_buf4.v[col4_base + 3u]);
+            d0 += dot_e2m1_u32_f16x2(qs.y, hx0, hx1);
+            acc[0] = fma(d0, scales.x, acc[0]);
+
+            hx0 = f16vec4(x_buf4.v[col4_base + 4u]);
+            hx1 = f16vec4(x_buf4.v[col4_base + 5u]);
+            float d1 = dot_e2m1_u32_f16x2(qs.z, hx0, hx1);
+            hx0 = f16vec4(x_buf4.v[col4_base + 6u]);
+            hx1 = f16vec4(x_buf4.v[col4_base + 7u]);
+            d1 += dot_e2m1_u32_f16x2(qs.w, hx0, hx1);
+            acc[0] = fma(d1, scales.y, acc[0]);
+#else
             vec4 w0 = agx_e2m1_u16_to_vec4(qs.x & 0xFFFFu);
             vec4 w1 = agx_e2m1_u16_to_vec4(qs.x >> 16);
             float sub0[BATCH_M];
@@ -283,6 +305,7 @@ void main() {
                     acc[m] = fma(sub0[m], scales.y, acc[m]);
                 }
             }
+#endif
         }
     }
 #else

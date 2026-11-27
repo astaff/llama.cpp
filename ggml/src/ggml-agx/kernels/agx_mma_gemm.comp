@@ -119,7 +119,10 @@ layout(push_constant, scalar) uniform PushArgs {
     uint     _pad;
 } pc;
 
-shared MAT_T sh_x[WG_M * SH_X_STRIDE];
+// Double-buffered sh_x (only 6.1 KB for FP16 TILE_K=16 -> cuts barrier() count in HALF!)
+#define SH_X_SLAB   (WG_M * SH_X_STRIDE)
+
+shared MAT_T sh_x[2u * SH_X_SLAB];
 shared float sh_y[SH_Y_ROWS * SH_Y_STRIDE];
 
 #if WEIGHT_MODE != 0 && WEIGHT_MODE != 2
@@ -244,9 +247,11 @@ void main() {
         }
     }
 
-    // Main K-tile loop
+    // Main K-tile loop with double-buffered sh_x (1 barrier per TILE_K instead of 2!)
+    uint buf_idx = 0u;
     for (uint k_base = 0u; k_base < pc.K; k_base += TILE_K) {
-        // Cooperative load of activation tile X[wg_m0..+WG_M, k_base..+TILE_K] -> sh_x
+        const uint sh_off = buf_idx * SH_X_SLAB;
+        // Cooperative load of activation tile X[wg_m0..+WG_M, k_base..+TILE_K] -> sh_x[buf_idx]
         if (x_vec4_ok && (k_base + TILE_K <= pc.K)) {
             const uint total_x4 = (WG_M * TILE_K) >> 2;
             const uint tk4      = TILE_K >> 2;
@@ -256,7 +261,7 @@ void main() {
                 const uint lk4 = idx4 % tk4;
                 const uint gm  = wg_m0 + lm;
                 vec4 xv = (gm < pc.M) ? x_buf4.v[gm * x_stride4 + kb4 + lk4] : vec4(0.0);
-                const uint dst_off = lm * SH_X_STRIDE + (lk4 << 2);
+                const uint dst_off = sh_off + lm * SH_X_STRIDE + (lk4 << 2);
                 sh_x[dst_off + 0u] = MAT_T(xv.x);
                 sh_x[dst_off + 1u] = MAT_T(xv.y);
                 sh_x[dst_off + 2u] = MAT_T(xv.z);
@@ -271,8 +276,8 @@ void main() {
                 const uint gk = k_base + lk;
                 MAT_T v0 = (gm < pc.M && gk      < pc.K) ? MAT_T(x_buf.v[gm * pc.x_stride + gk])      : MAT_T(0.0);
                 MAT_T v1 = (gm < pc.M && gk + 1u < pc.K) ? MAT_T(x_buf.v[gm * pc.x_stride + gk + 1u]) : MAT_T(0.0);
-                sh_x[lm * SH_X_STRIDE + lk]      = v0;
-                sh_x[lm * SH_X_STRIDE + lk + 1u] = v1;
+                sh_x[sh_off + lm * SH_X_STRIDE + lk]      = v0;
+                sh_x[sh_off + lm * SH_X_STRIDE + lk + 1u] = v1;
             }
         }
         barrier();
@@ -323,7 +328,7 @@ void main() {
                 coopmat<MAT_T, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> matB[SG_TILES_M];
                 for (uint im_t = 0u; im_t < SG_TILES_M; ++im_t) {
                     const uint sm_row = sg_m_idx * (SG_TILES_M * 8u) + im_t * 8u;
-                    coopMatLoad(matB[im_t], sh_x, sm_row * SH_X_STRIDE + ks, SH_X_STRIDE,
+                    coopMatLoad(matB[im_t], sh_x, sh_off + sm_row * SH_X_STRIDE + ks, SH_X_STRIDE,
                                 gl_CooperativeMatrixLayoutColumnMajor);
                 }
                 for (uint in_t = 0u; in_t < SG_TILES_N; ++in_t) {
@@ -347,9 +352,7 @@ void main() {
 
 #elif WEIGHT_MODE == 2
         // --------------------------------------------------------------------
-        // AGX_Q8_0_8BLK hoisted TILE_K=16 (exact 1 uvec4 half-block, 1 scale,
-        // 2 u32 words per in_t -> 8 GPRs total for all 4 in_t tiles!).
-        // Loads matB[0..SG_TILES_M-1] ONCE per ks_i (4x fewer SRAM loads!)
+        // AGX_Q8_0_8BLK hoisted TILE_K=16 + half-width 2-weight magic-bias decode
         // --------------------------------------------------------------------
         {
             AgxBufQ8_8Blk w_buf = AgxBufQ8_8Blk(w_base);
@@ -359,7 +362,7 @@ void main() {
             const uint blk_in   = k256 >> 5;
             const uint vec_idx  = k256 >> 4;
             const uint w_sub    = lc0 >> 2;
-            const uint pair_idx = (lc0 >> 1) & 1u;
+            const uint p_shift  = ((lc0 >> 1) & 1u) << 4; // 0 or 16
 
             uvec2     words_n[SG_TILES_N];
             float16_t sc_n[SG_TILES_N];
@@ -381,16 +384,16 @@ void main() {
                 coopmat<MAT_T, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> matB[SG_TILES_M];
                 for (uint im_t = 0u; im_t < SG_TILES_M; ++im_t) {
                     const uint sm_row = sg_m_idx * (SG_TILES_M * 8u) + im_t * 8u;
-                    coopMatLoad(matB[im_t], sh_x, sm_row * SH_X_STRIDE + ks, SH_X_STRIDE,
+                    coopMatLoad(matB[im_t], sh_x, sh_off + sm_row * SH_X_STRIDE + ks, SH_X_STRIDE,
                                 gl_CooperativeMatrixLayoutColumnMajor);
                 }
                 for (uint in_t = 0u; in_t < SG_TILES_N; ++in_t) {
                     const uint w_word = (ks_i == 0u) ? words_n[in_t].x : words_n[in_t].y;
-                    const f16vec4 q4  = agx_q8_u32_magic_to_f16vec4(w_word);
+                    const f16vec2 q2  = agx_q8_u16_magic_to_f16vec2((w_word >> p_shift) & 0xFFFFu);
   #if PREC_F32 == 1
-                    const vec2 wp = vec2((pair_idx == 0u) ? q4.xy : q4.zw) * float(sc_n[in_t]);
+                    const vec2 wp = vec2(q2) * float(sc_n[in_t]);
   #else
-                    const f16vec2 wp = ((pair_idx == 0u) ? q4.xy : q4.zw) * sc_n[in_t];
+                    const f16vec2 wp = q2 * sc_n[in_t];
   #endif
                     coopmat<MAT_T, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> matA =
                         coopmat<MAT_T, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA>(MAT_T(0.0));
@@ -408,7 +411,7 @@ void main() {
             coopmat<MAT_T, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> matB[SG_TILES_M];
             for (uint im_t = 0u; im_t < SG_TILES_M; ++im_t) {
                 const uint sm_row = sg_m_idx * (SG_TILES_M * 8u) + im_t * 8u;
-                coopMatLoad(matB[im_t], sh_x, sm_row * SH_X_STRIDE + ks, SH_X_STRIDE,
+                coopMatLoad(matB[im_t], sh_x, sh_off + sm_row * SH_X_STRIDE + ks, SH_X_STRIDE,
                             gl_CooperativeMatrixLayoutColumnMajor);
             }
 
@@ -428,7 +431,7 @@ void main() {
             }
         }
 #endif
-        barrier();
+        buf_idx ^= 1u;
     }
 
     // ------------------------------------------------------------------------
