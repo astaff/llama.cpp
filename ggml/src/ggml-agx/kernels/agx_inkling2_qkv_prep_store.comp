@@ -1,0 +1,468 @@
+#version 450
+
+// ============================================================================
+// Wave 4 Pillar 3: agx_inkling2_qkv_prep_store.comp
+// Single-Dispatch Stage 1a: Fused Q/K/V/R Prep + ShortConv (+ Dynamic) +
+// Recurrent State Store (incl. Multi-Slot DSpark Rollback, 100% WAR-free M=1..8)
+// + Exact L2 Clip / V RMSNorm + Tau + In-Register FWHT128 + Direct F16/Q8_0
+// KV Cache Store + Multi-WG Vectorized RelBias - Sink + BaseMask -> kq_mask_f16!
+// ============================================================================
+// Grid:  (40 + 24 * r_splits, M, 1)
+//        WGs  0..23: Q heads 0..23 (per-tok)
+//        WGs 24..31: K heads 0..7  (tok==0 loops 0..M-1)
+//        WGs 32..39: V heads 0..7  (tok==0 loops 0..M-1)
+//        WGs 40..  : R heads 0..23 x r_splits (vectorized BF16/F16/F32/Q8 rel_bias + -inf skip!)
+// Local: (128, 1, 1) [4 simdgroups / WG]
+// Target: <= 64 GPR32, 0:0 spills, 100% native FP32 math, n_conv == 4 (n_hist == 3).
+
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer ConstBufVec4 { vec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufI32 { int v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer ConstBufI64 { int64_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufU32 { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer ConstBufUvec2 { uvec2 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer BufF16 { float16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) readonly buffer ConstBufF16 { float16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer BufU16 { uint16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) readonly buffer ConstBufU16 { uint16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 1) readonly buffer ConstBufI8 { int8_t v[]; };
+
+// Flags bitmask
+#define QKV_FLAG_IS_FULL_ATTN   (1u << 0)
+#define QKV_FLAG_FWHT_K         (1u << 1)
+#define QKV_FLAG_FWHT_V         (1u << 2)
+#define QKV_FLAG_KV_Q8_0        (1u << 3)
+#define QKV_FLAG_K_IDS_I64      (1u << 4)
+#define QKV_FLAG_V_IDS_I64      (1u << 5)
+#define QKV_FLAG_BASE_MASK_F16  (1u << 6)
+#define QKV_FLAG_FUSE_REL_MASK  (1u << 7)
+#define QKV_FLAG_PACK_QGATE     (1u << 8)
+
+struct QkvPrepDesc {
+    uint64_t q_raw_va;
+    uint64_t k_raw_va;
+    uint64_t v_raw_va;
+    uint64_t r_raw_va;
+    uint64_t sinks_va;
+    uint64_t qgate_raw_va;
+    uint64_t qgate_compact_va;
+    uint64_t k_dyn_va;
+    uint64_t v_dyn_va;
+
+    uint64_t q_clip_va;
+    uint64_t r_clip_va;
+    uint64_t k_conv_w_va;
+    uint64_t v_conv_w_va;
+    uint64_t rel_bias_va;
+    uint64_t inp_pos_va;
+
+    uint64_t r_l_va;
+    uint64_t s_copy_va;
+    uint64_t k_cell_va;
+    uint64_t v_cell_va;
+
+    uint64_t k_store_va;
+    uint64_t v_store_va;
+    uint64_t k_idxs_va;
+    uint64_t v_idxs_va;
+
+    uint64_t q_out_va;
+    uint64_t r_out_va;
+    uint64_t rel_pos_va;
+    uint64_t base_mask_va;
+    uint64_t kq_mask_out_va;
+
+    uint     q_raw_stride_f32;
+    uint     k_raw_stride_f32;
+    uint     v_raw_stride_f32;
+    uint     r_raw_stride_f32;
+    uint     sinks_stride_f32;
+    uint     r_nb1_f32;
+    uint     rollback_slots;
+    uint     rollback_stride_f32;
+    uint     k_store_nb1_B;
+    uint     v_store_nb1_B;
+    uint     k_ids_nb0_B;
+    uint     v_ids_nb0_B;
+    uint     n_tokens;
+    uint     n_conv;
+    uint     n_rel;
+    uint     n_extent;
+    uint     n_kv;
+    uint     n_kv_mask_stride;
+    uint     rpos_nb1_B;
+    uint     bmask_nb1_B;
+    uint     bias_wtype;
+    uint     bias_nb1_B;
+    uint     flags;
+    uint     r_splits;
+    float    conv_res_scale;
+    float    qk_clip;
+    float    rel_clip;
+    float    rms_eps;
+    float    log_scale_alpha;
+    float    inv_log_floor;
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer DescBuf {
+    QkvPrepDesc d;
+};
+
+layout(push_constant) uniform PushArgs {
+    uint64_t desc_va;
+} pc;
+
+shared float s_r[32];
+
+void fwht128_in_reg(inout float reg[4], uint lane) {
+    const float sc = 0.08838834764831845;
+    [[unroll]] for (uint k = 0u; k < 4u; ++k) reg[k] *= sc;
+    [[unroll]] for (uint h = 1u; h < 32u; h <<= 1u) {
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+            float a = reg[k];
+            float b = subgroupShuffleXor(a, h);
+            reg[k] = ((lane & h) == 0u) ? (a + b) : (b - a);
+        }
+    }
+    float a0 = reg[0], a1 = reg[1], a2 = reg[2], a3 = reg[3];
+    float b0 = a0 + a1, b1 = a0 - a1, b2 = a2 + a3, b3 = a2 - a3;
+    reg[0] = b0 + b2; reg[1] = b1 + b3;
+    reg[2] = b0 - b2; reg[3] = b1 - b3;
+}
+
+void store_kv_head(uint64_t row_va, uint head, float reg[4], uint lane, bool is_q8) {
+    if (!is_q8) {
+        uint64_t h_va = row_va + uint64_t(head * 128u) * 2ul;
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+            BufF16(h_va).v[k * 32u + lane] = float16_t(reg[k]);
+        }
+    } else {
+        uint64_t h_va = row_va + uint64_t(head * 4u) * 34ul;
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+            float val  = reg[k];
+            float amax = subgroupMax(abs(val));
+            float d    = amax * (1.0 / 127.0);
+            float id   = (d != 0.0) ? (1.0 / d) : 0.0;
+            int   q    = clamp(int(round(val * id)), -127, 127);
+            uint64_t bva = h_va + uint64_t(k) * 34ul;
+            if (lane == 0u) BufF16(bva).v[0] = float16_t(d);
+            int q_hi = subgroupShuffleXor(q, 1u);
+            if ((lane & 1u) == 0u) {
+                BufU16(bva + 2ul).v[lane >> 1u] =
+                    uint16_t((uint(q) & 0xFFu) | ((uint(q_hi) & 0xFFu) << 8u));
+            }
+        }
+    }
+}
+
+float eval_conv4_tap(uint64_t raw_va, uint raw_stride_f32, uint ch, uint t,
+                     float p0, float p1, float p2, uint lag) {
+    if (t >= lag) return ConstBufF32(raw_va).v[(t - lag) * raw_stride_f32 + ch];
+    uint idx = 3u - (lag - t);
+    return (idx == 0u) ? p0 : ((idx == 1u) ? p1 : p2);
+}
+
+#define Q_FLD(f) (DescBuf(pc.desc_va).d.f)
+
+void process_kv_head_all_tokens(
+        bool is_v, uint head, uint lane,
+        bool is_full, bool do_fwht, bool kv_q8) {
+    const uint64_t raw_va     = is_v ? Q_FLD(v_raw_va)         : Q_FLD(k_raw_va);
+    const uint raw_stride     = is_v ? Q_FLD(v_raw_stride_f32) : Q_FLD(k_raw_stride_f32);
+    const uint64_t conv_w_va  = is_v ? Q_FLD(v_conv_w_va)      : Q_FLD(k_conv_w_va);
+    const uint64_t dyn_va     = is_v ? Q_FLD(v_dyn_va)         : Q_FLD(k_dyn_va);
+    const uint64_t cell_va    = is_v ? Q_FLD(v_cell_va)        : Q_FLD(k_cell_va);
+    const uint64_t store_va   = is_v ? Q_FLD(v_store_va)       : Q_FLD(k_store_va);
+    const uint64_t idxs_va    = is_v ? Q_FLD(v_idxs_va)        : Q_FLD(k_idxs_va);
+    const uint store_nb1_B    = is_v ? Q_FLD(v_store_nb1_B)    : Q_FLD(k_store_nb1_B);
+    const uint ids_nb0_B      = is_v ? Q_FLD(v_ids_nb0_B)      : Q_FLD(k_ids_nb0_B);
+    const uint flags          = Q_FLD(flags);
+    const bool ids_i64        = is_v ? ((flags & QKV_FLAG_V_IDS_I64) != 0u)
+                                     : ((flags & QKV_FLAG_K_IDS_I64) != 0u);
+    const uint conv_ch_off    = is_v ? 1024u : 0u;
+    const uint n_tok          = Q_FLD(n_tokens);
+    const float conv_res_sc   = Q_FLD(conv_res_scale);
+    const float qk_clip       = Q_FLD(qk_clip);
+    const float rms_eps       = Q_FLD(rms_eps);
+
+    const int src_cell = max(ConstBufI32(Q_FLD(s_copy_va)).v[0], 0);
+    const uint64_t hist_cell_va = Q_FLD(r_l_va) + uint64_t(src_cell) * uint64_t(Q_FLD(r_nb1_f32)) * 4ul;
+
+    for (uint t = 0u; t < n_tok; ++t) {
+        float reg[4];
+        float ss = 0.0;
+        for (uint k = 0u; k < 4u; ++k) {
+            const uint ch = head * 128u + k * 32u + lane;
+            const uint64_t past_va = hist_cell_va + uint64_t((conv_ch_off + ch) * 3u) * 4ul;
+            float p0 = ConstBufF32(past_va).v[0];
+            float p1 = ConstBufF32(past_va).v[1];
+            float p2 = ConstBufF32(past_va).v[2];
+
+            float x3 = eval_conv4_tap(raw_va, raw_stride, ch, t, p0, p1, p2, 3u);
+            float x2 = eval_conv4_tap(raw_va, raw_stride, ch, t, p0, p1, p2, 2u);
+            float x1 = eval_conv4_tap(raw_va, raw_stride, ch, t, p0, p1, p2, 1u);
+            float x0 = ConstBufF32(raw_va).v[t * raw_stride + ch];
+
+            vec4 cw = ConstBufVec4(conv_w_va).v[ch];
+            float csum = x3 * cw.x + x2 * cw.y + x1 * cw.z + x0 * cw.w;
+            if (is_full && dyn_va != 0ul) {
+                vec4 dw = ConstBufVec4(dyn_va).v[t * 8u + head];
+                csum += x0 * dw.x + x1 * dw.y + x2 * dw.z + x3 * dw.w;
+            }
+            float v = (x0 + csum) * conv_res_sc;
+            reg[k] = v;
+            ss += v * v;
+        }
+
+        float sum_sq = subgroupAdd(ss);
+        float sc = (!is_v)
+            ? (qk_clip / max(sqrt(sum_sq), qk_clip))
+            : inversesqrt(sum_sq * (1.0 / 128.0) + rms_eps);
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) reg[k] *= sc;
+        if (do_fwht) fwht128_in_reg(reg, lane);
+
+        const uint64_t id_va = idxs_va + uint64_t(t) * uint64_t(ids_nb0_B);
+        int64_t dst_row = ids_i64 ? ConstBufI64(id_va).v[0] : int64_t(ConstBufI32(id_va).v[0]);
+        if (dst_row >= 0l) {
+            store_kv_head(store_va + uint64_t(dst_row) * uint64_t(store_nb1_B), head, reg, lane, kv_q8);
+        }
+    }
+
+    if (cell_va != 0ul) {
+        const uint Kw = min(Q_FLD(rollback_slots), n_tok);
+        const uint rb_stride = Q_FLD(rollback_stride_f32);
+        for (uint k = 0u; k < 4u; ++k) {
+            const uint ch = head * 128u + k * 32u + lane;
+            const uint64_t past_va = hist_cell_va + uint64_t((conv_ch_off + ch) * 3u) * 4ul;
+            float p0 = ConstBufF32(past_va).v[0];
+            float p1 = ConstBufF32(past_va).v[1];
+            float p2 = ConstBufF32(past_va).v[2];
+            for (uint w = 0u; w < Kw; ++w) {
+                const uint slot  = (Kw - 1u) - w;
+                const uint t_end = (n_tok - Kw) + w;
+                const uint64_t dst_slot_va = cell_va +
+                    uint64_t(slot) * uint64_t(rb_stride) * 4ul +
+                    uint64_t(ch * 3u) * 4ul;
+                BufF32(dst_slot_va).v[0] = eval_conv4_tap(raw_va, raw_stride, ch, t_end, p0, p1, p2, 2u);
+                BufF32(dst_slot_va).v[1] = eval_conv4_tap(raw_va, raw_stride, ch, t_end, p0, p1, p2, 1u);
+                BufF32(dst_slot_va).v[2] = ConstBufF32(raw_va).v[t_end * raw_stride + ch];
+            }
+        }
+    }
+}
+
+// Vectorized 32-element dot product: rel_bias[d_idx, 0..n_rel-1] . s_r[0..n_rel-1]
+float dot_rel_bias_row(uint64_t b_va, uint wtype, uint n_rel) {
+    float acc = 0.0;
+    if (wtype == 2u) {
+        // BF16 (Inkling-2-Mini default!): 4 BF16s per 64-bit uvec2 load -> 8 loads for n_rel=32!
+        const uint n4 = n_rel >> 2u;
+        for (uint g = 0u; g < n4; ++g) {
+            uvec2 p = ConstBufUvec2(b_va).v[g];
+            uint k = g << 2u;
+            vec4 w = vec4(
+                uintBitsToFloat((p.x & 0xFFFFu) << 16u),
+                uintBitsToFloat(p.x & 0xFFFF0000u),
+                uintBitsToFloat((p.y & 0xFFFFu) << 16u),
+                uintBitsToFloat(p.y & 0xFFFF0000u));
+            acc += dot(w, vec4(s_r[k], s_r[k + 1u], s_r[k + 2u], s_r[k + 3u]));
+        }
+    } else if (wtype == 1u) {
+        // F16: 4 F16s per 64-bit uvec2 load
+        const uint n4 = n_rel >> 2u;
+        for (uint g = 0u; g < n4; ++g) {
+            uvec2 p = ConstBufUvec2(b_va).v[g];
+            uint k = g << 2u;
+            vec4 w = vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y));
+            acc += dot(w, vec4(s_r[k], s_r[k + 1u], s_r[k + 2u], s_r[k + 3u]));
+        }
+    } else if (wtype == 0u) {
+        // F32: 4 F32s per 128-bit vec4 load
+        const uint n4 = n_rel >> 2u;
+        for (uint g = 0u; g < n4; ++g) {
+            uint k = g << 2u;
+            acc += dot(ConstBufVec4(b_va).v[g], vec4(s_r[k], s_r[k + 1u], s_r[k + 2u], s_r[k + 3u]));
+        }
+    } else if (wtype == 4u) {
+        // Q8_0_8BLK (272B chunk: d[8] at +0, qs[256] at +16)
+        const uint n_chunks = (n_rel + 255u) >> 8u;
+        for (uint c = 0u; c < n_chunks; ++c) {
+            uint64_t cva = b_va + uint64_t(c) * 272ul;
+            uint blk_end = min(8u, (n_rel - c * 256u + 31u) >> 5u);
+            for (uint b = 0u; b < blk_end; ++b) {
+                float ds = unpackHalf2x16(uint(ConstBufU16(cva).v[b])).x;
+                float p = 0.0;
+                uint base_k = c * 256u + b * 32u;
+                for (uint w = 0u; w < 8u; ++w) {
+                    uint pk = ConstBufU32(cva + 16ul).v[b * 8u + w];
+                    uint kk = base_k + w * 4u;
+                    if (kk < n_rel) {
+                        p += float(bitfieldExtract(int(pk),  0, 8)) * s_r[kk + 0u]
+                           + float(bitfieldExtract(int(pk),  8, 8)) * s_r[kk + 1u]
+                           + float(bitfieldExtract(int(pk), 16, 8)) * s_r[kk + 2u]
+                           + float(bitfieldExtract(int(pk), 24, 8)) * s_r[kk + 3u];
+                    }
+                }
+                acc += ds * p;
+            }
+        }
+    } else {
+        // Q8_0_RAW (34B block)
+        for (uint k = 0u; k < n_rel; k += 32u) {
+            uint64_t blk_va = b_va + uint64_t(k >> 5u) * 34ul;
+            float ds = unpackHalf2x16(uint(ConstBufU16(blk_va).v[0])).x;
+            float p = 0.0;
+            for (uint o = 0u; o < 32u && (k + o) < n_rel; ++o) {
+                p += float(ConstBufI8(blk_va + 2ul).v[o]) * s_r[k + o];
+            }
+            acc += ds * p;
+        }
+    }
+    return acc;
+}
+
+void main() {
+    const uint wg  = gl_WorkGroupID.x;
+    const uint tok = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint sg  = tid >> 5u;
+    const uint ln  = tid & 31u;
+
+    const uint n_tok = Q_FLD(n_tokens);
+    if (tok >= n_tok) return;
+
+    const uint flags   = Q_FLD(flags);
+    const bool is_full = (flags & QKV_FLAG_IS_FULL_ATTN) != 0u;
+    const bool fwht_k  = (flags & QKV_FLAG_FWHT_K) != 0u;
+    const bool fwht_v  = (flags & QKV_FLAG_FWHT_V) != 0u;
+    const bool kv_q8   = (flags & QKV_FLAG_KV_Q8_0) != 0u;
+
+    if (wg < 24u) {
+        if (sg != 0u) return;
+        const uint head = wg;
+        const uint64_t q_raw_va  = Q_FLD(q_raw_va);
+        const uint64_t q_clip_va = Q_FLD(q_clip_va);
+        const uint q_stride      = Q_FLD(q_raw_stride_f32);
+        float reg[4];
+        float ss = 0.0;
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+            const uint ch = head * 128u + k * 32u + ln;
+            float x = ConstBufF32(q_raw_va).v[tok * q_stride + ch]
+                    * ConstBufF32(q_clip_va).v[ch];
+            reg[k] = x;
+            ss += x * x;
+        }
+        const float qk_clip = Q_FLD(qk_clip);
+        float sc = qk_clip / max(sqrt(subgroupAdd(ss)), qk_clip);
+        if (is_full) {
+            float pos_p1 = float(ConstBufI32(Q_FLD(inp_pos_va)).v[tok]) + 1.0;
+            sc *= 1.0 + Q_FLD(log_scale_alpha) * log(max(1.0, pos_p1 * Q_FLD(inv_log_floor)));
+        }
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) reg[k] *= sc;
+        if (fwht_k) fwht128_in_reg(reg, ln);
+        const uint q_base = (tok * 24u + head) * 128u;
+        const uint64_t q_out_va = Q_FLD(q_out_va);
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+            BufF32(q_out_va).v[q_base + k * 32u + ln] = reg[k];
+        }
+        if ((flags & QKV_FLAG_PACK_QGATE) != 0u && Q_FLD(qgate_compact_va) != 0ul) {
+            const uint64_t qg_raw = Q_FLD(qgate_raw_va);
+            const uint64_t qg_dst = Q_FLD(qgate_compact_va);
+            [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+                const uint ch = head * 128u + k * 32u + ln;
+                BufF32(qg_dst).v[q_base + k * 32u + ln] =
+                    ConstBufF32(qg_raw).v[tok * q_stride + ch];
+            }
+        }
+        return;
+    }
+
+    if (wg < 32u) {
+        if (sg != 0u || tok != 0u) return;
+        process_kv_head_all_tokens(false, wg - 24u, ln, is_full, fwht_k, kv_q8);
+        return;
+    }
+
+    if (wg < 40u) {
+        if (sg != 0u || tok != 0u) return;
+        process_kv_head_all_tokens(true, wg - 32u, ln, is_full, fwht_v, kv_q8);
+        return;
+    }
+
+    // ---- WGs 40..: R heads 0..23 x r_splits + vectorized RelBias - Sink + BaseMask -> kq_mask_f16 ----
+    const uint r_splits = max(Q_FLD(r_splits), 1u);
+    const uint r_wg     = wg - 40u;
+    const uint head     = r_wg / r_splits;
+    const uint r_sp     = r_wg - head * r_splits;
+    if (head >= 24u) return;
+
+    const uint n_rel = Q_FLD(n_rel);
+    if (sg == 0u) {
+        float rv = 0.0;
+        if (ln < n_rel) {
+            const uint ch = head * n_rel + ln;
+            rv = ConstBufF32(Q_FLD(r_raw_va)).v[tok * Q_FLD(r_raw_stride_f32) + ch] *
+                 ConstBufF32(Q_FLD(r_clip_va)).v[ch];
+        }
+        const float rel_clip = Q_FLD(rel_clip);
+        float sc = rel_clip / max(sqrt(subgroupAdd(rv * rv)), rel_clip);
+        if (is_full) {
+            float pos_p1 = float(ConstBufI32(Q_FLD(inp_pos_va)).v[tok]) + 1.0;
+            sc *= 1.0 + Q_FLD(log_scale_alpha) * log(max(1.0, pos_p1 * Q_FLD(inv_log_floor)));
+        }
+        float out_r = rv * sc;
+        if (ln < 32u) s_r[ln] = out_r;
+        if ((flags & QKV_FLAG_FUSE_REL_MASK) == 0u && r_sp == 0u && ln < n_rel) {
+            BufF32(Q_FLD(r_out_va)).v[(tok * 24u + head) * n_rel + ln] = out_r;
+        }
+    }
+
+    if ((flags & QKV_FLAG_FUSE_REL_MASK) == 0u) return;
+    barrier();
+
+    const float sink = ConstBufF32(Q_FLD(sinks_va)).v[tok * Q_FLD(sinks_stride_f32) + head];
+    const uint64_t rpos_row_va  = Q_FLD(rel_pos_va) + uint64_t(tok) * uint64_t(Q_FLD(rpos_nb1_B));
+    const uint64_t bmask_row_va = Q_FLD(base_mask_va) + uint64_t(tok) * uint64_t(Q_FLD(bmask_nb1_B));
+    const uint64_t dst_row_va   = Q_FLD(kq_mask_out_va) +
+        uint64_t((head * n_tok + tok) * Q_FLD(n_kv_mask_stride)) * 2ul;
+    const bool bmask_f16 = (flags & QKV_FLAG_BASE_MASK_F16) != 0u;
+    const uint n_kv      = Q_FLD(n_kv);
+    const uint n_extent  = Q_FLD(n_extent);
+    const uint64_t rel_bias_va = Q_FLD(rel_bias_va);
+    const uint bias_wtype      = Q_FLD(bias_wtype);
+    const uint bias_nb1_B      = Q_FLD(bias_nb1_B);
+
+    const uint chunk = (n_kv + r_splits - 1u) / r_splits;
+    const uint j_beg = r_sp * chunk;
+    const uint j_end = min(j_beg + chunk, n_kv);
+
+    for (uint j = j_beg + tid; j < j_end; j += 128u) {
+        float bm = bmask_f16 ? float(ConstBufF16(bmask_row_va).v[j]) : ConstBufF32(bmask_row_va).v[j];
+        if (!(bm > -1.0e20)) {
+            BufF16(dst_row_va).v[j] = float16_t(bm);
+            continue;
+        }
+        int d_idx = ConstBufI32(rpos_row_va).v[j];
+        float acc = 0.0;
+        if (d_idx >= 0 && uint(d_idx) < n_extent) {
+            uint64_t b_va = rel_bias_va + uint64_t(d_idx) * uint64_t(bias_nb1_B);
+            acc = dot_rel_bias_row(b_va, bias_wtype, n_rel);
+        }
+        BufF16(dst_row_va).v[j] = float16_t((acc - sink) + bm);
+    }
+}
+#undef Q_FLD

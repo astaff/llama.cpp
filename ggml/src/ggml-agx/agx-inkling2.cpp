@@ -1,10 +1,22 @@
 #include "agx-inkling2.h"
+#include "agx-graph-exec.h"
 #include "agx-gemm.h"
 #include "agx-kv-hybrid.h"
 #include "agx-moe.h"
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#endif
+#include "ggml-impl.h"
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -229,6 +241,243 @@ struct copy_f32_push {
     uint32_t pad0;
 };
 
+static const char * k_glsl_w4_router_topk_norm = R"GLSL(
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufI32 { int v[]; };
+
+layout(push_constant) uniform PushArgs {
+    uint64_t logits_va;
+    uint64_t bias_va;
+    uint64_t ids_dst_va;
+    uint64_t w_dst_va;
+    uint     n_exp;
+    uint     k_out;
+    uint     n_tokens;
+    uint     ids_nb1;
+    float    norm_eps;
+    float    w_scale;
+} pc;
+
+shared float s_sel[256];
+shared float s_prob[256];
+shared int   s_idx[256];
+
+void main() {
+    const uint tok = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    if (tok >= pc.n_tokens) return;
+
+    const uint E = pc.n_exp;
+    uint n_pad = 1u;
+    while (n_pad < E) n_pad <<= 1u;
+    const uint l_base = tok * E;
+
+    for (uint i = tid; i < n_pad; i += 128u) {
+        if (i < E) {
+            float x = ConstBufF32(pc.logits_va).v[l_base + i];
+            float p = 1.0 / (1.0 + exp(-x));
+            float s = (pc.bias_va != 0ul) ? (p + ConstBufF32(pc.bias_va).v[i]) : p;
+            s_prob[i] = p;
+            s_sel[i]  = s;
+            s_idx[i]  = int(i);
+        } else {
+            s_prob[i] = 0.0;
+            s_sel[i]  = uintBitsToFloat(0xFF800000u);
+            s_idx[i]  = 0x7FFFFFFF;
+        }
+    }
+    barrier();
+
+    const uint half_n = n_pad >> 1u;
+    for (uint k = 2u; k <= n_pad; k <<= 1u) {
+        for (uint j = k >> 1u; j > 0u; j >>= 1u) {
+            if (tid < half_n) {
+                uint low_mask = j - 1u;
+                uint lo = ((tid & ~low_mask) << 1u) | (tid & low_mask);
+                uint hi = lo | j;
+                bool asc_dir = ((lo & k) == 0u);
+                float va = s_sel[lo]; int ia = s_idx[lo];
+                float vb = s_sel[hi]; int ib = s_idx[hi];
+                bool a_before = (va > vb) || (va == vb && ia < ib);
+                if (asc_dir ? (!a_before) : a_before) {
+                    s_sel[lo] = vb; s_idx[lo] = ib;
+                    s_sel[hi] = va; s_idx[hi] = ia;
+                }
+            }
+            barrier();
+        }
+    }
+
+    const uint K = pc.k_out;
+    if (tid == 0u) {
+        float sum_p = 0.0;
+        for (uint k = 0u; k < K; ++k) {
+            sum_p += s_prob[uint(s_idx[k])];
+        }
+        float inv_s = 1.0 / (sum_p + pc.norm_eps);
+        const uint id_base = tok * pc.ids_nb1;
+        const uint w_base  = tok * K;
+        for (uint k = 0u; k < K; ++k) {
+            int eid = s_idx[k];
+            BufI32(pc.ids_dst_va).v[id_base + k] = eid;
+            BufF32(pc.w_dst_va).v[w_base + k]    = (s_prob[uint(eid)] * inv_s) * pc.w_scale;
+        }
+    }
+}
+)GLSL";
+
+struct w4_router_topk_push {
+    uint64_t logits_va;
+    uint64_t bias_va;
+    uint64_t ids_dst_va;
+    uint64_t w_dst_va;
+    uint32_t n_exp;
+    uint32_t k_out;
+    uint32_t n_tokens;
+    uint32_t ids_nb1;
+    float    norm_eps;
+    float    w_scale;
+};
+
+static const char * k_glsl_w4_gather_f32 = R"GLSL(
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufI32 { int v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufF32 { float v[]; };
+
+layout(push_constant) uniform PushArgs {
+    uint64_t src_va;
+    uint64_t ids_va;
+    uint64_t dst_va;
+    uint64_t dst2_va;
+    uint     n_embd;
+    uint     n_out;
+} pc;
+
+void main() {
+    const uint col = gl_GlobalInvocationID.x;
+    const uint row = gl_WorkGroupID.y;
+    if (col >= pc.n_embd || row >= pc.n_out) return;
+    const int src_row = max(ConstBufI32(pc.ids_va).v[row], 0);
+    const float val = ConstBufF32(pc.src_va).v[uint(src_row) * pc.n_embd + col];
+    BufF32(pc.dst_va).v[row * pc.n_embd + col] = val;
+    if (pc.dst2_va != 0ul) {
+        BufF32(pc.dst2_va).v[row * pc.n_embd + col] = val;
+    }
+}
+)GLSL";
+
+struct w4_gather_f32_push {
+    uint64_t src_va;
+    uint64_t ids_va;
+    uint64_t dst_va;
+    uint64_t dst2_va;
+    uint32_t n_embd;
+    uint32_t n_out;
+};
+
+static const char * k_glsl_w4_fill_f32 = R"GLSL(
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufF32 { float v[]; };
+
+layout(push_constant) uniform PushArgs {
+    uint64_t dst_va;
+    uint     n_elems;
+    float    val;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i < pc.n_elems) BufF32(pc.dst_va).v[i] = pc.val;
+}
+)GLSL";
+
+struct w4_fill_f32_push {
+    uint64_t dst_va;
+    uint32_t n_elems;
+    float    val;
+};
+
+static const char * k_glsl_w4_scatter_rows_f32 = R"GLSL(
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer ConstBufI64 { int64_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufI32 { int v[]; };
+
+layout(push_constant) uniform PushArgs {
+    uint64_t src_va;
+    uint64_t ids_va;
+    uint64_t dst_va;
+    uint     n_embd;
+    uint     n_tokens;
+    uint     dst_nb1_B;
+    uint     ids_is_i64;
+} pc;
+
+void main() {
+    uint i   = gl_GlobalInvocationID.x;
+    uint tok = gl_WorkGroupID.y;
+    if (i >= pc.n_embd || tok >= pc.n_tokens) return;
+    int64_t dst_row = (pc.ids_is_i64 != 0u) ? ConstBufI64(pc.ids_va).v[tok] : int64_t(ConstBufI32(pc.ids_va).v[tok]);
+    if (dst_row < 0l) return;
+    BufF32(pc.dst_va + uint64_t(dst_row) * uint64_t(pc.dst_nb1_B)).v[i] =
+        ConstBufF32(pc.src_va).v[tok * pc.n_embd + i];
+}
+)GLSL";
+
+struct w4_scatter_rows_f32_push {
+    uint64_t src_va;
+    uint64_t ids_va;
+    uint64_t dst_va;
+    uint32_t n_embd;
+    uint32_t n_tokens;
+    uint32_t dst_nb1_B;
+    uint32_t ids_is_i64;
+};
+
+// Coalesced W_attn_in descriptor per physical layer (order: [wq, wqkv_gate, attn_rel, attn_sink_proj, wk, wv])
+struct agx_w4_layer_coalesced {
+    agx_coalesced_weight w_attn_in{};
+    bool     valid             = false;
+    uint32_t q_prefix_rows     = 0; // contiguous Q-group rows starting at row 0
+    bool     in_coal[6]        = {};
+    uint32_t coal_idx[6]       = {};
+    uint32_t row_off[6]        = {};
+    uint32_t row_cnt[6]        = {};
+    size_t   byte_off[6]       = {};
+    uint32_t total_coal_rows   = 0;
+};
+
+struct agx_w4_bound_model {
+    bool     bound             = false;
+    uint64_t tok_embd_va       = 0;
+    uint64_t output_va         = 0;
+    agx_w4_layer_coalesced layers[AGX_INKLING2_MAX_PHYS_LAYERS];
+};
+
 // ============================================================================
 // Engine Struct & SLC Scratch Layout
 // ============================================================================
@@ -256,6 +505,28 @@ struct agx_inkling2_engine {
     const agx_kernel * k_embd_rmsnorm       = nullptr;
     const agx_kernel * k_rmsnorm_f32        = nullptr;
     const agx_kernel * k_copy_f32           = nullptr;
+
+    // Wave 4 Megakernel & DSpark fastpath kernels
+    const agx_kernel * k_w4_qkv_prep_store  = nullptr;
+    const agx_kernel * k_w4_stage_post_attn = nullptr;
+    const agx_kernel * k_w4_stage_post_ffn  = nullptr;
+    const agx_kernel * k_w4_rel_bias_mask   = nullptr;
+    const agx_kernel * k_w4_fwht_qgate      = nullptr;
+    const agx_kernel * k_w4_ctrl_norm_cat   = nullptr;
+    const agx_kernel * k_w4_ctrl_mix_norm   = nullptr;
+    const agx_kernel * k_w4_ctrl_up_mix     = nullptr;
+    const agx_kernel * k_w4_batch_rmsnorm   = nullptr;
+    const agx_kernel * k_w4_dspark_pack     = nullptr;
+    const agx_kernel * k_w4_dspark_gru      = nullptr;
+    const agx_kernel * k_w4_dspark_w2       = nullptr;
+    const agx_kernel * k_w4_dspark_merge    = nullptr;
+    const agx_kernel * k_w4_router_topk     = nullptr;
+    const agx_kernel * k_w4_gather_f32      = nullptr;
+    const agx_kernel * k_w4_fill_f32        = nullptr;
+    const agx_kernel * k_w4_scatter_rows_f32 = nullptr;
+    bool               w4_compiled          = false;
+
+    agx_w4_bound_model w4_model;
 
     // Dedicated SLC-pinned activation & recurrent-state arena (AGX_BO_SLC_PIN)
     agx_bo * slc_bo   = nullptr;
@@ -574,6 +845,12 @@ agx_inkling2_engine * agx_inkling2_engine_create(agx_backend_context *       ctx
 void agx_inkling2_engine_destroy(agx_inkling2_engine * eng) {
     if (!eng) return;
     if (eng->ctx && eng->ctx->drm) {
+        for (uint32_t i = 0; i < AGX_INKLING2_MAX_PHYS_LAYERS; ++i) {
+            if (eng->w4_model.layers[i].valid) {
+                agx_repack_coalesced_free(eng->ctx->drm, &eng->w4_model.layers[i].w_attn_in);
+                eng->w4_model.layers[i].valid = false;
+            }
+        }
         if (eng->conv_bo) agx_bo_free(eng->ctx->drm, eng->conv_bo);
         if (eng->slc_bo)  agx_bo_free(eng->ctx->drm, eng->slc_bo);
     }
@@ -940,7 +1217,8 @@ static bool dispatch_dense_mm(agx_backend_context *      ctx,
                               uint64_t                   x_va,
                               uint64_t                   y_va,
                               uint32_t                   M,
-                              agx_barrier_mode           post_barrier) {
+                              agx_barrier_mode           post_barrier,
+                              bool                       prec_f32 = false) {
     if (!w) return false;
     agx_weight_layout layout = AGX_WEIGHT_F32;
     if (!agx_gemm_infer_weight_layout(w, &layout)) {
@@ -954,6 +1232,7 @@ static bool dispatch_dense_mm(agx_backend_context *      ctx,
     d.N            = (uint32_t) w->ne[1];
     d.K            = (uint32_t) w->ne[0];
     d.layout       = layout;
+    d.prec_f32     = prec_f32;
     d.post_barrier = post_barrier;
     return agx_gemm_dispatch(ctx, stream, d);
 }
@@ -1407,6 +1686,8 @@ static bool encode_inkling2_layer(agx_inkling2_engine *             eng,
         margs.down_slice_B     = dn_slice;
         margs.gate_up_layout   = gu_layout;
         margs.down_layout      = dn_layout;
+        margs.gate_up_scale_va = layer.ffn_gate_up_exps_s ? agx_tensor_gpu_va(layer.ffn_gate_up_exps_s) : 0ull;
+        margs.down_scale_va    = layer.ffn_down_exps_s    ? agx_tensor_gpu_va(layer.ffn_down_exps_s)    : 0ull;
         margs.x_is_f16         = false;
         margs.accumulate_out   = false;
         if (!agx_moe_dispatch(moe_runner, stream, margs, AGX_BARRIER_STRONG_USC)) return false;
@@ -1672,4 +1953,2175 @@ bool agx_inkling2_run_sense_barrier_probe(agx_inkling2_engine * eng,
 
     agx_bo_free(eng->ctx->drm, scratch);
     return coherent;
+}
+
+// ============================================================================
+// Wave 4 Pillar 3: Precompile, Fused DSpark MTP & 48-Pass Megakernel Engine
+// ============================================================================
+
+bool agx_inkling2_precompile_w4(agx_inkling2_engine * eng) {
+    if (!eng || !eng->ctx || !eng->ctx->compiler) return false;
+    if (eng->w4_compiled) return true;
+
+    agx_compiler * comp = eng->ctx->compiler;
+    auto compile_file = [&](const char * name, const char * file, const char * def) -> const agx_kernel * {
+        agx_compile_opts opts;
+        opts.is_hot_kernel     = true;
+        opts.strict_zero_spill = true;
+        if (def && def[0]) opts.defines.emplace_back(def);
+        return agx_compiler_compile_file(comp, name, file, opts);
+    };
+    auto compile_inline = [&](const char * name, const char * glsl) -> const agx_kernel * {
+        agx_compile_opts opts;
+        opts.is_hot_kernel     = true;
+        opts.strict_zero_spill = true;
+        return agx_compiler_compile_glsl(comp, name, glsl, opts);
+    };
+
+    eng->k_w4_qkv_prep_store  = compile_file("agx_w4_qkv_prep_store",  "agx_inkling2_qkv_prep_store.comp", nullptr);
+    eng->k_w4_stage_post_attn = compile_file("agx_w4_stage_post_attn", "agx_inkling2_stage_prep.comp",     "STAGE_MODE=0");
+    eng->k_w4_stage_post_ffn  = compile_file("agx_w4_stage_post_ffn",  "agx_inkling2_stage_prep.comp",     "STAGE_MODE=1");
+    eng->k_w4_rel_bias_mask   = compile_file("agx_w4_rel_bias_mask",   "agx_inkling2_stage_prep.comp",     "STAGE_MODE=2");
+    eng->k_w4_fwht_qgate      = compile_file("agx_w4_fwht_qgate",      "agx_inkling2_stage_prep.comp",     "STAGE_MODE=3");
+    eng->k_w4_ctrl_norm_cat   = compile_file("agx_w4_ctrl_norm_cat",   "agx_inkling2_stage_prep.comp",     "STAGE_MODE=4");
+    eng->k_w4_ctrl_mix_norm   = compile_file("agx_w4_ctrl_mix_norm",   "agx_inkling2_stage_prep.comp",     "STAGE_MODE=5");
+    eng->k_w4_ctrl_up_mix     = compile_file("agx_w4_ctrl_up_mix",     "agx_inkling2_stage_prep.comp",     "STAGE_MODE=6");
+    eng->k_w4_batch_rmsnorm   = compile_file("agx_w4_batch_rmsnorm",   "agx_inkling2_stage_prep.comp",     "STAGE_MODE=7");
+    eng->k_w4_dspark_pack     = compile_file("agx_w4_dspark_pack",     "agx_inkling2_dspark_mtp.comp",     "DSPARK_FUSED_MODE=0");
+    eng->k_w4_dspark_gru      = compile_file("agx_w4_dspark_gru",      "agx_inkling2_dspark_mtp.comp",     "DSPARK_FUSED_MODE=3");
+    eng->k_w4_dspark_w2       = compile_file("agx_w4_dspark_w2",       "agx_inkling2_dspark_mtp.comp",     "DSPARK_FUSED_MODE=1");
+    eng->k_w4_dspark_merge    = compile_file("agx_w4_dspark_merge",    "agx_inkling2_dspark_mtp.comp",     "DSPARK_FUSED_MODE=2");
+    eng->k_w4_router_topk     = compile_inline("agx_w4_router_topk",   k_glsl_w4_router_topk_norm);
+    eng->k_w4_gather_f32      = compile_inline("agx_w4_gather_f32",    k_glsl_w4_gather_f32);
+    eng->k_w4_fill_f32        = compile_inline("agx_w4_fill_f32",      k_glsl_w4_fill_f32);
+    eng->k_w4_scatter_rows_f32 = compile_inline("agx_w4_scatter_rows_f32", k_glsl_w4_scatter_rows_f32);
+
+    eng->w4_compiled = eng->k_w4_qkv_prep_store && eng->k_w4_stage_post_attn &&
+                       eng->k_w4_stage_post_ffn && eng->k_w4_rel_bias_mask &&
+                       eng->k_w4_fwht_qgate && eng->k_w4_ctrl_norm_cat &&
+                       eng->k_w4_ctrl_mix_norm && eng->k_w4_ctrl_up_mix &&
+                       eng->k_w4_batch_rmsnorm && eng->k_w4_dspark_pack &&
+                       eng->k_w4_dspark_gru && eng->k_w4_dspark_w2 &&
+                       eng->k_w4_dspark_merge && eng->k_w4_router_topk &&
+                       eng->k_w4_gather_f32 && eng->k_w4_fill_f32 &&
+                       eng->k_w4_scatter_rows_f32;
+    return eng->w4_compiled;
+}
+
+// Static SLC arena sub-layout across `slc->extra_scratch` (2.43 MiB) & `slc->sconv_state` (3.65 MiB)
+struct agx_w4_slc_layout {
+    uint64_t x_q;               // slc->ctrl_scratch + 0          (73,728 B)
+    uint64_t x_k;               // slc->ctrl_scratch + 73,728     (73,728 B) -> also wo_out
+    uint64_t x_v;               // slc->ctrl_scratch + 147,456    (73,728 B) -> dedicated next-pass x_v (NO moe_out alias!)
+    uint64_t qkv_in_0;          // slc->ctrl_scratch + 221,184    (73,728 B) -> also ffn_pre
+    uint64_t router_logits;     // slc->router_topk  + 8,192      (4,096 B)
+
+    uint64_t moe_out;           // extra + ...                    (73,728 B, strictly disjoint from x_v for M=1..8 conv!)
+
+    uint64_t q_out;             // extra + 0                      (98,304 B)
+    uint64_t qgate_compact;     // extra + 98,304                 (98,304 B)
+    uint64_t r_out;             // extra + 196,608                (24,576 B)
+    uint64_t qkv_in_1;          // extra + 221,184                (73,728 B)
+    uint64_t qkv_in_2;          // extra + 294,912                (73,728 B)
+    uint64_t k_dyn;             // extra + 368,640                (4,096 B)
+    uint64_t v_dyn;             // extra + 372,736                (4,096 B)
+    uint64_t fallback_qkv;      // extra + 376,832                (287,488 B)
+    uint64_t dspark_state;      // extra + ...                    (16,384 B)
+    uint64_t dspark_markov;     // extra + ...                    (16,384 B)
+    uint64_t dspark_prev;       // extra + ...                    (4,096 B)
+
+    // 40-core Loop Controller & DSpark scratch inside `slc->sconv_state` (3,833,856 B, unused by MK!)
+    uint64_t ctrl_cat[3];       // 3 * (8 * 4608 * 4 = 147,456 B) = 442,368 B
+    uint64_t ctrl_gate[3];      // 3 * (8 *  256 * 4 =   8,192 B) =  24,576 B
+    uint64_t ctrl_gain[3];      // 3 * (8 * 2304 * 4 =  73,728 B) = 221,184 B
+    uint64_t ctrl_forget[3];    // 3 * (8 * 2304 * 4 =  73,728 B) = 221,184 B
+    uint64_t dspark_in;         // 4 * 6144 * 4                   =  98,304 B
+    uint64_t dspark_joint_out;  // 4 * 1536 * 4                   =  24,576 B
+    uint64_t dspark_cand_val;   // 4 * 160 * 64 * 4               = 163,840 B
+    uint64_t dspark_cand_idx;   // 4 * 160 * 64 * 4               = 163,840 B
+    uint64_t kq_mask_f16;       // remainder of sconv_state       (~2.47 MiB!)
+    size_t   kq_mask_f16_bytes;
+};
+
+static agx_w4_slc_layout agx_w4_partition_slc(const agx_slc_arena * slc) {
+    agx_w4_slc_layout L{};
+    constexpr uint64_t kEmbdB = AGX_SLC_ARENA_H_CUR_BYTES; // 73,728 B
+    L.x_q           = slc->ctrl_scratch;
+    L.x_k           = slc->ctrl_scratch + kEmbdB;
+    L.x_v           = slc->ctrl_scratch + 2u * kEmbdB;
+    L.qkv_in_0      = slc->ctrl_scratch + 3u * kEmbdB;
+    L.router_logits = slc->router_topk + 8192u;
+
+    uint64_t cur = slc->extra_scratch;
+    auto take_extra = [&](size_t sz) -> uint64_t {
+        uint64_t va = cur;
+        cur += agx_align_up(sz, AGX_CACHE_LINE_BYTES);
+        return va;
+    };
+    L.q_out           = take_extra(98304u);
+    L.qgate_compact   = take_extra(98304u);
+    L.r_out           = take_extra(24576u);
+    L.qkv_in_1        = take_extra(kEmbdB);
+    L.qkv_in_2        = take_extra(kEmbdB);
+    L.moe_out         = take_extra(kEmbdB);
+    L.k_dyn           = take_extra(4096u);
+    L.v_dyn           = take_extra(4096u);
+    L.fallback_qkv    = take_extra(AGX_SLC_ARENA_QKV_BUF_BYTES);
+    L.dspark_state    = take_extra(16384u);
+    L.dspark_markov   = take_extra(16384u);
+    L.dspark_prev     = take_extra(4096u);
+
+    uint64_t scur = slc->sconv_state;
+    auto take_sc = [&](size_t sz) -> uint64_t {
+        uint64_t va = scur;
+        scur += agx_align_up(sz, AGX_CACHE_LINE_BYTES);
+        return va;
+    };
+    for (int j = 0; j < 3; ++j) L.ctrl_cat[j]    = take_sc(2u * kEmbdB);
+    for (int j = 0; j < 3; ++j) L.ctrl_gate[j]   = take_sc(8192u);
+    for (int j = 0; j < 3; ++j) L.ctrl_gain[j]   = take_sc(kEmbdB);
+    for (int j = 0; j < 3; ++j) L.ctrl_forget[j] = take_sc(kEmbdB);
+    L.dspark_in        = take_sc(98304u);
+    L.dspark_joint_out = take_sc(24576u);
+    L.dspark_cand_val  = take_sc(163840u);
+    L.dspark_cand_idx  = take_sc(163840u);
+    L.kq_mask_f16      = scur;
+    const uint64_t sc_end = slc->sconv_state + AGX_SLC_ARENA_SCONV_STATE_BYTES;
+    L.kq_mask_f16_bytes   = (sc_end > scur) ? (size_t) (sc_end - scur) : 0u;
+    return L;
+}
+
+bool agx_dspark_dispatch_markov_head_w4(agx_inkling2_engine *          eng,
+                                        agx_cdm_stream *               stream,
+                                        const agx_dspark_mtp_tensors & w,
+                                        uint64_t                       anchor_toks_va,
+                                        uint64_t                       base_logits_va,
+                                        uint64_t                       hidden_va,
+                                        uint64_t                       f_rnn_va,
+                                        uint64_t                       rnn_state_va,
+                                        uint64_t                       out_logits_va,
+                                        uint64_t                       out_h_nextn_va,
+                                        uint32_t                       n_blocks,
+                                        uint32_t                       block_drafts,
+                                        agx_barrier_mode               post_barrier) {
+    if (!eng || !stream || !w.markov_w1 || !w.markov_w2 || n_blocks == 0 || n_blocks > 4 || block_drafts == 0) {
+        return false;
+    }
+    if (!agx_inkling2_precompile_w4(eng)) {
+        return false;
+    }
+    agx_slc_arena * slc = agx_backend_get_slc_arena(eng->ctx);
+    if (!slc) return false;
+    const agx_w4_slc_layout L = agx_w4_partition_slc(slc);
+
+    const uint32_t i_beg = w.sample_from_anchor ? 0u : 1u;
+
+    // Seed prev_tok from anchor token(s) (1-element copy per block when n_blocks == 1)
+    if (n_blocks == 1u) {
+        copy_f32_push cp{ anchor_toks_va, L.dspark_prev, 1u, 0u };
+        if (!agx_cdm_dispatch(stream, eng->k_copy_f32, 1u, 1u, 1u, &cp, sizeof(cp), AGX_BARRIER_NONE)) {
+            return false;
+        }
+    } else {
+        for (uint32_t b = 0; b < n_blocks; ++b) {
+            copy_f32_push cp{
+                anchor_toks_va + (uint64_t) (b * block_drafts) * sizeof(int32_t),
+                L.dspark_prev + (uint64_t) b * sizeof(int32_t),
+                1u, 0u
+            };
+            if (!agx_cdm_dispatch(stream, eng->k_copy_f32, 1u, 1u, 1u, &cp, sizeof(cp), AGX_BARRIER_NONE)) {
+                return false;
+            }
+        }
+    }
+
+    // Slot 0 pass-through (unbiased anchor logits + zero h_nextn slot 0)
+    if (!w.sample_from_anchor) {
+        if (out_logits_va != base_logits_va) {
+            for (uint32_t b = 0; b < n_blocks; ++b) {
+                const uint64_t off = (uint64_t) b * block_drafts * w.n_vocab * sizeof(float);
+                copy_f32_push cp{ base_logits_va + off, out_logits_va + off, w.n_vocab, 0u };
+                if (!agx_cdm_dispatch(stream, eng->k_copy_f32, (w.n_vocab + 255u) / 256u, 1u, 1u,
+                                      &cp, sizeof(cp), AGX_BARRIER_NONE)) {
+                    return false;
+                }
+            }
+        }
+        if (out_h_nextn_va != 0ull && rnn_state_va != 0ull) {
+            for (uint32_t b = 0; b < n_blocks; ++b) {
+                const uint64_t off = (uint64_t) b * block_drafts * w.n_embd * sizeof(float);
+                w4_fill_f32_push fp{ out_h_nextn_va + off, w.n_embd, 0.0f };
+                if (!agx_cdm_dispatch(stream, eng->k_w4_fill_f32, (w.n_embd + 255u) / 256u, 1u, 1u,
+                                      &fp, sizeof(fp), AGX_BARRIER_NONE)) {
+                    return false;
+                }
+            }
+        }
+    }
+    agx_cdm_barrier_usc(stream);
+
+    uint32_t w1_rb = 0, w2_rb = 0;
+    const uint32_t w1_wt = agx_inkling2_tensor_wtype(w.markov_w1, &w1_rb);
+    const uint32_t w2_wt = agx_inkling2_tensor_wtype(w.markov_w2, &w2_rb);
+    if (!agx_gemm_init(eng->ctx)) {
+        return false;
+    }
+
+    float w2_scale = 1.0f;
+    if (w.markov_w2_s && w.markov_w2_s->data && w.markov_w2_s->type == GGML_TYPE_F32) {
+        w2_scale = *static_cast<const float *>(w.markov_w2_s->data);
+    }
+
+    const uint32_t n_splits = 160u; // 4 WGs/core on M4 Max -> full 517 GB/s DRAM saturation!
+    const uint32_t n_cand   = std::min<uint32_t>(64u, w.n_vocab);
+
+    for (uint32_t i = i_beg; i < block_drafts; ++i) {
+        const bool is_last   = (i + 1u == block_drafts);
+        const bool need_draw = (rnn_state_va != 0ull || !is_last);
+
+        if (w.joint_proj) {
+            agx_w4_dspark_pack_push ppc{};
+            ppc.prev_tok_va  = L.dspark_prev;
+            ppc.w1_va        = agx_tensor_gpu_va(w.markov_w1);
+            ppc.hidden_va    = hidden_va;
+            ppc.f_rnn_va     = f_rnn_va;
+            ppc.state_va     = L.dspark_state;
+            ppc.joint_in_va  = L.dspark_in;
+            ppc.n_embd       = w.n_embd;
+            ppc.rank         = w.rank;
+            ppc.n_blocks     = n_blocks;
+            ppc.block_drafts = block_drafts;
+            ppc.draft_pos    = i;
+            ppc.w1_wtype     = w1_wt;
+            ppc.w1_row_bytes = w1_rb;
+            ppc.flags        = (w.has_f_rnn && f_rnn_va ? AGX_W4_DSPARK_F_HAS_FRNN : 0u) |
+                               (i == i_beg ? AGX_W4_DSPARK_F_ZERO_STATE : 0u);
+            if (!agx_cdm_dispatch(stream, eng->k_w4_dspark_pack, n_blocks, 1u, 1u,
+                                  &ppc, sizeof(ppc), AGX_BARRIER_STRONG_USC)) {
+                return false;
+            }
+            // All 40 cores at ~500 GB/s for joint_proj (replaces 1-WG bottleneck!)
+            if (!dispatch_dense_mm(eng->ctx, stream, w.joint_proj, L.dspark_in, L.dspark_joint_out,
+                                   n_blocks, AGX_BARRIER_STRONG_USC)) {
+                return false;
+            }
+            agx_w4_dspark_gru_push gpc{};
+            gpc.joint_out_va  = L.dspark_joint_out;
+            gpc.joint_b_va    = w.joint_proj_b ? agx_tensor_gpu_va(w.joint_proj_b) : 0ull;
+            gpc.state_va      = L.dspark_state;
+            gpc.markov_out_va = L.dspark_markov;
+            gpc.rank          = w.rank;
+            gpc.n_blocks      = n_blocks;
+            gpc.zero_state    = (i == i_beg) ? 1u : 0u;
+            if (!agx_cdm_dispatch(stream, eng->k_w4_dspark_gru, n_blocks, 1u, 1u,
+                                  &gpc, sizeof(gpc), AGX_BARRIER_STRONG_USC)) {
+                return false;
+            }
+        }
+
+        agx_w4_dspark_w2_push wpc{};
+        wpc.markov_va     = L.dspark_markov;
+        wpc.w2_va         = agx_tensor_gpu_va(w.markov_w2);
+        wpc.w2_bias_va    = w.markov_w2_b ? agx_tensor_gpu_va(w.markov_w2_b) : 0ull;
+        wpc.base_va       = base_logits_va;
+        wpc.out_logits_va = out_logits_va;
+        wpc.cand_val_va   = L.dspark_cand_val;
+        wpc.cand_idx_va   = L.dspark_cand_idx;
+        wpc.rank          = w.rank;
+        wpc.n_vocab       = w.n_vocab;
+        wpc.n_blocks      = n_blocks;
+        wpc.block_drafts  = block_drafts;
+        wpc.draft_pos     = i;
+        wpc.n_splits      = n_splits;
+        wpc.w2_wtype      = w2_wt;
+        wpc.w2_row_bytes  = w2_rb;
+        wpc.flags         = (w.markov_w2_b ? AGX_W4_DSPARK_F_HAS_W2_BIAS : 0u) |
+                            (need_draw ? AGX_W4_DSPARK_F_EMIT_TOP64 : 0u);
+        wpc.w2_scale      = w2_scale;
+        wpc.softcap       = w.softcap;
+        wpc.inv_softcap   = (w.softcap > 0.0f) ? (1.0f / w.softcap) : 0.0f;
+
+        if (!agx_cdm_dispatch(stream, eng->k_w4_dspark_w2, n_splits, n_blocks, 1u,
+                              &wpc, sizeof(wpc),
+                              need_draw ? AGX_BARRIER_STRONG_USC : (is_last ? post_barrier : AGX_BARRIER_STRONG_USC))) {
+            return false;
+        }
+
+        if (need_draw) {
+            agx_w4_dspark_merge_push mpc{};
+            mpc.cand_val_va   = L.dspark_cand_val;
+            mpc.cand_idx_va   = L.dspark_cand_idx;
+            mpc.rnn_state_va  = rnn_state_va;
+            mpc.prev_tok_va   = L.dspark_prev;
+            mpc.out_pack_va   = out_h_nextn_va;
+            mpc.n_embd        = w.n_embd;
+            mpc.n_blocks      = n_blocks;
+            mpc.block_drafts  = block_drafts;
+            mpc.draft_pos     = i;
+            mpc.n_splits      = n_splits;
+            mpc.n_cand        = n_cand;
+            mpc.has_rnn_state = (rnn_state_va != 0ull) ? 1u : 0u;
+            if (!agx_cdm_dispatch(stream, eng->k_w4_dspark_merge, n_blocks, 1u, 1u,
+                                  &mpc, sizeof(mpc),
+                                  is_last ? post_barrier : AGX_BARRIER_STRONG_USC)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// ============================================================================
+// Wave 4 Graph Auto-Discovery & 48-Pass Inkling-2-Mini Megakernel Execution
+// ============================================================================
+
+namespace {
+
+struct w4_layer_inp_store {
+    uint64_t dst_va     = 0;
+    uint64_t ids_va     = 0;
+    uint32_t dst_nb1_B  = 0;
+    bool     ids_is_i64 = true;
+};
+
+struct w4_pass_runtime {
+    uint32_t il            = 0;  // logical cache slot 0..47
+    uint32_t ip            = 0;  // physical layer 0..23
+    bool     is_swa        = true;
+    bool     has_loop      = false;
+    bool     has_k_rot     = false;
+    bool     has_v_rot     = false;
+    bool     kv_is_q8      = false;
+    bool     k_ids_is_i64  = true;
+    bool     v_ids_is_i64  = true;
+    bool     bmask_is_f16  = true;
+
+    // External KV cache (llama.cpp's k_l[il] / v_l[il])
+    uint64_t k_va          = 0;
+    uint64_t v_va          = 0;
+    uint32_t k_nb1         = 0;
+    uint32_t k_nb2         = 0;
+    uint32_t v_nb1         = 0;
+    uint32_t v_nb2         = 0;
+    uint32_t n_kv          = 0;
+    uint64_t k_store_va    = 0;
+    uint64_t v_store_va    = 0;
+    uint32_t k_store_nb1   = 0;
+    uint32_t v_store_nb1   = 0;
+    uint64_t k_idxs_va     = 0;
+    uint64_t v_idxs_va     = 0;
+    uint32_t k_ids_nb0     = 0;
+    uint32_t v_ids_nb0     = 0;
+
+    // Mask & relative pos
+    uint64_t rel_pos_va    = 0;
+    uint32_t rpos_nb1      = 0;
+    uint64_t base_mask_va  = 0;
+    uint32_t bmask_nb1     = 0;
+    uint64_t graph_mask_va = 0; // fallback VA of fa->src[3] when n_kv is huge
+    uint32_t graph_mask_nb1 = 0;
+
+    // Recurrent shortconv state (llama.cpp's r_l[il])
+    uint64_t r_l_va        = 0;
+    uint32_t r_nb1_f32     = 0;
+    uint64_t cell_va[4]    = {}; // [0]=k, [1]=v, [2]=attn_post, [3]=ffn_post
+    uint32_t rollback_slots      = 1;
+    uint32_t rollback_stride_f32 = 0;
+    uint64_t rs_zero_va    = 0;
+    uint32_t rs_zero_elems = 0;
+
+    // Optional DSpark target feature export (l_out of this pass: host OUTPUT or GPU layer_inp_dev SET_ROWS)
+    uint64_t export_l_out_va = 0;
+    std::vector<w4_layer_inp_store> layer_inp_stores;
+};
+
+struct w4_discovered_graph {
+    agx_inkling2_hparams       hp;
+    agx_inkling2_model_tensors W;
+    w4_pass_runtime            passes[48];
+    bool                       rel_bias_padded[24] = {};
+
+    uint32_t n_tokens          = 0; // M (1..8)
+    uint32_t n_out             = 0; // result_output->ne[1]
+    uint64_t inp_tokens_va     = 0;
+    uint64_t inp_pos_va        = 0;
+    uint64_t s_copy_va         = 0;
+    uint64_t inp_out_ids_va    = 0;
+    uint64_t lm_head_pad_va    = 0;
+    uint64_t result_output_va  = 0;
+    uint64_t result_norm_va    = 0; // non-zero if result_norm is marked OUTPUT
+    uint64_t export_tok_norm   = 0; // non-zero if t_layer_inp[0] is marked OUTPUT
+    uint64_t export_out_norm   = 0; // non-zero if t_layer_inp[48] is marked OUTPUT
+    std::vector<w4_layer_inp_store> tok_norm_stores; // DSpark GPU layer_inp_dev SET_ROWS from tok_norm_out
+    std::vector<w4_layer_inp_store> out_norm_stores; // DSpark GPU layer_inp_dev SET_ROWS from out_norm_out
+    bool     output_prec_f32   = true;
+};
+
+static const struct ggml_tensor * w4_strip_views(const struct ggml_tensor * t) {
+    while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW ||
+                 t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE)) {
+        t = t->src[0];
+    }
+    return t;
+}
+
+static void w4_read_scale_params(const struct ggml_tensor * t, float * s, float * b) {
+    std::memcpy(s, t->op_params, sizeof(float));
+    std::memcpy(b, reinterpret_cast<const char *>(t->op_params) + 4, sizeof(float));
+}
+
+static bool w4_tensor_in_va_range(const struct ggml_tensor * t, uint64_t base, uint64_t size) {
+    const uint64_t va = agx_tensor_gpu_va(t);
+    return va != 0 && va >= base && va < base + size;
+}
+
+static bool w4_parse_blk_name(const char * name, int * out_blk, const char ** out_suffix) {
+    if (!name || std::strncmp(name, "blk.", 4) != 0) return false;
+    char * endp = nullptr;
+    long idx = std::strtol(name + 4, &endp, 10);
+    if (!endp || *endp != '.' || idx < 0 || idx >= (long) AGX_INKLING2_MAX_PHYS_LAYERS) return false;
+    *out_blk = (int) idx;
+    *out_suffix = endp + 1;
+    return true;
+}
+
+static void w4_register_weight_tensor(const struct ggml_tensor * t, agx_inkling2_model_tensors & W) {
+    if (!t || !t->name[0] || agx_tensor_gpu_va(t) == 0) return;
+    const char * nm = t->name;
+    if (std::strcmp(nm, "token_embd.weight") == 0)        { W.tok_embd = t; return; }
+    if (std::strcmp(nm, "token_embd_norm.weight") == 0 ||
+        std::strcmp(nm, "blk.0.token_embd_norm.weight") == 0) { W.tok_norm = t; return; }
+    if (std::strcmp(nm, "output.weight") == 0)            { W.output = t; return; }
+    if (std::strcmp(nm, "output_norm.weight") == 0)       { W.output_norm = t; return; }
+    if (std::strcmp(nm, "output_res_query.weight") == 0)  { W.output_res_query = t; return; }
+
+    int blk = -1;
+    const char * sfx = nullptr;
+    if (!w4_parse_blk_name(nm, &blk, &sfx)) return;
+
+    auto & L = W.layers[blk];
+    if      (std::strcmp(sfx, "attn_q.weight") == 0)          L.wq = t;
+    else if (std::strcmp(sfx, "attn_k.weight") == 0)          L.wk = t;
+    else if (std::strcmp(sfx, "attn_v.weight") == 0)          L.wv = t;
+    else if (std::strcmp(sfx, "attn_output.weight") == 0)     L.wo = t;
+    else if (std::strcmp(sfx, "attn_gate.weight") == 0)       L.wqkv_gate = t;
+    else if (std::strcmp(sfx, "attn_q_clip.weight") == 0)     L.attn_q_clip = t;
+    else if (std::strcmp(sfx, "attn_sink_proj.weight") == 0)  L.attn_sink_proj = t;
+    else if (std::strcmp(sfx, "attn_rel.weight") == 0)        L.attn_rel = t;
+    else if (std::strcmp(sfx, "attn_rel_bias.weight") == 0)   L.attn_rel_bias = t;
+    else if (std::strcmp(sfx, "attn_rel_clip.weight") == 0)   L.attn_rel_clip = t;
+    else if (std::strcmp(sfx, "attn_k_conv.weight") == 0)     L.attn_k_conv = t;
+    else if (std::strcmp(sfx, "attn_v_conv.weight") == 0)     L.attn_v_conv = t;
+    else if (std::strcmp(sfx, "attn_post_conv.weight") == 0)  L.attn_post_conv = t;
+    else if (std::strcmp(sfx, "ffn_post_conv.weight") == 0)   L.ffn_post_conv = t;
+    else if (std::strcmp(sfx, "attn_norm.weight") == 0)       L.attn_norm = t;
+    else if (std::strcmp(sfx, "attn_q_inp_norm.weight") == 0) L.attn_q_inp_norm = t;
+    else if (std::strcmp(sfx, "attn_k_inp_norm.weight") == 0) L.attn_k_inp_norm = t;
+    else if (std::strcmp(sfx, "attn_v_inp_norm.weight") == 0) L.attn_v_inp_norm = t;
+    else if (std::strcmp(sfx, "attn_k_conv_proj.weight") == 0) L.attn_k_conv_proj = t;
+    else if (std::strcmp(sfx, "attn_v_conv_proj.weight") == 0) L.attn_v_conv_proj = t;
+    else if (std::strcmp(sfx, "attn_res_query.weight") == 0)  L.attn_res_query = t;
+    else if (std::strcmp(sfx, "ffn_res_query.weight") == 0)   L.ffn_res_query = t;
+    else if (std::strcmp(sfx, "ffn_norm.weight") == 0)        L.ffn_norm = t;
+    else if (std::strcmp(sfx, "ffn_gate_inp.weight") == 0)    L.ffn_gate_inp = t;
+    else if (std::strcmp(sfx, "exp_probs_b.bias") == 0 ||
+             std::strcmp(sfx, "ffn_exp_probs_b.bias") == 0)    L.ffn_exp_probs_b = t;
+    else if (std::strcmp(sfx, "ffn_gate_up_exps.weight") == 0) L.ffn_gate_up_exps   = t;
+    else if (std::strcmp(sfx, "ffn_down_exps.weight") == 0)    L.ffn_down_exps      = t;
+    else if (std::strcmp(sfx, "ffn_gate_up_exps.scale") == 0)  L.ffn_gate_up_exps_s = t;
+    else if (std::strcmp(sfx, "ffn_down_exps.scale") == 0)     L.ffn_down_exps_s    = t;
+    else if (blk >= 6 && blk < 18) {
+        auto & LP = W.loop_layers[blk - 6];
+        if      (std::strcmp(sfx, "loop_msg_query.weight") == 0)        LP.msg_query = t;
+        else if (std::strcmp(sfx, "loop_q_ctrl_down.weight") == 0)      LP.ctrl_down[0] = t;
+        else if (std::strcmp(sfx, "loop_q_ctrl_gain.weight") == 0)      LP.ctrl_gain[0] = t;
+        else if (std::strcmp(sfx, "loop_q_ctrl_forget.weight") == 0)    LP.ctrl_forget[0] = t;
+        else if (std::strcmp(sfx, "loop_k_ctrl_down.weight") == 0)      LP.ctrl_down[1] = t;
+        else if (std::strcmp(sfx, "loop_k_ctrl_gain.weight") == 0)      LP.ctrl_gain[1] = t;
+        else if (std::strcmp(sfx, "loop_k_ctrl_forget.weight") == 0)    LP.ctrl_forget[1] = t;
+        else if (std::strcmp(sfx, "loop_v_ctrl_down.weight") == 0)      LP.ctrl_down[2] = t;
+        else if (std::strcmp(sfx, "loop_v_ctrl_gain.weight") == 0)      LP.ctrl_gain[2] = t;
+        else if (std::strcmp(sfx, "loop_v_ctrl_forget.weight") == 0)    LP.ctrl_forget[2] = t;
+        else if (std::strcmp(sfx, "loop_ffn_ctrl_down.weight") == 0)    LP.ctrl_down[3] = t;
+        else if (std::strcmp(sfx, "loop_ffn_ctrl_gain.weight") == 0)    LP.ctrl_gain[3] = t;
+        else if (std::strcmp(sfx, "loop_ffn_ctrl_forget.weight") == 0)  LP.ctrl_forget[3] = t;
+    }
+}
+
+static bool discover_inkling2_cgraph(const struct ggml_cgraph * cgraph, w4_discovered_graph & out) {
+    if (!cgraph || cgraph->n_nodes < 512) return false;
+
+    const char * mk_dbg_env = std::getenv("GGML_AGX_MK_DEBUG");
+    const bool   mk_dbg     = (mk_dbg_env && mk_dbg_env[0] && mk_dbg_env[0] != '0');
+    static int   mk_dbg_fail_prints = 0;
+#define W4_MK_FAIL(...) do { \
+        if (mk_dbg && mk_dbg_fail_prints < 8) { \
+            ++mk_dbg_fail_prints; \
+            std::fprintf(stderr, "[ggml-agx MK DISCOVER FAIL] " __VA_ARGS__); \
+            std::fprintf(stderr, "\n"); \
+        } \
+        return false; \
+    } while (0)
+
+    agx_inkling2_fill_default_hparams(&out.hp);
+
+    // 1. Scan leafs & nodes to harvest weights, inputs, 48 FLASH_ATTN_EXT, 48 RS GET_ROWS, and outputs
+    for (int i = 0; i < cgraph->n_leafs; ++i) {
+        w4_register_weight_tensor(cgraph->leafs[i], out.W);
+    }
+
+    const struct ggml_tensor * fa_nodes[48]      = {};
+    int                        fa_node_idx[48]   = {};
+    int                        n_fa              = 0;
+    const struct ggml_tensor * rs_get_rows[48]   = {};
+    int                        n_rs_gr           = 0;
+    const struct ggml_tensor * l_out_nodes[48]   = {};
+    const struct ggml_tensor * inp_tokens        = nullptr;
+    const struct ggml_tensor * inp_pos           = nullptr;
+    const struct ggml_tensor * rs_s_copy         = nullptr;
+    const struct ggml_tensor * inp_out_ids       = nullptr;
+    const struct ggml_tensor * tok_norm_out      = nullptr;
+    const struct ggml_tensor * out_norm_out      = nullptr;
+    const struct ggml_tensor * result_norm_node  = nullptr;
+    const struct ggml_tensor * lm_head_node      = nullptr;
+    const struct ggml_tensor * result_output     = nullptr;
+
+    const struct ggml_tensor * rtr_div_node = nullptr;
+    bool found_situ_params = false;
+    bool found_tau_params  = false;
+    bool found_rtr_params  = false;
+    bool found_qk_clip     = false;
+    bool found_rel_clip    = false;
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const struct ggml_tensor * n = cgraph->nodes[i];
+        if (!n) continue;
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (n->src[s]) w4_register_weight_tensor(n->src[s], out.W);
+        }
+
+        if (n->op == GGML_OP_FLASH_ATTN_EXT) {
+            if (n_fa >= 48) return false; // not 48-pass Inkling-2-Mini
+            fa_nodes[n_fa]    = n;
+            fa_node_idx[n_fa] = i;
+            ++n_fa;
+        } else if (n->op == GGML_OP_GET_ROWS && n->src[0] && n->src[1]) {
+            if (std::strcmp(n->src[0]->name, "token_embd.weight") == 0) {
+                inp_tokens = n->src[1];
+            } else if (std::strncmp(n->src[1]->name, "rs_s_copy", 9) == 0) {
+                rs_s_copy = n->src[1];
+                if (n_rs_gr < 48) rs_get_rows[n_rs_gr++] = n;
+            } else if (std::strncmp(n->src[1]->name, "out_ids", 7) == 0 ||
+                       std::strncmp(n->src[1]->name, "inp_out_ids", 11) == 0) {
+                inp_out_ids = n->src[1];
+            }
+        } else if (n->op == GGML_OP_MUL && n->src[0] && n->src[1]) {
+            if (std::strcmp(n->src[1]->name, "token_embd_norm.weight") == 0 ||
+                std::strcmp(n->src[1]->name, "blk.0.token_embd_norm.weight") == 0) {
+                tok_norm_out = n;
+                if (n->src[0]->op == GGML_OP_RMS_NORM) {
+                    std::memcpy(&out.hp.f_norm_rms_eps, n->src[0]->op_params, sizeof(float));
+                }
+            } else if (std::strcmp(n->src[1]->name, "output_norm.weight") == 0) {
+                out_norm_out = n;
+            }
+        } else if (n->op == GGML_OP_MUL_MAT && n->src[0] && std::strcmp(n->src[0]->name, "output.weight") == 0) {
+            lm_head_node = n;
+        }
+
+        if (n->name[0]) {
+            if (std::strcmp(n->name, "result_output") == 0) {
+                result_output = n;
+            } else if (std::strcmp(n->name, "result_norm") == 0) {
+                result_norm_node = n;
+                if (!inp_out_ids && n->op == GGML_OP_GET_ROWS && n->src[1]) {
+                    inp_out_ids = n->src[1];
+                }
+            } else if (std::strncmp(n->name, "l_out-", 6) == 0) {
+                int il = std::atoi(n->name + 6);
+                if (il >= 0 && il < 48) l_out_nodes[il] = n;
+            }
+        }
+
+        // Structural (+ name-independent) SiTU extraction:
+        //   situ(gate, up) = MUL(MUL(SCALE(TANH(SCALE(gate, 1/beta)), beta), SIGMOID(gate)), [SCALE(TANH(SCALE(up, 1/lb)), lb)])
+        if (!found_situ_params && n->op == GGML_OP_MUL && n->src[0] && n->src[1]) {
+            const struct ggml_tensor * act_mul = n->src[0];
+            const struct ggml_tensor * up_node = n->src[1];
+            if (act_mul->op == GGML_OP_MUL && act_mul->src[0] && act_mul->src[1] &&
+                act_mul->src[0]->op == GGML_OP_SCALE &&
+                act_mul->src[0]->src[0] && act_mul->src[0]->src[0]->op == GGML_OP_UNARY &&
+                ggml_get_unary_op(act_mul->src[0]->src[0]) == GGML_UNARY_OP_TANH &&
+                act_mul->src[1]->op == GGML_OP_UNARY &&
+                ggml_get_unary_op(act_mul->src[1]) == GGML_UNARY_OP_SIGMOID) {
+                float sb = 1.0f, bb = 0.0f;
+                w4_read_scale_params(act_mul->src[0], &sb, &bb);
+                out.hp.situ_beta = sb;
+                if (up_node->op == GGML_OP_SCALE && up_node->src[0] && up_node->src[0]->op == GGML_OP_UNARY &&
+                    ggml_get_unary_op(up_node->src[0]) == GGML_UNARY_OP_TANH) {
+                    float slb = 1.0f, blb = 0.0f;
+                    w4_read_scale_params(up_node, &slb, &blb);
+                    out.hp.situ_linear_beta = slb;
+                } else {
+                    out.hp.situ_linear_beta = 0.0f;
+                }
+                found_situ_params = true;
+            }
+        }
+
+        // Direct tau subgraph extraction from outer SCALE_BIAS(LOG(CLAMP(SCALE(SCALE(CPY(inp_pos))))))
+        if (!found_tau_params && n->op == GGML_OP_SCALE && n->src[0] && n->src[0]->op == GGML_OP_LOG) {
+            const struct ggml_tensor * lg = n->src[0];
+            if (lg->src[0] && lg->src[0]->op == GGML_OP_CLAMP &&
+                lg->src[0]->src[0] && lg->src[0]->src[0]->op == GGML_OP_SCALE &&
+                lg->src[0]->src[0]->src[0] && lg->src[0]->src[0]->src[0]->op == GGML_OP_SCALE &&
+                lg->src[0]->src[0]->src[0]->src[0] && lg->src[0]->src[0]->src[0]->src[0]->op == GGML_OP_CPY) {
+                const struct ggml_tensor * pos_t = lg->src[0]->src[0]->src[0]->src[0]->src[0];
+                if (pos_t && pos_t->type == GGML_TYPE_I32) {
+                    inp_pos = pos_t;
+                    float inv_floor = 0.0f, b0 = 0.0f;
+                    w4_read_scale_params(lg->src[0]->src[0], &inv_floor, &b0);
+                    if (inv_floor > 0.0f) {
+                        out.hp.n_log_scale_floor = (uint32_t) std::llround(1.0 / (double) inv_floor);
+                    }
+                    float alpha = 0.0f, one = 0.0f;
+                    w4_read_scale_params(n, &alpha, &one);
+                    out.hp.f_log_scale_alpha = alpha;
+                    found_tau_params = true;
+                }
+            }
+        }
+
+        // Capture Q/R clip thresholds from first Qcur / Rcur L2_NORM
+        if (!found_qk_clip && n->op == GGML_OP_L2_NORM &&
+            ((n->ne[0] == 128 && n->ne[1] == 24) ||
+             (n->src[0] && n->src[0]->op == GGML_OP_MUL && n->src[0]->src[1] &&
+              std::strstr(n->src[0]->src[1]->name, "attn_q_clip") != nullptr))) {
+            std::memcpy(&out.hp.f_qk_clip, n->op_params, sizeof(float));
+            found_qk_clip = true;
+        }
+        if (!found_rel_clip && n->op == GGML_OP_L2_NORM &&
+            ((n->ne[0] <= 64 && n->ne[1] == 24) ||
+             (n->src[0] && n->src[0]->op == GGML_OP_MUL && n->src[0]->src[1] &&
+              std::strstr(n->src[0]->src[1]->name, "attn_rel_clip") != nullptr))) {
+            std::memcpy(&out.hp.f_relative_clip, n->op_params, sizeof(float));
+            found_rel_clip = true;
+        }
+
+        // Capture router norm_eps (from DIV) & weights_scale (from downstream SCALE through ggml_reshape_3d!)
+        if (!found_rtr_params && n->op == GGML_OP_DIV && n->src[1] && n->src[1]->op == GGML_OP_SCALE &&
+            n->src[1]->src[0] && n->src[1]->src[0]->op == GGML_OP_SUM_ROWS && n->ne[0] == 8) {
+            float s1 = 1.0f, b1 = 0.0f;
+            w4_read_scale_params(n->src[1], &s1, &b1);
+            out.hp.expert_weights_norm_eps = b1;
+            out.hp.expert_weights_scale    = 1.0f;
+            rtr_div_node                   = n;
+            found_rtr_params               = true;
+        } else if (rtr_div_node && n->op == GGML_OP_SCALE && n->src[0] &&
+                   w4_strip_views(n->src[0]) == rtr_div_node) {
+            float ws = 1.0f, wb = 0.0f;
+            w4_read_scale_params(n, &ws, &wb);
+            if (wb == 0.0f && ws > 0.0f) {
+                out.hp.expert_weights_scale = ws;
+            }
+            rtr_div_node = nullptr; // captured first layer's exact expert_weights_scale
+        }
+    }
+
+    // Must be 48-pass Inkling-2-Mini decode with 1 <= M <= 8 and all hparams verified
+    if (n_fa != 48) {
+        return false; // not a 48-pass Inkling-2-Mini graph (e.g., DSpark, prefill split, other model)
+    }
+    if (n_rs_gr != 48 || !inp_tokens || !inp_pos || !rs_s_copy ||
+        !tok_norm_out || !out_norm_out || !lm_head_node || !result_output ||
+        !found_situ_params || !found_tau_params || !found_rtr_params || !found_qk_clip || !found_rel_clip) {
+        W4_MK_FAIL("basic: n_fa=%d n_rs=%d tok=%d pos=%d scopy=%d tn=%d on=%d lm=%d ro=%d "
+                       "situ=%d tau=%d rtr=%d qk=%d rel=%d",
+                       n_fa, n_rs_gr, !!inp_tokens, !!inp_pos, !!rs_s_copy, !!tok_norm_out,
+                       !!out_norm_out, !!lm_head_node, !!result_output,
+                       (int) found_situ_params, (int) found_tau_params, (int) found_rtr_params,
+                       (int) found_qk_clip, (int) found_rel_clip);
+    }
+    if (inp_tokens->type != GGML_TYPE_I32 || inp_tokens->ne[1] != 1 ||
+        inp_tokens->ne[0] < 1 || inp_tokens->ne[0] > (int64_t) AGX_SLC_ARENA_MAX_M) {
+        W4_MK_FAIL("M=%lld ne1=%lld type=%d (max_M=%u)",
+                       (long long) inp_tokens->ne[0], (long long) inp_tokens->ne[1],
+                       (int) inp_tokens->type, (unsigned) AGX_SLC_ARENA_MAX_M);
+    }
+    if (rs_s_copy->ne[0] != 1) {
+        // Multi-sequence batch: fall back cleanly to Wave 3 generic graph
+        W4_MK_FAIL("rs_s_copy->ne[0]=%lld != 1", (long long) rs_s_copy->ne[0]);
+    }
+
+    // Harvest attn_rel_bias from fa_nodes[v]->src[3] BEFORE weight check:
+    // Because BF16 GGML_OP_PAD may run on CPU in split 0, the GPU split often sees the
+    // already-padded [n_rel, n_extent+1] GPU split-copy as table->src[0] without the original weight name!
+    for (uint32_t v = 0; v < 48; ++v) {
+        uint32_t ip = (v < 18u) ? v : ((v < 30u) ? (6u + (v - 18u)) : ((v < 42u) ? (6u + (v - 30u)) : (18u + (v - 42u))));
+        if (out.W.layers[ip].attn_rel_bias) continue;
+        const struct ggml_tensor * m_in  = fa_nodes[v]->src[3];
+        const struct ggml_tensor * add_m = (m_in && m_in->op == GGML_OP_CPY) ? m_in->src[0] : m_in;
+        if (!add_m || add_m->op != GGML_OP_ADD || !add_m->src[0]) continue;
+        const struct ggml_tensor * gr = add_m->src[0];
+        if (gr->op == GGML_OP_CONT) gr = gr->src[0];
+        gr = w4_strip_views(gr);
+        if (!gr || gr->op != GGML_OP_GET_ROWS || !gr->src[0]) continue;
+        const struct ggml_tensor * tbl = gr->src[0];
+        if (tbl->op == GGML_OP_CONT) tbl = tbl->src[0];
+        tbl = w4_strip_views(tbl);
+        if (tbl && tbl->op == GGML_OP_SUB) tbl = tbl->src[0];
+        if (tbl && tbl->op == GGML_OP_MUL_MAT && tbl->src[0]) {
+            const struct ggml_tensor * rb = tbl->src[0];
+            if (rb->op == GGML_OP_PAD && rb->src[0] && agx_tensor_gpu_va(rb->src[0]) != 0) {
+                out.W.layers[ip].attn_rel_bias = rb->src[0];
+                out.rel_bias_padded[ip]        = false;
+            } else if (agx_tensor_gpu_va(rb) != 0) {
+                out.W.layers[ip].attn_rel_bias = rb;
+                out.rel_bias_padded[ip]        = true;
+            }
+        }
+    }
+
+    // Verify all 24 physical layers + 12 loop layers + core weights are present with supported dtypes
+    auto is_wtype_supported = [](const struct ggml_tensor * t) -> bool {
+        if (!t) return false;
+        return t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 ||
+               t->type == GGML_TYPE_BF16 || t->type == GGML_TYPE_Q8_0;
+    };
+    const auto & W = out.W;
+    if (!W.tok_embd || !W.tok_norm || !W.output || !W.output_norm || !W.output_res_query) {
+        W4_MK_FAIL("core weights missing: emb=%d tn=%d out=%d on=%d orq=%d",
+                       !!W.tok_embd, !!W.tok_norm, !!W.output, !!W.output_norm, !!W.output_res_query);
+    }
+    if (W.tok_embd->ne[0] != 2304 || W.output->ne[0] != 2304) {
+        W4_MK_FAIL("n_embd mismatch: emb=%lld out=%lld",
+                       (long long) W.tok_embd->ne[0], (long long) W.output->ne[0]);
+    }
+    if (!is_wtype_supported(W.tok_embd) || W.tok_norm->type != GGML_TYPE_F32 ||
+        W.output_norm->type != GGML_TYPE_F32 || W.output_res_query->type != GGML_TYPE_F32) {
+        W4_MK_FAIL("core weight dtype unsupported");
+    }
+
+    out.n_tokens         = (uint32_t) inp_tokens->ne[0];
+    out.n_out            = (uint32_t) result_output->ne[1];
+    out.inp_tokens_va    = agx_tensor_gpu_va(inp_tokens);
+    out.inp_pos_va       = agx_tensor_gpu_va(inp_pos);
+    out.s_copy_va        = agx_tensor_gpu_va(rs_s_copy);
+    out.inp_out_ids_va   = inp_out_ids ? agx_tensor_gpu_va(inp_out_ids) : 0ull;
+    out.lm_head_pad_va   = agx_tensor_gpu_va(lm_head_node);
+    out.result_output_va = agx_tensor_gpu_va(result_output);
+    out.hp.n_vocab_padded   = (uint32_t) W.output->ne[1];
+    out.hp.n_vocab_unpadded = (uint32_t) result_output->ne[0];
+    if (!out.inp_tokens_va || !out.inp_pos_va || !out.s_copy_va || !out.lm_head_pad_va || !out.result_output_va) {
+        W4_MK_FAIL("missing core GPU VA: tok=%llu pos=%llu sc=%llu lm=%llu ro=%llu",
+                       (unsigned long long) out.inp_tokens_va, (unsigned long long) out.inp_pos_va,
+                       (unsigned long long) out.s_copy_va, (unsigned long long) out.lm_head_pad_va,
+                       (unsigned long long) out.result_output_va);
+    }
+
+    // Check final logit softcapping between lm_head_node and result_output
+    out.hp.f_final_logit_softcapping = 0.0f;
+    {
+        const struct ggml_tensor * ro_src = result_output->src[0];
+        if (ro_src && ro_src->op == GGML_OP_VIEW) ro_src = ro_src->src[0];
+        if (ro_src && ro_src->op == GGML_OP_SCALE && ro_src->src[0] && ro_src->src[0]->op == GGML_OP_UNARY &&
+            ggml_get_unary_op(ro_src->src[0]) == GGML_UNARY_OP_TANH) {
+            float cap = 0.0f, b = 0.0f;
+            w4_read_scale_params(ro_src, &cap, &b);
+            if (cap > 0.0f && b == 0.0f) out.hp.f_final_logit_softcapping = cap;
+        }
+    }
+
+    for (uint32_t ip = 0; ip < 24; ++ip) {
+        const auto & L = W.layers[ip];
+        const bool is_swa = (ip % 6u != 5u);
+        if (!L.wq || !L.wk || !L.wv || !L.wo || !L.wqkv_gate ||
+            !L.attn_q_clip || !L.attn_sink_proj || !L.attn_rel || !L.attn_rel_bias || !L.attn_rel_clip ||
+            !L.attn_k_conv || !L.attn_v_conv || !L.attn_post_conv || !L.ffn_post_conv ||
+            !L.ffn_res_query || !L.ffn_norm || !L.ffn_gate_inp || !L.ffn_gate_up_exps || !L.ffn_down_exps) {
+            W4_MK_FAIL("layer %u missing weight (rb=%d wq=%d exp=%d)",
+                           ip, !!L.attn_rel_bias, !!L.wq, !!L.ffn_gate_up_exps);
+        }
+        if (ip > 0 && !L.attn_res_query) W4_MK_FAIL("layer %u missing attn_res_query", ip);
+        if (is_swa && !L.attn_norm) W4_MK_FAIL("layer %u missing attn_norm", ip);
+        if (!is_swa && (!L.attn_q_inp_norm || !L.attn_k_inp_norm || !L.attn_v_inp_norm ||
+                        !L.attn_k_conv_proj || !L.attn_v_conv_proj)) {
+            W4_MK_FAIL("layer %u missing full-attn norm/conv_proj", ip);
+        }
+        if (L.attn_k_conv->ne[0] != 4 || L.attn_v_conv->ne[0] != 4 ||
+            L.attn_post_conv->ne[0] != 4 || L.ffn_post_conv->ne[0] != 4) {
+            W4_MK_FAIL("layer %u conv kernel != 4", ip);
+        }
+        if (!is_wtype_supported(L.attn_rel_bias) ||
+            L.attn_k_conv->type != GGML_TYPE_F32 || L.attn_v_conv->type != GGML_TYPE_F32 ||
+            L.attn_post_conv->type != GGML_TYPE_F32 || L.ffn_post_conv->type != GGML_TYPE_F32 ||
+            L.attn_q_clip->type != GGML_TYPE_F32 || L.attn_rel_clip->type != GGML_TYPE_F32 ||
+            L.ffn_res_query->type != GGML_TYPE_F32 || L.ffn_norm->type != GGML_TYPE_F32 ||
+            (L.attn_res_query && L.attn_res_query->type != GGML_TYPE_F32) ||
+            (L.attn_norm && L.attn_norm->type != GGML_TYPE_F32) ||
+            (L.attn_q_inp_norm && L.attn_q_inp_norm->type != GGML_TYPE_F32) ||
+            (L.attn_k_inp_norm && L.attn_k_inp_norm->type != GGML_TYPE_F32) ||
+            (L.attn_v_inp_norm && L.attn_v_inp_norm->type != GGML_TYPE_F32)) {
+            W4_MK_FAIL("layer %u unsupported dtype (rb=%d)", ip, (int) L.attn_rel_bias->type);
+        }
+        const uint32_t eff_ext = (uint32_t) (L.attn_rel_bias->ne[1] - (out.rel_bias_padded[ip] ? 1 : 0));
+        if (ip == 0) {
+            out.hp.n_relative = (uint32_t) L.attn_rel_bias->ne[0];
+            out.hp.n_swa      = eff_ext;
+            out.hp.n_expert   = (uint32_t) L.ffn_gate_inp->ne[1];
+            out.hp.n_ff_exp   = (uint32_t) L.ffn_down_exps->ne[0];
+        } else if (ip == 5) {
+            out.hp.n_relative_extent = eff_ext;
+        }
+    }
+    for (uint32_t l = 0; l < 12; ++l) {
+        const auto & LP = W.loop_layers[l];
+        if (!LP.msg_query) W4_MK_FAIL("loop %u missing msg_query", l);
+        for (int c = 0; c < 4; ++c) {
+            if (!LP.ctrl_down[c] || !LP.ctrl_gain[c] || !LP.ctrl_forget[c]) {
+                W4_MK_FAIL("loop %u ctrl %d missing", l, c);
+            }
+        }
+        if (l == 0) out.hp.gate_rank = (uint32_t) LP.ctrl_down[0]->ne[1];
+    }
+
+    // 2. Discover per-pass (visit 0..47) KV cache, mask, rel_pos, and recurrent conv state VAs
+    for (uint32_t v = 0; v < 48; ++v) {
+        uint32_t il = 0, ip = 0;
+        bool has_loop = false;
+        if (v < 6u) {
+            il = v; ip = v;
+        } else if (v < 18u) {
+            il = v; ip = v;
+        } else if (v < 30u) {
+            il = 24u + (v - 18u); ip = 6u + (v - 18u); has_loop = true;
+        } else if (v < 42u) {
+            il = 36u + (v - 30u); ip = 6u + (v - 30u); has_loop = true;
+        } else {
+            il = 18u + (v - 42u); ip = 18u + (v - 42u);
+        }
+
+        auto & P = out.passes[v];
+        P.il       = il;
+        P.ip       = ip;
+        P.is_swa   = (ip % 6u != 5u);
+        P.has_loop = has_loop;
+
+        const struct ggml_tensor * fa   = fa_nodes[v];
+        const struct ggml_tensor * q_in = fa->src[0];
+        const struct ggml_tensor * k_l  = fa->src[1];
+        const struct ggml_tensor * v_l  = fa->src[2];
+        const struct ggml_tensor * m_in = fa->src[3];
+        if (!q_in || !k_l || !v_l || !m_in) W4_MK_FAIL("v=%u missing fa src", v);
+        if (q_in->ne[0] != 128 || q_in->ne[1] != (int64_t) out.n_tokens ||
+            q_in->ne[2] != 24 || q_in->ne[3] != 1 || k_l->ne[2] != 8 || v_l->ne[2] != 8) {
+            W4_MK_FAIL("v=%u fa dims q=[%lld,%lld,%lld] k2=%lld v2=%lld", v,
+                           (long long) q_in->ne[0], (long long) q_in->ne[1], (long long) q_in->ne[2],
+                           (long long) k_l->ne[2], (long long) v_l->ne[2]);
+        }
+        if ((k_l->type != GGML_TYPE_F16 && k_l->type != GGML_TYPE_Q8_0) || k_l->type != v_l->type) {
+            W4_MK_FAIL("v=%u kv type k=%d v=%d", v, (int) k_l->type, (int) v_l->type);
+        }
+        P.kv_is_q8 = (k_l->type == GGML_TYPE_Q8_0);
+        P.k_va     = agx_tensor_gpu_va(k_l);
+        P.v_va     = agx_tensor_gpu_va(v_l);
+        P.k_nb1    = (uint32_t) k_l->nb[1];
+        P.k_nb2    = (uint32_t) k_l->nb[2];
+        P.v_nb1    = (uint32_t) v_l->nb[1];
+        P.v_nb2    = (uint32_t) v_l->nb[2];
+        P.n_kv     = (uint32_t) k_l->ne[1];
+        P.graph_mask_va  = agx_tensor_gpu_va(m_in);
+        P.graph_mask_nb1 = (uint32_t) m_in->nb[1];
+        if (!P.k_va || !P.v_va || !P.graph_mask_va) W4_MK_FAIL("v=%u missing kv/mask VA", v);
+
+        // Detect k_rot Hadamard on Q/K
+        const struct ggml_tensor * q_root = w4_strip_views(q_in);
+        if (q_root && q_root->op == GGML_OP_MUL_MAT &&
+            ggml_get_op_params_i32(q_root, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+            P.has_k_rot = true;
+        }
+        // Detect v_rot Hadamard on kqv_out right after fa_nodes[v]
+        const int next_idx = fa_node_idx[v] + 1;
+        for (int j = next_idx; j < std::min(cgraph->n_nodes, next_idx + 6); ++j) {
+            const struct ggml_tensor * cand = cgraph->nodes[j];
+            if (cand && cand->op == GGML_OP_MUL_MAT &&
+                ggml_get_op_params_i32(cand, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+                w4_strip_views(cand->src[1]) == fa) {
+                P.has_v_rot = true;
+                break;
+            }
+        }
+
+        // Unwrap kq_mask_rel_pos -> ADD(kq_b, raw_mask) -> rel_pos + base_mask
+        const struct ggml_tensor * add_m = (m_in->op == GGML_OP_CPY) ? m_in->src[0] : m_in;
+        if (!add_m || add_m->op != GGML_OP_ADD || !add_m->src[0] || !add_m->src[1]) {
+            W4_MK_FAIL("v=%u m_in unwrap failed (op=%d)", v, add_m ? (int) add_m->op : -1);
+        }
+        const struct ggml_tensor * kq_b_t = add_m->src[0];
+        const struct ggml_tensor * raw_m  = add_m->src[1];
+        if (raw_m->op == GGML_OP_CPY) raw_m = raw_m->src[0];
+        if (!raw_m || (raw_m->type != GGML_TYPE_F16 && raw_m->type != GGML_TYPE_F32)) {
+            W4_MK_FAIL("v=%u raw_m bad type=%d", v, raw_m ? (int) raw_m->type : -1);
+        }
+        P.base_mask_va = agx_tensor_gpu_va(raw_m);
+        P.bmask_nb1    = (uint32_t) raw_m->nb[1];
+        P.bmask_is_f16 = (raw_m->type == GGML_TYPE_F16);
+
+        // kq_b_t = CONT(PERMUTE(RESHAPE(GET_ROWS(table, rel_pos))))
+        const struct ggml_tensor * gr = kq_b_t;
+        if (gr->op == GGML_OP_CONT) gr = gr->src[0];
+        gr = w4_strip_views(gr);
+        if (!gr || gr->op != GGML_OP_GET_ROWS || !gr->src[1] || gr->src[1]->type != GGML_TYPE_I32) {
+            W4_MK_FAIL("v=%u kq_b gr unwrap failed (op=%d)", v, gr ? (int) gr->op : -1);
+        }
+        P.rel_pos_va = agx_tensor_gpu_va(gr->src[1]);
+        P.rpos_nb1   = (uint32_t) gr->src[1]->nb[1];
+        if (!P.base_mask_va || !P.rel_pos_va) W4_MK_FAIL("v=%u missing bmask/rpos VA", v);
+
+        // Recurrent state base r_l[il] from rs_get_rows[v]
+        const struct ggml_tensor * r_src = rs_get_rows[v]->src[0];
+        const struct ggml_tensor * r_raw = (r_src && r_src->op == GGML_OP_RESHAPE) ? r_src->src[0] : r_src;
+        if (!r_raw || r_raw->type != GGML_TYPE_F32) W4_MK_FAIL("v=%u r_raw invalid", v);
+        P.r_l_va    = agx_tensor_gpu_va(r_raw);
+        P.r_nb1_f32 = (uint32_t) (r_raw->nb[1] / sizeof(float));
+        if (!P.r_l_va || P.r_nb1_f32 < 6656u * 3u) {
+            W4_MK_FAIL("v=%u r_l_va=%llu r_nb1_f32=%u", v, (unsigned long long) P.r_l_va, P.r_nb1_f32);
+        }
+
+        const uint64_t r_size_B = (uint64_t) ggml_nbytes(r_raw);
+        const uint64_t k_size_B = (uint64_t) ggml_nbytes(k_l);
+        const uint64_t v_size_B = (uint64_t) ggml_nbytes(v_l);
+
+        // Scan pass window [win_beg, win_end) to find k/v SET_ROWS, rs_zero FILL, and 4 conv state stores
+        const int win_beg = (v == 0u) ? 0 : fa_node_idx[v - 1];
+        const int win_end = (v + 1u < 48u) ? fa_node_idx[v + 1] : cgraph->n_nodes;
+
+        int n_conv_stores = 0;
+        for (int j = win_beg; j < win_end; ++j) {
+            const struct ggml_tensor * nd = cgraph->nodes[j];
+            if (!nd) continue;
+            if (j < fa_node_idx[v] && nd->op == GGML_OP_SET_ROWS && nd->src[0] && nd->src[1]) {
+                if (!P.k_store_va && w4_tensor_in_va_range(nd, P.k_va, k_size_B) && nd->ne[0] == 1024) {
+                    P.k_store_va   = agx_tensor_gpu_va(nd);
+                    P.k_store_nb1  = (uint32_t) nd->nb[1];
+                    P.k_idxs_va    = agx_tensor_gpu_va(nd->src[1]);
+                    P.k_ids_is_i64 = (nd->src[1]->type == GGML_TYPE_I64);
+                    P.k_ids_nb0    = (uint32_t) nd->src[1]->nb[0];
+                } else if (!P.v_store_va && w4_tensor_in_va_range(nd, P.v_va, v_size_B) && nd->ne[0] == 1024) {
+                    P.v_store_va   = agx_tensor_gpu_va(nd);
+                    P.v_store_nb1  = (uint32_t) nd->nb[1];
+                    P.v_idxs_va    = agx_tensor_gpu_va(nd->src[1]);
+                    P.v_ids_is_i64 = (nd->src[1]->type == GGML_TYPE_I64);
+                    P.v_ids_nb0    = (uint32_t) nd->src[1]->nb[0];
+                }
+            }
+            if (j < fa_node_idx[v] && nd->op == GGML_OP_FILL && ggml_nelements(nd) > 0 &&
+                w4_tensor_in_va_range(nd, P.r_l_va, r_size_B)) {
+                P.rs_zero_va    = agx_tensor_gpu_va(nd);
+                P.rs_zero_elems = (uint32_t) ggml_nelements(nd);
+            }
+            if (n_conv_stores < 4 && (nd->op == GGML_OP_CPY || nd->op == GGML_OP_SET_ROWS) &&
+                w4_tensor_in_va_range(nd, P.r_l_va, r_size_B)) {
+                // Skip zero-size extra-state copy (`states_extra` when n_rs == 1)
+                if (ggml_nelements(nd) == 0) continue;
+                const uint64_t cva = agx_tensor_gpu_va(nd);
+                if (nd->op == GGML_OP_CPY) {
+                    P.cell_va[n_conv_stores++] = cva;
+                    P.rollback_slots           = 1u;
+                    P.rollback_stride_f32      = 0u;
+                } else if (nd->op == GGML_OP_SET_ROWS && nd->src[0]) {
+                    P.cell_va[n_conv_stores++] = cva;
+                    P.rollback_slots           = (uint32_t) nd->src[0]->ne[1];
+                    P.rollback_stride_f32      = (uint32_t) (nd->nb[1] / sizeof(float));
+                }
+            }
+        }
+        if (!P.k_store_va || !P.v_store_va || !P.k_idxs_va || !P.v_idxs_va || n_conv_stores != 4) {
+            W4_MK_FAIL("v=%u stores ks=%d vs=%d ki=%d vi=%d conv=%d",
+                           v, !!P.k_store_va, !!P.v_store_va, !!P.k_idxs_va, !!P.v_idxs_va, n_conv_stores);
+        }
+        // Sanity check the 4 channel offsets in r_l[il]: 0, 1024*12, 2048*12, 4352*12
+        if (P.cell_va[1] - P.cell_va[0] != 1024ULL * 3ULL * 4ULL ||
+            P.cell_va[2] - P.cell_va[0] != 2048ULL * 3ULL * 4ULL ||
+            P.cell_va[3] - P.cell_va[0] != 4352ULL * 3ULL * 4ULL) {
+            W4_MK_FAIL("v=%u cell_va deltas=(%lld,%lld,%lld)", v,
+                           (long long) (P.cell_va[1] - P.cell_va[0]),
+                           (long long) (P.cell_va[2] - P.cell_va[0]),
+                           (long long) (P.cell_va[3] - P.cell_va[0]));
+        }
+    }
+
+    // 3. Audit EVERY GGML_TENSOR_FLAG_OUTPUT node in cgraph (handles DSpark t_layer_inp[0..48] & rejects unknown outputs!)
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const struct ggml_tensor * n = cgraph->nodes[i];
+        if (!n || (n->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) continue;
+        if (n == result_output) continue;
+        if (n == result_norm_node) {
+            out.result_norm_va = agx_tensor_gpu_va(n);
+            continue;
+        }
+        if (n == tok_norm_out) {
+            out.export_tok_norm = agx_tensor_gpu_va(n);
+            continue;
+        }
+        if (n == out_norm_out) {
+            out.export_out_norm = agx_tensor_gpu_va(n);
+            continue;
+        }
+        bool matched_lout = false;
+        for (uint32_t v = 0; v < 48; ++v) {
+            if (l_out_nodes[out.passes[v].il] == n) {
+                out.passes[v].export_l_out_va = agx_tensor_gpu_va(n);
+                matched_lout = true;
+                break;
+            }
+        }
+        if (!matched_lout) {
+            // Unknown output tensor requested by caller -> fall back cleanly to Wave 3 generic graph
+            W4_MK_FAIL("unknown OUTPUT tensor '%s' op=%d", n->name, (int) n->op);
+        }
+    }
+
+    // 4. Discover DSpark GPU layer_inp_dev SET_ROWS side-effect writes (ne[0]==2304, F32, src0 in t_layer_inp[0..48])
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const struct ggml_tensor * nd = cgraph->nodes[i];
+        if (!nd || nd->op != GGML_OP_SET_ROWS || nd->ne[0] != 2304 || !nd->src[0] || !nd->src[1]) continue;
+        if (nd->type != GGML_TYPE_F32 ||
+            (nd->src[1]->type != GGML_TYPE_I64 && nd->src[1]->type != GGML_TYPE_I32)) {
+            W4_MK_FAIL("unsupported 2304-wide SET_ROWS type=%d idx_type=%d", (int) nd->type, (int) nd->src[1]->type);
+        }
+        w4_layer_inp_store st{};
+        st.dst_va     = agx_tensor_gpu_va(nd);
+        st.ids_va     = agx_tensor_gpu_va(nd->src[1]);
+        st.dst_nb1_B  = (uint32_t) nd->nb[1];
+        st.ids_is_i64 = (nd->src[1]->type == GGML_TYPE_I64);
+        if (!st.dst_va || !st.ids_va) {
+            W4_MK_FAIL("2304-wide SET_ROWS missing GPU VA");
+        }
+        const struct ggml_tensor * s0 = w4_strip_views(nd->src[0]);
+        if (s0 == tok_norm_out) {
+            out.tok_norm_stores.push_back(st);
+            continue;
+        }
+        if (s0 == out_norm_out) {
+            out.out_norm_stores.push_back(st);
+            continue;
+        }
+        bool matched = false;
+        for (uint32_t v = 0; v < 48u; ++v) {
+            if (l_out_nodes[out.passes[v].il] == s0) {
+                out.passes[v].layer_inp_stores.push_back(st);
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            W4_MK_FAIL("unknown 2304-wide SET_ROWS src '%s' op=%d", s0 ? s0->name : "null", s0 ? (int) s0->op : -1);
+        }
+    }
+
+#undef W4_MK_FAIL
+    return true;
+}
+
+static bool ensure_w4_bound_model(agx_inkling2_engine * eng, const agx_inkling2_model_tensors & W) {
+    const uint64_t tok_va = agx_tensor_gpu_va(W.tok_embd);
+    const uint64_t out_va = agx_tensor_gpu_va(W.output);
+    if (eng->w4_model.bound && eng->w4_model.tok_embd_va == tok_va && eng->w4_model.output_va == out_va) {
+        return true;
+    }
+
+    // Free any previously bound model's coalesced W_attn_in BOs
+    for (uint32_t ip = 0; ip < AGX_INKLING2_MAX_PHYS_LAYERS; ++ip) {
+        if (eng->w4_model.layers[ip].valid) {
+            agx_repack_coalesced_free(eng->ctx->drm, &eng->w4_model.layers[ip].w_attn_in);
+            eng->w4_model.layers[ip] = agx_w4_layer_coalesced{};
+        }
+    }
+    eng->w4_model.bound = false;
+
+    for (uint32_t ip = 0; ip < 24u; ++ip) {
+        const auto & L = W.layers[ip];
+        // Exact order: [0]=wq, [1]=wqkv_gate, [2]=attn_rel, [3]=attn_sink_proj, [4]=wk, [5]=wv
+        const struct ggml_tensor * mats_all[6] = {
+            L.wq, L.wqkv_gate, L.attn_rel, L.attn_sink_proj, L.wk, L.wv
+        };
+        const struct ggml_tensor * q8_mats[6] = {};
+        uint32_t q8_src_idx[6] = {};
+        uint32_t n_q8 = 0;
+        uint32_t q_prefix_cnt = 0;
+
+        for (uint32_t m = 0; m < 6u; ++m) {
+            if (mats_all[m] && mats_all[m]->type == GGML_TYPE_Q8_0 && mats_all[m]->ne[0] == 2304) {
+                q8_mats[n_q8]    = mats_all[m];
+                q8_src_idx[n_q8] = m;
+                if (m < 4u) q_prefix_cnt++;
+                n_q8++;
+            }
+        }
+
+        auto & C = eng->w4_model.layers[ip];
+        if (n_q8 >= 2u) {
+            if (!agx_repack_coalesce_q8_0_matrices(eng->ctx->drm, q8_mats, n_q8, &C.w_attn_in)) {
+                AGX_LOG_WARN("agx-inkling2: W_attn_in[%u] coalesce failed; falling back to per-mat GEMM", ip);
+                C.valid = false;
+            } else {
+                C.valid           = true;
+                C.total_coal_rows = C.w_attn_in.total_rows;
+                C.q_prefix_rows   = 0u;
+                for (uint32_t k = 0; k < n_q8; ++k) {
+                    const uint32_t m = q8_src_idx[k];
+                    C.in_coal[m]  = true;
+                    C.coal_idx[m] = k;
+                    C.row_off[m]  = C.w_attn_in.row_offsets[k];
+                    C.row_cnt[m]  = C.w_attn_in.row_counts[k];
+                    C.byte_off[m] = C.w_attn_in.byte_offsets[k];
+                    if (k < q_prefix_cnt) {
+                        C.q_prefix_rows += C.row_cnt[m];
+                    }
+                }
+            }
+        }
+    }
+
+    eng->w4_model.bound       = true;
+    eng->w4_model.tok_embd_va = tok_va;
+    eng->w4_model.output_va   = out_va;
+    return true;
+}
+
+} // namespace
+
+extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_cgraph * cgraph) {
+    if (!ctx || !ctx->drm || !ctx->stream || !ctx->compiler || !cgraph) {
+        return false;
+    }
+    const char * no_mk = std::getenv("GGML_AGX_NO_MEGAKERNEL");
+    if (no_mk && no_mk[0] && no_mk[0] != '0') {
+        return false;
+    }
+
+    // 1. Discover Inkling-2-Mini 48-pass decode graph (M=1..8) without touching ctx->stream on mismatch
+    w4_discovered_graph G;
+    if (!discover_inkling2_cgraph(cgraph, G)) {
+        return false;
+    }
+
+    // 2. Ensure engine, Wave 4 kernels, SLC arena, GEMM, KV-hybrid & MoE runners are ready
+    const char * dbg_env = std::getenv("GGML_AGX_MK_DEBUG");
+    const bool   mk_dbg  = (dbg_env && dbg_env[0] && dbg_env[0] != '0');
+    agx_inkling2_engine * eng = agx_graph_exec_get_inkling2(ctx);
+    if (!eng || !agx_inkling2_precompile_w4(eng)) {
+        if (mk_dbg) std::fprintf(stderr, "[ggml-agx MK FAIL] eng=%d precompile_w4 failed\n", !!eng);
+        return false;
+    }
+    agx_slc_arena * slc = agx_backend_get_slc_arena(ctx);
+    if (!slc || !agx_gemm_init(ctx)) {
+        if (mk_dbg) std::fprintf(stderr, "[ggml-agx MK FAIL] slc=%d gemm_init failed\n", !!slc);
+        return false;
+    }
+    if (!ctx->kv_hybrid_state) {
+        agx_kv_hybrid_config kcfg;
+        kcfg.n_slots = 48;
+        kcfg.max_full_tokens = 4096;
+        ctx->kv_hybrid_state = agx_kv_hybrid_create(ctx->drm, ctx->compiler, kcfg);
+        if (!ctx->kv_hybrid_state) {
+            if (mk_dbg) std::fprintf(stderr, "[ggml-agx MK FAIL] kv_hybrid_create failed\n");
+            return false;
+        }
+    }
+    if (!ctx->moe_state) {
+        ctx->moe_state = agx_moe_create(ctx->drm, ctx->compiler);
+        if (!ctx->moe_state) {
+            if (mk_dbg) std::fprintf(stderr, "[ggml-agx MK FAIL] moe_create failed\n");
+            return false;
+        }
+    }
+    if (!ensure_w4_bound_model(eng, G.W)) {
+        if (mk_dbg) std::fprintf(stderr, "[ggml-agx MK FAIL] ensure_w4_bound_model failed\n");
+        return false;
+    }
+
+    auto * kv_pool    = static_cast<agx_kv_hybrid_pool *>(ctx->kv_hybrid_state);
+    auto * moe_runner = static_cast<agx_moe_runner *>(ctx->moe_state);
+    agx_cdm_stream * stream = ctx->stream;
+    const agx_w4_slc_layout L = agx_w4_partition_slc(slc);
+
+    const auto t_enc_beg = std::chrono::steady_clock::now();
+    agx_cdm_stream_reset(stream);
+    agx_cdm_stats cdm_before{};
+    agx_cdm_get_stats(stream, &cdm_before);
+
+    const uint32_t M  = G.n_tokens;
+    const uint32_t D  = 2304u;
+    const auto &   hp = G.hp;
+    const auto &   W  = G.W;
+
+    const char * no_coal_env = std::getenv("GGML_AGX_MK_NO_COAL");
+    const bool   disable_coal = (no_coal_env && no_coal_env[0] && no_coal_env[0] != '0');
+    const char * dump_env = std::getenv("GGML_AGX_MK_DUMP");
+    static bool  did_dump = false;
+    const bool   mk_dump  = (dump_env && dump_env[0] && dump_env[0] != '0' && !did_dump && M == 1u);
+    if (mk_dump) did_dump = true;
+
+    auto slc_dump_f32 = [&](const char * tag, uint64_t va, uint32_t n) {
+        if (!mk_dump || !slc->cpu_base || va < slc->base_va || va + n * 4ull > slc->base_va + slc->total_bytes) return;
+        agx_cdm_barrier_host(stream);
+        agx_cdm_submit(stream, true, nullptr);
+        agx_cdm_stream_reset(stream);
+        const float * p = reinterpret_cast<const float *>(static_cast<const uint8_t *>(slc->cpu_base) + (va - slc->base_va));
+        double ss = 0.0;
+        for (uint32_t i = 0; i < n; ++i) ss += (double) p[i] * (double) p[i];
+        std::fprintf(stderr, "[MK DUMP] %-16s n=%-5u l2=%10.5f v=[%9.5f %9.5f %9.5f %9.5f]\n",
+                     tag, n, std::sqrt(ss), p[0], n > 1 ? p[1] : 0.0f, n > 2 ? p[2] : 0.0f, n > 3 ? p[3] : 0.0f);
+    };
+    static bool  printed_dbg = false;
+    if (mk_dbg && !printed_dbg) {
+        printed_dbg = true;
+        std::fprintf(stderr,
+                     "[ggml-agx MK DEBUG] M=%u n_out=%u kv=%s n_kv0=%u n_kv5=%u "
+                     "eps=%.1e qk_clip=%.3f rel_clip=%.3f situ=(%.3f,%.3f) rtr_scale=%.4f rtr_eps=%.1e "
+                     "tau=(floor=%u,alpha=%.4f) softcap=%.2f k_rot=%d v_rot=%d "
+                     "dtypes: emb=%s wq=%s(r%d) rel_b=%s ctrl_d=%s exp0=%s(r%d,gs%d,ds%d,epb%d) exp20=%s(r%d) out=%s(r%d) coal0=%d\n",
+                     M, G.n_out, G.passes[0].kv_is_q8 ? "Q8_0" : "F16", G.passes[0].n_kv, G.passes[5].n_kv,
+                     hp.f_norm_rms_eps, hp.f_qk_clip, hp.f_relative_clip, hp.situ_beta, hp.situ_linear_beta,
+                     hp.expert_weights_scale, hp.expert_weights_norm_eps,
+                     hp.n_log_scale_floor, hp.f_log_scale_alpha, hp.f_final_logit_softcapping,
+                     (int) G.passes[0].has_k_rot, (int) G.passes[0].has_v_rot,
+                     ggml_type_name(W.tok_embd->type),
+                     ggml_type_name(W.layers[0].wq->type), (int) agx_tensor_is_repacked(W.layers[0].wq),
+                     ggml_type_name(W.layers[0].attn_rel_bias->type),
+                     ggml_type_name(W.loop_layers[0].ctrl_down[0]->type),
+                     ggml_type_name(W.layers[0].ffn_gate_up_exps->type),
+                     (int) agx_tensor_is_repacked(W.layers[0].ffn_gate_up_exps),
+                     !!W.layers[0].ffn_gate_up_exps_s, !!W.layers[0].ffn_down_exps_s, !!W.layers[0].ffn_exp_probs_b,
+                     ggml_type_name(W.layers[20].ffn_gate_up_exps->type),
+                     (int) agx_tensor_is_repacked(W.layers[20].ffn_gate_up_exps),
+                     ggml_type_name(W.output->type), (int) agx_tensor_is_repacked(W.output),
+                     (int) eng->w4_model.layers[0].valid);
+    }
+
+    // Static zero-copy slot mapping inside slc->res_blocks[0..7]:
+    //   [0]=h_0, [1]=prelude, [2]=h_12_p0/p2, [3]=h_12_p1, [4]=bank_out, [5]=cur_p2, [6]=h_alt, [7]=ffn_inp
+    const uint64_t va_h_0      = slc->res_blocks[0];
+    const uint64_t va_prelude  = slc->res_blocks[1];
+    const uint64_t va_h12_even = slc->res_blocks[2];
+    const uint64_t va_h12_odd  = slc->res_blocks[3];
+    const uint64_t va_bank_out = slc->res_blocks[4];
+    const uint64_t va_cur_p2   = slc->res_blocks[5];
+    const uint64_t va_h_alt    = slc->res_blocks[6];
+    const uint64_t va_ffn_inp  = slc->res_blocks[7];
+
+    auto alloc_block_ptrs = [&](const std::vector<uint64_t> & blk_vec) -> uint64_t {
+        if (blk_vec.empty()) return 0ull;
+        void * cpu_p = nullptr;
+        uint64_t va = agx_cdm_alloc_args(stream, blk_vec.size() * sizeof(uint64_t), 16, &cpu_p);
+        if (!va || !cpu_p) return 0ull;
+        // Order: [b_{k-1}, ..., b_0] matching llama_model_inkling2::graph::mix_stack
+        auto * dst = static_cast<uint64_t *>(cpu_p);
+        for (size_t k = 0; k < blk_vec.size(); ++k) {
+            dst[k] = blk_vec[blk_vec.size() - 1u - k];
+        }
+        return va;
+    };
+
+    // Helper: pick output VA for `l_out` of pass `v` so block/prelude/bank slots need ZERO copies!
+    auto target_l_out_va = [&](uint32_t v, uint64_t cur_va) -> uint64_t {
+        if (v == 5u)  return va_prelude;  // prelude output -> res_blocks[1]
+        if (v == 11u) return va_h12_even; // ip=12 pass 0 input -> res_blocks[2]
+        if (v == 17u) return va_bank_out; // pass 0 output -> res_blocks[4] (bank_out for pass 1)
+        if (v == 23u) return va_h12_odd;  // ip=12 pass 1 input -> res_blocks[3]
+        if (v == 29u) return va_bank_out; // pass 1 output -> res_blocks[4] (bank_out for pass 2)
+        if (v == 35u) return va_h12_even; // ip=12 pass 2 input -> res_blocks[2]
+        if (v == 41u) return va_cur_p2;   // pass 2 output -> res_blocks[5]
+        return (cur_va == slc->h_cur) ? va_h_alt : slc->h_cur;
+    };
+
+    // ------------------------------------------------------------------------
+    // Step 0: Embedding lookup + tok_norm -> va_h_0 (+ optional rs_zero FILLs)
+    // ------------------------------------------------------------------------
+    {
+        uint32_t emb_rb = 0;
+        embd_rmsnorm_push ep{};
+        ep.embd_va    = agx_tensor_gpu_va(W.tok_embd);
+        ep.tok_ids_va = G.inp_tokens_va;
+        ep.norm_w_va  = agx_tensor_gpu_va(W.tok_norm);
+        ep.dst_va     = va_h_0;
+        ep.n_embd     = D;
+        ep.n_tokens   = M;
+        ep.wtype      = agx_inkling2_tensor_wtype(W.tok_embd, &emb_rb);
+        ep.row_bytes  = emb_rb;
+        ep.eps        = hp.f_norm_rms_eps;
+        if (!agx_cdm_dispatch(stream, eng->k_embd_rmsnorm, M, 1u, 1u, &ep, sizeof(ep), AGX_BARRIER_NONE)) {
+            return false;
+        }
+        // Emit any non-empty rs_zero FILLs concurrently with embd_rmsnorm!
+        for (uint32_t v = 0; v < 48u; ++v) {
+            if (G.passes[v].rs_zero_va && G.passes[v].rs_zero_elems > 0u) {
+                w4_fill_f32_push fp{ G.passes[v].rs_zero_va, G.passes[v].rs_zero_elems, 0.0f };
+                if (!agx_cdm_dispatch(stream, eng->k_w4_fill_f32, (fp.n_elems + 255u) / 256u, 1u, 1u,
+                                      &fp, sizeof(fp), AGX_BARRIER_NONE)) {
+                    return false;
+                }
+            }
+        }
+        if (G.export_tok_norm != 0ull) {
+            copy_f32_push cp{ va_h_0, G.export_tok_norm, M * D, 0u };
+            agx_cdm_barrier_usc(stream);
+            if (!agx_cdm_dispatch(stream, eng->k_copy_f32, (M * D + 255u) / 256u, 1u, 1u,
+                                  &cp, sizeof(cp), AGX_BARRIER_NONE)) {
+                return false;
+            }
+        }
+        agx_cdm_barrier_usc(stream);
+    }
+
+    auto emit_layer_inp_stores = [&](const std::vector<w4_layer_inp_store> & stores, uint64_t src_va) -> bool {
+        for (const auto & st : stores) {
+            w4_scatter_rows_f32_push sp{ src_va, st.ids_va, st.dst_va, D, M, st.dst_nb1_B, st.ids_is_i64 ? 1u : 0u };
+            if (!agx_cdm_dispatch(stream, eng->k_w4_scatter_rows_f32, (D + 255u) / 256u, M, 1u,
+                                  &sp, sizeof(sp), AGX_BARRIER_NONE)) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!emit_layer_inp_stores(G.tok_norm_stores, va_h_0)) {
+        return false;
+    }
+
+    // Layer 0 has no attn_res_query -> run single RMSNorm(va_h_0, blk.0.attn_norm) -> L.x_q
+    {
+        rmsnorm_f32_push np{ va_h_0, agx_tensor_gpu_va(W.layers[0].attn_norm), L.x_q, D, M, hp.f_norm_rms_eps };
+        if (!agx_cdm_dispatch(stream, eng->k_rmsnorm_f32, M, 1u, 1u, &np, sizeof(np), AGX_BARRIER_STRONG_USC)) {
+            return false;
+        }
+    }
+
+    std::vector<uint64_t> blocks;
+    blocks.reserve(6);
+    std::vector<uint64_t> bank;
+    bank.reserve(2);
+    uint64_t cur_va = va_h_0;
+    bool attn_inputs_ready = true; // Layer 0 x_q already normalized above!
+
+    // ------------------------------------------------------------------------
+    // Main 48-Pass Loop (v = 0..47)
+    // ------------------------------------------------------------------------
+    for (uint32_t v = 0; v < 48u; ++v) {
+        const auto & P     = G.passes[v];
+        const auto & layer = W.layers[P.ip];
+        const auto & C     = eng->w4_model.layers[P.ip];
+        const agx_inkling2_loop_tensors * loop = P.has_loop ? &W.loop_layers[P.ip - 6u] : nullptr;
+
+        // Pass 1 (v==18) & Pass 2 (v==30) reset cur = va_prelude, blocks = {va_h_0}, bank = {prev h12}
+        if (v == 18u || v == 30u) {
+            bank.clear();
+            bank.push_back((v == 18u) ? va_h12_even : va_h12_odd);
+            blocks.clear();
+            blocks.push_back(va_h_0);
+            cur_va = va_prelude;
+            attn_inputs_ready = false;
+        }
+
+        // ---- Stage 0a: Ensure Q/K/V inputs are ready (only needed for v==18,30 or looped ctrl_gates!) ----
+        if (P.has_loop) {
+            // Compute cross-pass messages = mix(bank, va_bank_out, loop->msg_query) -> slc->h_msg
+            uint64_t msg_states[2] = { bank[0], va_bank_out };
+            if (!agx_inkling2_dispatch_depth_mix(eng, stream, msg_states, 2u,
+                    agx_tensor_gpu_va(loop->msg_query), 4u, 0ull, slc->h_msg, 0ull,
+                    D, M, 1e-6f, hp.f_norm_rms_eps, AGX_BARRIER_NONE)) {
+                return false;
+            }
+            if (!attn_inputs_ready) {
+                // Only happens at v==18 and v==30 (start of Pass 1/2 where cur reset to va_prelude!)
+                agx_w4_stage_prep_desc sd{};
+                sd.cur_out_va    = cur_va;
+                sd.block_ptrs_va = alloc_block_ptrs(blocks);
+                sd.query_va      = agx_tensor_gpu_va(layer.attn_res_query);
+                sd.mix_out_va[0] = L.qkv_in_0;
+                sd.mix_out_va[1] = L.qkv_in_1;
+                sd.mix_out_va[2] = L.qkv_in_2;
+                sd.n_embd        = D;
+                sd.n_tokens      = M;
+                sd.n_blocks      = (uint32_t) blocks.size();
+                sd.n_queries     = P.is_swa ? 1u : 3u;
+                sd.flags         = AGX_W4_SPREP_FLAG_DO_DEPTH_MIX;
+                sd.inv_sqrt_d    = 1.0f / std::sqrt((float) D);
+                sd.eps_mix       = 1e-6f;
+                sd.eps_norm      = hp.f_norm_rms_eps;
+                void * d_cpu = nullptr;
+                uint64_t d_va = agx_cdm_alloc_args(stream, sizeof(sd), 16, &d_cpu);
+                if (!d_va || !d_cpu) return false;
+                std::memcpy(d_cpu, &sd, sizeof(sd));
+                agx_w4_desc_va_push pc{ d_va };
+                if (!agx_cdm_dispatch(stream, eng->k_w4_stage_post_ffn, 1u, 1u, 1u,
+                                      &pc, sizeof(pc), AGX_BARRIER_NONE)) {
+                    return false;
+                }
+            }
+            agx_cdm_barrier_usc(stream);
+
+            // 40-Core Loop Controllers (Q, K, V): norm_cat -> 3x concurrent ctrl_down -> 6x concurrent ctrl_gain/forget -> mix_norm!
+            // Eliminates the ~19 ms 1-3 WG single-core bandwidth wall on 226 MB of F32 controller weights!
+            const uint64_t cur_vas[3] = {
+                L.qkv_in_0,
+                P.is_swa ? L.qkv_in_0 : L.qkv_in_1,
+                P.is_swa ? L.qkv_in_0 : L.qkv_in_2
+            };
+            const struct ggml_tensor * norms[3] = {
+                P.is_swa ? layer.attn_norm : layer.attn_q_inp_norm,
+                P.is_swa ? layer.attn_norm : layer.attn_k_inp_norm,
+                P.is_swa ? layer.attn_norm : layer.attn_v_inp_norm,
+            };
+            {
+                agx_w4_ctrl_norm_cat_push ncp{};
+                for (int j = 0; j < 3; ++j) {
+                    ncp.cur_va[j] = cur_vas[j];
+                    ncp.dst_va[j] = L.ctrl_cat[j];
+                }
+                ncp.msg_va   = slc->h_msg;
+                ncp.n_embd   = D;
+                ncp.n_tokens = M;
+                ncp.n_ctrls  = 3u;
+                ncp.msg_base = 0u;
+                ncp.eps_ctrl = 1e-6f;
+                if (!agx_cdm_dispatch(stream, eng->k_w4_ctrl_norm_cat, 3u, M, 1u,
+                                      &ncp, sizeof(ncp), AGX_BARRIER_STRONG_USC)) {
+                    return false;
+                }
+            }
+            for (int j = 0; j < 3; ++j) {
+                if (!dispatch_dense_mm(ctx, stream, loop->ctrl_down[j], L.ctrl_cat[j], L.ctrl_gate[j],
+                                       M, (j == 2) ? AGX_BARRIER_STRONG_USC : AGX_BARRIER_NONE)) {
+                    return false;
+                }
+            }
+            const bool fused_qkv_up =
+                loop->ctrl_gain[0]->type == GGML_TYPE_F32 && loop->ctrl_forget[0]->type == GGML_TYPE_F32 &&
+                loop->ctrl_gain[1]->type == GGML_TYPE_F32 && loop->ctrl_forget[1]->type == GGML_TYPE_F32 &&
+                loop->ctrl_gain[2]->type == GGML_TYPE_F32 && loop->ctrl_forget[2]->type == GGML_TYPE_F32 &&
+                loop->ctrl_gain[0]->ne[0] == 64 && loop->ctrl_forget[0]->ne[0] == 64;
+            const uint64_t out_vas[3] = { L.x_q, L.x_k, L.x_v };
+            if (fused_qkv_up) {
+                // 1 SINGLE 40-core coalesced dispatch replacing 6x K=64 GEMMs + mix!
+                agx_w4_ctrl_up_mix_push ump{};
+                for (int j = 0; j < 3; ++j) {
+                    ump.cur_va[j]      = cur_vas[j];
+                    ump.gate_va[j]     = L.ctrl_gate[j];
+                    ump.gain_w_va[j]   = agx_tensor_gpu_va(loop->ctrl_gain[j]);
+                    ump.forget_w_va[j] = agx_tensor_gpu_va(loop->ctrl_forget[j]);
+                    ump.out_va[j]      = L.ctrl_gain[j];
+                }
+                ump.msg_va   = slc->h_msg;
+                ump.n_embd   = D;
+                ump.n_tokens = M;
+                ump.n_ctrls  = 3u;
+                ump.msg_base = 0u;
+                if (!agx_cdm_dispatch(stream, eng->k_w4_ctrl_up_mix, (D + 15u) / 16u, 3u, M,
+                                      &ump, sizeof(ump), AGX_BARRIER_STRONG_USC)) {
+                    return false;
+                }
+                agx_w4_batch_rmsnorm_push brp{};
+                for (int j = 0; j < 3; ++j) {
+                    brp.src_va[j]    = L.ctrl_gain[j];
+                    brp.norm_w_va[j] = agx_tensor_gpu_va(norms[j]);
+                    brp.dst_va[j]    = out_vas[j];
+                }
+                brp.n_embd   = D;
+                brp.n_tokens = M;
+                brp.n_ctrls  = 3u;
+                brp.eps_norm = hp.f_norm_rms_eps;
+                if (!agx_cdm_dispatch(stream, eng->k_w4_batch_rmsnorm, 3u, M, 1u,
+                                      &brp, sizeof(brp), AGX_BARRIER_STRONG_USC)) {
+                    return false;
+                }
+            } else {
+                for (int j = 0; j < 3; ++j) {
+                    if (!dispatch_dense_mm(ctx, stream, loop->ctrl_gain[j],   L.ctrl_gate[j], L.ctrl_gain[j],
+                                           M, AGX_BARRIER_NONE)) return false;
+                    if (!dispatch_dense_mm(ctx, stream, loop->ctrl_forget[j], L.ctrl_gate[j], L.ctrl_forget[j],
+                                           M, (j == 2) ? AGX_BARRIER_STRONG_USC : AGX_BARRIER_NONE)) return false;
+                }
+                agx_w4_ctrl_mix_norm_push mnp{};
+                for (int j = 0; j < 3; ++j) {
+                    mnp.cur_va[j]    = cur_vas[j];
+                    mnp.gain_va[j]   = L.ctrl_gain[j];
+                    mnp.forget_va[j] = L.ctrl_forget[j];
+                    mnp.norm_w_va[j] = agx_tensor_gpu_va(norms[j]);
+                    mnp.out_va[j]    = out_vas[j];
+                }
+                mnp.msg_va   = slc->h_msg;
+                mnp.n_embd   = D;
+                mnp.n_tokens = M;
+                mnp.n_ctrls  = 3u;
+                mnp.msg_base = 0u;
+                mnp.eps_norm = hp.f_norm_rms_eps;
+                if (!agx_cdm_dispatch(stream, eng->k_w4_ctrl_mix_norm, 3u, M, 1u,
+                                      &mnp, sizeof(mnp), AGX_BARRIER_STRONG_USC)) {
+                    return false;
+                }
+            }
+        }
+
+        const uint64_t x_q_va = L.x_q;
+        const uint64_t x_k_va = (P.is_swa && !P.has_loop) ? L.x_q : L.x_k;
+        const uint64_t x_v_va = (P.is_swa && !P.has_loop) ? L.x_q : L.x_v;
+
+        // ---- Stage 0b: Coalesced W_attn_in GEMM -> slc->qkv_buf (1 dispatch for SWA !has_loop!) ----
+        const struct ggml_tensor * mats_all[6] = {
+            layer.wq, layer.wqkv_gate, layer.attn_rel, layer.attn_sink_proj, layer.wk, layer.wv
+        };
+        uint64_t raw_va[6]     = {};
+        uint32_t raw_stride[6] = {};
+        uint64_t fb_cur        = L.fallback_qkv;
+
+        const bool use_coal     = C.valid && !disable_coal;
+        const bool same_qkv_inp = (P.is_swa && !P.has_loop);
+        if (use_coal && same_qkv_inp) {
+            // 1 SINGLE DISPATCH for ALL coalesced Q8_0 attention projections reading x_q ONCE at 517 GB/s!
+            if (!agx_gemm_dispatch_raw_q8_0(ctx, stream, C.w_attn_in.gpu_va, x_q_va, slc->qkv_buf,
+                                            M, C.total_coal_rows, D, AGX_BARRIER_NONE, D, C.total_coal_rows)) {
+                return false;
+            }
+            for (uint32_t m = 0; m < 6u; ++m) {
+                if (C.in_coal[m]) {
+                    raw_va[m]     = slc->qkv_buf + (uint64_t) C.row_off[m] * sizeof(float);
+                    raw_stride[m] = C.total_coal_rows;
+                } else {
+                    const uint32_t N = (uint32_t) mats_all[m]->ne[1];
+                    raw_va[m]     = fb_cur;
+                    raw_stride[m] = N;
+                    fb_cur += agx_align_up((size_t) M * N * sizeof(float), AGX_CACHE_LINE_BYTES);
+                    if (!dispatch_dense_mm(ctx, stream, mats_all[m], x_q_va, raw_va[m], M, AGX_BARRIER_NONE)) {
+                        return false;
+                    }
+                }
+            }
+        } else if (use_coal) {
+            // Non-overlapping 128B-aligned slices inside slc->qkv_buf (eliminates AGX3B USC L1 false sharing!)
+            const uint32_t pref_stride = C.q_prefix_rows;
+            uint64_t qkv_cur = slc->qkv_buf;
+            const uint64_t pref_va = qkv_cur;
+            qkv_cur += agx_align_up((size_t) M * pref_stride * sizeof(float), AGX_CACHE_LINE_BYTES);
+            // Prefix [0..3] (wq, wqkv_gate, attn_rel, attn_sink_proj) in 1 SINGLE DISPATCH on x_q!
+            if (C.q_prefix_rows > 0u) {
+                if (!agx_gemm_dispatch_raw_q8_0(ctx, stream, C.w_attn_in.gpu_va, x_q_va, pref_va,
+                                                M, C.q_prefix_rows, D, AGX_BARRIER_NONE, D, pref_stride)) {
+                    return false;
+                }
+            }
+            // Suffix [4]=wk on x_k, [5]=wv on x_v (128B-aligned, 100% concurrent AGX_BARRIER_NONE!)
+            for (uint32_t m = 0; m < 6u; ++m) {
+                const uint64_t xin = (m < 4u) ? x_q_va : ((m == 4u) ? x_k_va : x_v_va);
+                if (C.in_coal[m]) {
+                    if (m < 4u) {
+                        raw_va[m]     = pref_va + (uint64_t) C.row_off[m] * sizeof(float);
+                        raw_stride[m] = pref_stride;
+                    } else {
+                        raw_va[m]     = qkv_cur;
+                        raw_stride[m] = C.row_cnt[m];
+                        qkv_cur += agx_align_up((size_t) M * C.row_cnt[m] * sizeof(float), AGX_CACHE_LINE_BYTES);
+                        if (!agx_gemm_dispatch_raw_q8_0(ctx, stream, C.w_attn_in.gpu_va + C.byte_off[m],
+                                                        xin, raw_va[m], M, C.row_cnt[m], D,
+                                                        AGX_BARRIER_NONE, D, C.row_cnt[m])) {
+                            return false;
+                        }
+                    }
+                } else {
+                    const uint32_t N = (uint32_t) mats_all[m]->ne[1];
+                    raw_va[m]     = fb_cur;
+                    raw_stride[m] = N;
+                    fb_cur += agx_align_up((size_t) M * N * sizeof(float), AGX_CACHE_LINE_BYTES);
+                    if (!dispatch_dense_mm(ctx, stream, mats_all[m], xin, raw_va[m], M, AGX_BARRIER_NONE)) {
+                        return false;
+                    }
+                }
+            }
+        } else {
+            for (uint32_t m = 0; m < 6u; ++m) {
+                const uint64_t xin = (m < 4u) ? x_q_va : ((m == 4u) ? x_k_va : x_v_va);
+                const uint32_t N   = (uint32_t) mats_all[m]->ne[1];
+                raw_va[m]     = fb_cur;
+                raw_stride[m] = N;
+                fb_cur += agx_align_up((size_t) M * N * sizeof(float), AGX_CACHE_LINE_BYTES);
+                if (!dispatch_dense_mm(ctx, stream, mats_all[m], xin, raw_va[m], M, AGX_BARRIER_NONE)) {
+                    return false;
+                }
+            }
+        }
+        if (!P.is_swa) {
+            if (!dispatch_dense_mm(ctx, stream, layer.attn_k_conv_proj, x_k_va, L.k_dyn, M, AGX_BARRIER_NONE)) return false;
+            if (!dispatch_dense_mm(ctx, stream, layer.attn_v_conv_proj, x_v_va, L.v_dyn, M, AGX_BARRIER_NONE)) return false;
+        }
+        agx_cdm_barrier_usc(stream);
+
+        // ---- Stage 1a: 1-Dispatch Fused Q/K/V/R ShortConv + State-Store + Clip/Norm + Tau + FWHT + KV-Store + kq_mask_f16! ----
+        const uint32_t mask_row_stride = (P.n_kv + 7u) & ~7u;
+        const size_t   mask_need_B     = (size_t) 24u * M * mask_row_stride * sizeof(uint16_t);
+        const bool     use_slc_mask    = (mask_need_B <= L.kq_mask_f16_bytes);
+        const uint64_t kq_mask_va      = use_slc_mask ? L.kq_mask_f16 : P.graph_mask_va;
+        const uint32_t kq_mask_stride  = use_slc_mask ? mask_row_stride : (P.graph_mask_nb1 / 2u);
+        const bool     fuse_rel_inline = (P.n_kv <= 2048u);
+        const bool     need_pack_qgate = (M > 1u) && (raw_stride[1] != 3072u);
+
+        {
+            agx_w4_qkv_prep_desc qd{};
+            qd.q_raw_va         = raw_va[0];
+            qd.k_raw_va         = raw_va[4];
+            qd.v_raw_va         = raw_va[5];
+            qd.r_raw_va         = raw_va[2];
+            qd.sinks_va         = raw_va[3];
+            qd.qgate_raw_va     = raw_va[1];
+            qd.qgate_compact_va = need_pack_qgate ? L.qgate_compact : 0ull;
+            qd.k_dyn_va         = P.is_swa ? 0ull : L.k_dyn;
+            qd.v_dyn_va         = P.is_swa ? 0ull : L.v_dyn;
+
+            qd.q_clip_va        = agx_tensor_gpu_va(layer.attn_q_clip);
+            qd.r_clip_va        = agx_tensor_gpu_va(layer.attn_rel_clip);
+            qd.k_conv_w_va      = agx_tensor_gpu_va(layer.attn_k_conv);
+            qd.v_conv_w_va      = agx_tensor_gpu_va(layer.attn_v_conv);
+            qd.rel_bias_va      = agx_tensor_gpu_va(layer.attn_rel_bias);
+            qd.inp_pos_va       = G.inp_pos_va;
+
+            qd.r_l_va           = P.r_l_va;
+            qd.s_copy_va        = G.s_copy_va;
+            qd.k_cell_va        = P.cell_va[0];
+            qd.v_cell_va        = P.cell_va[1];
+
+            qd.k_store_va       = P.k_store_va;
+            qd.v_store_va       = P.v_store_va;
+            qd.k_idxs_va        = P.k_idxs_va;
+            qd.v_idxs_va        = P.v_idxs_va;
+
+            qd.q_out_va         = L.q_out;
+            qd.r_out_va         = L.r_out;
+            qd.rel_pos_va       = P.rel_pos_va;
+            qd.base_mask_va     = P.base_mask_va;
+            qd.kq_mask_out_va   = kq_mask_va;
+
+            qd.q_raw_stride_f32    = raw_stride[0];
+            qd.k_raw_stride_f32    = raw_stride[4];
+            qd.v_raw_stride_f32    = raw_stride[5];
+            qd.r_raw_stride_f32    = raw_stride[2];
+            qd.sinks_stride_f32    = raw_stride[3];
+            qd.r_nb1_f32           = P.r_nb1_f32;
+            qd.rollback_slots      = P.rollback_slots;
+            qd.rollback_stride_f32 = P.rollback_stride_f32;
+            qd.k_store_nb1_B       = P.k_store_nb1;
+            qd.v_store_nb1_B       = P.v_store_nb1;
+            qd.k_ids_nb0_B         = P.k_ids_nb0;
+            qd.v_ids_nb0_B         = P.v_ids_nb0;
+            qd.n_tokens            = M;
+            qd.n_conv              = 4u;
+            qd.n_rel               = (uint32_t) layer.attn_rel_bias->ne[0];
+            qd.n_extent            = (uint32_t) (layer.attn_rel_bias->ne[1] - (G.rel_bias_padded[P.ip] ? 1 : 0));
+            qd.n_kv                = P.n_kv;
+            qd.n_kv_mask_stride    = kq_mask_stride;
+            qd.rpos_nb1_B          = P.rpos_nb1;
+            qd.bmask_nb1_B         = P.bmask_nb1;
+            uint32_t rb_tmp = 0;
+            qd.bias_wtype          = agx_inkling2_tensor_wtype(layer.attn_rel_bias, &rb_tmp);
+            qd.bias_nb1_B          = rb_tmp;
+            qd.flags               = (!P.is_swa ? AGX_W4_QKV_FLAG_IS_FULL_ATTN : 0u) |
+                                     (P.has_k_rot ? AGX_W4_QKV_FLAG_FWHT_K : 0u) |
+                                     (P.has_v_rot ? AGX_W4_QKV_FLAG_FWHT_V : 0u) |
+                                     (P.kv_is_q8 ? AGX_W4_QKV_FLAG_KV_Q8_0 : 0u) |
+                                     (P.k_ids_is_i64 ? AGX_W4_QKV_FLAG_K_IDS_I64 : 0u) |
+                                     (P.v_ids_is_i64 ? AGX_W4_QKV_FLAG_V_IDS_I64 : 0u) |
+                                     (P.bmask_is_f16 ? AGX_W4_QKV_FLAG_BASE_MASK_F16 : 0u) |
+                                     (fuse_rel_inline ? AGX_W4_QKV_FLAG_FUSE_REL_MASK : 0u) |
+                                     (need_pack_qgate ? AGX_W4_QKV_FLAG_PACK_QGATE : 0u);
+            qd.r_splits            = fuse_rel_inline ? ((P.n_kv > 512u) ? 4u : ((P.n_kv > 128u) ? 2u : 1u)) : 1u;
+            qd.conv_res_scale      = 1.0f / std::sqrt((float) ((P.is_swa ? 1u : 2u) * 4u + 1u));
+            qd.qk_clip             = hp.f_qk_clip;
+            qd.rel_clip            = hp.f_relative_clip;
+            qd.rms_eps             = hp.f_norm_rms_eps;
+            qd.log_scale_alpha     = hp.f_log_scale_alpha;
+            qd.inv_log_floor       = 1.0f / (float) hp.n_log_scale_floor;
+
+            void * d_cpu = nullptr;
+            uint64_t d_va = agx_cdm_alloc_args(stream, sizeof(qd), 16, &d_cpu);
+            if (!d_va || !d_cpu) return false;
+            std::memcpy(d_cpu, &qd, sizeof(qd));
+            agx_w4_desc_va_push pc{ d_va };
+            if (!agx_cdm_dispatch(stream, eng->k_w4_qkv_prep_store, 40u + 24u * qd.r_splits, M, 1u,
+                                  &pc, sizeof(pc), AGX_BARRIER_STRONG_USC)) {
+                return false;
+            }
+            if (mk_dump && v == 0u) {
+                slc_dump_f32("v0.h_0",   va_h_0,   D);
+                slc_dump_f32("v0.x_q",   x_q_va,   D);
+                slc_dump_f32("v0.q_out", L.q_out,  3072u);
+                slc_dump_f32("v0.qgate", raw_va[1], 3072u);
+                slc_dump_f32("v0.sinks", raw_va[3], 24u);
+            }
+        }
+
+        if (!fuse_rel_inline) {
+            agx_w4_rel_mask_push rmc{};
+            rmc.r_va             = L.r_out;
+            rmc.rel_bias_va      = agx_tensor_gpu_va(layer.attn_rel_bias);
+            rmc.sinks_va         = raw_va[3];
+            rmc.rel_pos_va       = P.rel_pos_va;
+            rmc.base_mask_va     = P.base_mask_va;
+            rmc.dst_va           = kq_mask_va;
+            rmc.n_rel            = (uint32_t) layer.attn_rel_bias->ne[0];
+            rmc.n_extent         = (uint32_t) (layer.attn_rel_bias->ne[1] - (G.rel_bias_padded[P.ip] ? 1 : 0));
+            rmc.n_kv             = P.n_kv;
+            rmc.n_kv_stride      = kq_mask_stride;
+            rmc.n_head           = 24u;
+            rmc.n_tokens         = M;
+            rmc.sinks_stride_f32 = raw_stride[3];
+            rmc.rpos_nb1_B       = P.rpos_nb1;
+            rmc.bmask_nb1_B      = P.bmask_nb1;
+            uint32_t rb_tmp = 0;
+            rmc.bias_wtype       = agx_inkling2_tensor_wtype(layer.attn_rel_bias, &rb_tmp);
+            rmc.bias_nb1_B       = rb_tmp;
+            rmc.base_mask_is_f16 = P.bmask_is_f16 ? 1u : 0u;
+            if (!agx_cdm_dispatch(stream, eng->k_w4_rel_bias_mask, (P.n_kv + 63u) / 64u, 24u, M,
+                                  &rmc, sizeof(rmc), AGX_BARRIER_STRONG_USC)) {
+                return false;
+            }
+        }
+
+        // ---- Stage 1b: FlashAttention (+ fused sigmoid(qgate) when !has_v_rot) -> slc->attn_out ----
+        const uint64_t qgate_cont_va = need_pack_qgate ? L.qgate_compact : raw_va[1];
+        {
+            agx_attn_stage_args attn{};
+            attn.n_tokens      = M;
+            attn.n_kv          = P.n_kv;
+            attn.n_head_q      = 24u;
+            attn.n_head_kv     = 8u;
+            attn.head_dim      = 128u;
+            attn.kq_scale      = 1.0f / std::sqrt(128.0f);
+            attn.flags         = AGX_ATTN_FLAG_HAS_MASK_F16 | AGX_ATTN_FLAG_REL_TABLE_SINK |
+                                 (!P.has_v_rot ? AGX_ATTN_FLAG_QGATE_F32 : 0u);
+            attn.q_va          = L.q_out;
+            attn.q_nb1         = 24u * 128u * sizeof(float);
+            attn.q_nb2         = 128u * sizeof(float);
+            attn.out_va        = slc->attn_out;
+            attn.q_gate_va     = !P.has_v_rot ? qgate_cont_va : 0ull;
+            attn.kq_mask_va    = kq_mask_va;
+            attn.ext_mask_nb1  = kq_mask_stride * sizeof(uint16_t);
+            attn.ext_mask_nb2  = M * kq_mask_stride * sizeof(uint16_t);
+            attn.ext_mask_ne2  = 24u;
+            attn.ext_k_dtype   = P.kv_is_q8 ? AGX_KV_Q8_0_GGML : AGX_KV_F16;
+            attn.ext_v_dtype   = P.kv_is_q8 ? AGX_KV_Q8_0_GGML : AGX_KV_F16;
+            attn.ext_k_va      = P.k_va;
+            attn.ext_v_va      = P.v_va;
+            attn.ext_k_nb1     = P.k_nb1;
+            attn.ext_k_nb2     = P.k_nb2;
+            attn.ext_v_nb1     = P.v_nb1;
+            attn.ext_v_nb2     = P.v_nb2;
+            if (!agx_kv_hybrid_dispatch_full_attn(kv_pool, stream, attn, AGX_BARRIER_STRONG_USC)) {
+                return false;
+            }
+            if (mk_dump && v == 0u) {
+                slc_dump_f32("v0.attn_out", slc->attn_out, 3072u);
+            }
+        }
+        if (P.has_v_rot) {
+            agx_w4_fwht_qgate_push fpc{};
+            fpc.attn_va          = slc->attn_out;
+            fpc.qgate_va         = raw_va[1];
+            fpc.n_head           = 24u;
+            fpc.n_tokens         = M;
+            fpc.qgate_stride_f32 = raw_stride[1];
+            fpc.do_fwht128       = 1u;
+            if (!agx_cdm_dispatch(stream, eng->k_w4_fwht_qgate, 24u, M, 1u,
+                                  &fpc, sizeof(fpc), AGX_BARRIER_STRONG_USC)) {
+                return false;
+            }
+        }
+
+        // ---- Stage 1c: W_o GEMM -> L.x_k (wo_out) ----
+        if (!dispatch_dense_mm(ctx, stream, layer.wo, slc->attn_out, L.x_k, M, AGX_BARRIER_STRONG_USC)) {
+            return false;
+        }
+
+        // ---- Stage 2a: Fused attn_post_conv + state-store + block-res + ffn_depth_mix (+ ffn_norm if !has_loop) ----
+        const bool new_block = (P.ip % hp.attn_res_block_size == 0u);
+        if (new_block) {
+            // cur_va already resides in its permanent static res_blocks slot (va_h_0 / va_prelude / va_h12_* / va_cur_p2)!
+            blocks.push_back(cur_va);
+        }
+
+        {
+            agx_w4_stage_prep_desc sd{};
+            sd.conv_src_va         = L.x_k;
+            sd.res_va              = new_block ? 0ull : cur_va;
+            sd.conv_w_va           = agx_tensor_gpu_va(layer.attn_post_conv);
+            sd.r_l_va              = P.r_l_va;
+            sd.s_copy_va           = G.s_copy_va;
+            sd.cell_va             = P.cell_va[2];
+            sd.cur_out_va          = va_ffn_inp;
+            sd.block_ptrs_va       = alloc_block_ptrs(blocks);
+            sd.query_va            = agx_tensor_gpu_va(layer.ffn_res_query);
+            sd.norm_w_va[0]        = !P.has_loop ? agx_tensor_gpu_va(layer.ffn_norm) : 0ull;
+            sd.mix_out_va[0]       = !P.has_loop ? L.x_q : L.qkv_in_0;
+            sd.n_embd              = D;
+            sd.n_tokens            = M;
+            sd.n_conv              = 4u;
+            sd.conv_ch_offset      = 2048u;
+            sd.r_nb1_f32           = P.r_nb1_f32;
+            sd.rollback_slots      = P.rollback_slots;
+            sd.rollback_stride_f32 = P.rollback_stride_f32;
+            sd.n_blocks            = (uint32_t) blocks.size();
+            sd.n_queries           = 1u;
+            sd.flags               = AGX_W4_SPREP_FLAG_DO_CONV | AGX_W4_SPREP_FLAG_DO_DEPTH_MIX |
+                                     (!new_block ? AGX_W4_SPREP_FLAG_ADD_RESIDUAL : 0u) |
+                                     (!P.has_loop ? AGX_W4_SPREP_FLAG_DO_NORM : 0u);
+            sd.conv_res_scale      = 1.0f / std::sqrt(5.0f);
+            sd.inv_sqrt_d          = 1.0f / std::sqrt((float) D);
+            sd.eps_mix             = 1e-6f;
+            sd.eps_norm            = hp.f_norm_rms_eps;
+
+            void * d_cpu = nullptr;
+            uint64_t d_va = agx_cdm_alloc_args(stream, sizeof(sd), 16, &d_cpu);
+            if (!d_va || !d_cpu) return false;
+            std::memcpy(d_cpu, &sd, sizeof(sd));
+            agx_w4_desc_va_push pc{ d_va };
+            if (!agx_cdm_dispatch(stream, eng->k_w4_stage_post_attn, 1u, 1u, 1u,
+                                  &pc, sizeof(pc), AGX_BARRIER_STRONG_USC)) {
+                return false;
+            }
+            if (mk_dump && v == 0u) {
+                slc_dump_f32("v0.wo_out",  L.x_k,      D);
+                slc_dump_f32("v0.ffn_inp", va_ffn_inp, D);
+                slc_dump_f32("v0.ffn_x",   L.x_q,      D);
+            }
+        }
+
+        if (P.has_loop) {
+            // 40-Core FFN Loop Controller: norm_cat -> ctrl_down -> concurrent ctrl_gain + ctrl_forget -> mix_norm!
+            {
+                agx_w4_ctrl_norm_cat_push ncp{};
+                ncp.cur_va[0] = L.qkv_in_0;
+                ncp.dst_va[0] = L.ctrl_cat[0];
+                ncp.msg_va    = slc->h_msg;
+                ncp.n_embd    = D;
+                ncp.n_tokens  = M;
+                ncp.n_ctrls   = 1u;
+                ncp.msg_base  = 3u;
+                ncp.eps_ctrl  = 1e-6f;
+                if (!agx_cdm_dispatch(stream, eng->k_w4_ctrl_norm_cat, 1u, M, 1u,
+                                      &ncp, sizeof(ncp), AGX_BARRIER_STRONG_USC)) {
+                    return false;
+                }
+            }
+            if (!dispatch_dense_mm(ctx, stream, loop->ctrl_down[3], L.ctrl_cat[0], L.ctrl_gate[0],
+                                   M, AGX_BARRIER_STRONG_USC)) {
+                return false;
+            }
+            const bool fused_ffn_up =
+                loop->ctrl_gain[3]->type == GGML_TYPE_F32 && loop->ctrl_forget[3]->type == GGML_TYPE_F32 &&
+                loop->ctrl_gain[3]->ne[0] == 64 && loop->ctrl_forget[3]->ne[0] == 64;
+            if (fused_ffn_up) {
+                agx_w4_ctrl_up_mix_push ump{};
+                ump.cur_va[0]      = L.qkv_in_0;
+                ump.gate_va[0]     = L.ctrl_gate[0];
+                ump.gain_w_va[0]   = agx_tensor_gpu_va(loop->ctrl_gain[3]);
+                ump.forget_w_va[0] = agx_tensor_gpu_va(loop->ctrl_forget[3]);
+                ump.out_va[0]      = L.ctrl_gain[0];
+                ump.msg_va         = slc->h_msg;
+                ump.n_embd         = D;
+                ump.n_tokens       = M;
+                ump.n_ctrls        = 1u;
+                ump.msg_base       = 3u;
+                if (!agx_cdm_dispatch(stream, eng->k_w4_ctrl_up_mix, (D + 15u) / 16u, 1u, M,
+                                      &ump, sizeof(ump), AGX_BARRIER_STRONG_USC)) {
+                    return false;
+                }
+                agx_w4_batch_rmsnorm_push brp{};
+                brp.src_va[0]    = L.ctrl_gain[0];
+                brp.norm_w_va[0] = agx_tensor_gpu_va(layer.ffn_norm);
+                brp.dst_va[0]    = L.x_q;
+                brp.n_embd       = D;
+                brp.n_tokens     = M;
+                brp.n_ctrls      = 1u;
+                brp.eps_norm     = hp.f_norm_rms_eps;
+                if (!agx_cdm_dispatch(stream, eng->k_w4_batch_rmsnorm, 1u, M, 1u,
+                                      &brp, sizeof(brp), AGX_BARRIER_STRONG_USC)) {
+                    return false;
+                }
+            } else {
+                if (!dispatch_dense_mm(ctx, stream, loop->ctrl_gain[3], L.ctrl_gate[0], L.ctrl_gain[0],
+                                       M, AGX_BARRIER_NONE)) {
+                    return false;
+                }
+                if (!dispatch_dense_mm(ctx, stream, loop->ctrl_forget[3], L.ctrl_gate[0], L.ctrl_forget[0],
+                                       M, AGX_BARRIER_STRONG_USC)) {
+                    return false;
+                }
+                agx_w4_ctrl_mix_norm_push mnp{};
+                mnp.cur_va[0]    = L.qkv_in_0;
+                mnp.gain_va[0]   = L.ctrl_gain[0];
+                mnp.forget_va[0] = L.ctrl_forget[0];
+                mnp.norm_w_va[0] = agx_tensor_gpu_va(layer.ffn_norm);
+                mnp.out_va[0]    = L.x_q;
+                mnp.msg_va       = slc->h_msg;
+                mnp.n_embd       = D;
+                mnp.n_tokens     = M;
+                mnp.n_ctrls      = 1u;
+                mnp.msg_base     = 3u;
+                mnp.eps_norm     = hp.f_norm_rms_eps;
+                if (!agx_cdm_dispatch(stream, eng->k_w4_ctrl_mix_norm, 1u, M, 1u,
+                                      &mnp, sizeof(mnp), AGX_BARRIER_STRONG_USC)) {
+                    return false;
+                }
+            }
+        }
+
+        // ---- Stage 2b: Router (40-core GEMM + bitonic Top-8 + norm -> slc->router_topk / router_topk_w) ----
+        if (!dispatch_dense_mm(ctx, stream, layer.ffn_gate_inp, L.x_q, L.router_logits, M, AGX_BARRIER_STRONG_USC, true)) {
+            return false;
+        }
+        {
+            w4_router_topk_push rpc{};
+            rpc.logits_va  = L.router_logits;
+            rpc.bias_va    = layer.ffn_exp_probs_b ? agx_tensor_gpu_va(layer.ffn_exp_probs_b) : 0ull;
+            rpc.ids_dst_va = slc->router_topk;
+            rpc.w_dst_va   = slc->router_topk_w;
+            rpc.n_exp      = hp.n_expert;
+            rpc.k_out      = hp.n_expert_used;
+            rpc.n_tokens   = M;
+            rpc.ids_nb1    = hp.n_expert_used;
+            rpc.norm_eps   = hp.expert_weights_norm_eps;
+            rpc.w_scale    = (hp.expert_weights_scale != 0.0f) ? hp.expert_weights_scale : 1.0f;
+            if (!agx_cdm_dispatch(stream, eng->k_w4_router_topk, M, 1u, 1u,
+                                  &rpc, sizeof(rpc), AGX_BARRIER_STRONG_USC)) {
+                return false;
+            }
+        }
+
+        // ---- Stage 2c + Stage 3a: @w4-kv-moe Fused 2-Stage MoE (gate_up+SiTU -> slc->moe_inter -> down+wsum -> L.x_v) ----
+        {
+            agx_weight_layout gu_layout = AGX_WEIGHT_F32, dn_layout = AGX_WEIGHT_F32;
+            if (!agx_gemm_infer_weight_layout(layer.ffn_gate_up_exps, &gu_layout) ||
+                !agx_gemm_infer_weight_layout(layer.ffn_down_exps,    &dn_layout)) {
+                return false;
+            }
+            const uint64_t gu_slice = agx_tensor_is_repacked(layer.ffn_gate_up_exps)
+                ? agx_repack_slice_stride(layer.ffn_gate_up_exps->type, layer.ffn_gate_up_exps->ne[0], layer.ffn_gate_up_exps->ne[1])
+                : (uint64_t) layer.ffn_gate_up_exps->nb[2];
+            const uint64_t dn_slice = agx_tensor_is_repacked(layer.ffn_down_exps)
+                ? agx_repack_slice_stride(layer.ffn_down_exps->type, layer.ffn_down_exps->ne[0], layer.ffn_down_exps->ne[1])
+                : (uint64_t) layer.ffn_down_exps->nb[2];
+
+            agx_moe_stage_args margs{};
+            margs.n_tokens         = M;
+            margs.n_embd           = D;
+            margs.n_ff             = hp.n_ff_exp;
+            margs.n_expert         = hp.n_expert;
+            margs.top_k            = hp.n_expert_used;
+            margs.act_op           = AGX_MOE_ACT_SITU;
+            margs.situ_beta        = hp.situ_beta;
+            margs.situ_linear_beta = hp.situ_linear_beta;
+            margs.exp_scale0       = 1.0f; // already scaled in k_w4_router_topk
+            margs.ffn_x_va         = L.x_q;
+            margs.topk_ids_va      = slc->router_topk;
+            margs.ids_row_stride   = hp.n_expert_used;
+            margs.topk_w_va        = slc->router_topk_w;
+            margs.moe_out_va       = L.moe_out;
+            margs.gate_up_va       = agx_tensor_gpu_va(layer.ffn_gate_up_exps);
+            margs.down_va          = agx_tensor_gpu_va(layer.ffn_down_exps);
+            margs.gate_up_slice_B  = gu_slice;
+            margs.down_slice_B     = dn_slice;
+            margs.gate_up_layout   = gu_layout;
+            margs.down_layout      = dn_layout;
+            margs.gate_up_scale_va = layer.ffn_gate_up_exps_s ? agx_tensor_gpu_va(layer.ffn_gate_up_exps_s) : 0ull;
+            margs.down_scale_va    = layer.ffn_down_exps_s    ? agx_tensor_gpu_va(layer.ffn_down_exps_s)    : 0ull;
+            margs.x_is_f16         = false;
+            margs.accumulate_out   = false;
+            margs.moe_inter_va     = slc->moe_inter;
+            margs.res_va           = 0ull; // ffn_post_conv runs between moe_out and + ffn_inp!
+
+            if (!agx_moe_dispatch_fused_situ_down(moe_runner, stream, margs, AGX_BARRIER_STRONG_USC)) {
+                return false;
+            }
+            if (mk_dump && v == 0u) {
+                slc_dump_f32("v0.rtr_w",     slc->router_topk_w, 8u);
+                slc_dump_f32("v0.moe_inter", slc->moe_inter,     hp.n_ff_exp * hp.n_expert_used);
+                slc_dump_f32("v0.moe_out",   L.moe_out,          D);
+                const int32_t * ids = reinterpret_cast<const int32_t *>(
+                    static_cast<const uint8_t *>(slc->cpu_base) + (slc->router_topk - slc->base_va));
+                std::fprintf(stderr, "[MK DUMP] v0.rtr_ids       [%d %d %d %d %d %d %d %d] "
+                             "gu=(lay=%u rep=%d s2=%d sl=%llu ne=%lldx%lld) dn=(lay=%u rep=%d s2=%d sl=%llu ne=%lldx%lld)\n",
+                             ids[0], ids[1], ids[2], ids[3], ids[4], ids[5], ids[6], ids[7],
+                             (unsigned) gu_layout, (int) agx_tensor_is_repacked(layer.ffn_gate_up_exps),
+                             !!layer.ffn_gate_up_exps_s,
+                             (unsigned long long) gu_slice,
+                             (long long) layer.ffn_gate_up_exps->ne[0], (long long) layer.ffn_gate_up_exps->ne[1],
+                             (unsigned) dn_layout, (int) agx_tensor_is_repacked(layer.ffn_down_exps),
+                             !!layer.ffn_down_exps_s,
+                             (unsigned long long) dn_slice,
+                             (long long) layer.ffn_down_exps->ne[0], (long long) layer.ffn_down_exps->ne[1]);
+            }
+        }
+
+        // ---- Stage 3b -> NEXT PASS Stage 0a FUSED: ffn_post_conv + state-store + res_add + next depth_mix (+ norm)! ----
+        const uint64_t next_cur_va = target_l_out_va(v, cur_va);
+        const bool is_pass_reset   = (v == 17u || v == 29u);
+        const bool is_final_pass   = (v == 47u);
+
+        {
+            agx_w4_stage_prep_desc sd{};
+            sd.conv_src_va         = L.moe_out;
+            sd.res_va              = va_ffn_inp;
+            sd.conv_w_va           = agx_tensor_gpu_va(layer.ffn_post_conv);
+            sd.r_l_va              = P.r_l_va;
+            sd.s_copy_va           = G.s_copy_va;
+            sd.cell_va             = P.cell_va[3];
+            sd.cur_out_va          = next_cur_va;
+            sd.export_va           = P.export_l_out_va;
+            sd.n_embd              = D;
+            sd.n_tokens            = M;
+            sd.n_conv              = 4u;
+            sd.conv_ch_offset      = 4352u;
+            sd.r_nb1_f32           = P.r_nb1_f32;
+            sd.rollback_slots      = P.rollback_slots;
+            sd.rollback_stride_f32 = P.rollback_stride_f32;
+            sd.flags               = AGX_W4_SPREP_FLAG_DO_CONV | AGX_W4_SPREP_FLAG_ADD_RESIDUAL;
+            sd.conv_res_scale      = 1.0f / std::sqrt(5.0f);
+            sd.inv_sqrt_d          = 1.0f / std::sqrt((float) D);
+            sd.eps_mix             = 1e-6f;
+            sd.eps_norm            = hp.f_norm_rms_eps;
+
+            if (is_final_pass) {
+                // Fuse final output_depth_mix + output_norm right here!
+                sd.block_ptrs_va     = alloc_block_ptrs(blocks);
+                sd.query_va          = agx_tensor_gpu_va(W.output_res_query);
+                sd.norm_w_va[0]      = agx_tensor_gpu_va(W.output_norm);
+                sd.mix_out_va[0]     = L.x_q;
+                sd.mix_out_export_va = G.export_out_norm;
+                sd.n_blocks          = (uint32_t) blocks.size();
+                sd.n_queries         = 1u;
+                sd.flags            |= AGX_W4_SPREP_FLAG_DO_DEPTH_MIX | AGX_W4_SPREP_FLAG_DO_NORM;
+            } else if (!is_pass_reset) {
+                // Fuse next pass's attn_depth_mix (+ fused 1x/3x RMSNorm if !next.has_loop)!
+                const auto & Pn    = G.passes[v + 1u];
+                const auto & Ln    = W.layers[Pn.ip];
+                sd.block_ptrs_va   = alloc_block_ptrs(blocks);
+                sd.query_va        = agx_tensor_gpu_va(Ln.attn_res_query);
+                sd.n_blocks        = (uint32_t) blocks.size();
+                sd.n_queries       = Pn.is_swa ? 1u : 3u;
+                sd.flags          |= AGX_W4_SPREP_FLAG_DO_DEPTH_MIX;
+                if (!Pn.has_loop) {
+                    sd.flags        |= AGX_W4_SPREP_FLAG_DO_NORM;
+                    sd.norm_w_va[0]  = agx_tensor_gpu_va(Pn.is_swa ? Ln.attn_norm : Ln.attn_q_inp_norm);
+                    sd.norm_w_va[1]  = !Pn.is_swa ? agx_tensor_gpu_va(Ln.attn_k_inp_norm) : 0ull;
+                    sd.norm_w_va[2]  = !Pn.is_swa ? agx_tensor_gpu_va(Ln.attn_v_inp_norm) : 0ull;
+                    sd.mix_out_va[0] = L.x_q;
+                    sd.mix_out_va[1] = L.x_k;
+                    sd.mix_out_va[2] = L.x_v;
+                } else {
+                    sd.mix_out_va[0] = L.qkv_in_0;
+                    sd.mix_out_va[1] = L.qkv_in_1;
+                    sd.mix_out_va[2] = L.qkv_in_2;
+                }
+                attn_inputs_ready = true;
+            }
+
+            void * d_cpu = nullptr;
+            uint64_t d_va = agx_cdm_alloc_args(stream, sizeof(sd), 16, &d_cpu);
+            if (!d_va || !d_cpu) return false;
+            std::memcpy(d_cpu, &sd, sizeof(sd));
+            agx_w4_desc_va_push pc{ d_va };
+            if (!agx_cdm_dispatch(stream, eng->k_w4_stage_post_ffn, 1u, 1u, 1u,
+                                  &pc, sizeof(pc), AGX_BARRIER_STRONG_USC)) {
+                return false;
+            }
+            if (!emit_layer_inp_stores(P.layer_inp_stores, next_cur_va)) {
+                return false;
+            }
+            if (is_final_pass && !emit_layer_inp_stores(G.out_norm_stores, L.x_q)) {
+                return false;
+            }
+            if (mk_dump && (v == 0u || v == 1u || v == 5u || v == 6u || v == 17u || v == 18u || v == 29u || v == 30u || v == 41u || v == 47u)) {
+                char tag[32];
+                std::snprintf(tag, sizeof(tag), "v%u.l_out(il%u)", v, P.il);
+                slc_dump_f32(tag, next_cur_va, D);
+                if (v == 47u) slc_dump_f32("v47.out_norm", L.x_q, D);
+            }
+        }
+
+        cur_va = next_cur_va;
+    }
+
+    // ------------------------------------------------------------------------
+    // Final: Optional inp_out_ids Gather + Q8_0 LM Head + Softcap/Trunc -> result_output
+    // ------------------------------------------------------------------------
+    uint64_t lm_in_va = L.x_q;
+    if (G.inp_out_ids_va != 0ull) {
+        w4_gather_f32_push gp{};
+        gp.src_va  = L.x_q;
+        gp.ids_va  = G.inp_out_ids_va;
+        gp.dst_va  = L.x_k;
+        gp.dst2_va = G.result_norm_va;
+        gp.n_embd  = D;
+        gp.n_out   = G.n_out;
+        if (!agx_cdm_dispatch(stream, eng->k_w4_gather_f32, (D + 255u) / 256u, G.n_out, 1u,
+                              &gp, sizeof(gp), AGX_BARRIER_STRONG_USC)) {
+            return false;
+        }
+        lm_in_va = L.x_k;
+    } else if (G.result_norm_va != 0ull) {
+        copy_f32_push cp{ L.x_q, G.result_norm_va, G.n_out * D, 0u };
+        if (!agx_cdm_dispatch(stream, eng->k_copy_f32, (G.n_out * D + 255u) / 256u, 1u, 1u,
+                              &cp, sizeof(cp), AGX_BARRIER_NONE)) {
+            return false;
+        }
+    }
+
+    {
+        agx_weight_layout lm_layout = AGX_WEIGHT_F32;
+        if (!agx_gemm_infer_weight_layout(W.output, &lm_layout)) return false;
+        agx_gemm_desc d{};
+        d.w_va         = agx_tensor_gpu_va(W.output);
+        d.x_va         = lm_in_va;
+        d.y_va         = G.lm_head_pad_va;
+        d.M            = G.n_out;
+        d.N            = hp.n_vocab_padded;
+        d.K            = D;
+        d.layout       = lm_layout;
+        d.prec_f32     = true; // matches prec_policy.set_acc(output, GGML_PREC_F32)
+        d.post_barrier = AGX_BARRIER_STRONG_USC;
+        if (!agx_gemm_dispatch(ctx, stream, d)) {
+            return false;
+        }
+    }
+
+    if (!agx_inkling2_dispatch_softcap_argmax(eng, stream,
+            G.lm_head_pad_va, G.result_output_va, 0ull,
+            hp.n_vocab_unpadded, hp.n_vocab_padded, G.n_out,
+            hp.f_final_logit_softcapping, false, AGX_BARRIER_MEMORY_HOST)) {
+        return false;
+    }
+
+    const auto t_enc_end = std::chrono::steady_clock::now();
+    const uint64_t cpu_enc_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(t_enc_end - t_enc_beg).count();
+
+    uint64_t gpu_ns = 0;
+    if (agx_cdm_submit(stream, true, &gpu_ns) != 0) {
+        AGX_LOG_ERROR("agx_inkling2_try_execute: CDM submit failed");
+        return false;
+    }
+
+    const char * stats_env = std::getenv("GGML_AGX_STATS");
+    if (stats_env && stats_env[0] && stats_env[0] != '0') {
+        agx_cdm_stats cdm_after{};
+        agx_cdm_get_stats(stream, &cdm_after);
+        std::fprintf(stderr,
+                     "[ggml-agx MEGAKERNEL STATS] M=%u n_out=%u kv=%s dispatches=%llu submits=%llu "
+                     "usc_bar=%llu elided=%llu cpu_enc=%.2fms gpu=%.2fms\n",
+                     M, G.n_out, G.passes[0].kv_is_q8 ? "Q8_0" : "F16",
+                     (unsigned long long) (cdm_after.dispatches          - cdm_before.dispatches),
+                     (unsigned long long) (cdm_after.submits             - cdm_before.submits),
+                     (unsigned long long) (cdm_after.strong_usc_barriers - cdm_before.strong_usc_barriers),
+                     (unsigned long long) (cdm_after.elided_barriers     - cdm_before.elided_barriers),
+                     (double) cpu_enc_ns * 1e-6, (double) gpu_ns * 1e-6);
+    }
+
+    return true;
 }

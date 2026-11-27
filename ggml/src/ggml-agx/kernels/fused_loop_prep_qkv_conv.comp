@@ -74,22 +74,22 @@ layout(push_constant) uniform PushArgs {
     uint     pad0;
 } pc;
 
-shared float s_red[8];
+shared float s_red5[5][8];
 shared float s_inv_rms[16];
 shared float s_w[4][16];      // probs[q][s] * inv_rms[s]
 shared float s_tmp_out[3840]; // only used when fused trailing norm_w_va != 0
 
 float wg_sum(float val, uint sg_id, uint lane_id) {
     float s = subgroupAdd(val);
-    if (lane_id == 0u) s_red[sg_id] = s;
+    if (lane_id == 0u) s_red5[0][sg_id] = s;
     barrier();
     if (sg_id == 0u) {
-        float v = (lane_id < 8u) ? s_red[lane_id] : 0.0;
+        float v = (lane_id < 8u) ? s_red5[0][lane_id] : 0.0;
         float tot = subgroupAdd(v);
-        if (lane_id == 0u) s_red[0] = tot;
+        if (lane_id == 0u) s_red5[0][0] = tot;
     }
     barrier();
-    float res = s_red[0];
+    float res = s_red5[0][0];
     barrier();
     return res;
 }
@@ -107,8 +107,7 @@ void main() {
     const float inv_D  = 1.0 / float(D);
     const uint64_t tok_off_B = uint64_t(tok) * uint64_t(D) * 4ul;
 
-    // 1. For each state s: compute inv_rms[s] and raw dot(src[s], query[q]) in a single pass!
-    //    Since dot(rms_norm(x), q) == inv_rms * dot(x, q), we avoid reading x twice for scores!
+    // 1. For each state s: compute inv_rms[s] and raw dot(src[s], query[q]) in ONE barrier!
     for (uint s = 0u; s < S; ++s) {
         uint64_t x_va = ConstBufU64(pc.states_ptrs_va).v[s] + tok_off_B;
         float ss = 0.0;
@@ -123,28 +122,35 @@ void main() {
             if (Q >= 4u) d3 += xv * ConstBufF32(pc.query_va).v[3u * D + i];
         }
 
-        float inv_rms = inversesqrt(wg_sum(ss, sg_id, lane_id) * inv_D + pc.eps_mix);
-        if (tid == 0u) s_inv_rms[s] = inv_rms;
-
-        float scale = inv_rms * pc.inv_sqrt_d;
-        if (Q >= 1u) {
-            float r = wg_sum(d0, sg_id, lane_id) * scale;
-            if (tid == 0u) s_w[0][s] = r;
+        float r_ss = subgroupAdd(ss);
+        float r_d0 = subgroupAdd(d0);
+        float r_d1 = subgroupAdd(d1);
+        float r_d2 = subgroupAdd(d2);
+        float r_d3 = subgroupAdd(d3);
+        if (lane_id == 0u) {
+            s_red5[0][sg_id] = r_ss;
+            s_red5[1][sg_id] = r_d0;
+            s_red5[2][sg_id] = r_d1;
+            s_red5[3][sg_id] = r_d2;
+            s_red5[4][sg_id] = r_d3;
         }
-        if (Q >= 2u) {
-            float r = wg_sum(d1, sg_id, lane_id) * scale;
-            if (tid == 0u) s_w[1][s] = r;
+        barrier();
+        if (sg_id < 5u) {
+            float t = subgroupAdd((lane_id < 8u) ? s_red5[sg_id][lane_id] : 0.0);
+            if (lane_id == 0u) s_red5[sg_id][0] = t;
         }
-        if (Q >= 3u) {
-            float r = wg_sum(d2, sg_id, lane_id) * scale;
-            if (tid == 0u) s_w[2][s] = r;
+        barrier();
+        if (tid == 0u) {
+            float inv_rms = inversesqrt(s_red5[0][0] * inv_D + pc.eps_mix);
+            s_inv_rms[s]  = inv_rms;
+            float scale   = inv_rms * pc.inv_sqrt_d;
+            if (Q >= 1u) s_w[0][s] = s_red5[1][0] * scale;
+            if (Q >= 2u) s_w[1][s] = s_red5[2][0] * scale;
+            if (Q >= 3u) s_w[2][s] = s_red5[3][0] * scale;
+            if (Q >= 4u) s_w[3][s] = s_red5[4][0] * scale;
         }
-        if (Q >= 4u) {
-            float r = wg_sum(d3, sg_id, lane_id) * scale;
-            if (tid == 0u) s_w[3][s] = r;
-        }
+        barrier();
     }
-    barrier();
 
     // 2. Numerically stable softmax over s in [0..S-1] per query q, folded with inv_rms[s]
     if (tid < Q) {

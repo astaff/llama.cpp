@@ -11,6 +11,7 @@
 #include "kernels/fused_loop_prep_qkv_conv.h"
 #include "kernels/fused_softcap_argmax.h"
 #include "kernels/dspark_mtp.h"
+#include "kernels/agx_inkling2_w4.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -106,8 +107,10 @@ struct agx_inkling2_layer_tensors {
     const struct ggml_tensor * ffn_norm        = nullptr;
     const struct ggml_tensor * ffn_gate_inp    = nullptr;
     const struct ggml_tensor * ffn_exp_probs_b = nullptr;
-    const struct ggml_tensor * ffn_gate_up_exps = nullptr;
-    const struct ggml_tensor * ffn_down_exps   = nullptr;
+    const struct ggml_tensor * ffn_gate_up_exps   = nullptr;
+    const struct ggml_tensor * ffn_down_exps      = nullptr;
+    const struct ggml_tensor * ffn_gate_up_exps_s = nullptr; // NVFP4 per-expert scale2 [n_expert] F32
+    const struct ggml_tensor * ffn_down_exps_s    = nullptr; // NVFP4 per-expert scale2 [n_expert] F32
 };
 
 struct agx_inkling2_loop_tensors {
@@ -278,3 +281,30 @@ bool agx_inkling2_run_sense_barrier_probe(agx_inkling2_engine * eng,
                                           uint32_t              n_iters,
                                           uint64_t *            out_gpu_ns,
                                           uint32_t *            out_epoch);
+
+// ============================================================================
+// Wave 4 Pillar 3: Dedicated 48-Pass Megakernel Engine & DSpark Fastpath
+// ============================================================================
+
+// Precompile all Wave 4 megakernel + DSpark shaders (for Borealis shaderdb audit)
+bool agx_inkling2_precompile_w4(agx_inkling2_engine * eng);
+
+// High-BW 40-core fused DSpark Markov Head dispatcher (writes directly into
+// [n_vocab, block_drafts, n_blocks] out_logits and [n_embd, block_drafts, n_blocks] out_h_nextn)
+bool agx_dspark_dispatch_markov_head_w4(agx_inkling2_engine *          eng,
+                                        agx_cdm_stream *               stream,
+                                        const agx_dspark_mtp_tensors & w,
+                                        uint64_t                       anchor_toks_va,
+                                        uint64_t                       base_logits_va,
+                                        uint64_t                       hidden_va,
+                                        uint64_t                       f_rnn_va,
+                                        uint64_t                       rnn_state_va,
+                                        uint64_t                       out_logits_va,
+                                        uint64_t                       out_h_nextn_va,
+                                        uint32_t                       n_blocks,
+                                        uint32_t                       block_drafts,
+                                        agx_barrier_mode               post_barrier = AGX_BARRIER_STRONG_USC);
+
+// Graph auto-discovery + 48-pass megakernel execution (called by ggml-agx.cpp
+// before falling back to generic agx_graph_compute). Returns true iff executed.
+extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_cgraph * cgraph);

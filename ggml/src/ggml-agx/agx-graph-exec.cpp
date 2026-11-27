@@ -3,7 +3,14 @@
 #include "agx-gemm.h"
 #include "agx-kv-hybrid.h"
 #include "agx-moe.h"
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#endif
 #include "ggml-impl.h"
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -2377,6 +2384,20 @@ enum agx_exec_kind : uint8_t {
     ITEM_FULL_SHORTCONV,
     ITEM_ROUTER_TOPK,
     ITEM_REL_BIAS,
+    ITEM_DSPARK_MARKOV_W4,
+};
+
+struct agx_dspark_w4_item_args {
+    agx_dspark_mtp_tensors w;
+    uint64_t anchor_toks_va = 0;
+    uint64_t base_logits_va = 0;
+    uint64_t hidden_va      = 0;
+    uint64_t f_rnn_va       = 0;
+    uint64_t rnn_state_va   = 0;
+    uint64_t out_logits_va  = 0;
+    uint64_t out_h_nextn_va = 0;
+    uint32_t n_blocks       = 1;
+    uint32_t block_drafts   = 1;
 };
 
 struct agx_exec_item {
@@ -2396,6 +2417,7 @@ struct agx_exec_item {
     uint64_t             va0 = 0, va1 = 0;
     uint32_t             u0 = 0, u1 = 0, u2 = 0;
     float                f0 = 0.0f, f1 = 0.0f;
+    agx_dspark_w4_item_args dspark_w4 = {};
 
     void add_read(agx_va_range r) {
         if (r.beg < r.end && n_reads < 8u) reads[n_reads++] = r;
@@ -3154,6 +3176,163 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
     uint64_t g_l2_clip = 0, g_situ = 0, g_softcap = 0, g_ctrl = 0, g_rms_mul = 0, g_add_sc = 0, g_sig_mul = 0;
     uint64_t g_mix = 0, g_moe_wsum = 0, g_ssm_res = 0, g_moe_norm = 0;
     uint64_t g_prep_store = 0, g_full_sconv = 0, g_router = 0, g_rel_bias = 0, g_cont_abs = 0;
+
+    // ------------------------------------------------------------------------
+    // Wave 4 Fusion 12: DSpark Markov Head Tail Fusion (~320 ops -> 21 high-BW dispatches!)
+    // Matches src/models/dspark.cpp:build_dspark_markov_head (RNN + Top-64 CDF draw + softcap)
+    // ------------------------------------------------------------------------
+    if ((fusion_mask & (1u << 13)) && n_exec >= 64u) {
+        const struct ggml_tensor * w1_t = nullptr, * w2_t = nullptr, * w2_s_t = nullptr, * w2_b_t = nullptr;
+        const struct ggml_tensor * jp_t = nullptr, * jp_b_t = nullptr;
+        const struct ggml_tensor * base_t = nullptr, * hid_t = nullptr;
+        bool has_d2t_or_conf = false;
+        int32_t e_base = -1, e_hid = -1, e_first_w1 = -1;
+
+        for (size_t e = 0; e < n_exec; ++e) {
+            const struct ggml_tensor * nd = cgraph->nodes[st->exec_nodes[e]];
+            if (nd->name[0]) {
+                if (std::strcmp(nd->name, "result_output") == 0) { base_t = nd; e_base = (int32_t) e; }
+                else if (std::strcmp(nd->name, "result_norm") == 0) { hid_t = nd; e_hid = (int32_t) e; }
+            }
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                const struct ggml_tensor * src = nd->src[s];
+                if (!src || !src->name[0]) continue;
+                if      (std::strcmp(src->name, "markov_w1.weight") == 0) { w1_t = src; if (e_first_w1 < 0) e_first_w1 = (int32_t) e; }
+                else if (std::strcmp(src->name, "markov_w2.weight") == 0) w2_t = src;
+                else if (std::strcmp(src->name, "markov_w2.scale") == 0)  w2_s_t = src;
+                else if (std::strcmp(src->name, "markov_w2.bias") == 0)   w2_b_t = src;
+                else if (std::strcmp(src->name, "joint_proj.weight") == 0) jp_t = src;
+                else if (std::strcmp(src->name, "joint_proj.bias") == 0)  jp_b_t = src;
+                else if (std::strcmp(src->name, "d2t") == 0 ||
+                         std::strcmp(src->name, "conf_proj.weight") == 0) has_d2t_or_conf = true;
+            }
+        }
+
+        if (w1_t && w2_t && jp_t && base_t && hid_t && !has_d2t_or_conf &&
+            e_base >= 0 && e_hid >= 0 && e_first_w1 > e_base && e_first_w1 > e_hid) {
+            // Find the start of build_dspark_markov_head: CONT(VIEW_2D(inp_tokens, 1, n_blocks))
+            const int32_t markov_beg = e_base + 1;
+            const struct ggml_tensor * prev_cont = cgraph->nodes[st->exec_nodes[(size_t) markov_beg]];
+            const struct ggml_tensor * inp_toks  = (prev_cont->op == GGML_OP_CONT && prev_cont->src[0] &&
+                                                    prev_cont->src[0]->op == GGML_OP_VIEW)
+                                                   ? prev_cont->src[0]->view_src : nullptr;
+            const struct ggml_tensor * final_out = cgraph->nodes[st->exec_nodes[n_exec - 1u]];
+
+            if (inp_toks && inp_toks->type == GGML_TYPE_I32 &&
+                prev_cont->type == GGML_TYPE_I32 && prev_cont->ne[0] >= 1 && prev_cont->ne[0] <= 4 &&
+                final_out->op == GGML_OP_CONT && final_out->type == GGML_TYPE_F32 &&
+                base_t->type == GGML_TYPE_F32 && hid_t->type == GGML_TYPE_F32 &&
+                base_t->ne[1] == hid_t->ne[1] && base_t->ne[1] == inp_toks->ne[0] &&
+                (base_t->ne[1] % prev_cont->ne[0]) == 0 &&
+                ggml_nelements(final_out) == ggml_nelements(base_t)) {
+                const uint32_t n_blocks     = (uint32_t) prev_cont->ne[0];
+                const uint32_t block_drafts = (uint32_t) (base_t->ne[1] / prev_cont->ne[0]);
+                const uint32_t n_vocab      = (uint32_t) base_t->ne[0];
+                const uint32_t n_embd       = (uint32_t) hid_t->ne[0];
+                const uint32_t rank         = (uint32_t) w1_t->ne[0];
+
+                // Locate optional rnn_state (from f_rnn CONT(VIEW_2D(rnn_state, n_embd, n_blocks)) right after prev_cont)
+                const struct ggml_tensor * rnn_state = nullptr;
+                const struct ggml_tensor * final_h_nextn = nullptr;
+                bool sample_from_anchor = true;
+                float softcap = 0.0f;
+
+                for (size_t e = (size_t) markov_beg + 1u; e < (size_t) e_first_w1; ++e) {
+                    const struct ggml_tensor * nd = cgraph->nodes[st->exec_nodes[e]];
+                    if (!rnn_state && nd->op == GGML_OP_CONT && nd->src[0] && nd->src[0]->op == GGML_OP_VIEW &&
+                        nd->src[0]->view_src && nd->src[0]->view_src->type == GGML_TYPE_F32 &&
+                        nd->src[0]->view_src->ne[0] == (int64_t) n_embd &&
+                        nd->src[0]->view_src->ne[1] == base_t->ne[1] &&
+                        nd->src[0]->view_src != hid_t) {
+                        rnn_state = nd->src[0]->view_src;
+                    }
+                    if (nd->op == GGML_OP_CONT && nd->src[0] && nd->src[0]->op == GGML_OP_VIEW &&
+                        nd->src[0]->view_src == base_t && nd->src[0]->view_offs == 0) {
+                        sample_from_anchor = false;
+                    }
+                }
+                if (rnn_state && n_exec >= 2u) {
+                    // final_h_nextn is the CONT(PERMUTE(cat_draw)) right before final_out
+                    const struct ggml_tensor * cand_h = cgraph->nodes[st->exec_nodes[n_exec - 2u]];
+                    if (cand_h->op == GGML_OP_CONT && cand_h->type == GGML_TYPE_F32 &&
+                        ggml_nelements(cand_h) == (int64_t) n_embd * base_t->ne[1]) {
+                        final_h_nextn = cand_h;
+                    }
+                }
+                // Detect softcap on first col: SCALE(1/c) -> TANH -> SCALE(c) with ne[0] == n_vocab
+                for (size_t e = (size_t) e_first_w1; e + 2u < n_exec; ++e) {
+                    const struct ggml_tensor * s0 = cgraph->nodes[st->exec_nodes[e]];
+                    const struct ggml_tensor * u1 = cgraph->nodes[st->exec_nodes[e + 1u]];
+                    const struct ggml_tensor * s2 = cgraph->nodes[st->exec_nodes[e + 2u]];
+                    if (s0->op == GGML_OP_SCALE && s0->ne[0] == (int64_t) n_vocab &&
+                        u1->op == GGML_OP_UNARY && ggml_get_unary_op(u1) == GGML_UNARY_OP_TANH &&
+                        s2->op == GGML_OP_SCALE && u1->src[0] == s0 && s2->src[0] == u1) {
+                        float cap = 0.0f, b = 0.0f;
+                        read_scale_params(s2, &cap, &b);
+                        if (cap > 0.0f && b == 0.0f) { softcap = cap; break; }
+                    }
+                }
+
+                // Verify NO external side effects (SET_ROWS / unexpected OUTPUT) inside [markov_beg .. n_exec-1]
+                bool tail_clean = (block_drafts >= 2u && rank <= 512u && n_embd <= 2304u) &&
+                                  (!rnn_state || final_h_nextn != nullptr) &&
+                                  va_disjoint(base_t, final_out) &&
+                                  (!final_h_nextn || va_disjoint(rnn_state, final_h_nextn));
+                for (size_t e = (size_t) markov_beg; tail_clean && e < n_exec; ++e) {
+                    const struct ggml_tensor * nd = cgraph->nodes[st->exec_nodes[e]];
+                    if (nd->op == GGML_OP_SET_ROWS) tail_clean = false;
+                    if ((nd->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 &&
+                        nd != final_out && nd != final_h_nextn) {
+                        tail_clean = false;
+                    }
+                }
+
+                if (tail_clean) {
+                    agx_exec_item it{};
+                    it.kind          = ITEM_DSPARK_MARKOV_W4;
+                    it.nodes_covered = (uint32_t) (n_exec - (size_t) markov_beg);
+                    it.add_read(tensor_va_range(inp_toks));
+                    it.add_read(tensor_va_range(base_t));
+                    it.add_read(tensor_va_range(hid_t));
+                    if (rnn_state) it.add_read(tensor_va_range(rnn_state));
+                    it.add_write(tensor_va_range(final_out));
+                    if (final_h_nextn) it.add_write(tensor_va_range(final_h_nextn));
+
+                    auto & da = it.dspark_w4;
+                    da.w.markov_w1          = w1_t;
+                    da.w.markov_w2          = w2_t;
+                    da.w.markov_w2_s        = w2_s_t;
+                    da.w.markov_w2_b        = w2_b_t;
+                    da.w.joint_proj         = jp_t;
+                    da.w.joint_proj_b       = jp_b_t;
+                    da.w.n_embd             = n_embd;
+                    da.w.rank               = rank;
+                    da.w.n_vocab            = n_vocab;
+                    da.w.block_size         = block_drafts;
+                    da.w.sample_from_anchor = sample_from_anchor;
+                    da.w.has_f_rnn          = (rnn_state != nullptr);
+                    da.w.softcap            = softcap;
+                    da.anchor_toks_va       = agx_tensor_gpu_va(inp_toks);
+                    da.base_logits_va       = agx_tensor_gpu_va(base_t);
+                    da.hidden_va            = agx_tensor_gpu_va(hid_t);
+                    da.f_rnn_va             = rnn_state ? agx_tensor_gpu_va(rnn_state) : 0ull;
+                    da.rnn_state_va         = rnn_state ? agx_tensor_gpu_va(rnn_state) : 0ull;
+                    da.out_logits_va        = agx_tensor_gpu_va(final_out);
+                    da.out_h_nextn_va       = final_h_nextn ? agx_tensor_gpu_va(final_h_nextn) : 0ull;
+                    da.n_blocks             = n_blocks;
+                    da.block_drafts         = block_drafts;
+
+                    const uint32_t idx = (uint32_t) st->items.size();
+                    st->items.push_back(it);
+                    anchors[(size_t) markov_beg] = { idx, 1u };
+                    for (size_t e = (size_t) markov_beg; e < n_exec; ++e) {
+                        consumed[e] = 1u;
+                    }
+                    st->stats.fused_dspark_hits++;
+                }
+            }
+        }
+    }
 
     for (size_t e = 0; e < n_exec; ++e) {
         if (consumed[e]) continue;
@@ -5132,6 +5311,16 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                                       it.push, it.push_bytes, AGX_BARRIER_NONE);
                 break;
 
+            case ITEM_DSPARK_MARKOV_W4: {
+                auto * eng = agx_graph_exec_get_inkling2(ctx);
+                const auto & da = it.dspark_w4;
+                ok = eng && agx_dspark_dispatch_markov_head_w4(eng, stream, da.w,
+                                                               da.anchor_toks_va, da.base_logits_va,
+                                                               da.hidden_va, da.f_rnn_va, da.rnn_state_va,
+                                                               da.out_logits_va, da.out_h_nextn_va,
+                                                               da.n_blocks, da.block_drafts, AGX_BARRIER_NONE);
+            } break;
+
             case ITEM_GENERIC_NODE: {
                 struct ggml_tensor * node = it.node;
                 switch (node->op) {
@@ -5553,6 +5742,50 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
             return GGML_STATUS_FAILED;
         }
         st->stats.total_gpu_ns += gpu_ns;
+    }
+
+    const char * nomk_dump = std::getenv("GGML_AGX_NOMK_DUMP");
+    static bool  did_nomk_dump = false;
+    if (nomk_dump && nomk_dump[0] && nomk_dump[0] != '0' && !did_nomk_dump && cgraph->n_nodes > 512) {
+        // Trigger on first M=1 decode graph (skip prefill where result_output->ne[1] > 1 or token_embd ne[1] > 1)
+        bool is_m1 = false;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const struct ggml_tensor * nd = cgraph->nodes[i];
+            if (nd && nd->op == GGML_OP_GET_ROWS && nd->src[0] &&
+                std::strcmp(nd->src[0]->name, "token_embd.weight") == 0 && nd->ne[1] == 1) {
+                is_m1 = true;
+                break;
+            }
+        }
+        if (is_m1) {
+            did_nomk_dump = true;
+            const char * wanted[] = {
+                "Qcur-0", "kqv_out-0", "attn_out-0", "ffn_inp-0",
+                "ffn_moe_topk-0", "ffn_moe_weights_scaled-0", "ffn_out-0",
+                "l_out-0", "l_out-1", "l_out-5", "l_out-6", "l_out-17",
+                "l_out-24", "l_out-35", "l_out-36", "l_out-47", "l_out-23", "result_norm"
+            };
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                const struct ggml_tensor * nd = cgraph->nodes[i];
+                if (!nd || !nd->data || !nd->name[0]) continue;
+                for (const char * wn : wanted) {
+                    if (std::strcmp(nd->name, wn) != 0) continue;
+                    const size_t ne = (size_t) ggml_nelements(nd);
+                    if (nd->type == GGML_TYPE_I32 && ne >= 8) {
+                        const int32_t * ip = static_cast<const int32_t *>(nd->data);
+                        std::fprintf(stderr, "[NOMK DUMP] %-24s [%d %d %d %d %d %d %d %d]\n",
+                                     nd->name, ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], ip[6], ip[7]);
+                    } else if (nd->type == GGML_TYPE_F32 && ne > 0) {
+                        const float * fp = static_cast<const float *>(nd->data);
+                        double ss = 0.0;
+                        for (size_t k = 0; k < ne; ++k) ss += (double) fp[k] * (double) fp[k];
+                        std::fprintf(stderr, "[NOMK DUMP] %-24s n=%-5zu l2=%10.5f v=[%9.5f %9.5f %9.5f %9.5f]\n",
+                                     nd->name, ne, std::sqrt(ss), fp[0], ne > 1 ? fp[1] : 0.0f,
+                                     ne > 2 ? fp[2] : 0.0f, ne > 3 ? fp[3] : 0.0f);
+                    }
+                }
+            }
+        }
     }
 
     if (print_stats && n_exec >= 64u) {
