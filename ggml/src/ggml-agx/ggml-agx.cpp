@@ -460,13 +460,56 @@ static enum ggml_status agx_backend_graph_compute(ggml_backend_t backend, struct
     if (!ctx || !ctx->drm || !ctx->stream) {
         return GGML_STATUS_FAILED;
     }
-    return agx_graph_compute(ctx, cgraph);
+    if (!cgraph || cgraph->n_nodes == 0) {
+        return GGML_STATUS_SUCCESS;
+    }
+
+    const bool can_replay = !ctx->debug && !ctx->profile &&
+                            cgraph->uid != 0 &&
+                            agx_cdm_replay_enabled();
+    if (can_replay) {
+        const void * first_node = cgraph->nodes[0];
+        const void * last_node  = cgraph->nodes[cgraph->n_nodes - 1];
+        const uint64_t bo_epoch = agx_drm_get_bo_epoch(ctx->drm);
+        int replay_ret = 0;
+        if (agx_cdm_stream_try_replay(ctx->stream, cgraph->uid, cgraph->n_nodes,
+                                      first_node, last_node, bo_epoch,
+                                      /*wait=*/true, /*out_gpu_ns=*/nullptr, &replay_ret)) {
+            if (replay_ret != 0) {
+                AGX_LOG_ERROR("agx_backend_graph_compute: CDM replay submit failed (%d)", replay_ret);
+                return GGML_STATUS_FAILED;
+            }
+            return GGML_STATUS_SUCCESS;
+        }
+    }
+
+    const uint64_t submits_before = agx_cdm_stream_submit_count(ctx->stream);
+    const enum ggml_status st = agx_graph_compute(ctx, cgraph);
+    if (st == GGML_STATUS_SUCCESS && can_replay) {
+        const uint64_t submits_after = agx_cdm_stream_submit_count(ctx->stream);
+        if (submits_after == submits_before + 1ULL &&
+            agx_cdm_stream_is_replayable(ctx->stream) &&
+            agx_drm_vm_error(ctx->drm) == 0) {
+            const uint64_t bo_epoch_after = agx_drm_get_bo_epoch(ctx->drm);
+            agx_cdm_stream_tag_replay(ctx->stream, cgraph->uid, cgraph->n_nodes,
+                                      cgraph->nodes[0], cgraph->nodes[cgraph->n_nodes - 1],
+                                      bo_epoch_after);
+        } else {
+            agx_cdm_stream_invalidate_replay(ctx->stream);
+        }
+    } else {
+        agx_cdm_stream_invalidate_replay(ctx->stream);
+    }
+    return st;
 }
 
 static void agx_backend_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * cgraph,
                                        struct ggml_backend_graph_optimize_params * params) {
     auto * ctx = static_cast<agx_backend_context *>(backend->context);
     if (ctx) {
+        if (ctx->stream) {
+            agx_cdm_stream_invalidate_replay(ctx->stream);
+        }
         agx_graph_optimize(ctx, cgraph, params);
     }
 }

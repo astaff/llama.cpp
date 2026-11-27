@@ -107,7 +107,8 @@ int      agx_drm_wait_timeline(agx_drm_device * dev,
                                uint64_t         timeout_ns = UINT64_MAX);
 void     agx_drm_sync_all(agx_drm_device * dev);
 
-// Sticky VM error & GPU hardware timestamp queries
+// Sticky VM error, BO mutation epoch & GPU hardware timestamp queries
 int32_t  agx_drm_vm_error(agx_drm_device * dev);
+uint64_t agx_drm_get_bo_epoch(const agx_drm_device * dev);
 uint64_t agx_drm_get_gpu_time_ns(agx_drm_device * dev);
 uint64_t agx_drm_ticks_to_ns(const agx_drm_device * dev, uint64_t ticks);

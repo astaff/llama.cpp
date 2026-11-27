@@ -35,6 +35,7 @@ struct agx_cdm_stats {
     uint64_t submits;
     uint64_t last_gpu_ns;
     uint64_t total_gpu_ns;
+    uint64_t replays;
 };
 
 struct agx_cdm_stream;
@@ -131,6 +132,31 @@ void             agx_cdm_reset_sense_barrier(agx_cdm_stream * stream, uint32_t n
 void             agx_cdm_get_stats(const agx_cdm_stream * stream, agx_cdm_stats * out);
 void             agx_cdm_reset_stats(agx_cdm_stream * stream);
 bool             agx_cdm_is_empty(const agx_cdm_stream * stream);
+
+// Steady-state CDM graph replay (toggleable via GGML_AGX_NO_REPLAY=1).
+// When a ggml_cgraph repeats with identical uid, topology, and device BO epoch,
+// `agx_cdm_stream_try_replay` re-submits the already-recorded CDM/Ioto/Arg BOs
+// in place with zero CPU re-encoding.
+bool             agx_cdm_replay_enabled();
+uint64_t         agx_cdm_stream_record_gen(const agx_cdm_stream * stream);
+uint64_t         agx_cdm_stream_submit_count(const agx_cdm_stream * stream);
+bool             agx_cdm_stream_is_replayable(const agx_cdm_stream * stream);
+bool             agx_cdm_stream_try_replay(agx_cdm_stream * stream,
+                                           uint64_t         graph_uid,
+                                           int              n_nodes,
+                                           const void *     first_node,
+                                           const void *     last_node,
+                                           uint64_t         bo_epoch,
+                                           bool             wait,
+                                           uint64_t *       out_gpu_ns,
+                                           int *            out_ret);
+void             agx_cdm_stream_tag_replay(agx_cdm_stream * stream,
+                                           uint64_t         graph_uid,
+                                           int              n_nodes,
+                                           const void *     first_node,
+                                           const void *     last_node,
+                                           uint64_t         bo_epoch);
+void             agx_cdm_stream_invalidate_replay(agx_cdm_stream * stream);
 
 // Low-level HAL200/G17P CDM packet encoders (also callable from unit tests)
 uint32_t         agx_cdm_encode_barrier_word(agx_barrier_mode mode);

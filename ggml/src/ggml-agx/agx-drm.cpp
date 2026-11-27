@@ -506,8 +506,12 @@ struct agx_drm_device {
     volatile int32_t * vm_mirror_word = nullptr;
 
     // Submission serialization + monotonic timeline
-    std::mutex submit_mutex;
-    uint64_t   timeline_value = 0;
+    std::mutex            submit_mutex;
+    uint64_t              timeline_value = 0;
+    std::atomic<uint64_t> completed_timeline{ 0 };
+
+    // Monotonic BO allocation/free epoch (invalidates recorded CDM replay on any VA change)
+    std::atomic<uint64_t> bo_epoch{ 1 };
 
     // Memory accounting
     std::atomic<uint64_t> slc_pin_bytes{ 0 };
@@ -858,10 +862,16 @@ agx_drm_device * agx_drm_open(int device_index) {
         AGX_LOG_WARN("Failed to bind zero page at 0x100000000; continuing without it");
     }
 
-    // Register zero-ioctl VM sticky-error mirror if kernel supports it
+    // Register zero-ioctl VM sticky-error mirror if kernel supports it.
+    // Try VM-private first, then fall back to shared GEM BO if kernel requires shared.
     if (info.has_vm_status_mirror) {
-        dev->vm_mirror_bo = alloc_fixed_bo(dev, AGX_PAGE_SIZE, 0, 0, true, "vm-status-mirror");
-        if (dev->vm_mirror_bo) {
+        for (int attempt = 0; attempt < 2 && !dev->vm_mirror_word; ++attempt) {
+            const bool use_shared = (attempt == 1);
+            dev->vm_mirror_bo = alloc_fixed_bo(dev, AGX_PAGE_SIZE, 0, 0, true,
+                                               "vm-status-mirror", use_shared);
+            if (!dev->vm_mirror_bo) {
+                continue;
+            }
             struct asahi_vm_status_mirror mirror = {};
             mirror.vm_id  = dev->vm_id;
             mirror.handle = dev->vm_mirror_bo->handle;
@@ -905,13 +915,14 @@ agx_drm_device * agx_drm_open(int device_index) {
     dev->syncobj = sc.handle;
 
     AGX_LOG_INFO("Opened %s (%s): %u cores (%u clusters x %u), %u MHz, USC=%u HAL=%u, "
-                 "limit=%.2f GiB (client=%.2f GiB), residency=%d timeout=%ums",
+                 "limit=%.2f GiB (client=%.2f GiB), residency=%d vm_mirror=%d timeout=%ums",
                  info.device_name, info.render_node, info.num_cores, info.num_clusters,
                  info.cores_per_cluster, info.max_frequency_khz / 1000u,
                  info.usc_generation, info.gpu_hal_generation,
                  (double) info.memory_limit / (1024.0 * 1024.0 * 1024.0),
                  (double) info.client_memory_limit / (1024.0 * 1024.0 * 1024.0),
-                 (int) info.has_gem_residency, qc.compute_timeout_ms);
+                 (int) info.has_gem_residency, (int) (dev->vm_mirror_word != nullptr),
+                 qc.compute_timeout_ms);
 
     return dev;
 }
@@ -1136,6 +1147,7 @@ agx_bo * agx_bo_alloc(agx_drm_device * dev, size_t size, uint32_t flags, const c
     }
 
     counter_for_policy(dev, policy).fetch_add(alloc_size, std::memory_order_relaxed);
+    dev->bo_epoch.fetch_add(1, std::memory_order_release);
     return bo;
 }
 
@@ -1197,6 +1209,7 @@ agx_bo * agx_bo_import_userptr(agx_drm_device * dev, void * ptr, size_t size,
     }
 
     counter_for_policy(dev, policy).fetch_add(size, std::memory_order_relaxed);
+    dev->bo_epoch.fetch_add(1, std::memory_order_release);
     return bo;
 }
 
@@ -1204,6 +1217,8 @@ void agx_bo_free(agx_drm_device * dev, agx_bo * bo) {
     if (!dev || !bo) {
         return;
     }
+
+    dev->bo_epoch.fetch_add(1, std::memory_order_release);
 
     if (bo->ts_obj_handle != 0) {
         struct asahi_gem_bind_object unbind = {};
@@ -1298,10 +1313,11 @@ int agx_drm_submit_cdm(agx_drm_device * dev,
         struct asahi_cmd_compute cmd;
     } packet = {};
 
+    const uint64_t done_pt = dev->completed_timeline.load(std::memory_order_acquire);
     packet.hdr.cmd_type    = ASAHI_CMD_COMPUTE;
     packet.hdr.size        = sizeof(struct asahi_cmd_compute);
     packet.hdr.vdm_barrier = ASAHI_BARRIER_NONE;
-    packet.hdr.cdm_barrier = (dev->timeline_value == 0) ? ASAHI_BARRIER_NONE : 0u;
+    packet.hdr.cdm_barrier = (dev->timeline_value <= done_pt) ? ASAHI_BARRIER_NONE : 0u;
 
     packet.cmd.flags                = compute_flags;
     packet.cmd.cdm_ctrl_stream_base = cdm_start_va;
@@ -1372,6 +1388,14 @@ int agx_drm_wait_timeline(agx_drm_device * dev, uint64_t timeline_point, uint64_
         return -errno;
     }
 
+    // Record monotonic completed timeline so subsequent synchronous submits can
+    // elide redundant cross-submission CDM barriers.
+    uint64_t cur_done = dev->completed_timeline.load(std::memory_order_relaxed);
+    while (timeline_point > cur_done &&
+           !dev->completed_timeline.compare_exchange_weak(
+               cur_done, timeline_point, std::memory_order_release, std::memory_order_relaxed)) {
+    }
+
     // Per drm_asahi UAPI contract: a signalled fence does NOT imply execution success;
     // always check sticky VM status before trusting GPU outputs.
     const int32_t vm_err = agx_drm_vm_error(dev);
@@ -1381,6 +1405,10 @@ int agx_drm_wait_timeline(agx_drm_device * dev, uint64_t timeline_point, uint64_
         return vm_err;
     }
     return 0;
+}
+
+uint64_t agx_drm_get_bo_epoch(const agx_drm_device * dev) {
+    return dev ? dev->bo_epoch.load(std::memory_order_acquire) : 0ULL;
 }
 
 void agx_drm_sync_all(agx_drm_device * dev) {

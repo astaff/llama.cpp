@@ -8,19 +8,38 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(__GNUC__) || defined(__clang__)
+#    define AGX_LIKELY(x)   __builtin_expect(!!(x), 1)
+#    define AGX_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#    define AGX_LIKELY(x)   (x)
+#    define AGX_UNLIKELY(x) (x)
+#endif
+
 struct agx_ioto_reloc {
     uint16_t byte_off;
     uint16_t dest_half;
     uint32_t root_delta;
+    uint64_t dest_mask_lo;
+    uint64_t dest_mask_hi;
 };
 
 struct agx_ioto_template {
     uint64_t                    shader_va          = 0;
     uint64_t                    rodata_va          = 0;
+    uint64_t                    const_data_va      = 0;
     uint32_t                    max_push_dma_bytes = 0;
+    uint32_t                    push_offset_bytes  = 0;
+    uint32_t                    alloc_root_min     = 64u;
+    uint32_t                    launch_w0_1d       = 0;
+    uint32_t                    launch_w0_nd       = 0;
+    uint32_t                    launch_w1          = 0;
+    uint32_t                    local_size[3]      = { 1u, 1u, 1u };
+    bool                        uses_root_or_dma   = false;
     bool                        needs_full_zero    = false;
+    bool                        local_size_valid   = false;
     uint8_t                     reloc_count        = 0;
-    agx_ioto_reloc              reloc0             = { 0, 0, 0 };
+    agx_ioto_reloc              reloc0             = { 0, 0, 0, 0, 0 };
     std::vector<uint8_t>        bytes;
     std::vector<agx_ioto_reloc> relocs;
 };
@@ -31,6 +50,17 @@ struct agx_ioto_fast_entry {
     uint64_t            rodata_va   = 0;
     agx_ioto_template * tmpl        = nullptr;
     bool                is_indirect = false;
+};
+
+struct agx_cdm_replay_tag {
+    bool         valid      = false;
+    uint64_t     graph_uid  = 0;
+    int          n_nodes    = 0;
+    const void * first_node = nullptr;
+    const void * last_node  = nullptr;
+    uint64_t     bo_epoch   = 0;
+    uint64_t     record_gen = 0;
+    uint64_t     hit_count  = 0;
 };
 
 namespace {
@@ -82,10 +112,24 @@ static inline void store_le16(uint8_t * dst, uint16_t v) {
 }
 
 static inline void store_le32(uint8_t * dst, uint32_t v) {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    std::memcpy(dst, &v, sizeof(v));
+#else
     dst[0] = static_cast<uint8_t>(v);
     dst[1] = static_cast<uint8_t>(v >> 8);
     dst[2] = static_cast<uint8_t>(v >> 16);
     dst[3] = static_cast<uint8_t>(v >> 24);
+#endif
+}
+
+static inline void store_le64(uint8_t * dst, uint64_t v) {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    std::memcpy(dst, &v, sizeof(v));
+#else
+    for (int i = 0; i < 8; ++i) {
+        dst[i] = static_cast<uint8_t>(v >> (8 * i));
+    }
+#endif
 }
 
 static inline uint32_t load_le32(const uint8_t * src) {
@@ -155,21 +199,23 @@ static bool pack_g17p_state_tail(uint64_t shader_va,
     return true;
 }
 
-static void pack_ldimm_long(uint16_t dest_half, uint32_t imm, uint8_t out[8]) {
-    const uint64_t dest =
-        static_cast<uint64_t>(0x800cu | (((dest_half >> 1) & 0xfu) << 4)) |
-        (static_cast<uint64_t>(0x0002u | ((dest_half & 1u) << 2) |
-                               (((dest_half >> 5) & 3u) << 6) |
-                               (((dest_half >> 7) & 1u) << 3)) << 16);
-    const uint64_t val =
-        static_cast<uint64_t>((imm & 0x7fu) << 8) |
-        (static_cast<uint64_t>(((imm >> 25) & 0x7fu) << 9) << 16) |
-        (static_cast<uint64_t>((((imm >> 7) & 0xfu) << 1) | (((imm >> 11) & 3u) << 10)) << 32) |
-        (static_cast<uint64_t>(((imm >> 13) & 0xfu) | (((imm >> 17) & 0xffu) << 4)) << 48);
-    const uint64_t word = dest | val;
-    for (int i = 0; i < 8; ++i) {
-        out[i] = static_cast<uint8_t>(word >> (8 * i));
-    }
+static inline uint64_t ldimm_dest_mask(uint16_t dest_half) {
+    return static_cast<uint64_t>(0x800cu | (((dest_half >> 1) & 0xfu) << 4)) |
+           (static_cast<uint64_t>(0x0002u | ((dest_half & 1u) << 2) |
+                                  (((dest_half >> 5) & 3u) << 6) |
+                                  (((dest_half >> 7) & 1u) << 3)) << 16);
+}
+
+static inline uint64_t pack_ldimm_val(uint32_t imm) {
+    return (static_cast<uint64_t>(imm & 0x7fu) << 8) |
+           (static_cast<uint64_t>((imm >> 25) & 0x7fu) << 25) |
+           (static_cast<uint64_t>((imm >> 7) & 0xfu) << 33) |
+           (static_cast<uint64_t>((imm >> 11) & 3u) << 42) |
+           (static_cast<uint64_t>((imm >> 13) & 0xfffu) << 48);
+}
+
+static inline void pack_ldimm_long(uint16_t dest_half, uint32_t imm, uint8_t out[8]) {
+    store_le64(out, ldimm_dest_mask(dest_half) | pack_ldimm_val(imm));
 }
 
 static bool pack_gpu0_lddev14(uint16_t data_half, uint16_t base_half,
@@ -373,6 +419,8 @@ static bool compose_g17p_ioto_template(const agx_kernel *    kernel,
                         static_cast<uint16_t>(ldimm_off),
                         base_temp_half,
                         root_delta,
+                        ldimm_dest_mask(base_temp_half),
+                        ldimm_dest_mask(static_cast<uint16_t>(base_temp_half + 2u)),
                     });
                 }
                 uint8_t lo[8], hi[8];
@@ -529,6 +577,7 @@ struct agx_cdm_stream {
     size_t           cmd_offset       = 0;
     size_t           ioto_offset      = 0;
     size_t           arg_offset       = 0;
+    bool             arg_bo_single_hi32 = false;
 
     // Barrier tracking (enforces HAL200 rule: never two adjacent CDM barrier records)
     size_t           last_barrier_off = SIZE_MAX;
@@ -536,13 +585,23 @@ struct agx_cdm_stream {
     bool             last_launch_elidable = false;
     bool             terminated       = false;
     bool             has_external_args = false;
+    bool             last_submit_has_ts = false;
 
     uint64_t         in_flight_point  = 0;
+    uint64_t         record_gen       = 0;
+    uint64_t         submits_since_reset = 0;
     agx_cdm_stats    stats            = {};
 
     // Per-(shader_va, is_indirect) pre-templated G17P Ioto programs (zero heap allocs/dispatch!)
     std::unordered_map<uint64_t, agx_ioto_template> ioto_templates;
-    agx_ioto_fast_entry fast_cache[64] = {};
+    agx_ioto_fast_entry fast_cache[256] = {};
+
+    // Steady-state graph replay state
+    agx_cdm_replay_tag replay{};
+    uint64_t           last_rec_disp    = 0;
+    uint64_t           last_rec_ind     = 0;
+    uint64_t           last_rec_usc     = 0;
+    uint64_t           last_rec_elid    = 0;
 
     // Lightweight GGML_AGX_STATS=1 telemetry (CPU encode vs GPU execute split)
     std::chrono::steady_clock::time_point reset_tp{};
@@ -576,6 +635,9 @@ agx_cdm_stream * agx_cdm_stream_create(agx_drm_device * dev,
         agx_cdm_stream_destroy(s);
         return nullptr;
     }
+    const uint64_t arg_beg_hi = s->arg_bo->gpu_va >> 32;
+    const uint64_t arg_end_hi = (s->arg_bo->gpu_va + s->arg_bo->alloc_size - 1u) >> 32;
+    s->arg_bo_single_hi32 = (arg_beg_hi == arg_end_hi);
     return s;
 }
 
@@ -610,6 +672,9 @@ void agx_cdm_stream_reset(agx_cdm_stream * s) {
     s->last_launch_elidable = false;
     s->terminated           = false;
     s->has_external_args    = false;
+    s->submits_since_reset  = 0;
+    s->record_gen++;
+    s->replay.valid         = false;
     if (g_agx_stats_enabled()) {
         s->reset_tp       = std::chrono::steady_clock::now();
         s->stats_at_reset = s->stats;
@@ -668,14 +733,17 @@ static bool maybe_auto_flush_chunk(agx_cdm_stream * s,
 static const agx_ioto_template * get_or_build_ioto_template(agx_cdm_stream *   s,
                                                             const agx_kernel * kernel,
                                                             bool               is_indirect) {
-    const uint64_t rodata_va = (kernel->rodata_size_16 != 0 && kernel->code_bo)
+    const uint64_t rodata_va = (AGX_UNLIKELY(kernel->rodata_size_16 != 0) && kernel->code_bo)
                                    ? (kernel->code_bo->gpu_va + kernel->rodata_offset)
                                    : 0ULL;
 
-    const size_t fidx = ((reinterpret_cast<uintptr_t>(kernel) >> 6) ^ (is_indirect ? 31u : 0u)) & 63u;
+    // 256-slot direct-mapped L1 pointer cache with Fibonacci hash (~99.8% hit rate across 55+ kernels)
+    const size_t fidx = static_cast<size_t>(
+        ((static_cast<uint64_t>(reinterpret_cast<uintptr_t>(kernel)) * 0x9e3779b97f4a7c15ULL) >> 56) ^
+        (is_indirect ? 0x55u : 0u)) & 255u;
     agx_ioto_fast_entry & fe = s->fast_cache[fidx];
-    if (fe.kernel == kernel && fe.is_indirect == is_indirect && fe.tmpl != nullptr &&
-        fe.shader_va == kernel->shader_va && fe.rodata_va == rodata_va) {
+    if (AGX_LIKELY(fe.kernel == kernel && fe.is_indirect == is_indirect && fe.tmpl != nullptr &&
+                   fe.shader_va == kernel->shader_va && fe.rodata_va == rodata_va)) {
         return fe.tmpl;
     }
 
@@ -692,7 +760,10 @@ static const agx_ioto_template * get_or_build_ioto_template(agx_cdm_stream *   s
     //   1. `uses_root` (root_va + 0)
     //   2. `uniform_dma` spans sorted by `offset_B` ascending (all reuse root_va base -> 1 LDIMM pair!)
     //   3. `rodata` (static code_bo VA baked into template -> 0 runtime relocations!)
-    constexpr uint64_t kDummyRootVa = 0x4000000000ULL;
+    // Bake `arg_bo`'s upper 32 bits into the template so hot-path patching only writes lo32!
+    const uint64_t kDummyRootVa = (s->arg_bo_single_hi32 && s->arg_bo)
+                                      ? (s->arg_bo->gpu_va & ~0xffffffffULL)
+                                      : 0x4000000000ULL;
     uniform_range ranges[32];
     size_t range_count = 0;
 
@@ -762,9 +833,25 @@ static const agx_ioto_template * get_or_build_ioto_template(agx_cdm_stream *   s
         AGX_LOG_ERROR("Failed to compose G17P Ioto template for kernel '%s'", kernel->name.c_str());
         return nullptr;
     }
+    tmpl.const_data_va      = kernel->const_data_va;
     tmpl.max_push_dma_bytes = max_push_dma_bytes;
+    tmpl.push_offset_bytes  = kernel->push_offset_bytes;
+    tmpl.alloc_root_min     = std::max<uint32_t>(kernel->root_size_bytes, 64u);
+    tmpl.uses_root_or_dma   = kernel->uses_root || !kernel->uniform_dma.empty();
     tmpl.needs_full_zero    = needs_full_zero;
-    tmpl.reloc_count        = static_cast<uint8_t>(std::min<size_t>(tmpl.relocs.size(), 255u));
+    tmpl.local_size[0]      = kernel->local_size[0];
+    tmpl.local_size[1]      = kernel->local_size[1];
+    tmpl.local_size[2]      = kernel->local_size[2];
+    tmpl.local_size_valid   =
+        (kernel->local_size[0] > 0 && kernel->local_size[0] <= 0x7ffu) &&
+        (kernel->local_size[1] > 0 && kernel->local_size[1] <= 0x7ffu) &&
+        (kernel->local_size[2] > 0 && kernel->local_size[2] <= 0x7ffu);
+    build_template_words(kernel->ti_spill_bytes, kernel->ti_ipr_bytes, true,
+                         &tmpl.launch_w0_1d, &tmpl.launch_w1);
+    uint32_t dummy_w1 = 0;
+    build_template_words(kernel->ti_spill_bytes, kernel->ti_ipr_bytes, false,
+                         &tmpl.launch_w0_nd, &dummy_w1);
+    tmpl.reloc_count = static_cast<uint8_t>(std::min<size_t>(tmpl.relocs.size(), 255u));
     if (!tmpl.relocs.empty()) {
         tmpl.reloc0 = tmpl.relocs[0];
     }
@@ -773,6 +860,100 @@ static const agx_ioto_template * get_or_build_ioto_template(agx_cdm_stream *   s
     slot = std::move(tmpl);
     fe = { kernel, kernel->shader_va, rodata_va, &slot, is_indirect };
     return fe.tmpl;
+}
+
+static inline bool prepare_launch_ioto_with_tmpl(agx_cdm_stream *          s,
+                                                 const agx_ioto_template * tmpl,
+                                                 const void *              push_args,
+                                                 size_t                    push_bytes,
+                                                 size_t                    alloc_root,
+                                                 uint64_t *                out_program_va) {
+    // Upload hk_root_descriptor_table slice with push constants at push_offset_bytes.
+    // Avoids full 1,088B memset per dispatch (~8x less CPU/SLC write traffic) by explicitly
+    // writing every live field (`root_va`, `const_data_va`, `group_count`/`base_group`, `push[]` + tail).
+    uint64_t root_va = 0;
+    if (AGX_LIKELY(tmpl->uses_root_or_dma || push_bytes > 0)) {
+        const size_t off = agx_align_up(s->arg_offset, 16u);
+        if (AGX_UNLIKELY(off + alloc_root > s->arg_bo->alloc_size)) {
+            AGX_LOG_ERROR("CDM arg ring overflow (need %zu at %zu / %zu)",
+                          alloc_root, off, s->arg_bo->alloc_size);
+            return false;
+        }
+        s->arg_offset = off + alloc_root;
+        root_va = s->arg_bo->gpu_va + off;
+        auto * rbytes = static_cast<uint8_t *>(s->arg_bo->cpu_ptr) + off;
+
+        if (AGX_UNLIKELY(tmpl->needs_full_zero)) {
+            std::memset(rbytes, 0, alloc_root);
+            store_le64(rbytes, root_va);
+            if (tmpl->const_data_va != 0 && alloc_root >= 144u) {
+                store_le64(rbytes + 136u, tmpl->const_data_va);
+            }
+            if (push_args && push_bytes > 0) {
+                std::memcpy(rbytes + tmpl->push_offset_bytes, push_args, push_bytes);
+            }
+        } else {
+            // Field 0 of hk_root_descriptor_table is always its own GPU VA (reflection)
+            store_le64(rbytes, root_va);
+            if (AGX_LIKELY(alloc_root >= 0xa8u)) {
+                // Write cs.constant_data_addr (0x88) and zero group_count/base_group[3] (0x90..0xa8)
+                store_le64(rbytes + 0x88u, tmpl->const_data_va);
+                store_le64(rbytes + 0x90u, 0ULL);
+                store_le64(rbytes + 0x98u, 0ULL);
+                store_le64(rbytes + 0xa0u, 0ULL);
+            } else if (alloc_root >= 144u) {
+                store_le64(rbytes + 136u, tmpl->const_data_va);
+            }
+            if (AGX_LIKELY(push_args && push_bytes > 0)) {
+                std::memcpy(rbytes + tmpl->push_offset_bytes, push_args, push_bytes);
+            }
+            if (AGX_UNLIKELY(tmpl->max_push_dma_bytes > push_bytes)) {
+                std::memset(rbytes + tmpl->push_offset_bytes + push_bytes, 0,
+                            tmpl->max_push_dma_bytes - push_bytes);
+            }
+        }
+    }
+
+    // Reserve 64B-aligned slot in the stream's USC Ioto arena (bit 40 set!)
+    const size_t ioto_off = agx_align_up(s->ioto_offset, AGX_IOTO_PROGRAM_ALIGN);
+    const size_t written  = tmpl->bytes.size();
+    if (AGX_UNLIKELY(ioto_off + written > s->ioto_bo->alloc_size)) {
+        AGX_LOG_ERROR("CDM USC Ioto arena overflow (%zu + %zu / %zu)",
+                      ioto_off, written, s->ioto_bo->alloc_size);
+        return false;
+    }
+
+    uint8_t * dst = static_cast<uint8_t *>(s->ioto_bo->cpu_ptr) + ioto_off;
+    std::memcpy(dst, tmpl->bytes.data(), written);
+    if (AGX_LIKELY(tmpl->reloc_count == 1u)) {
+        const uint64_t addr = root_va + tmpl->reloc0.root_delta;
+        store_le64(dst + tmpl->reloc0.byte_off,
+                   tmpl->reloc0.dest_mask_lo | pack_ldimm_val(static_cast<uint32_t>(addr)));
+        if (AGX_UNLIKELY(!s->arg_bo_single_hi32)) {
+            store_le64(dst + tmpl->reloc0.byte_off + 8u,
+                       tmpl->reloc0.dest_mask_hi | pack_ldimm_val(static_cast<uint32_t>(addr >> 32)));
+        }
+    } else if (tmpl->reloc_count > 1u) {
+        if (AGX_LIKELY(s->arg_bo_single_hi32)) {
+            for (const auto & rel : tmpl->relocs) {
+                const uint64_t addr = root_va + rel.root_delta;
+                store_le64(dst + rel.byte_off,
+                           rel.dest_mask_lo | pack_ldimm_val(static_cast<uint32_t>(addr)));
+            }
+        } else {
+            for (const auto & rel : tmpl->relocs) {
+                const uint64_t addr = root_va + rel.root_delta;
+                store_le64(dst + rel.byte_off,
+                           rel.dest_mask_lo | pack_ldimm_val(static_cast<uint32_t>(addr)));
+                store_le64(dst + rel.byte_off + 8u,
+                           rel.dest_mask_hi | pack_ldimm_val(static_cast<uint32_t>(addr >> 32)));
+            }
+        }
+    }
+
+    s->ioto_offset = ioto_off + written;
+    *out_program_va = s->ioto_bo->gpu_va + ioto_off;
+    return true;
 }
 
 static bool prepare_launch_ioto(agx_cdm_stream *   s,
@@ -794,79 +975,12 @@ static bool prepare_launch_ioto(agx_cdm_stream *   s,
     if (!tmpl) {
         return false;
     }
-
-    // Upload hk_root_descriptor_table slice with push constants at push_offset_bytes.
-    // Avoids full 1,088B memset per dispatch (~8x less CPU/SLC write traffic) by explicitly
-    // writing every live field (`root_va`, `const_data_va`, `group_count`/`base_group`, `push[]` + tail).
-    uint64_t root_va = 0;
-    if (kernel->uses_root || !kernel->uniform_dma.empty() || push_bytes > 0) {
-        const size_t root_size = std::max<size_t>(
-            kernel->root_size_bytes,
-            static_cast<size_t>(kernel->push_offset_bytes) + agx_align_up(push_bytes, 16u));
-        const size_t alloc_root = std::max<size_t>(root_size, 64u);
-        void * root_cpu = nullptr;
-        root_va = alloc_args_internal(s, alloc_root, 16u, &root_cpu);
-        if (root_va == 0) {
-            return false;
-        }
-        auto * rbytes = static_cast<uint8_t *>(root_cpu);
-        if (tmpl->needs_full_zero) {
-            std::memset(rbytes, 0, alloc_root);
-        } else if (alloc_root >= 0xa8u) {
-            // Write cs.constant_data_addr (0x88) and zero group_count/base_group[3] (0x90..0xa8)
-            const uint64_t cdata = kernel->const_data_va;
-            std::memcpy(rbytes + 0x88u, &cdata, sizeof(uint64_t));
-            std::memset(rbytes + 0x90u, 0, 24u);
-        } else if (alloc_root >= 144u) {
-            const uint64_t cdata = kernel->const_data_va;
-            std::memcpy(rbytes + 136u, &cdata, sizeof(uint64_t));
-        }
-        // Field 0 of hk_root_descriptor_table is always its own GPU VA (reflection)
-        std::memcpy(rbytes, &root_va, sizeof(root_va));
-        if (tmpl->needs_full_zero && kernel->const_data_va != 0 && alloc_root >= 144u) {
-            std::memcpy(rbytes + 136u, &kernel->const_data_va, sizeof(uint64_t));
-        }
-        // Copy push constants into root.push[] and zero any unread DMA tail
-        if (push_args && push_bytes > 0) {
-            std::memcpy(rbytes + kernel->push_offset_bytes, push_args, push_bytes);
-        }
-        if (!tmpl->needs_full_zero && tmpl->max_push_dma_bytes > push_bytes) {
-            std::memset(rbytes + kernel->push_offset_bytes + push_bytes, 0,
-                        tmpl->max_push_dma_bytes - push_bytes);
-        }
-    }
-
-    // Reserve 64B-aligned slot in the stream's USC Ioto arena (bit 40 set!)
-    const size_t ioto_off = agx_align_up(s->ioto_offset, AGX_IOTO_PROGRAM_ALIGN);
-    const size_t written  = tmpl->bytes.size();
-    if (ioto_off + written > s->ioto_bo->alloc_size) {
-        AGX_LOG_ERROR("CDM USC Ioto arena overflow (%zu + %zu / %zu)",
-                      ioto_off, written, s->ioto_bo->alloc_size);
-        return false;
-    }
-
-    uint8_t * dst = static_cast<uint8_t *>(s->ioto_bo->cpu_ptr) + ioto_off;
-    std::memcpy(dst, tmpl->bytes.data(), written);
-    if (tmpl->reloc_count == 1u) {
-        const uint64_t addr = root_va + tmpl->reloc0.root_delta;
-        pack_ldimm_long(tmpl->reloc0.dest_half, static_cast<uint32_t>(addr), dst + tmpl->reloc0.byte_off);
-        pack_ldimm_long(static_cast<uint16_t>(tmpl->reloc0.dest_half + 2u),
-                        static_cast<uint32_t>(addr >> 32), dst + tmpl->reloc0.byte_off + 8u);
-    } else if (tmpl->reloc_count > 1u) {
-        for (const auto & rel : tmpl->relocs) {
-            const uint64_t addr = root_va + rel.root_delta;
-            pack_ldimm_long(rel.dest_half, static_cast<uint32_t>(addr), dst + rel.byte_off);
-            pack_ldimm_long(static_cast<uint16_t>(rel.dest_half + 2u),
-                            static_cast<uint32_t>(addr >> 32), dst + rel.byte_off + 8u);
-        }
-    }
-
-    s->ioto_offset = ioto_off + written;
-    *out_program_va = s->ioto_bo->gpu_va + ioto_off;
-    return true;
+    const size_t push_end = static_cast<size_t>(tmpl->push_offset_bytes) + agx_align_up(push_bytes, 16u);
+    const size_t alloc_root = std::max<size_t>(tmpl->alloc_root_min, push_end);
+    return prepare_launch_ioto_with_tmpl(s, tmpl, push_args, push_bytes, alloc_root, out_program_va);
 }
 
-static void maybe_elide_previous_barrier(agx_cdm_stream * s) {
+static inline void maybe_elide_previous_barrier(agx_cdm_stream * s) {
     // Pillar 6 barrier elision: if the previous launch requested AGX_BARRIER_NONE
     // and nothing subsequently strengthened its trailing weak barrier, overwrite
     // that trailing 4-byte record directly with the next launch so independent
@@ -883,59 +997,84 @@ static void maybe_elide_previous_barrier(agx_cdm_stream * s) {
     }
 }
 
-bool agx_cdm_dispatch_threads(agx_cdm_stream *   s,
-                              const agx_kernel * kernel,
-                              uint32_t           global_x,
-                              uint32_t           global_y,
-                              uint32_t           global_z,
-                              const void *       push_args,
-                              size_t             push_bytes,
-                              agx_barrier_mode   post_barrier) {
-    if (!s || !kernel || s->terminated) {
+static inline bool dispatch_threads_impl(agx_cdm_stream *   s,
+                                         const agx_kernel * kernel,
+                                         uint32_t           global_x,
+                                         uint32_t           global_y,
+                                         uint32_t           global_z,
+                                         const void *       push_args,
+                                         size_t             push_bytes,
+                                         agx_barrier_mode   post_barrier) {
+    if (AGX_UNLIKELY(!s || !kernel || s->terminated || kernel->shader_va == 0)) {
         return false;
     }
-    if (global_x == 0 || global_y == 0 || global_z == 0) {
+    if (AGX_UNLIKELY(global_x == 0 || global_y == 0 || global_z == 0)) {
         return true;
     }
-    const size_t est_root_bytes = std::max<size_t>(
-        kernel->root_size_bytes,
-        static_cast<size_t>(kernel->push_offset_bytes) + agx_align_up(push_bytes, 16u));
-    if (!maybe_auto_flush_chunk(s, AGX3_CDM_DIRECT_LAUNCH_BYTES, 4096u, std::max<size_t>(est_root_bytes, 64u))) {
-        return false;
-    }
-    if (s->cmd_offset + AGX3_CDM_DIRECT_LAUNCH_BYTES + AGX3_CDM_BARRIER_BYTES + AGX3_CDM_TERMINATE_BYTES >
-        s->cmd_bo->alloc_size) {
-        AGX_LOG_ERROR("CDM command buffer overflow (%zu / %zu)", s->cmd_offset, s->cmd_bo->alloc_size);
+    if (AGX_UNLIKELY(push_bytes > AGX_MAX_PUSH_BYTES)) {
+        AGX_LOG_ERROR("Push constant size %zu exceeds AGX_MAX_PUSH_BYTES (%u)",
+                      push_bytes, AGX_MAX_PUSH_BYTES);
         return false;
     }
 
+    const agx_ioto_template * tmpl = get_or_build_ioto_template(s, kernel, false);
+    if (AGX_UNLIKELY(!tmpl || !tmpl->local_size_valid)) {
+        return false;
+    }
+
+    const size_t push_end   = static_cast<size_t>(tmpl->push_offset_bytes) + agx_align_up(push_bytes, 16u);
+    const size_t alloc_root = std::max<size_t>(tmpl->alloc_root_min, push_end);
+    const size_t ioto_bytes = tmpl->bytes.size();
+
+    // Fast single-branch capacity check before touching rings; auto-flush only on overflow.
+    if (AGX_UNLIKELY(s->cmd_offset + AGX3_CDM_DIRECT_LAUNCH_BYTES + AGX3_CDM_BARRIER_BYTES + AGX3_CDM_TERMINATE_BYTES > s->cmd_bo->alloc_size ||
+                     agx_align_up(s->ioto_offset, AGX_IOTO_PROGRAM_ALIGN) + ioto_bytes > s->ioto_bo->alloc_size ||
+                     agx_align_up(s->arg_offset, 16u) + alloc_root > s->arg_bo->alloc_size)) {
+        if (!maybe_auto_flush_chunk(s, AGX3_CDM_DIRECT_LAUNCH_BYTES, ioto_bytes, alloc_root)) {
+            return false;
+        }
+        if (s->cmd_offset + AGX3_CDM_DIRECT_LAUNCH_BYTES + AGX3_CDM_BARRIER_BYTES + AGX3_CDM_TERMINATE_BYTES >
+            s->cmd_bo->alloc_size) {
+            AGX_LOG_ERROR("CDM command buffer overflow (%zu / %zu)", s->cmd_offset, s->cmd_bo->alloc_size);
+            return false;
+        }
+    }
+
     uint64_t program_va = 0;
-    if (!prepare_launch_ioto(s, kernel, push_args, push_bytes, false, &program_va)) {
+    if (AGX_UNLIKELY(!prepare_launch_ioto_with_tmpl(s, tmpl, push_args, push_bytes, alloc_root, &program_va))) {
+        return false;
+    }
+    if (AGX_UNLIKELY(program_va == 0 || (program_va & 0x3fULL) != 0 || program_va >= (1ULL << 48))) {
+        AGX_LOG_ERROR("Invalid Ioto program VA 0x%llx for kernel '%s'",
+                      (unsigned long long) program_va, kernel->name.c_str());
         return false;
     }
 
     maybe_elide_previous_barrier(s);
 
-    const uint32_t global_size[3] = { global_x, global_y, global_z };
-    uint8_t * cmd = static_cast<uint8_t *>(s->cmd_bo->cpu_ptr);
-    if (!agx_cdm_pack_direct_launch(program_va, global_size, kernel->local_size,
-                                    kernel->ti_spill_bytes, kernel->ti_ipr_bytes,
-                                    cmd + s->cmd_offset)) {
-        AGX_LOG_ERROR("Failed to pack direct CDM launch for kernel '%s'", kernel->name.c_str());
-        return false;
-    }
-    s->cmd_offset += AGX3_CDM_DIRECT_LAUNCH_BYTES;
-
-    // HAL200 launches always end with a barrier record; AGX_BARRIER_NONE writes a
-    // weak tail that the next launch will elide in place if still unstrengthened.
+    const bool is_1d = (global_y < 2u && global_z < 2u);
     const agx_barrier_mode emit_mode =
         (post_barrier == AGX_BARRIER_NONE) ? AGX_BARRIER_WEAK_WFI : post_barrier;
     const uint32_t bword = agx_cdm_encode_barrier_word(emit_mode);
-    s->last_barrier_off     = s->cmd_offset;
+
+    // Emit 40-byte HAL200 direct launch + 4-byte trailing barrier in one compact 44B store burst
+    uint8_t * dst = static_cast<uint8_t *>(s->cmd_bo->cpu_ptr) + s->cmd_offset;
+    store_le32(dst + 0,  is_1d ? tmpl->launch_w0_1d : tmpl->launch_w0_nd);
+    store_le32(dst + 4,  static_cast<uint32_t>(((program_va >> 38) & 0x3ffu) << 22) | tmpl->launch_w1);
+    store_le32(dst + 8,  static_cast<uint32_t>(program_va >> 6));
+    store_le32(dst + 12, 0x40000000u | static_cast<uint32_t>((program_va >> 40) & 0xffu));
+    store_le32(dst + 16, global_x);
+    store_le32(dst + 20, global_y);
+    store_le32(dst + 24, global_z);
+    store_le32(dst + 28, tmpl->local_size[0]);
+    store_le32(dst + 32, tmpl->local_size[1]);
+    store_le32(dst + 36, tmpl->local_size[2]);
+    store_le32(dst + 40, bword);
+
+    s->last_barrier_off     = s->cmd_offset + AGX3_CDM_DIRECT_LAUNCH_BYTES;
     s->last_barrier_mode    = emit_mode;
     s->last_launch_elidable = (post_barrier == AGX_BARRIER_NONE);
-    store_le32(cmd + s->cmd_offset, bword);
-    s->cmd_offset += AGX3_CDM_BARRIER_BYTES;
+    s->cmd_offset          += AGX3_CDM_DIRECT_LAUNCH_BYTES + AGX3_CDM_BARRIER_BYTES;
 
     s->stats.dispatches++;
     if (emit_mode == AGX_BARRIER_WEAK_WFI) {
@@ -948,6 +1087,18 @@ bool agx_cdm_dispatch_threads(agx_cdm_stream *   s,
     return true;
 }
 
+bool agx_cdm_dispatch_threads(agx_cdm_stream *   s,
+                              const agx_kernel * kernel,
+                              uint32_t           global_x,
+                              uint32_t           global_y,
+                              uint32_t           global_z,
+                              const void *       push_args,
+                              size_t             push_bytes,
+                              agx_barrier_mode   post_barrier) {
+    return dispatch_threads_impl(s, kernel, global_x, global_y, global_z,
+                                 push_args, push_bytes, post_barrier);
+}
+
 bool agx_cdm_dispatch(agx_cdm_stream *   s,
                       const agx_kernel * kernel,
                       uint32_t           grid_x,
@@ -956,20 +1107,20 @@ bool agx_cdm_dispatch(agx_cdm_stream *   s,
                       const void *       push_args,
                       size_t             push_bytes,
                       agx_barrier_mode   post_barrier) {
-    if (!kernel) {
+    if (AGX_UNLIKELY(!kernel)) {
         return false;
     }
     const uint64_t gx = static_cast<uint64_t>(grid_x) * kernel->local_size[0];
     const uint64_t gy = static_cast<uint64_t>(grid_y) * kernel->local_size[1];
     const uint64_t gz = static_cast<uint64_t>(grid_z) * kernel->local_size[2];
-    if (gx > UINT32_MAX || gy > UINT32_MAX || gz > UINT32_MAX) {
+    if (AGX_UNLIKELY((gx | gy | gz) > UINT32_MAX)) {
         return false;
     }
-    return agx_cdm_dispatch_threads(s, kernel,
-                                    static_cast<uint32_t>(gx),
-                                    static_cast<uint32_t>(gy),
-                                    static_cast<uint32_t>(gz),
-                                    push_args, push_bytes, post_barrier);
+    return dispatch_threads_impl(s, kernel,
+                                 static_cast<uint32_t>(gx),
+                                 static_cast<uint32_t>(gy),
+                                 static_cast<uint32_t>(gz),
+                                 push_args, push_bytes, post_barrier);
 }
 
 bool agx_cdm_dispatch_indirect(agx_cdm_stream *   s,
@@ -1060,12 +1211,14 @@ int agx_cdm_submit_recorded(agx_cdm_stream * s, bool wait, uint64_t * out_gpu_ns
         return -EINVAL;
     }
 
-    // Reset hardware timestamp slots before submission
-    if (s->ts_bo) {
+    // Only attach kernel/firmware timestamp object when timestamps are requested or stats enabled.
+    const bool want_ts = ((out_gpu_ns != nullptr) || g_agx_stats_enabled()) && (s->ts_bo != nullptr);
+    if (want_ts) {
         auto * ts = static_cast<uint64_t *>(s->ts_bo->cpu_ptr);
         ts[0] = 0;
         ts[1] = 0;
     }
+    s->last_submit_has_ts = want_ts;
 
     // Ensure all CPU writes to command stream, Ioto arena, and arg ring are visible
     // to the GPU before ringing the kernel submission doorbell.
@@ -1076,7 +1229,7 @@ int agx_cdm_submit_recorded(agx_cdm_stream * s, bool wait, uint64_t * out_gpu_ns
         s->dev,
         s->cmd_bo->gpu_va,
         s->cmd_bo->gpu_va + s->cmd_offset,
-        s->ts_bo ? s->ts_bo->ts_obj_handle : 0u,
+        want_ts ? s->ts_bo->ts_obj_handle : 0u,
         0u,
         sizeof(uint64_t),
         &pt,
@@ -1086,6 +1239,7 @@ int agx_cdm_submit_recorded(agx_cdm_stream * s, bool wait, uint64_t * out_gpu_ns
     }
 
     s->in_flight_point = pt;
+    s->submits_since_reset++;
     s->stats.submits++;
 
     if (wait) {
@@ -1119,9 +1273,16 @@ int agx_cdm_submit(agx_cdm_stream * s, bool wait, uint64_t * out_gpu_ns) {
     const auto t_sub = emit_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
     uint64_t gpu_ns_local = 0;
-    const int ret = agx_cdm_submit_recorded(s, wait, &gpu_ns_local);
+    const int ret = agx_cdm_submit_recorded(s, wait, (emit_stats || out_gpu_ns) ? &gpu_ns_local : nullptr);
     if (out_gpu_ns) {
         *out_gpu_ns = gpu_ns_local;
+    }
+
+    if (ret == 0) {
+        s->last_rec_disp = s->stats.dispatches          - s->stats_at_reset.dispatches;
+        s->last_rec_ind  = s->stats.indirect_dispatches - s->stats_at_reset.indirect_dispatches;
+        s->last_rec_usc  = s->stats.strong_usc_barriers - s->stats_at_reset.strong_usc_barriers;
+        s->last_rec_elid = s->stats.elided_barriers     - s->stats_at_reset.elided_barriers;
     }
 
     if (emit_stats && ret == 0) {
@@ -1131,16 +1292,12 @@ int agx_cdm_submit(agx_cdm_stream * s, bool wait, uint64_t * out_gpu_ns) {
             : 0.0;
         const double wait_ms = std::chrono::duration<double, std::milli>(t_done - t_sub).count();
         const double gpu_ms  = static_cast<double>(gpu_ns_local) * 1e-6;
-        const uint64_t disp  = s->stats.dispatches           - s->stats_at_reset.dispatches;
-        const uint64_t ind   = s->stats.indirect_dispatches  - s->stats_at_reset.indirect_dispatches;
-        const uint64_t usc_b = s->stats.strong_usc_barriers  - s->stats_at_reset.strong_usc_barriers;
-        const uint64_t elid  = s->stats.elided_barriers      - s->stats_at_reset.elided_barriers;
         AGX_LOG_INFO("stats submit=#%llu | cpu_encode=%.3fms gpu=%.3fms wait=%.3fms (drm_oh=%.3fms) | "
                      "disp=%llu (ind=%llu) strong_usc=%llu elided=%llu | ring(cmd=%.1fK ioto=%.1fK arg=%.1fK tmpl=%zu)",
                      (unsigned long long) s->stats.submits,
                      encode_ms, gpu_ms, wait_ms, std::max(0.0, wait_ms - gpu_ms),
-                     (unsigned long long) disp, (unsigned long long) ind,
-                     (unsigned long long) usc_b, (unsigned long long) elid,
+                     (unsigned long long) s->last_rec_disp, (unsigned long long) s->last_rec_ind,
+                     (unsigned long long) s->last_rec_usc, (unsigned long long) s->last_rec_elid,
                      static_cast<double>(s->cmd_offset) / 1024.0,
                      static_cast<double>(s->ioto_offset) / 1024.0,
                      static_cast<double>(s->arg_offset) / 1024.0,
@@ -1167,7 +1324,7 @@ int agx_cdm_wait(agx_cdm_stream * s, uint64_t * out_gpu_ns) {
     }
 
     uint64_t gpu_ns = 0;
-    if (s->ts_bo) {
+    if (s->last_submit_has_ts && s->ts_bo) {
         const auto * ts = static_cast<const uint64_t *>(s->ts_bo->cpu_ptr);
         if (ts[1] >= ts[0]) {
             gpu_ns = agx_drm_ticks_to_ns(s->dev, ts[1] - ts[0]);
@@ -1213,4 +1370,112 @@ void agx_cdm_reset_stats(agx_cdm_stream * s) {
 
 bool agx_cdm_is_empty(const agx_cdm_stream * s) {
     return !s || s->cmd_offset == 0;
+}
+
+bool agx_cdm_replay_enabled() {
+    const char * v = std::getenv("GGML_AGX_NO_REPLAY");
+    return !(v && v[0] && v[0] != '0');
+}
+
+uint64_t agx_cdm_stream_record_gen(const agx_cdm_stream * s) {
+    return s ? s->record_gen : 0ULL;
+}
+
+uint64_t agx_cdm_stream_submit_count(const agx_cdm_stream * s) {
+    return s ? s->stats.submits : 0ULL;
+}
+
+bool agx_cdm_stream_is_replayable(const agx_cdm_stream * s) {
+    return s && s->terminated && s->cmd_offset > 0 && s->submits_since_reset >= 1u;
+}
+
+void agx_cdm_stream_invalidate_replay(agx_cdm_stream * s) {
+    if (s) {
+        s->replay.valid = false;
+    }
+}
+
+void agx_cdm_stream_tag_replay(agx_cdm_stream * s,
+                               uint64_t         graph_uid,
+                               int              n_nodes,
+                               const void *     first_node,
+                               const void *     last_node,
+                               uint64_t         bo_epoch) {
+    if (!s || graph_uid == 0 || n_nodes <= 0 || !agx_cdm_stream_is_replayable(s)) {
+        agx_cdm_stream_invalidate_replay(s);
+        return;
+    }
+    s->replay.valid      = true;
+    s->replay.graph_uid  = graph_uid;
+    s->replay.n_nodes    = n_nodes;
+    s->replay.first_node = first_node;
+    s->replay.last_node  = last_node;
+    s->replay.bo_epoch   = bo_epoch;
+    s->replay.record_gen = s->record_gen;
+    s->replay.hit_count  = 0;
+}
+
+bool agx_cdm_stream_try_replay(agx_cdm_stream * s,
+                               uint64_t         graph_uid,
+                               int              n_nodes,
+                               const void *     first_node,
+                               const void *     last_node,
+                               uint64_t         bo_epoch,
+                               bool             wait,
+                               uint64_t *       out_gpu_ns,
+                               int *            out_ret) {
+    if (AGX_UNLIKELY(!s || graph_uid == 0 || n_nodes <= 0)) {
+        return false;
+    }
+    const bool emit_stats = g_agx_stats_enabled();
+    const auto t_enter = emit_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
+    if (!s->replay.valid ||
+        s->replay.graph_uid != graph_uid ||
+        s->replay.n_nodes != n_nodes ||
+        s->replay.first_node != first_node ||
+        s->replay.last_node != last_node ||
+        s->replay.bo_epoch != bo_epoch ||
+        s->replay.record_gen != s->record_gen ||
+        !s->terminated ||
+        s->cmd_offset == 0 ||
+        !agx_cdm_replay_enabled() ||
+        agx_drm_vm_error(s->dev) != 0) {
+        return false;
+    }
+
+    const auto t_sub = emit_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    uint64_t gpu_ns_local = 0;
+    const int ret = agx_cdm_submit_recorded(s, wait, (emit_stats || out_gpu_ns) ? &gpu_ns_local : nullptr);
+    if (out_gpu_ns) {
+        *out_gpu_ns = gpu_ns_local;
+    }
+    if (out_ret) {
+        *out_ret = ret;
+    }
+    if (ret != 0) {
+        s->replay.valid = false;
+        return true;
+    }
+
+    s->replay.hit_count++;
+    s->stats.replays++;
+    if (emit_stats) {
+        const auto t_done = std::chrono::steady_clock::now();
+        const double encode_ms = std::chrono::duration<double, std::milli>(t_sub - t_enter).count();
+        const double wait_ms   = std::chrono::duration<double, std::milli>(t_done - t_sub).count();
+        const double gpu_ms    = static_cast<double>(gpu_ns_local) * 1e-6;
+        AGX_LOG_INFO("stats submit=#%llu [REPLAY #%llu] | cpu_encode=%.3fms gpu=%.3fms wait=%.3fms (drm_oh=%.3fms) | "
+                     "disp=%llu (ind=%llu) strong_usc=%llu elided=%llu | ring(cmd=%.1fK ioto=%.1fK arg=%.1fK tmpl=%zu)",
+                     (unsigned long long) s->stats.submits,
+                     (unsigned long long) s->replay.hit_count,
+                     encode_ms, gpu_ms, wait_ms, std::max(0.0, wait_ms - gpu_ms),
+                     (unsigned long long) s->last_rec_disp, (unsigned long long) s->last_rec_ind,
+                     (unsigned long long) s->last_rec_usc, (unsigned long long) s->last_rec_elid,
+                     static_cast<double>(s->cmd_offset) / 1024.0,
+                     static_cast<double>(s->ioto_offset) / 1024.0,
+                     static_cast<double>(s->arg_offset) / 1024.0,
+                     s->ioto_templates.size());
+    }
+    return true;
 }
