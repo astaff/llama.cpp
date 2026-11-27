@@ -15,10 +15,22 @@ struct agx_ioto_reloc {
 };
 
 struct agx_ioto_template {
-    uint64_t                    shader_va = 0;
-    uint64_t                    rodata_va = 0;
+    uint64_t                    shader_va          = 0;
+    uint64_t                    rodata_va          = 0;
+    uint32_t                    max_push_dma_bytes = 0;
+    bool                        needs_full_zero    = false;
+    uint8_t                     reloc_count        = 0;
+    agx_ioto_reloc              reloc0             = { 0, 0, 0 };
     std::vector<uint8_t>        bytes;
     std::vector<agx_ioto_reloc> relocs;
+};
+
+struct agx_ioto_fast_entry {
+    const agx_kernel *  kernel      = nullptr;
+    uint64_t            shader_va   = 0;
+    uint64_t            rodata_va   = 0;
+    agx_ioto_template * tmpl        = nullptr;
+    bool                is_indirect = false;
 };
 
 namespace {
@@ -530,8 +542,7 @@ struct agx_cdm_stream {
 
     // Per-(shader_va, is_indirect) pre-templated G17P Ioto programs (zero heap allocs/dispatch!)
     std::unordered_map<uint64_t, agx_ioto_template> ioto_templates;
-    uint64_t            last_tmpl_key = 0;
-    agx_ioto_template * last_tmpl_ptr = nullptr;
+    agx_ioto_fast_entry fast_cache[64] = {};
 
     // Lightweight GGML_AGX_STATS=1 telemetry (CPU encode vs GPU execute split)
     std::chrono::steady_clock::time_point reset_tp{};
@@ -657,24 +668,24 @@ static bool maybe_auto_flush_chunk(agx_cdm_stream * s,
 static const agx_ioto_template * get_or_build_ioto_template(agx_cdm_stream *   s,
                                                             const agx_kernel * kernel,
                                                             bool               is_indirect) {
-    const uint64_t key = (kernel->shader_va << 1) | (is_indirect ? 1ULL : 0ULL);
     const uint64_t rodata_va = (kernel->rodata_size_16 != 0 && kernel->code_bo)
                                    ? (kernel->code_bo->gpu_va + kernel->rodata_offset)
                                    : 0ULL;
 
-    if (s->last_tmpl_ptr && s->last_tmpl_key == key &&
-        s->last_tmpl_ptr->shader_va == kernel->shader_va &&
-        s->last_tmpl_ptr->rodata_va == rodata_va) {
-        return s->last_tmpl_ptr;
+    const size_t fidx = ((reinterpret_cast<uintptr_t>(kernel) >> 6) ^ (is_indirect ? 31u : 0u)) & 63u;
+    agx_ioto_fast_entry & fe = s->fast_cache[fidx];
+    if (fe.kernel == kernel && fe.is_indirect == is_indirect && fe.tmpl != nullptr &&
+        fe.shader_va == kernel->shader_va && fe.rodata_va == rodata_va) {
+        return fe.tmpl;
     }
 
+    const uint64_t key = (kernel->shader_va << 1) | (is_indirect ? 1ULL : 0ULL);
     auto it = s->ioto_templates.find(key);
     if (it != s->ioto_templates.end() &&
         it->second.shader_va == kernel->shader_va &&
         it->second.rodata_va == rodata_va) {
-        s->last_tmpl_key = key;
-        s->last_tmpl_ptr = &it->second;
-        return s->last_tmpl_ptr;
+        fe = { kernel, kernel->shader_va, rodata_va, &it->second, is_indirect };
+        return fe.tmpl;
     }
 
     // Build Ioto uniform range list in optimal base-sharing order:
@@ -695,12 +706,25 @@ static const agx_ioto_template * get_or_build_ioto_template(agx_cdm_stream *   s
         };
     }
 
+    uint32_t max_push_dma_bytes = 0;
+    bool     needs_full_zero    = false;
+
     const size_t dma_start = range_count;
     for (const auto & span : kernel->uniform_dma) {
         if (span.set != -1 || range_count >= 31) {
             continue;
         }
         const uint16_t aligned_halfs = static_cast<uint16_t>((span.halfs + 1u) & ~1u);
+        const uint32_t span_bytes    = static_cast<uint32_t>(aligned_halfs) * 2u;
+        const uint32_t span_beg      = span.offset_B;
+        const uint32_t span_end      = span_beg + span_bytes;
+        if (span_beg >= kernel->push_offset_bytes &&
+            span_end <= kernel->push_offset_bytes + AGX_MAX_PUSH_BYTES) {
+            max_push_dma_bytes = std::max(max_push_dma_bytes, span_end - kernel->push_offset_bytes);
+        } else if (!((span_beg == 0u && span_end <= 8u) ||
+                     (span_beg >= 0x88u && span_end <= 0xa8u))) {
+            needs_full_zero = true;
+        }
         ranges[range_count++] = {
             span.dest_half,
             aligned_halfs,
@@ -738,12 +762,17 @@ static const agx_ioto_template * get_or_build_ioto_template(agx_cdm_stream *   s
         AGX_LOG_ERROR("Failed to compose G17P Ioto template for kernel '%s'", kernel->name.c_str());
         return nullptr;
     }
+    tmpl.max_push_dma_bytes = max_push_dma_bytes;
+    tmpl.needs_full_zero    = needs_full_zero;
+    tmpl.reloc_count        = static_cast<uint8_t>(std::min<size_t>(tmpl.relocs.size(), 255u));
+    if (!tmpl.relocs.empty()) {
+        tmpl.reloc0 = tmpl.relocs[0];
+    }
 
     auto & slot = s->ioto_templates[key];
     slot = std::move(tmpl);
-    s->last_tmpl_key = key;
-    s->last_tmpl_ptr = &slot;
-    return s->last_tmpl_ptr;
+    fe = { kernel, kernel->shader_va, rodata_va, &slot, is_indirect };
+    return fe.tmpl;
 }
 
 static bool prepare_launch_ioto(agx_cdm_stream *   s,
@@ -761,7 +790,14 @@ static bool prepare_launch_ioto(agx_cdm_stream *   s,
         return false;
     }
 
+    const agx_ioto_template * tmpl = get_or_build_ioto_template(s, kernel, is_indirect);
+    if (!tmpl) {
+        return false;
+    }
+
     // Upload hk_root_descriptor_table slice with push constants at push_offset_bytes.
+    // Avoids full 1,088B memset per dispatch (~8x less CPU/SLC write traffic) by explicitly
+    // writing every live field (`root_va`, `const_data_va`, `group_count`/`base_group`, `push[]` + tail).
     uint64_t root_va = 0;
     if (kernel->uses_root || !kernel->uniform_dma.empty() || push_bytes > 0) {
         const size_t root_size = std::max<size_t>(
@@ -774,22 +810,30 @@ static bool prepare_launch_ioto(agx_cdm_stream *   s,
             return false;
         }
         auto * rbytes = static_cast<uint8_t *>(root_cpu);
-        std::memset(rbytes, 0, alloc_root);
+        if (tmpl->needs_full_zero) {
+            std::memset(rbytes, 0, alloc_root);
+        } else if (alloc_root >= 0xa8u) {
+            // Write cs.constant_data_addr (0x88) and zero group_count/base_group[3] (0x90..0xa8)
+            const uint64_t cdata = kernel->const_data_va;
+            std::memcpy(rbytes + 0x88u, &cdata, sizeof(uint64_t));
+            std::memset(rbytes + 0x90u, 0, 24u);
+        } else if (alloc_root >= 144u) {
+            const uint64_t cdata = kernel->const_data_va;
+            std::memcpy(rbytes + 136u, &cdata, sizeof(uint64_t));
+        }
         // Field 0 of hk_root_descriptor_table is always its own GPU VA (reflection)
         std::memcpy(rbytes, &root_va, sizeof(root_va));
-        // If shader has immutable NIR constant data, place at cs.constant_data_addr (offset 136 = 8 + 16*8)
-        if (kernel->const_data_va != 0 && alloc_root >= 144u) {
+        if (tmpl->needs_full_zero && kernel->const_data_va != 0 && alloc_root >= 144u) {
             std::memcpy(rbytes + 136u, &kernel->const_data_va, sizeof(uint64_t));
         }
-        // Copy push constants into root.push[]
+        // Copy push constants into root.push[] and zero any unread DMA tail
         if (push_args && push_bytes > 0) {
             std::memcpy(rbytes + kernel->push_offset_bytes, push_args, push_bytes);
         }
-    }
-
-    const agx_ioto_template * tmpl = get_or_build_ioto_template(s, kernel, is_indirect);
-    if (!tmpl) {
-        return false;
+        if (!tmpl->needs_full_zero && tmpl->max_push_dma_bytes > push_bytes) {
+            std::memset(rbytes + kernel->push_offset_bytes + push_bytes, 0,
+                        tmpl->max_push_dma_bytes - push_bytes);
+        }
     }
 
     // Reserve 64B-aligned slot in the stream's USC Ioto arena (bit 40 set!)
@@ -803,11 +847,18 @@ static bool prepare_launch_ioto(agx_cdm_stream *   s,
 
     uint8_t * dst = static_cast<uint8_t *>(s->ioto_bo->cpu_ptr) + ioto_off;
     std::memcpy(dst, tmpl->bytes.data(), written);
-    for (const auto & rel : tmpl->relocs) {
-        const uint64_t addr = root_va + rel.root_delta;
-        pack_ldimm_long(rel.dest_half, static_cast<uint32_t>(addr), dst + rel.byte_off);
-        pack_ldimm_long(static_cast<uint16_t>(rel.dest_half + 2u),
-                        static_cast<uint32_t>(addr >> 32), dst + rel.byte_off + 8u);
+    if (tmpl->reloc_count == 1u) {
+        const uint64_t addr = root_va + tmpl->reloc0.root_delta;
+        pack_ldimm_long(tmpl->reloc0.dest_half, static_cast<uint32_t>(addr), dst + tmpl->reloc0.byte_off);
+        pack_ldimm_long(static_cast<uint16_t>(tmpl->reloc0.dest_half + 2u),
+                        static_cast<uint32_t>(addr >> 32), dst + tmpl->reloc0.byte_off + 8u);
+    } else if (tmpl->reloc_count > 1u) {
+        for (const auto & rel : tmpl->relocs) {
+            const uint64_t addr = root_va + rel.root_delta;
+            pack_ldimm_long(rel.dest_half, static_cast<uint32_t>(addr), dst + rel.byte_off);
+            pack_ldimm_long(static_cast<uint16_t>(rel.dest_half + 2u),
+                            static_cast<uint32_t>(addr >> 32), dst + rel.byte_off + 8u);
+        }
     }
 
     s->ioto_offset = ioto_off + written;
@@ -863,19 +914,17 @@ bool agx_cdm_dispatch_threads(agx_cdm_stream *   s,
         return false;
     }
 
+    maybe_elide_previous_barrier(s);
+
     const uint32_t global_size[3] = { global_x, global_y, global_z };
-    uint8_t launch[AGX3_CDM_DIRECT_LAUNCH_BYTES];
+    uint8_t * cmd = static_cast<uint8_t *>(s->cmd_bo->cpu_ptr);
     if (!agx_cdm_pack_direct_launch(program_va, global_size, kernel->local_size,
-                                    kernel->ti_spill_bytes, kernel->ti_ipr_bytes, launch)) {
+                                    kernel->ti_spill_bytes, kernel->ti_ipr_bytes,
+                                    cmd + s->cmd_offset)) {
         AGX_LOG_ERROR("Failed to pack direct CDM launch for kernel '%s'", kernel->name.c_str());
         return false;
     }
-
-    maybe_elide_previous_barrier(s);
-
-    uint8_t * cmd = static_cast<uint8_t *>(s->cmd_bo->cpu_ptr);
-    std::memcpy(cmd + s->cmd_offset, launch, sizeof(launch));
-    s->cmd_offset += sizeof(launch);
+    s->cmd_offset += AGX3_CDM_DIRECT_LAUNCH_BYTES;
 
     // HAL200 launches always end with a barrier record; AGX_BARRIER_NONE writes a
     // weak tail that the next launch will elide in place if still unstrengthened.
@@ -953,16 +1002,14 @@ bool agx_cdm_dispatch_indirect(agx_cdm_stream *   s,
         return false;
     }
 
-    uint8_t launch[AGX3_CDM_INDIRECT_LAUNCH_BYTES];
-    if (!agx_cdm_pack_indirect_launch(program_va, geometry_va,
-                                      kernel->ti_spill_bytes, kernel->ti_ipr_bytes, launch)) {
-        return false;
-    }
-
     // Indirect launches do not elide the preceding barrier (the geometry producer must settle).
     uint8_t * cmd = static_cast<uint8_t *>(s->cmd_bo->cpu_ptr);
-    std::memcpy(cmd + s->cmd_offset, launch, sizeof(launch));
-    s->cmd_offset += sizeof(launch);
+    if (!agx_cdm_pack_indirect_launch(program_va, geometry_va,
+                                      kernel->ti_spill_bytes, kernel->ti_ipr_bytes,
+                                      cmd + s->cmd_offset)) {
+        return false;
+    }
+    s->cmd_offset += AGX3_CDM_INDIRECT_LAUNCH_BYTES;
 
     const agx_barrier_mode emit_mode =
         (post_barrier == AGX_BARRIER_NONE) ? AGX_BARRIER_WEAK_WFI : post_barrier;
