@@ -73,16 +73,18 @@ static const agx_kernel * get_or_compile_q8_mxfp8_vecmat(agx_backend_context * c
                                                          uint32_t              quant_mode,
                                                          uint32_t              batch_m,
                                                          bool                  k_split_row,
-                                                         uint32_t              wg_sgs = 0u) {
+                                                         uint32_t              wg_sgs = 0u,
+                                                         bool                  x_aligned4 = false) {
     auto * st = get_gemm_state(ctx);
     if (!st || !ctx->compiler) {
         return nullptr;
     }
-    const uint32_t eff_sgs = wg_sgs ? wg_sgs
-                                    : ((quant_mode == 0u && !k_split_row && batch_m > 1u) ? 8u : 4u);
+    const bool     shx_path = (quant_mode == 0u && !k_split_row && batch_m > 1u);
+    const uint32_t eff_sgs  = wg_sgs ? wg_sgs : (shx_path ? 8u : 4u);
+    const bool     eff_a4   = x_aligned4 && shx_path;
     char name[96];
-    std::snprintf(name, sizeof(name), "mxfp8_q8_vecmat_q%u_m%u_s%u_g%u",
-                  quant_mode, batch_m, k_split_row ? 1u : 0u, eff_sgs);
+    std::snprintf(name, sizeof(name), "mxfp8_q8_vecmat_q%u_m%u_s%u_g%u_a%u",
+                  quant_mode, batch_m, k_split_row ? 1u : 0u, eff_sgs, eff_a4 ? 1u : 0u);
     auto it = st->cache.find(name);
     if (it != st->cache.end()) {
         return it->second;
@@ -93,6 +95,7 @@ static const agx_kernel * get_or_compile_q8_mxfp8_vecmat(agx_backend_context * c
     opts.defines.push_back(std::string("BATCH_M=") + std::to_string(batch_m));
     opts.defines.push_back(std::string("K_SPLIT_ROW=") + (k_split_row ? "1" : "0"));
     opts.defines.push_back(std::string("WG_SGS=") + std::to_string(eff_sgs));
+    opts.defines.push_back(std::string("X_ALIGNED4=") + (eff_a4 ? "1" : "0"));
     opts.push_constant_bytes = sizeof(agx_gemm_push_args);
     opts.is_hot_kernel       = true;
     opts.strict_zero_spill   = true;
@@ -107,14 +110,18 @@ static const agx_kernel * get_or_compile_q8_mxfp8_vecmat(agx_backend_context * c
 static const agx_kernel * get_or_compile_mma_gemm(agx_backend_context * ctx,
                                                   agx_weight_layout     layout,
                                                   uint32_t              tile_mode,
-                                                  bool                  prec_f32) {
+                                                  bool                  prec_f32,
+                                                  bool                  x_aligned4 = false) {
     auto * st = get_gemm_state(ctx);
     if (!st || !ctx->compiler) {
         return nullptr;
     }
+    const bool pf_64x64 = (tile_mode == 0u) && !prec_f32 &&
+                          (layout == AGX_WEIGHT_NVFP4_REPACKED || layout == AGX_WEIGHT_Q8_0_REPACKED);
+    const bool eff_a4   = x_aligned4 && pf_64x64;
     char name[96];
-    std::snprintf(name, sizeof(name), "agx_mma_gemm_w%u_t%u_p%u",
-                  static_cast<uint32_t>(layout), tile_mode, prec_f32 ? 1u : 0u);
+    std::snprintf(name, sizeof(name), "agx_mma_gemm_w%u_t%u_p%u_a%u",
+                  static_cast<uint32_t>(layout), tile_mode, prec_f32 ? 1u : 0u, eff_a4 ? 1u : 0u);
     auto it = st->cache.find(name);
     if (it != st->cache.end()) {
         return it->second;
@@ -124,6 +131,7 @@ static const agx_kernel * get_or_compile_mma_gemm(agx_backend_context * ctx,
     opts.defines.push_back(std::string("WEIGHT_MODE=") + std::to_string(static_cast<uint32_t>(layout)));
     opts.defines.push_back(std::string("TILE_MODE=") + std::to_string(tile_mode));
     opts.defines.push_back(std::string("PREC_F32=") + (prec_f32 ? "1" : "0"));
+    opts.defines.push_back(std::string("X_ALIGNED4=") + (eff_a4 ? "1" : "0"));
     opts.push_constant_bytes = sizeof(agx_gemm_push_args);
     opts.is_hot_kernel       = true;
     opts.strict_zero_spill   = true;
@@ -155,10 +163,11 @@ bool agx_gemm_precompile_all(agx_backend_context * ctx) {
     for (uint32_t qm : {0u, 4u, 6u}) {
         ok &= (get_or_compile_q8_mxfp8_vecmat(ctx, qm, 1u, true) != nullptr);
     }
-    // Q8_0 repacked B=4,5,8 (DSpark verify M=2..8 at full DRAM BW via 0-conflict sh_x!)
-    ok &= (get_or_compile_q8_mxfp8_vecmat(ctx, 0u, 4u, false, 8u) != nullptr);
-    ok &= (get_or_compile_q8_mxfp8_vecmat(ctx, 0u, 5u, false, 8u) != nullptr);
-    ok &= (get_or_compile_q8_mxfp8_vecmat(ctx, 0u, 8u, false, 8u) != nullptr);
+    // Q8_0 repacked B=4,5,8 (DSpark M=4 verify at full DRAM BW via 0-conflict sh_x + f16vec2 FMA!)
+    ok &= (get_or_compile_q8_mxfp8_vecmat(ctx, 0u, 4u, false, 4u, true) != nullptr);
+    ok &= (get_or_compile_q8_mxfp8_vecmat(ctx, 0u, 4u, false, 8u, true) != nullptr);
+    ok &= (get_or_compile_q8_mxfp8_vecmat(ctx, 0u, 5u, false, 8u, true) != nullptr);
+    ok &= (get_or_compile_q8_mxfp8_vecmat(ctx, 0u, 8u, false, 8u, true) != nullptr);
 
     // 8x8 simdgroup_matrix MMA GEMM (prefill tile=0, medium tile=1, narrow-N tile=2)
     for (agx_weight_layout wl : {
@@ -168,7 +177,8 @@ bool agx_gemm_precompile_all(agx_backend_context * ctx) {
              AGX_WEIGHT_BF16,
              AGX_WEIGHT_F16,
              AGX_WEIGHT_F32}) {
-        ok &= (get_or_compile_mma_gemm(ctx, wl, 0u, false) != nullptr);
+        const bool is_pf64 = (wl == AGX_WEIGHT_NVFP4_REPACKED || wl == AGX_WEIGHT_Q8_0_REPACKED);
+        ok &= (get_or_compile_mma_gemm(ctx, wl, 0u, false, is_pf64) != nullptr);
         ok &= (get_or_compile_mma_gemm(ctx, wl, 1u, false) != nullptr);
     }
     // Wave 5 M=2..8 native 8x8 MMA tiles (TILE_MODE=3 large-N 128x8, TILE_MODE=4 medium-N 32x8 K-split)
@@ -242,12 +252,14 @@ bool agx_gemm_dispatch(agx_backend_context * ctx,
     pc.y_slice_elems = desc.y_slice_elems;
     pc.w_bcast_div   = std::max(1u, desc.w_bcast_div);
 
-    // Wave 5 M=2..8 Coalesced-Load sh_w-Staged 8x8 MMA fast path (Theorem W5.2):
-    //   - TILE_MODE=3 (64N x 8M): large-N (e.g. Q8_0 LM head 201024 -> 3,141 WGs, 1x sh_x per 64 rows!)
-    //   - TILE_MODE=4 (32N x 8M): medium-N (e.g. NVFP4 2304x2304 -> 72 WGs, W_attn_in 8984 -> 281 WGs!)
+    // Wave 6 M=5..8 Coalesced-Load sh_w-Staged 8x8 MMA fast path (Theorem W5.2):
+    //   - M=2..4 (DSpark M=4 verify!) routes to upgraded `mxfp8_q8_vecmat` / `nvfp4_vecmat`
+    //     (zero 50% MMA padding waste, 0 sh_w staging, 4x more WGs on Wk/Wv/Wo!).
+    //   - TILE_MODE=3 (64N x 8M): large-N (e.g. Q8_0 LM head 201024 -> 3,141 WGs)
+    //   - TILE_MODE=4 (32N/16N x 8M): medium-N (e.g. NVFP4 2304x2304 -> 144 WGs, W_attn_in 8984 -> 281 WGs!)
     const bool use_m8_mma = !desc.force_vecmat && !desc.prec_f32 &&
                             (desc.layout == AGX_WEIGHT_NVFP4_REPACKED || desc.layout == AGX_WEIGHT_Q8_0_REPACKED) &&
-                            (desc.M >= 2u && desc.M <= 8u) &&
+                            (desc.M >= 5u && desc.M <= 8u) &&
                             (desc.N > 256u) &&
                             (desc.K >= 256u && ((desc.K & 31u) == 0u)) &&
                             (desc.layout == AGX_WEIGHT_Q8_0_REPACKED || (desc.K & 63u) == 0u) &&
@@ -285,7 +297,8 @@ bool agx_gemm_dispatch(agx_backend_context * ctx,
                                                      : 64u;
         const uint32_t wg_m      = pf_64x64 ? 64u : ((tile_mode == 0u) ? 32u : 16u);
 
-        const agx_kernel * k = get_or_compile_mma_gemm(ctx, desc.layout, tile_mode, desc.prec_f32);
+        const bool mma_a4 = pf_64x64 && ((desc.K & 3u) == 0u) && ((x_stride & 3u) == 0u);
+        const agx_kernel * k = get_or_compile_mma_gemm(ctx, desc.layout, tile_mode, desc.prec_f32, mma_a4);
         if (!k) {
             return false;
         }
@@ -365,12 +378,18 @@ bool agx_gemm_dispatch(agx_backend_context * ctx,
 
     // Use K_SPLIT_ROW (all 4 sgs split K over 1 row -> 4x-8x core occupancy!) on narrow-N, large-K
     const bool k_split_row = can_ksplit && (desc.N * batch_z <= 256u) && (desc.K >= ksplit_min_k);
-    // For Q8_0 M=2..8 sh_x staged path: WG_SGS=8 (256T, 16 rows/WG -> 2x less X SLC traffic AND 2+ WGs/core!)
-    const uint32_t wg_sgs = (quant_mode == 0u && !k_split_row && m_spec > 1u) ? 8u : 4u;
+    // For Q8_0 M=2..8 sh_x staged path:
+    //   - N*batch_z <= 4096 (Wk/Wv 1024, Wo 2304, QKV 3072): WG_SGS=4 (128T, 8 rows/WG -> 128-384 WGs!)
+    //   - N*batch_z >  4096 (W_attn_in 8984, LM head 201024): WG_SGS=8 (256T, 16 rows/WG -> 2x less X load!)
+    const uint32_t wg_sgs = (quant_mode == 0u && !k_split_row && m_spec > 1u)
+                                ? ((desc.N * batch_z > 4096u) ? 8u : 4u)
+                                : 4u;
+    const bool x_aligned4 = (quant_mode == 0u && !k_split_row && m_spec > 1u) &&
+                            ((desc.K & 3u) == 0u) && ((x_stride & 3u) == 0u);
     if (quant_mode == 0u && !k_split_row) {
         rows_per_wg = wg_sgs * 2u;
     }
-    const agx_kernel * k = get_or_compile_q8_mxfp8_vecmat(ctx, quant_mode, m_spec, k_split_row, wg_sgs);
+    const agx_kernel * k = get_or_compile_q8_mxfp8_vecmat(ctx, quant_mode, m_spec, k_split_row, wg_sgs, x_aligned4);
     if (!k) {
         return false;
     }

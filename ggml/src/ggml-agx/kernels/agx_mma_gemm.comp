@@ -50,6 +50,10 @@
 #define PREC_F32 0
 #endif
 
+#ifndef X_ALIGNED4
+#define X_ALIGNED4 0
+#endif
+
 #define PF_SHW_64X64 (TILE_MODE == 0 && PREC_F32 == 0 && (WEIGHT_MODE == 0 || WEIGHT_MODE == 2))
 
 #if TILE_MODE == 3 || TILE_MODE == 4
@@ -147,17 +151,11 @@ void decode_e2m1_u32_f16x2_scaled(uint w32, float16_t sc, out f16vec4 w0, out f1
   #if WEIGHT_MODE == 0
     #if TILE_MODE == 3
       // 64N x 8M (no K-split): 2 super-tiles along N share ONE RowMajor 64x8 sh_x (1,024 B)!
-      #define NV_SH_STRIDE 72u
-      #define NV_W_SLAB    (32u * NV_SH_STRIDE)
-      shared float16_t sh_w[2u * NV_W_SLAB]; // 9,216 B
-      shared float16_t sh_x[64u * 8u];       // 1,024 B (RowMajor, 0-bank-conflict stride 8!)
-
-      void store_f16vec4_sh_w(uint off, f16vec4 v) {
-          sh_w[off + 0u] = v.x;
-          sh_w[off + 1u] = v.y;
-          sh_w[off + 2u] = v.z;
-          sh_w[off + 3u] = v.w;
-      }
+      // Vectorized f16vec4 sh_w (stride 18 f16vec4 = 72 halfs -> 0 bank conflicts, 4x fewer stores!)
+      #define NV_SH_STRIDE_V4 18u
+      #define NV_W_SLAB_V4    (32u * NV_SH_STRIDE_V4)
+      shared f16vec4   sh_w[2u * NV_W_SLAB_V4]; // 9,216 B
+      shared float16_t sh_x[64u * 8u];          // 1,024 B (RowMajor, 0-bank-conflict stride 8!)
 
       void store_f16vec4_sh_x_T(uint off, f16vec4 v) {
           sh_x[off +  0u] = v.x;
@@ -167,21 +165,14 @@ void decode_e2m1_u32_f16x2_scaled(uint w32, float16_t sc, out f16vec4 w0, out f1
       }
     #else
       // 16N x 8M (4-way K-split, ZERO cross-SG barrier() in K-loop!):
-      //   - 5,120 B sh_w16 + 2,048 B sh_x16 + 768 B sh_red16 = **7,936 B <= 8,192 B**
-      //     -> **4 WGs/core = 160 WGs resident -> ALL 144 WGs on N=2304 fit in 1 SINGLE WAVE!**
-      #define NV16_W_STRIDE 40u // 20 words -> bijection onto all 32 banks!
-      #define NV16_W_SLAB   (16u * NV16_W_STRIDE)
-      #define NV16_X_SLAB   (32u * 8u)
-      shared float16_t sh_w16[4u * NV16_W_SLAB]; // 5,120 B
-      shared float16_t sh_x16[4u * NV16_X_SLAB]; // 2,048 B
-      shared float     sh_red16[3u * 64u];       //   768 B (acc0 then acc1 -> saves 768 B -> 4 WGs/core!)
-
-      void store_f16vec4_sh_w16(uint off, f16vec4 v) {
-          sh_w16[off + 0u] = v.x;
-          sh_w16[off + 1u] = v.y;
-          sh_w16[off + 2u] = v.z;
-          sh_w16[off + 3u] = v.w;
-      }
+      //   - 5,120 B sh_w16 (f16vec4 -> 4x fewer stores!) + 2,048 B sh_x16 + 768 B sh_red16
+      //     = **7,936 B <= 8,192 B** -> **4 WGs/core = ALL 144 WGs on N=2304 in 1 SINGLE WAVE!**
+      #define NV16_W_STRIDE_V4 10u // 10 f16vec4 = 40 halfs = 20 words -> bijection onto all 32 banks!
+      #define NV16_W_SLAB_V4   (16u * NV16_W_STRIDE_V4)
+      #define NV16_X_SLAB      (32u * 8u)
+      shared f16vec4   sh_w16[4u * NV16_W_SLAB_V4]; // 5,120 B
+      shared float16_t sh_x16[4u * NV16_X_SLAB];    // 2,048 B
+      shared float     sh_red16[3u * 64u];          //   768 B
 
       void store_f16vec4_sh_x16_T(uint off, f16vec4 v) {
           sh_x16[off +  0u] = v.x;
@@ -192,21 +183,14 @@ void decode_e2m1_u32_f16x2_scaled(uint w32, float16_t sc, out f16vec4 w0, out f1
     #endif
 
   #else
-    // Q8_0_8BLK Lean sh_w-Staged M=2..8:
-    //   - Single-buffered sh_w_q8 (4,224 B) + RowMajor sh_x_q8 (4,096 B) + sh_red_q8 (768 B)
-    //     = **9,088 B (3 WGs/core = 12 SGs/core!)**, Q8_RN_ITERS=4 (32 rows/WG -> <= 60 GPR32!)
-    #define Q8_SH_STRIDE 264u
-    #define Q8_RN_ITERS  4u
-    shared float16_t sh_w_q8[8u * Q8_SH_STRIDE]; // 4,224 B
-    shared float16_t sh_x_q8[256u * 8u];         // 4,096 B (RowMajor, 1x 32-bit coopMatLoad!)
-    shared float     sh_red_q8[3u * 64u];        //   768 B
-
-    void store_f16vec4_sh_w_q8(uint off, f16vec4 v) {
-        sh_w_q8[off + 0u] = v.x;
-        sh_w_q8[off + 1u] = v.y;
-        sh_w_q8[off + 2u] = v.z;
-        sh_w_q8[off + 3u] = v.w;
-    }
+    // Q8_0_8BLK Lean f16vec4 sh_w-Staged M=5..8:
+    //   - Single-buffered f16vec4 sh_w_q8 (4,224 B -> 4x fewer stores!) + RowMajor sh_x_q8 (4,096 B)
+    //     + sh_red_q8 (768 B) = **9,088 B (3 WGs/core = 12 SGs/core!)**, Q8_RN_ITERS=4 (32 rows/WG)!
+    #define Q8_SH_STRIDE_V4 66u // 66 f16vec4 = 264 halfs = 132 words -> 0 bank conflicts!
+    #define Q8_RN_ITERS     4u
+    shared f16vec4   sh_w_q8[8u * Q8_SH_STRIDE_V4]; // 4,224 B
+    shared float16_t sh_x_q8[256u * 8u];            // 4,096 B (RowMajor, 1x 32-bit coopMatLoad!)
+    shared float     sh_red_q8[3u * 64u];           //   768 B
 
     void store_f16vec4_sh_x_q8_T(uint off, f16vec4 v) {
         sh_x_q8[off +  0u] = v.x;
@@ -219,11 +203,11 @@ void decode_e2m1_u32_f16x2_scaled(uint w32, float16_t sc, out f16vec4 w0, out f1
 #elif PF_SHW_64X64
 
   // ==========================================================================
-  // sh_w-Staged 64N x 64M Prefill (TILE_MODE=0, PREC_F32=0, NVFP4 & Q8_0):
-  //   - sh_w: 64 x 40 halfs = 5,120 B (0 bank conflicts!)
+  // Wave 5/6 sh_w-Staged 64N x 64M Prefill (TILE_MODE=0, PREC_F32=0):
+  //   - sh_w: 64 x 40 halfs = 5,120 B (0 bank conflicts, native float16_t coopMatLoad!)
   //   - sh_x: 32 x 72 halfs = 4,608 B (0 bank conflicts!)
-  //   - Total = **9,728 B (9.5 KB -> 3 WGs/core = 12 SGs/core!)**
-  //   - ZERO dequant ALU & ZERO weight pointers live in the 64-MMA loop -> ~68 GPR32, 0:0 spills!
+  //   - Total = **9,728 B (9.5 KB -> 3 WGs/core = 12 SGs/core!)**, 68 GPR32, 0:0 spills!
+  //   - X_ALIGNED4=1 removes scalar fallback bloat (2x smaller runtime binary in L1 I-cache!)
   // ==========================================================================
   #define SH_W_STRIDE 40u
   #define SH_X_STRIDE 72u
@@ -245,6 +229,7 @@ void decode_e2m1_u32_f16x2_scaled(uint w32, float16_t sc, out f16vec4 w0, out f1
       sh_x[dst_rel + 3u * SH_X_STRIDE] = xv.w;
   }
 
+#if X_ALIGNED4 == 0
   void load_sh_x_scalar_T(AgxBufF32R x_buf, uint tid, uint wg_m0, uint k_base) {
       const uint total_x = WG_M * TILE_K;
       for (uint idx = tid * 2u; idx < total_x; idx += LOCAL_SIZE_X * 2u) {
@@ -258,6 +243,7 @@ void decode_e2m1_u32_f16x2_scaled(uint w32, float16_t sc, out f16vec4 w0, out f1
           sh_x[(lk + 1u) * SH_X_STRIDE + lm] = v1;
       }
   }
+#endif
 
 #else // TILE_MODE == 1, 2 or TILE_MODE == 0 (PREC_F32 == 1 / non-repacked)
 
@@ -425,8 +411,8 @@ void main() {
         const uint t64         = tid & 63u;
         const uint row_t       = (t64 >> 5) * 16u + ((t64 & 31u) >> 1);
         const uint kh_t        = t64 & 1u;
-        const uint sh_w_t      = g * NV_W_SLAB + row_t * NV_SH_STRIDE + kh_t * 32u;
-        const uint w_sg_b      = g * NV_W_SLAB + sg_g * 16u * NV_SH_STRIDE;
+        const uint sh_w_t      = g * NV_W_SLAB_V4 + row_t * NV_SH_STRIDE_V4 + kh_t * 8u;
+        const uint w_sg_b      = g * NV_W_SLAB_V4 + sg_g * 16u * NV_SH_STRIDE_V4;
 
         const uint tn          = gl_WorkGroupID.x * 2u + g;
         const bool tn_valid    = (tn * 32u < pc.N);
@@ -449,28 +435,28 @@ void main() {
                 const f16vec2 sc     = agx_ue4m3_pair_to_f16vec2(st_buf.st[st_idx].d[t64]);
                 f16vec4 w0, w1;
                 decode_e2m1_u32_f16x2_scaled(qs.x, sc.x, w0, w1);
-                store_f16vec4_sh_w(sh_w_t +  0u, w0);
-                store_f16vec4_sh_w(sh_w_t +  4u, w1);
+                sh_w[sh_w_t + 0u] = w0;
+                sh_w[sh_w_t + 1u] = w1;
                 decode_e2m1_u32_f16x2_scaled(qs.y, sc.x, w0, w1);
-                store_f16vec4_sh_w(sh_w_t +  8u, w0);
-                store_f16vec4_sh_w(sh_w_t + 12u, w1);
+                sh_w[sh_w_t + 2u] = w0;
+                sh_w[sh_w_t + 3u] = w1;
                 decode_e2m1_u32_f16x2_scaled(qs.z, sc.y, w0, w1);
-                store_f16vec4_sh_w(sh_w_t + 16u, w0);
-                store_f16vec4_sh_w(sh_w_t + 20u, w1);
+                sh_w[sh_w_t + 4u] = w0;
+                sh_w[sh_w_t + 5u] = w1;
                 decode_e2m1_u32_f16x2_scaled(qs.w, sc.y, w0, w1);
-                store_f16vec4_sh_w(sh_w_t + 24u, w0);
-                store_f16vec4_sh_w(sh_w_t + 28u, w1);
+                sh_w[sh_w_t + 6u] = w0;
+                sh_w[sh_w_t + 7u] = w1;
             }
             barrier();
 
             if (tn_valid) {
                 for (uint ks = 0u; ks < 8u; ++ks) {
-                    const uint koff = ks * 8u;
+                    const uint koff_v4 = ks * 2u;
                     coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> matB;
-                    coopMatLoad(matB, sh_x, koff * 8u, 8u, gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatLoad(matB, sh_x, (ks * 8u) * 8u, 8u, gl_CooperativeMatrixLayoutRowMajor);
                     coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> matA0, matA1;
-                    coopMatLoad(matA0, sh_w, w_sg_b + 0u * NV_SH_STRIDE + koff, NV_SH_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
-                    coopMatLoad(matA1, sh_w, w_sg_b + 8u * NV_SH_STRIDE + koff, NV_SH_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatLoad(matA0, sh_w, w_sg_b + 0u * NV_SH_STRIDE_V4 + koff_v4, NV_SH_STRIDE_V4, gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatLoad(matA1, sh_w, w_sg_b + 8u * NV_SH_STRIDE_V4 + koff_v4, NV_SH_STRIDE_V4, gl_CooperativeMatrixLayoutRowMajor);
                     acc0 = coopMatMulAdd(matA0, matB, acc0);
                     acc1 = coopMatMulAdd(matA1, matB, acc1);
                 }
@@ -499,7 +485,7 @@ void main() {
             }
         }
 
-    #else // TILE_MODE == 4: 16N x 8M, 4-way K-split, 7,936 B SRAM (4 WGs/core = 1 WAVE!), W prefetch!
+    #else // TILE_MODE == 4: 16N x 8M, 4-way K-split, 7,936 B SRAM (4 WGs/core!), f16vec4 sh_w16!
         const uint half_idx    = gl_WorkGroupID.x;
         const uint tn          = half_idx >> 1;
         const uint sub_s       = half_idx & 1u;
@@ -509,9 +495,9 @@ void main() {
         const uint row_l       = lane >> 1;  // 0..15
         const uint kh_l        = lane & 1u;  // 0 or 1
 
-        const uint w_sg_base   = sg_id * NV16_W_SLAB;
+        const uint w_sg_base   = sg_id * NV16_W_SLAB_V4;
         const uint x_sg_base   = sg_id * NV16_X_SLAB;
-        const uint sh_w_lane   = w_sg_base + row_l * NV16_W_STRIDE + kh_l * 16u;
+        const uint sh_w_lane   = w_sg_base + row_l * NV16_W_STRIDE_V4 + kh_l * 4u;
 
         const uint lm0_x    = lane >> 3;  // 0..3
         const uint lk4_loc  = lane & 7u;  // 0..7
@@ -535,18 +521,18 @@ void main() {
                 const bool has_next = (next_tk < nb_k);
                 const f16vec2 sc    = agx_ue4m3_pair_to_f16vec2(d_cur);
 
-                // Phase 0: store prefetched X[p0] + decode qs_cur.xy -> sh_w16
+                // Phase 0: store prefetched X[p0] + decode qs_cur.xy -> vectorized f16vec4 sh_w16
                 {
                     store_f16vec4_sh_x16_T(sh_x_l0,      xv0_cur);
                     store_f16vec4_sh_x16_T(sh_x_l0 + 4u, xv1_cur);
 
                     f16vec4 w0, w1;
                     decode_e2m1_u32_f16x2_scaled(qs_cur.x, sc.x, w0, w1);
-                    store_f16vec4_sh_w16(sh_w_lane +  0u, w0);
-                    store_f16vec4_sh_w16(sh_w_lane +  4u, w1);
+                    sh_w16[sh_w_lane + 0u] = w0;
+                    sh_w16[sh_w_lane + 1u] = w1;
                     decode_e2m1_u32_f16x2_scaled(qs_cur.y, sc.x, w0, w1);
-                    store_f16vec4_sh_w16(sh_w_lane +  8u, w0);
-                    store_f16vec4_sh_w16(sh_w_lane + 12u, w1);
+                    sh_w16[sh_w_lane + 2u] = w0;
+                    sh_w16[sh_w_lane + 3u] = w1;
                 }
                 controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
 
@@ -556,29 +542,29 @@ void main() {
                 xv1_cur = m4_ok_x ? f16vec4(x_buf4.v[x_off0 + x_step4 + k4_tk1]) : f16vec4(float16_t(0.0));
 
                 for (uint ks = 0u; ks < 4u; ++ks) {
-                    const uint koff = ks * 8u;
+                    const uint koff_v4 = ks * 2u;
                     coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> matB;
-                    coopMatLoad(matB, sh_x16, x_sg_base + koff * 8u, 8u, gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatLoad(matB, sh_x16, x_sg_base + (ks * 8u) * 8u, 8u, gl_CooperativeMatrixLayoutRowMajor);
                     coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> matA0, matA1;
-                    coopMatLoad(matA0, sh_w16, w_sg_base + 0u * NV16_W_STRIDE + koff, NV16_W_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
-                    coopMatLoad(matA1, sh_w16, w_sg_base + 8u * NV16_W_STRIDE + koff, NV16_W_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatLoad(matA0, sh_w16, w_sg_base + 0u * NV16_W_STRIDE_V4 + koff_v4, NV16_W_STRIDE_V4, gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatLoad(matA1, sh_w16, w_sg_base + 8u * NV16_W_STRIDE_V4 + koff_v4, NV16_W_STRIDE_V4, gl_CooperativeMatrixLayoutRowMajor);
                     acc0 = coopMatMulAdd(matA0, matB, acc0);
                     acc1 = coopMatMulAdd(matA1, matB, acc1);
                 }
                 controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
 
-                // Phase 1: store prefetched X[p1] + decode qs_cur.zw -> sh_w16
+                // Phase 1: store prefetched X[p1] + decode qs_cur.zw -> vectorized f16vec4 sh_w16
                 {
                     store_f16vec4_sh_x16_T(sh_x_l0,      xv0_cur);
                     store_f16vec4_sh_x16_T(sh_x_l0 + 4u, xv1_cur);
 
                     f16vec4 w0, w1;
                     decode_e2m1_u32_f16x2_scaled(qs_cur.z, sc.y, w0, w1);
-                    store_f16vec4_sh_w16(sh_w_lane +  0u, w0);
-                    store_f16vec4_sh_w16(sh_w_lane +  4u, w1);
+                    sh_w16[sh_w_lane + 0u] = w0;
+                    sh_w16[sh_w_lane + 1u] = w1;
                     decode_e2m1_u32_f16x2_scaled(qs_cur.w, sc.y, w0, w1);
-                    store_f16vec4_sh_w16(sh_w_lane +  8u, w0);
-                    store_f16vec4_sh_w16(sh_w_lane + 12u, w1);
+                    sh_w16[sh_w_lane + 2u] = w0;
+                    sh_w16[sh_w_lane + 3u] = w1;
                 }
                 controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
 
@@ -593,12 +579,12 @@ void main() {
                 }
 
                 for (uint ks = 0u; ks < 4u; ++ks) {
-                    const uint koff = ks * 8u;
+                    const uint koff_v4 = ks * 2u;
                     coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> matB;
-                    coopMatLoad(matB, sh_x16, x_sg_base + koff * 8u, 8u, gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatLoad(matB, sh_x16, x_sg_base + (ks * 8u) * 8u, 8u, gl_CooperativeMatrixLayoutRowMajor);
                     coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> matA0, matA1;
-                    coopMatLoad(matA0, sh_w16, w_sg_base + 0u * NV16_W_STRIDE + koff, NV16_W_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
-                    coopMatLoad(matA1, sh_w16, w_sg_base + 8u * NV16_W_STRIDE + koff, NV16_W_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatLoad(matA0, sh_w16, w_sg_base + 0u * NV16_W_STRIDE_V4 + koff_v4, NV16_W_STRIDE_V4, gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatLoad(matA1, sh_w16, w_sg_base + 8u * NV16_W_STRIDE_V4 + koff_v4, NV16_W_STRIDE_V4, gl_CooperativeMatrixLayoutRowMajor);
                     acc0 = coopMatMulAdd(matA0, matB, acc0);
                     acc1 = coopMatMulAdd(matA1, matB, acc1);
                 }
@@ -651,15 +637,16 @@ void main() {
     #endif
     }
 
-  #else // WEIGHT_MODE == 2 (Q8_0_8BLK Lean 9.0 KB / <= 60 GPR32 + RowMajor sh_x, M = 2..8)
+  #else // WEIGHT_MODE == 2 (Q8_0_8BLK Lean 9.0 KB / <= 68 GPR32 + f16vec4 sh_w + RowMajor sh_x)
     {
         AgxBufQ8_8Blk w_buf = AgxBufQ8_8Blk(w_base);
         const uint n_chunks = (pc.K + 255u) >> 8;
         const uint wg_n0    = gl_WorkGroupID.x * WG_N;
         const uint row_in_8 = tid >> 4;  // 0..7
         const uint lane16   = tid & 15u; // 0..15 (16 lanes = 256B = 2 full 128B cache lines!)
-        const uint sh_w_t   = row_in_8 * Q8_SH_STRIDE + lane16 * 16u;
+        const uint sh_w_t   = row_in_8 * Q8_SH_STRIDE_V4 + lane16 * 4u;
         const uint k_sg_off = sg_id * 64u;
+        const uint k_sg_v4  = sg_id * 16u;
 
         // Coalesced X loading into RowMajor sh_x_q8[256][8]:
         const uint lm0_x   = tid >> 6;  // 0 or 1
@@ -697,22 +684,17 @@ void main() {
                 store_f16vec4_sh_x_q8_T(sh_x_t0 + s * 2u, xv);
             }
 
-            // 2. Stream 4 x 8 rows through single-buffered sh_w_q8 (9,088 B = 3 WGs/core, <= 64 GPR32!)
-            //    with software-pipelined W[rn+1] DRAM prefetch overlapped with AMX compute!
+            // 2. Stream 4 x 8 rows through vectorized f16vec4 sh_w_q8 (4x fewer SRAM stores!)
             for (uint rn = 0u; rn < Q8_RN_ITERS; ++rn) {
                 if (rn > 0u) {
                     barrier();
                 }
                 const uint grow = wg_n0 + rn * 8u + row_in_8;
                 const bool w_ok = (grow < pc.N) && k_w_ok;
-                const f16vec4 w0 = w_ok ? (agx_q8_u32_magic_to_f16vec4(qv_cur.x) * d_cur) : f16vec4(float16_t(0.0));
-                const f16vec4 w1 = w_ok ? (agx_q8_u32_magic_to_f16vec4(qv_cur.y) * d_cur) : f16vec4(float16_t(0.0));
-                const f16vec4 w2 = w_ok ? (agx_q8_u32_magic_to_f16vec4(qv_cur.z) * d_cur) : f16vec4(float16_t(0.0));
-                const f16vec4 w3 = w_ok ? (agx_q8_u32_magic_to_f16vec4(qv_cur.w) * d_cur) : f16vec4(float16_t(0.0));
-                store_f16vec4_sh_w_q8(sh_w_t +  0u, w0);
-                store_f16vec4_sh_w_q8(sh_w_t +  4u, w1);
-                store_f16vec4_sh_w_q8(sh_w_t +  8u, w2);
-                store_f16vec4_sh_w_q8(sh_w_t + 12u, w3);
+                sh_w_q8[sh_w_t + 0u] = w_ok ? (agx_q8_u32_magic_to_f16vec4(qv_cur.x) * d_cur) : f16vec4(float16_t(0.0));
+                sh_w_q8[sh_w_t + 1u] = w_ok ? (agx_q8_u32_magic_to_f16vec4(qv_cur.y) * d_cur) : f16vec4(float16_t(0.0));
+                sh_w_q8[sh_w_t + 2u] = w_ok ? (agx_q8_u32_magic_to_f16vec4(qv_cur.z) * d_cur) : f16vec4(float16_t(0.0));
+                sh_w_q8[sh_w_t + 3u] = w_ok ? (agx_q8_u32_magic_to_f16vec4(qv_cur.w) * d_cur) : f16vec4(float16_t(0.0));
                 barrier();
 
                 // Prefetch next row-group (or next chunk's rn=0) IN-PLACE overlapped with 8 MMAs!
@@ -734,11 +716,12 @@ void main() {
 
                 // 3. Pure 8x8 MMA compute loop (1x 32-bit RowMajor coopMatLoad(matB)!)
                 for (uint ks = 0u; ks < 8u; ++ks) {
-                    const uint koff = k_sg_off + ks * 8u;
+                    const uint koff    = k_sg_off + ks * 8u;
+                    const uint koff_v4 = k_sg_v4  + ks * 2u;
                     coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> matA;
                     coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> matB;
-                    coopMatLoad(matA, sh_w_q8, koff,      Q8_SH_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
-                    coopMatLoad(matB, sh_x_q8, koff * 8u, 8u,           gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatLoad(matA, sh_w_q8, koff_v4,   Q8_SH_STRIDE_V4, gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatLoad(matB, sh_x_q8, koff * 8u, 8u,              gl_CooperativeMatrixLayoutRowMajor);
                     acc[rn] = coopMatMulAdd(matA, matB, acc[rn]);
                 }
             }
@@ -782,23 +765,26 @@ void main() {
 
 #elif PF_SHW_64X64
     // ========================================================================
-    // Wave 5 sh_w-Staged 64N x 64M Prefill (TILE_MODE=0, PREC_F32=0, NVFP4 & Q8_0)
-    //   - ZERO dequant ALU & ZERO weight pointers inside the 64-MMA loop!
-    //   - 128 threads cooperatively dequant 64x32 W (16 weights/thread) -> sh_w (5.0 KB)
-    //     + sh_x (4.5 KB) = 9.5 KB SRAM (3 WGs/core = 12 SGs/core!), ~68 GPR32, 0:0 spills!
+    // Wave 5/6 sh_w-Staged 64N x 64M Prefill (TILE_MODE=0, PREC_F32=0, NVFP4 & Q8_0)
+    //   - 4x1 SGs x (16N x 64M = 2x8 acc): 68 GPR32 (max occupancy tier, 9.90 / 10.12+ TFLOPS!)
+    //   - Native shared float16_t sh_w[] (fastest Borealis coopMatLoad lowering!)
+    //   - X_ALIGNED4=1 eliminates scalar fallback bloat (2x smaller runtime binary in L1 I-cache!)
+    //   - 9,728 B SRAM (3 WGs/core = 12 SGs/core), 0:0 spills!
     // ========================================================================
-    const uint wg_n0 = gl_WorkGroupID.x * 64u;
-    const uint wg_m0 = gl_WorkGroupID.y * 64u;
-    const uint sg_n0 = wg_n0 + sg_id * 16u;
+    const uint wg_n0    = gl_WorkGroupID.x * 64u;
+    const uint wg_m0    = gl_WorkGroupID.y * 64u;
+    const uint sg_n0    = wg_n0 + sg_id * 16u;
     const uint w_sg_off = (sg_id * 16u) * SH_W_STRIDE;
 
+#if X_ALIGNED4 == 0
     const bool x_vec4_ok = ((pc.K & 3u) == 0u) && ((pc.x_stride & 3u) == 0u);
-    const uint lm0       = tid >> 3;
-    const uint lk4       = tid & 7u;
-    const uint gm0       = wg_m0 + lm0;
-    const uint x_off0    = gm0 * x_stride4 + lk4;
-    const uint x_step_s  = 16u * x_stride4;
-    const uint sh_dst0   = (lk4 << 2) * SH_X_STRIDE + lm0;
+#endif
+    const uint lm0      = tid >> 3;
+    const uint lk4      = tid & 7u;
+    const uint gm0      = wg_m0 + lm0;
+    const uint x_off0   = gm0 * x_stride4 + lk4;
+    const uint x_step_s = 16u * x_stride4;
+    const uint sh_dst0  = (lk4 << 2) * SH_X_STRIDE + lm0;
 
     coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> acc[2][8];
     for (uint in_t = 0u; in_t < 2u; ++in_t) {
@@ -822,8 +808,9 @@ void main() {
         const uint l_base_t  = (row_in_32 >> 4) * 32u + ((row_in_32 & 15u) << 1);
         const uint sh_w_dst  = row_in_64 * SH_W_STRIDE + half_k16 * 16u;
 
+#if X_ALIGNED4 == 0
         if (x_vec4_ok) {
-            // Hoisted fast path (zero scalar-fallback regs in K-loop -> <= 64-72 GPR32 max occupancy!)
+#endif
             for (uint k_base = 0u; k_base < pc.K; k_base += 32u) {
                 const uint kb4 = k_base >> 2;
                 for (uint s = 0u; s < 4u; ++s) {
@@ -853,7 +840,6 @@ void main() {
                 store_f16vec4_sh_w(sh_w_dst + 12u, w3);
                 barrier();
 
-                // Pure 64-MMA compute loop (ZERO dequant ALU, 2-at-a-time matB streaming!)
                 for (uint ks = 0u; ks < 4u; ++ks) {
                     const uint koff = ks * 8u;
                     coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> matA0, matA1;
@@ -874,8 +860,8 @@ void main() {
                     barrier();
                 }
             }
+#if X_ALIGNED4 == 0
         } else {
-            // Unaligned x_stride fallback
             AgxBufF32R x_buf = AgxBufF32R(x_base);
             for (uint k_base = 0u; k_base < pc.K; k_base += 32u) {
                 load_sh_x_scalar_T(x_buf, tid, wg_m0, k_base);
@@ -916,20 +902,22 @@ void main() {
                 }
             }
         }
+#endif
     }
   #else // WEIGHT_MODE == 2 (Q8_0_8BLK)
     {
-        AgxBufQ8_8Blk w_buf = AgxBufQ8_8Blk(w_base);
+        AgxBufQ8_8Blk w_buf  = AgxBufQ8_8Blk(w_base);
         const uint n_chunks  = (pc.K + 255u) >> 8;
-        const uint row_in_64 = tid >> 1;  // 0..63
-        const uint half_k16  = tid & 1u;  // 0 or 1
+        const uint row_in_64 = tid >> 1;          // 0..63
+        const uint half_k16  = tid & 1u;          // 0 or 1
         const uint grow      = wg_n0 + row_in_64;
         const bool row_ok    = (grow < pc.N);
         const uint row_chk0  = grow * n_chunks;
         const uint sh_w_dst  = row_in_64 * SH_W_STRIDE + half_k16 * 16u;
 
+#if X_ALIGNED4 == 0
         if (x_vec4_ok) {
-            // Hoisted fast path (zero scalar-fallback regs in K-loop -> <= 64-72 GPR32 max occupancy!)
+#endif
             for (uint k_base = 0u; k_base < pc.K; k_base += 32u) {
                 const uint kb4 = k_base >> 2;
                 for (uint s = 0u; s < 4u; ++s) {
@@ -960,7 +948,6 @@ void main() {
                 store_f16vec4_sh_w(sh_w_dst + 12u, w3);
                 barrier();
 
-                // Pure 64-MMA compute loop (ZERO dequant ALU, 2-at-a-time matB streaming!)
                 for (uint ks = 0u; ks < 4u; ++ks) {
                     const uint koff = ks * 8u;
                     coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> matA0, matA1;
@@ -981,8 +968,8 @@ void main() {
                     barrier();
                 }
             }
+#if X_ALIGNED4 == 0
         } else {
-            // Unaligned x_stride fallback
             AgxBufF32R x_buf = AgxBufF32R(x_base);
             for (uint k_base = 0u; k_base < pc.K; k_base += 32u) {
                 load_sh_x_scalar_T(x_buf, tid, wg_m0, k_base);
@@ -1024,6 +1011,7 @@ void main() {
                 }
             }
         }
+#endif
     }
   #endif
 

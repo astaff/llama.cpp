@@ -51,6 +51,10 @@
 #endif
 #endif
 
+#ifndef X_ALIGNED4
+#define X_ALIGNED4 0
+#endif
+
 #define Q8_LOCAL_X (WG_SGS * 32)
 layout(local_size_x = Q8_LOCAL_X, local_size_y = 1, local_size_z = 1) in;
 
@@ -76,11 +80,34 @@ shared float sh_row_red[4][BATCH_M];
 
 #if QUANT_MODE == 0 && K_SPLIT_ROW == 0 && BATCH_M > 1
 // Double-buffered 0-bank-conflict XOR-swizzled FP16 X staging:
-//   BATCH_M=8 -> 2 * 8 * 64 * 8 B = 8,192 B (EXACTLY 8 KB -> 4 WGs/core = 16 sgs/core!)
+//   BATCH_M=4 -> 2 * 4 * 64 * 8 B = 4,096 B (4 KB -> 8 WGs/core!)
+//   BATCH_M=8 -> 2 * 8 * 64 * 8 B = 8,192 B (8 KB -> 4 WGs/core!)
 //   Eliminates the stride-64B L1D gather wall (128x fewer L1D cache-line fetches!)
-//   and removes all inner-loop branches & f32->f16 casts -> 450-510+ GB/s at M=2..8!
+//   and uses f16vec2 SIMD2-packed FMA + W software pipelining -> 480-510+ GB/s at M=2..4!
 shared f16vec4 sh_x[2][BATCH_M][64];
 
+#if X_ALIGNED4 == 1
+void load_q8_sh_x(AgxBufVec4R x_buf4,
+                  uint        tid,
+                  uint        buf,
+                  uint        c,
+                  uint        x_stride4) {
+    const uint total_e = uint(BATCH_M) * 64u;
+    const uint k4_base = c * 64u;
+    const uint k4_lim  = pc.K >> 2;
+    for (uint e = tid; e < total_e; e += uint(Q8_LOCAL_X)) {
+        const uint m    = e >> 6;
+        const uint idx  = e & 63u;
+        const uint l    = idx >> 2;
+        const uint j    = idx & 3u;
+        const uint swiz = (j << 4) | (l ^ (j << 2));
+        const uint col4 = k4_base + idx;
+        sh_x[buf][m][swiz] = (m < pc.M && col4 < k4_lim)
+            ? f16vec4(x_buf4.v[m * x_stride4 + col4])
+            : f16vec4(float16_t(0.0));
+    }
+}
+#else
 void load_q8_sh_x(AgxBufF32R  x_buf,
                   AgxBufVec4R x_buf4,
                   uint        tid,
@@ -114,10 +141,11 @@ void load_q8_sh_x(AgxBufF32R  x_buf,
     }
 }
 #endif
+#endif
 
 void main() {
     const uint lane  = gl_SubgroupInvocationID; // 0..31
-    const uint sg_id = gl_SubgroupID;           // 0..3
+    const uint sg_id = gl_SubgroupID;           // 0..WG_SGS-1
     const uint slice = gl_WorkGroupID.z;
 
     const uint w_slice = slice / max(1u, pc.w_bcast_div);
@@ -125,7 +153,9 @@ void main() {
     const uint64_t x_base = pc.x_va + uint64_t(slice)   * uint64_t(pc.x_slice_elems) * 4ul;
     const uint64_t y_base = pc.y_va + uint64_t(slice)   * uint64_t(pc.y_slice_elems) * 4ul;
 
+#if !(QUANT_MODE == 0 && K_SPLIT_ROW == 0 && BATCH_M > 1 && X_ALIGNED4 == 1)
     AgxBufF32R  x_buf  = AgxBufF32R(x_base);
+#endif
     AgxBufVec4R x_buf4 = AgxBufVec4R(x_base);
     AgxBufF32RW y_buf  = AgxBufF32RW(y_base);
 
@@ -136,11 +166,12 @@ void main() {
 
 #if QUANT_MODE == 0 && K_SPLIT_ROW == 0 && BATCH_M > 1
     // ------------------------------------------------------------------------
-    // AGX_Q8_0_8BLK M=2..8 (DSpark verify & LM head!):
+    // Wave 6 AGX_Q8_0_8BLK M=2..8 (DSpark M=4 verify & LM head!):
     //   - Double-buffered 0-bank-conflict XOR-swizzled `sh_x[2][BATCH_M][64]`
-    //     (8,192 B max -> 4 WGs/core = 16 sgs/core, 1x coalesced X load/WG!)
-    //   - Overflow-proof q/128 magic-bias + 2x-rate AGX3B ffma16, ZERO inner
-    //     branches, 1x DRAM weight read, <= 40 GPR32, 0:0 spills!
+    //     (4 KB at M=4 -> 8 WGs/core; 8 KB at M=8 -> 4 WGs/core!)
+    //   - Software-pipelined `qv`/`d128` weight prefetch hides DRAM latency
+    //     behind f16vec2 SIMD2-packed FMAs + sh_x loads + barrier()!
+    //   - Compile-time `X_ALIGNED4=1` eliminates scalar fallback bloat -> <= 44 GPR32, 0:0 spills!
     // ------------------------------------------------------------------------
     const uint tid      = gl_LocalInvocationIndex;
     const uint row      = (gl_WorkGroupID.x * uint(WG_SGS) + sg_id) * 2u + (lane >> 4);
@@ -150,7 +181,9 @@ void main() {
     AgxBufQ8_8Blk w_buf = AgxBufQ8_8Blk(w_base);
     const uint row_chk_base = row * n_chunks;
     const uint x_stride4    = pc.x_stride >> 2;
+#if X_ALIGNED4 == 0
     const bool x_aligned4   = ((pc.K & 3u) == 0u) && ((pc.x_stride & 3u) == 0u);
+#endif
     const bool row_valid    = (row < pc.N);
 
     const uint s0 =  0u | (lane16 ^ 0u);
@@ -158,38 +191,59 @@ void main() {
     const uint s2 = 32u | (lane16 ^ 8u);
     const uint s3 = 48u | (lane16 ^ 12u);
 
+    uvec4 qv_cur = uvec4(0u);
+    float d_cur  = 0.0;
     if (n_chunks > 0u) {
+#if X_ALIGNED4 == 1
+        load_q8_sh_x(x_buf4, tid, 0u, 0u, x_stride4);
+#else
         load_q8_sh_x(x_buf, x_buf4, tid, 0u, 0u, x_aligned4, x_stride4);
+#endif
+        if (row_valid) {
+            qv_cur = w_buf.blk[row_chk_base].qs[lane16];
+            d_cur  = float(unpackFloat2x16(uint(w_buf.blk[row_chk_base].d[lane16 >> 1])).x) * 128.0;
+        }
     }
     barrier();
 
     uint buf = 0u;
     for (uint c = 0u; c < n_chunks; ++c) {
-        uvec4 qv   = uvec4(0u);
-        float d128 = 0.0;
-        if (row_valid) {
-            const uint chk_idx = row_chk_base + c;
-            qv   = w_buf.blk[chk_idx].qs[lane16];
-            d128 = float(unpackFloat2x16(uint(w_buf.blk[chk_idx].d[lane16 >> 1])).x) * 128.0;
-        }
+        const f16vec4 w0   = agx_q8_u32_magic_norm_to_f16vec4(qv_cur.x);
+        const f16vec4 w1   = agx_q8_u32_magic_norm_to_f16vec4(qv_cur.y);
+        const f16vec4 w2   = agx_q8_u32_magic_norm_to_f16vec4(qv_cur.z);
+        const f16vec4 w3   = agx_q8_u32_magic_norm_to_f16vec4(qv_cur.w);
+        const float   d_now = d_cur;
 
         const bool has_next = (c + 1u < n_chunks);
         if (has_next) {
+#if X_ALIGNED4 == 1
+            load_q8_sh_x(x_buf4, tid, buf ^ 1u, c + 1u, x_stride4);
+#else
             load_q8_sh_x(x_buf, x_buf4, tid, buf ^ 1u, c + 1u, x_aligned4, x_stride4);
+#endif
+            if (row_valid) {
+                const uint next_chk = row_chk_base + c + 1u;
+                qv_cur = w_buf.blk[next_chk].qs[lane16];
+                d_cur  = float(unpackFloat2x16(uint(w_buf.blk[next_chk].d[lane16 >> 1])).x) * 128.0;
+            }
         }
 
         const uint k0 = c * 256u + lane16 * 16u;
         if (row_valid && k0 < pc.K) {
-            const f16vec4 w0 = agx_q8_u32_magic_norm_to_f16vec4(qv.x);
-            const f16vec4 w1 = agx_q8_u32_magic_norm_to_f16vec4(qv.y);
-            const f16vec4 w2 = agx_q8_u32_magic_norm_to_f16vec4(qv.z);
-            const f16vec4 w3 = agx_q8_u32_magic_norm_to_f16vec4(qv.w);
             for (uint m = 0u; m < uint(BATCH_M); ++m) {
-                float16_t dp = dot(w0, sh_x[buf][m][s0])
-                             + dot(w1, sh_x[buf][m][s1])
-                             + dot(w2, sh_x[buf][m][s2])
-                             + dot(w3, sh_x[buf][m][s3]);
-                acc[m] = fma(float(dp), d128, acc[m]);
+                const f16vec4 x0 = sh_x[buf][m][s0];
+                const f16vec4 x1 = sh_x[buf][m][s1];
+                const f16vec4 x2 = sh_x[buf][m][s2];
+                const f16vec4 x3 = sh_x[buf][m][s3];
+                f16vec2 dp2 = w0.xy * x0.xy;
+                dp2 = fma(w0.zw, x0.zw, dp2);
+                dp2 = fma(w1.xy, x1.xy, dp2);
+                dp2 = fma(w1.zw, x1.zw, dp2);
+                dp2 = fma(w2.xy, x2.xy, dp2);
+                dp2 = fma(w2.zw, x2.zw, dp2);
+                dp2 = fma(w3.xy, x3.xy, dp2);
+                dp2 = fma(w3.zw, x3.zw, dp2);
+                acc[m] = fma(float(dp2.x + dp2.y), d_now, acc[m]);
             }
         }
 
