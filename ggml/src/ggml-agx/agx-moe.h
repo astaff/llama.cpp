@@ -42,7 +42,7 @@
 #define AGX_MOE_MAX_EXPERTS      256u
 #define AGX_MOE_VECMAT_MAX_M     5u
 #define AGX_MOE_GEMM_MIN_M       6u
-#define AGX_MOE_GEMM_TILE_M      16u
+#define AGX_MOE_GEMM_TILE_M      32u
 #define AGX_MOE_VECMAT_WG_PAIRS  32u // 32 (gate,up) pairs/WG for gate_up vec-mat
 #define AGX_MOE_VECMAT_WG_OUT    64u // 64 output rows/WG for down vec-mat
 #define AGX_MOE_GEMM_WG_PAIRS    32u // 32 (gate,up) pairs/WG for gate_up 8x8 MMA GEMM
@@ -72,7 +72,7 @@ struct alignas(128) agx_moe_bucket_header {
     uint32_t              n_tokens;
     uint32_t              top_k;
     uint32_t              n_expert;
-    uint32_t              pad0;
+    uint32_t              n_skipped;           // count of negative/OOB expert assignments
     agx_cdm_indirect_grid grid_gate_up_vecmat; // offset 32
     agx_cdm_indirect_grid grid_down_vecmat;    // offset 56
     agx_cdm_indirect_grid grid_gate_up_gemm;   // offset 80

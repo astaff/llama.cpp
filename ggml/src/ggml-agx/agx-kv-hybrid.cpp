@@ -248,6 +248,7 @@ struct agx_kv_hybrid_pool {
     const agx_kernel * k_swa_attn[3]          = {}; // F8_E4M3, Q8_0_PLANAR, F16
     const agx_kernel * k_full_phase1[2][5][5] = {}; // [head_slot][k_dt][v_dt]
     const agx_kernel * k_full_phase2[2]       = {}; // [head_slot]
+    const agx_kernel * k_full_prefill[5][5]   = {}; // D128 tiled multi-Q prefill [k_dt][v_dt]
     const agx_kernel * k_kv_append[3]         = {}; // F8_E4M3, Q8_0_PLANAR, F16
 };
 
@@ -312,6 +313,31 @@ static const agx_kernel * get_full_phase2_kernel(agx_kv_hybrid_pool * pool, uint
             pool->compiler, name.c_str(), "fused_full_flash_decode.comp", opts);
     }
     return pool->k_full_phase2[hs];
+}
+
+static const agx_kernel * get_full_prefill_kernel(agx_kv_hybrid_pool * pool,
+                                                  agx_kv_dtype         k_dt,
+                                                  agx_kv_dtype         v_dt) {
+    const uint32_t ik = static_cast<uint32_t>(k_dt);
+    const uint32_t iv = static_cast<uint32_t>(v_dt);
+    if (ik >= 5u || iv >= 5u) {
+        return nullptr;
+    }
+    if (!pool->k_full_prefill[ik][iv] && pool->compiler) {
+        agx_compile_opts opts;
+        opts.defines.push_back("PASS_MODE=3");
+        opts.defines.push_back("HEAD_DIM=128");
+        opts.defines.push_back("KV_DTYPE_K=" + std::to_string(ik));
+        opts.defines.push_back("KV_DTYPE_V=" + std::to_string(iv));
+        opts.defines.push_back("N_SG=4");
+        opts.is_hot_kernel     = true;
+        opts.strict_zero_spill = true;
+        const std::string name = "fused_full_flash_prefill_d128_k" + std::to_string(ik)
+                               + "_v" + std::to_string(iv);
+        pool->k_full_prefill[ik][iv] = agx_compiler_compile_file(
+            pool->compiler, name.c_str(), "fused_full_flash_decode.comp", opts);
+    }
+    return pool->k_full_prefill[ik][iv];
 }
 
 static const agx_kernel * get_kv_append_kernel(agx_kv_hybrid_pool * pool, agx_kv_dtype dt) {
@@ -776,6 +802,20 @@ bool agx_kv_hybrid_dispatch_full_attn(agx_kv_hybrid_pool *        pool,
         pc.ext_mask_nb1  = args.ext_mask_nb1;
         pc.ext_mask_nb2  = args.ext_mask_nb2;
         pc.ext_mask_ne2  = args.ext_mask_ne2 ? args.ext_mask_ne2 : 1u;
+    }
+
+    // Tiled Multi-Q Prefill fastpath (8 queries/WG sharing 16-key K/V in 8 KB SRAM + causal skip!)
+    // Triggers for non-paged D=128 prefill with F16/F8_E4M3/Q8_0 KV (preserves full F32 accuracy for F32 KV).
+    if (!is_paged && args.head_dim == 128u && args.n_tokens >= 16u && args.n_kv >= 32u &&
+        k_dt != AGX_KV_F32 && v_dt != AGX_KV_F32 &&
+        (args.flags & (AGX_ATTN_FLAG_CAUSAL | AGX_ATTN_FLAG_HAS_REL_TABLE)) == 0u) {
+        const agx_kernel * k_pf = get_full_prefill_kernel(pool, k_dt, v_dt);
+        if (k_pf) {
+            pc.n_splits = 1u;
+            const uint32_t grid_y = (args.n_tokens + 7u) / 8u;
+            return agx_cdm_dispatch(stream, k_pf, args.n_head_q, grid_y, 1u,
+                                    &pc, sizeof(pc), post_barrier);
+        }
     }
 
     if (n_splits == 1u) {

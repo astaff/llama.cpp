@@ -24,6 +24,7 @@
 //   PASS_MODE  = 1 : Phase 2 Split-K Reduction + single-application sink + FWHT64 + Qgate
 //   PASS_MODE  = 2 : Fused KV-Append (quantizes F32/F16 K/V -> F8_E4M3 / Q8_0_PLANAR / F16
 //                    into SWA-1024 ring OR 64-token paged full-attn pool + pos table)
+//   PASS_MODE  = 3 : Tiled Multi-Q Prefill Flash-Attention (HEAD_DIM=128, 8 Q/WG, TILE_KV=16)
 //
 //   HEAD_DIM   = 128 (default, vec4/lane) or 64 (vec2/lane)
 //   KV_DTYPE   = 0 (F8_E4M3), 1 (Q8_0_PLANAR), 2 (F16), 3 (F32), 4 (Q8_0_GGML)
@@ -64,7 +65,7 @@
 #define PARTIAL_STRIDE 130u
 #endif
 
-#if PASS_MODE == 0
+#if PASS_MODE == 0 || PASS_MODE == 3
 layout(local_size_x = 32, local_size_y = N_SG, local_size_z = 1) in;
 #else
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
@@ -187,7 +188,7 @@ vec4 fwht64_in_reg(vec4 v, uint lane) {
 }
 #endif
 
-#if PASS_MODE == 0 || PASS_MODE == 1
+#if PASS_MODE == 0 || PASS_MODE == 1 || PASS_MODE == 3
 
 // Push constants for Phase 1 & Phase 2: 192 bytes (exact multiple of 8, <= 256 B!)
 layout(push_constant) uniform PushAttn {
@@ -302,13 +303,15 @@ void get_sink_info(uint tok, uint h_q, out bool has_sink, out float eff_sink) {
     }
 }
 
-#endif // PASS_MODE == 0 || PASS_MODE == 1
+#endif // PASS_MODE == 0 || PASS_MODE == 1 || PASS_MODE == 3
+
+#if PASS_MODE == 0 || PASS_MODE == 3
 
 #if PASS_MODE == 0
-
 shared float sh_m[N_SG];
 shared float sh_l[N_SG];
 shared VEC_T sh_o[N_SG][32];
+#endif
 
 #if HEAD_DIM == 128
 vec4 load_paged_kv(uint64_t page_va, uint v_or_k_off_B, uint sc_off_B, uint in_page, uint h_kv, uint lane) {
@@ -501,6 +504,7 @@ vec4 load_ext_v(uint64_t base_va, uint nb1, uint nb2, uint kv_idx, uint h_kv, ui
 }
 #endif
 
+#if PASS_MODE == 0
 void main() {
     const uint lane  = gl_LocalInvocationID.x;
     const uint sg    = gl_LocalInvocationID.y;
@@ -662,6 +666,185 @@ void main() {
         }
     }
 }
+
+#elif PASS_MODE == 3
+
+// ============================================================================
+// Phase 3: Tiled Multi-Q Prefill Flash-Attention (HEAD_DIM=128, 8 Q/WG, TILE_KV=16)
+//   - 4 simdgroups x 2 Q-tokens/sg = 8 queries sharing K/V[16, 128] in 8 KB TG SRAM
+//   - 8x KV load reuse + parallel 128-thread masked tile skip (2x causal speedup!)
+// ============================================================================
+shared uvec2 sh_k[16][32];
+shared uvec2 sh_v[16][32];
+shared uint  sh_any_valid;
+
+void main() {
+    const uint lane  = gl_LocalInvocationID.x; // 0..31
+    const uint sg    = gl_LocalInvocationID.y; // 0..3
+    const uint tid   = sg * 32u + lane;        // 0..127
+    const uint h_q   = gl_WorkGroupID.x;
+    const uint wg_q0 = gl_WorkGroupID.y * 8u;
+
+    if (h_q >= pc.n_head_q || wg_q0 >= pc.n_tokens) {
+        return;
+    }
+
+    const uint gqa_ratio = pc.n_head_q / pc.n_head_kv;
+    const uint h_kv      = h_q / gqa_ratio;
+
+    const uint tok0  = wg_q0 + sg * 2u;
+    const uint tok1  = tok0 + 1u;
+    const bool v0_ok = (tok0 < pc.n_tokens);
+    const bool v1_ok = (tok1 < pc.n_tokens);
+
+    vec4 q0 = vec4(0.0f);
+    vec4 q1 = vec4(0.0f);
+    if (v0_ok) {
+        uint64_t qva = pc.q_va + uint64_t(tok0) * uint64_t(pc.q_nb1) + uint64_t(h_q) * uint64_t(pc.q_nb2);
+        if ((pc.flags & FLAG_Q_F16) != 0u) {
+            uvec2 qp = BufUvec2(qva).d[lane];
+            q0 = vec4(unpackHalf2x16(qp.x), unpackHalf2x16(qp.y)) * pc.kq_scale;
+        } else {
+            BufF32 qb = BufF32(qva);
+            uint o = lane * 4u;
+            q0 = vec4(qb.d[o + 0u], qb.d[o + 1u], qb.d[o + 2u], qb.d[o + 3u]) * pc.kq_scale;
+        }
+    }
+    if (v1_ok) {
+        uint64_t qva = pc.q_va + uint64_t(tok1) * uint64_t(pc.q_nb1) + uint64_t(h_q) * uint64_t(pc.q_nb2);
+        if ((pc.flags & FLAG_Q_F16) != 0u) {
+            uvec2 qp = BufUvec2(qva).d[lane];
+            q1 = vec4(unpackHalf2x16(qp.x), unpackHalf2x16(qp.y)) * pc.kq_scale;
+        } else {
+            BufF32 qb = BufF32(qva);
+            uint o = lane * 4u;
+            q1 = vec4(qb.d[o + 0u], qb.d[o + 1u], qb.d[o + 2u], qb.d[o + 3u]) * pc.kq_scale;
+        }
+    }
+
+    const bool has_mask_f16 = (pc.flags & FLAG_HAS_MASK_F16) != 0u && (pc.kq_mask_va != 0ul);
+    const bool has_mask_f32 = (pc.flags & FLAG_HAS_MASK_F32) != 0u && (pc.kq_mask_va != 0ul);
+    const bool has_softcap  = (pc.flags & FLAG_SOFTCAP) != 0u && (pc.logit_softcap != 0.0f);
+    const float slope       = compute_alibi_slope(h_q);
+    const uint h_mask       = (pc.ext_mask_ne2 > 1u) ? (h_q % pc.ext_mask_ne2) : 0u;
+    const uint64_t mask_head_va = pc.kq_mask_va + uint64_t(h_mask) * uint64_t(pc.ext_mask_nb2);
+    const uint64_t mask0_va = mask_head_va + uint64_t(tok0) * uint64_t(pc.ext_mask_nb1);
+    const uint64_t mask1_va = mask_head_va + uint64_t(tok1) * uint64_t(pc.ext_mask_nb1);
+
+    float m0 = -3.402823466e+38f * 0.5f;
+    float l0 = 0.0f;
+    vec4  o0 = vec4(0.0f);
+
+    float m1 = -3.402823466e+38f * 0.5f;
+    float l1 = 0.0f;
+    vec4  o1 = vec4(0.0f);
+
+    for (uint kv0 = 0u; kv0 < pc.n_kv; kv0 += 16u) {
+        const uint tile_len = min(16u, pc.n_kv - kv0);
+
+        // Parallel 128-thread masked tile skip (skips 100% of upper-triangular causal tiles!)
+        if (has_mask_f16 || has_mask_f32) {
+            if (tid == 0u) sh_any_valid = 0u;
+            barrier();
+            const uint ql = tid >> 4;   // 0..7
+            const uint kl = tid & 15u;  // 0..15
+            if (wg_q0 + ql < pc.n_tokens && kl < tile_len) {
+                uint64_t mva = mask_head_va + uint64_t(wg_q0 + ql) * uint64_t(pc.ext_mask_nb1);
+                float mv = has_mask_f16
+                    ? float(BufF16(mva).d[kv0 + kl]) * slope
+                    : BufF32(mva).d[kv0 + kl] * slope;
+                if (mv > -1.0e30f) {
+                    sh_any_valid = 1u;
+                }
+            }
+            barrier();
+            if (sh_any_valid == 0u) {
+                continue;
+            }
+        }
+
+        // Cooperative 128-thread load of K[kv0..+tile_len] & V[kv0..+tile_len] into 8 KB SRAM
+        for (uint kl = sg; kl < tile_len; kl += 4u) {
+            vec4 kv_k = load_ext_k(pc.k_or_pt_va, pc.ext_k_nb1, pc.ext_k_nb2, kv0 + kl, h_kv, lane);
+            vec4 kv_v = load_ext_v(pc.v_va,       pc.ext_v_nb1, pc.ext_v_nb2, kv0 + kl, h_kv, lane);
+            sh_k[kl][lane] = uvec2(packHalf2x16(kv_k.xy), packHalf2x16(kv_k.zw));
+            sh_v[kl][lane] = uvec2(packHalf2x16(kv_v.xy), packHalf2x16(kv_v.zw));
+        }
+        barrier();
+
+        // Evaluate BOTH query tokens per simdgroup against all keys in SRAM
+        for (uint kl = 0u; kl < tile_len; ++kl) {
+            const uint kv = kv0 + kl;
+            float mv0 = 0.0f;
+            float mv1 = 0.0f;
+            bool ok0 = v0_ok;
+            bool ok1 = v1_ok;
+            if (has_mask_f16) {
+                if (ok0) { mv0 = float(BufF16(mask0_va).d[kv]) * slope; ok0 = (mv0 > -1.0e30f); }
+                if (ok1) { mv1 = float(BufF16(mask1_va).d[kv]) * slope; ok1 = (mv1 > -1.0e30f); }
+            } else if (has_mask_f32) {
+                if (ok0) { mv0 = BufF32(mask0_va).d[kv] * slope; ok0 = (mv0 > -1.0e30f); }
+                if (ok1) { mv1 = BufF32(mask1_va).d[kv] * slope; ok1 = (mv1 > -1.0e30f); }
+            }
+            if (!ok0 && !ok1) {
+                continue;
+            }
+
+            uvec2 pk = sh_k[kl][lane];
+            vec4  kr = vec4(unpackHalf2x16(pk.x), unpackHalf2x16(pk.y));
+            uvec2 pv = sh_v[kl][lane];
+            vec4  vr = vec4(unpackHalf2x16(pv.x), unpackHalf2x16(pv.y));
+
+            if (ok0) {
+                float s0 = subgroupAdd(dot(q0, kr));
+                if (has_softcap) s0 = pc.logit_softcap * tanh(s0);
+                s0 += mv0;
+                float mn = max(m0, s0);
+                float a  = exp(m0 - mn);
+                float p  = exp(s0 - mn);
+                o0 = o0 * a + vr * p;
+                l0 = l0 * a + p;
+                m0 = mn;
+            }
+            if (ok1) {
+                float s1 = subgroupAdd(dot(q1, kr));
+                if (has_softcap) s1 = pc.logit_softcap * tanh(s1);
+                s1 += mv1;
+                float mn = max(m1, s1);
+                float a  = exp(m1 - mn);
+                float p  = exp(s1 - mn);
+                o1 = o1 * a + vr * p;
+                l1 = l1 * a + p;
+                m1 = mn;
+            }
+        }
+        barrier();
+    }
+
+    if (v0_ok) {
+        bool has_sink; float eff_sink;
+        get_sink_info(tok0, h_q, has_sink, eff_sink);
+        if (has_sink) {
+            float mf = (l0 > 0.0f) ? max(m0, eff_sink) : eff_sink;
+            float wo = (l0 > 0.0f) ? exp(m0 - mf) : 0.0f;
+            o0 *= wo;
+            l0  = l0 * wo + exp(eff_sink - mf);
+        }
+        apply_epilogue_and_store((l0 > 0.0f) ? (o0 / l0) : vec4(0.0f), tok0, h_q, lane);
+    }
+    if (v1_ok) {
+        bool has_sink; float eff_sink;
+        get_sink_info(tok1, h_q, has_sink, eff_sink);
+        if (has_sink) {
+            float mf = (l1 > 0.0f) ? max(m1, eff_sink) : eff_sink;
+            float wo = (l1 > 0.0f) ? exp(m1 - mf) : 0.0f;
+            o1 *= wo;
+            l1  = l1 * wo + exp(eff_sink - mf);
+        }
+        apply_epilogue_and_store((l1 > 0.0f) ? (o1 / l1) : vec4(0.0f), tok1, h_q, lane);
+    }
+}
+#endif // PASS_MODE == 0 vs 3
 
 #elif PASS_MODE == 1
 
