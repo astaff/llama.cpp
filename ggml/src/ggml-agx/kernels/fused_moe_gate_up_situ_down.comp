@@ -76,11 +76,12 @@ layout(buffer_reference, scalar, buffer_reference_align = 128) readonly buffer B
 };
 
 // Flags for PushMoe::flags
-const uint MOE_FLAG_SEPARATE_GU = 1u << 0; // gate_va and up_va are separate buffers
-const uint MOE_FLAG_X_F16       = 1u << 1; // input ffn_x is F16
-const uint MOE_FLAG_RAW_MMID    = 1u << 2; // generic GGML_OP_MUL_MAT_ID direct store (no atomic scatter)
-const uint MOE_FLAG_ACT_SILU    = 1u << 3; // SwiGLU instead of Inkling SiTU
-const uint MOE_FLAG_ACT_GELU    = 1u << 4; // GeGLU instead of Inkling SiTU
+const uint MOE_FLAG_SEPARATE_GU      = 1u << 0; // gate_va and up_va are separate buffers
+const uint MOE_FLAG_X_F16            = 1u << 1; // input ffn_x is F16
+const uint MOE_FLAG_RAW_MMID         = 1u << 2; // generic GGML_OP_MUL_MAT_ID direct store (no atomic scatter)
+const uint MOE_FLAG_ACT_SILU         = 1u << 3; // SwiGLU instead of Inkling SiTU
+const uint MOE_FLAG_ACT_GELU         = 1u << 4; // GeGLU instead of Inkling SiTU
+const uint MOE_FLAG_RAW_MMID_PERSLOT = 1u << 5; // MUL_MAT_ID with x->ne[1] == top_k (e.g. ffn_down_exps!)
 
 // Push constants: 144 bytes (<= 256 B AGX push window)
 layout(push_constant) uniform PushMoe {
@@ -395,14 +396,14 @@ void vecmat_16rows(
             }
         }
 #else
-        // Flat F32 (default fallback)
-        AgxBufVec4R wbuf4 = AgxBufVec4R(w_base + uint64_t(row) * uint64_t(pc.K) * 4ul);
-        for (uint col4 = lane; col4 < K4; col4 += 32u) {
-            const vec4 wv = wbuf4.v[col4];
+        // Flat F32 (element-wise: supports arbitrary K including K % 4 != 0!)
+        AgxBufF32R wbuf = AgxBufF32R(w_base + uint64_t(row) * uint64_t(pc.K) * 4ul);
+        for (uint k = lane; k < pc.K; k += 32u) {
+            const float wv = wbuf.v[k];
             for (uint m = 0u; m < uint(BATCH_CAP); ++m) {
                 if (m < m_cnt) {
                     const uint row_x = x_is_contiguous_assign ? (tok_off + m) : tok_ids[m];
-                    acc[m] += dot(wv, x_buf4.v[row_x * K4 + col4]);
+                    acc[m] += wv * x_buf1.v[row_x * pc.K + k];
                 }
             }
         }
@@ -495,15 +496,26 @@ void main() {
 
 #else
     // Stage 1: Down Projection + Weighted Scatter-Add (64 output rows/WG, 16 rows/simdgroup)
-    const uint64_t w_base = pc.w_gate_va + uint64_t(bkt.expert_id) * pc.w_slice_B;
+    const uint64_t w_base   = pc.w_gate_va + uint64_t(bkt.expert_id) * pc.w_slice_B;
     const uint     row_base = gl_WorkGroupID.x * 64u + sg_id * 16u;
 
     const bool raw_mmid = (pc.flags & MOE_FLAG_RAW_MMID) != 0u;
+    const bool per_slot = (pc.flags & MOE_FLAG_RAW_MMID_PERSLOT) != 0u;
+
+    uint x_rows[BATCH_CAP];
+    BufU32R sksl_x = BufU32R(pc.sorted_kslot_va);
+    for (uint m = 0u; m < uint(BATCH_CAP); ++m) {
+        if (m < m_cnt) {
+            x_rows[m] = per_slot ? (tok_ids[m] * pc.top_k + sksl_x.d[tok_off + m]) : tok_ids[m];
+        } else {
+            x_rows[m] = 0u;
+        }
+    }
 
     float vals[BATCH_CAP];
     uint  out_r;
     bool  writes;
-    vecmat_16rows(w_base, row_base, pc.N, m_cnt, tok_ids, tok_off, !raw_mmid, lane,
+    vecmat_16rows(w_base, row_base, pc.N, m_cnt, x_rows, tok_off, !raw_mmid, lane,
                   vals, out_r, writes);
 
     if (writes) {
@@ -682,12 +694,15 @@ void main() {
     }
     const bool x_is_assign = false;
 #else
-    const uint64_t w_base  = pc.w_gate_va + uint64_t(tile.expert_id) * pc.w_slice_B;
-    const uint     sg_n0   = gl_WorkGroupID.x * 64u + sg_id * 16u;
+    const uint64_t w_base    = pc.w_gate_va + uint64_t(tile.expert_id) * pc.w_slice_B;
+    const uint     sg_n0     = gl_WorkGroupID.x * 64u + sg_id * 16u;
     const uint     row_limit = pc.N;
-    const bool     raw_mmid = (pc.flags & MOE_FLAG_RAW_MMID) != 0u;
+    const bool     raw_mmid  = (pc.flags & MOE_FLAG_RAW_MMID) != 0u;
+    const bool     per_slot  = (pc.flags & MOE_FLAG_RAW_MMID_PERSLOT) != 0u;
     const bool     x_is_assign = !raw_mmid;
 #endif
+
+    BufU32R sksl_g = BufU32R(pc.sorted_kslot_va);
 
     // 2(N) x 2(M) = 4 FP32 8x8 coopmat accumulators per simdgroup (only 8 GPRs!)
     coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> acc[2][2];
@@ -698,7 +713,7 @@ void main() {
     }
 
     for (uint k_base = 0u; k_base < pc.K; k_base += TILE_K) {
-        // Cooperative load of X[0..m_len-1, k_base..+32] -> sh_x (FP16)
+        // Cooperative load of X[0..m_len-1, k_base..+32] -> sh_x (FP16, clamped finite)
         for (uint idx = tid * 2u; idx < WG_M * TILE_K; idx += 256u) {
             const uint lm = idx / TILE_K;
             const uint lk = idx % TILE_K;
@@ -706,12 +721,22 @@ void main() {
             float16_t v0 = float16_t(0.0);
             float16_t v1 = float16_t(0.0);
             if (lm < m_len) {
-                const uint row_x = x_is_assign ? (tok_off + lm) : stok.d[tok_off + lm];
+                uint row_x;
+                if (x_is_assign) {
+                    row_x = tok_off + lm;
+                } else {
+                    uint t_id = stok.d[tok_off + lm];
+#if PASS_STAGE == 3
+                    row_x = per_slot ? (t_id * pc.top_k + sksl_g.d[tok_off + lm]) : t_id;
+#else
+                    row_x = t_id;
+#endif
+                }
                 if (gk < pc.K) {
-                    v0 = float16_t(x_buf.v[row_x * pc.K + gk]);
+                    v0 = float16_t(clamp(x_buf.v[row_x * pc.K + gk], -65504.0f, 65504.0f));
                 }
                 if (gk + 1u < pc.K) {
-                    v1 = float16_t(x_buf.v[row_x * pc.K + gk + 1u]);
+                    v1 = float16_t(clamp(x_buf.v[row_x * pc.K + gk + 1u], -65504.0f, 65504.0f));
                 }
             }
             sh_x[lm * SH_X_STRIDE + lk]      = v0;

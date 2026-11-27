@@ -165,6 +165,7 @@ struct agx_attn_stage_args {
     uint32_t     ext_v_nb2;
     uint32_t     ext_mask_nb1;      // byte stride between mask rows (queries)
     uint32_t     ext_mask_nb2;      // byte stride between mask heads (0 = broadcast across heads)
+    uint32_t     ext_mask_ne2;      // mask head count for modulo broadcast (h_q % ext_mask_ne2)
     uint32_t     q_nb1;             // optional Q token byte stride (0 -> n_head_q * head_dim * elem)
     uint32_t     q_nb2;             // optional Q head byte stride  (0 -> head_dim * elem)
 };
@@ -188,7 +189,8 @@ bool agx_kv_hybrid_dispatch_attn(agx_kv_hybrid_pool *        pool,
                                  const agx_attn_stage_args & args,
                                  agx_barrier_mode            post_barrier = AGX_BARRIER_STRONG_USC);
 
-// Generic ggml `GGML_OP_FLASH_ATTN_EXT` entrypoint for `agx-graph-exec.cpp` / `test-backend-ops`.
+// Generic ggml `GGML_OP_FLASH_ATTN_EXT` support check & dispatcher for `agx-graph-exec.cpp`.
+bool agx_kv_hybrid_supports_ggml_flash_attn(const struct ggml_tensor * dst);
 bool agx_kv_hybrid_dispatch_ggml_flash_attn(agx_kv_hybrid_pool *     pool,
                                             agx_cdm_stream *         stream,
                                             const struct ggml_tensor * dst,

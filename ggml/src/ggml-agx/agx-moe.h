@@ -96,7 +96,8 @@ struct agx_moe_stage_args {
 
     // Activations & router outputs (SLC-pinned)
     uint64_t          ffn_x_va;          // [M, n_embd] F32 (post-ffn_norm)
-    uint64_t          topk_ids_va;       // [M, top_k] int32_t
+    uint64_t          topk_ids_va;       // [M, top_k] int32_t (row stride = ids_row_stride elems)
+    uint32_t          ids_row_stride;    // int32 elems between token rows in topk_ids (0 -> top_k)
     uint64_t          topk_w_va;         // [M, top_k] F32 (sigmoid-gated + norm eps=1e-20)
     uint64_t          moe_out_va;        // [M, n_embd] F32 output (pre-ffn_post_conv; zeroed internally)
 

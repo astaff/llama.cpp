@@ -160,6 +160,7 @@ struct agx_push_full_attn {
     uint32_t ext_v_nb2;
     uint32_t ext_mask_nb1;
     uint32_t ext_mask_nb2;
+    uint32_t ext_mask_ne2;
     uint32_t q_nb1;
     uint32_t q_nb2;
     uint32_t mask_n_head_log2;
@@ -168,7 +169,7 @@ struct agx_push_full_attn {
     float    m0;
     float    m1;
 };
-static_assert(sizeof(agx_push_full_attn) <= AGX_MAX_PUSH_BYTES, "agx_push_full_attn exceeds 256B");
+static_assert(sizeof(agx_push_full_attn) == 192, "agx_push_full_attn must match GLSL PushAttn (192B)");
 
 struct agx_push_kv_append {
     uint64_t k_src_va;
@@ -243,11 +244,11 @@ struct agx_kv_hybrid_pool {
     agx_bo * split_partial_bo = nullptr;
     size_t   split_partial_cap_bytes = 0;
 
-    // Compiled kernels (indexed by agx_kv_dtype 0..4)
-    const agx_kernel * k_swa_attn[3]    = {}; // F8_E4M3, Q8_0_PLANAR, F16
-    const agx_kernel * k_full_phase1[5] = {}; // F8_E4M3, Q8_0_PLANAR, F16, F32, Q8_0_GGML
-    const agx_kernel * k_full_phase2    = nullptr;
-    const agx_kernel * k_kv_append[3]   = {}; // F8_E4M3, Q8_0_PLANAR, F16
+    // Compiled kernels (head_slot: 0 = D128, 1 = D64; k_dt/v_dt: 0..4)
+    const agx_kernel * k_swa_attn[3]          = {}; // F8_E4M3, Q8_0_PLANAR, F16
+    const agx_kernel * k_full_phase1[2][5][5] = {}; // [head_slot][k_dt][v_dt]
+    const agx_kernel * k_full_phase2[2]       = {}; // [head_slot]
+    const agx_kernel * k_kv_append[3]         = {}; // F8_E4M3, Q8_0_PLANAR, F16
 };
 
 static const agx_kernel * get_swa_kernel(agx_kv_hybrid_pool * pool, agx_kv_dtype dt) {
@@ -268,35 +269,49 @@ static const agx_kernel * get_swa_kernel(agx_kv_hybrid_pool * pool, agx_kv_dtype
     return pool->k_swa_attn[idx];
 }
 
-static const agx_kernel * get_full_phase1_kernel(agx_kv_hybrid_pool * pool, agx_kv_dtype dt) {
-    const uint32_t idx = static_cast<uint32_t>(dt);
-    if (idx >= 5u) {
+static const agx_kernel * get_full_phase1_kernel(agx_kv_hybrid_pool * pool,
+                                                 uint32_t             head_dim,
+                                                 agx_kv_dtype         k_dt,
+                                                 agx_kv_dtype         v_dt) {
+    const uint32_t hs = (head_dim == 64u) ? 1u : (head_dim == 128u ? 0u : 2u);
+    const uint32_t ik = static_cast<uint32_t>(k_dt);
+    const uint32_t iv = static_cast<uint32_t>(v_dt);
+    if (hs >= 2u || ik >= 5u || iv >= 5u) {
         return nullptr;
     }
-    if (!pool->k_full_phase1[idx] && pool->compiler) {
+    if (!pool->k_full_phase1[hs][ik][iv] && pool->compiler) {
         agx_compile_opts opts;
         opts.defines.push_back("PASS_MODE=0");
-        opts.defines.push_back("KV_DTYPE=" + std::to_string(idx));
+        opts.defines.push_back("HEAD_DIM=" + std::to_string(head_dim));
+        opts.defines.push_back("KV_DTYPE_K=" + std::to_string(ik));
+        opts.defines.push_back("KV_DTYPE_V=" + std::to_string(iv));
         opts.defines.push_back("N_SG=4");
         opts.is_hot_kernel     = true;
         opts.strict_zero_spill = true;
-        const std::string name = "fused_full_flash_decode_p1_dt" + std::to_string(idx);
-        pool->k_full_phase1[idx] = agx_compiler_compile_file(
+        const std::string name = "fused_full_flash_decode_p1_d" + std::to_string(head_dim)
+                               + "_k" + std::to_string(ik) + "_v" + std::to_string(iv);
+        pool->k_full_phase1[hs][ik][iv] = agx_compiler_compile_file(
             pool->compiler, name.c_str(), "fused_full_flash_decode.comp", opts);
     }
-    return pool->k_full_phase1[idx];
+    return pool->k_full_phase1[hs][ik][iv];
 }
 
-static const agx_kernel * get_full_phase2_kernel(agx_kv_hybrid_pool * pool) {
-    if (!pool->k_full_phase2 && pool->compiler) {
+static const agx_kernel * get_full_phase2_kernel(agx_kv_hybrid_pool * pool, uint32_t head_dim) {
+    const uint32_t hs = (head_dim == 64u) ? 1u : (head_dim == 128u ? 0u : 2u);
+    if (hs >= 2u) {
+        return nullptr;
+    }
+    if (!pool->k_full_phase2[hs] && pool->compiler) {
         agx_compile_opts opts;
         opts.defines.push_back("PASS_MODE=1");
+        opts.defines.push_back("HEAD_DIM=" + std::to_string(head_dim));
         opts.is_hot_kernel     = true;
         opts.strict_zero_spill = true;
-        pool->k_full_phase2 = agx_compiler_compile_file(
-            pool->compiler, "fused_full_flash_decode_p2", "fused_full_flash_decode.comp", opts);
+        const std::string name = "fused_full_flash_decode_p2_d" + std::to_string(head_dim);
+        pool->k_full_phase2[hs] = agx_compiler_compile_file(
+            pool->compiler, name.c_str(), "fused_full_flash_decode.comp", opts);
     }
-    return pool->k_full_phase2;
+    return pool->k_full_phase2[hs];
 }
 
 static const agx_kernel * get_kv_append_kernel(agx_kv_hybrid_pool * pool, agx_kv_dtype dt) {
@@ -687,7 +702,8 @@ bool agx_kv_hybrid_dispatch_full_attn(agx_kv_hybrid_pool *        pool,
                                       agx_cdm_stream *            stream,
                                       const agx_attn_stage_args & args,
                                       agx_barrier_mode            post_barrier) {
-    if (!pool || !stream || args.n_tokens == 0 || args.n_head_q == 0 || args.head_dim != 128u) {
+    if (!pool || !stream || args.n_tokens == 0 || args.n_head_q == 0 ||
+        (args.head_dim != 64u && args.head_dim != 128u)) {
         return false;
     }
 
@@ -696,8 +712,9 @@ bool agx_kv_hybrid_dispatch_full_attn(agx_kv_hybrid_pool *        pool,
         return false;
     }
 
-    const agx_kv_dtype dt = is_paged ? pool->cfg.full_dtype : args.ext_k_dtype;
-    const agx_kernel * k_p1 = get_full_phase1_kernel(pool, dt);
+    const agx_kv_dtype k_dt = is_paged ? pool->cfg.full_dtype : args.ext_k_dtype;
+    const agx_kv_dtype v_dt = is_paged ? pool->cfg.full_dtype : args.ext_v_dtype;
+    const agx_kernel * k_p1 = get_full_phase1_kernel(pool, args.head_dim, k_dt, v_dt);
     if (!k_p1) {
         return false;
     }
@@ -758,17 +775,22 @@ bool agx_kv_hybrid_dispatch_full_attn(agx_kv_hybrid_pool *        pool,
         pc.ext_v_nb2     = args.ext_v_nb2;
         pc.ext_mask_nb1  = args.ext_mask_nb1;
         pc.ext_mask_nb2  = args.ext_mask_nb2;
+        pc.ext_mask_ne2  = args.ext_mask_ne2 ? args.ext_mask_ne2 : 1u;
     }
 
     if (n_splits == 1u) {
-        // Single-pass direct store + sink + epilogue
         return agx_cdm_dispatch(stream, k_p1, args.n_head_q, args.n_tokens, 1u,
                                 &pc, sizeof(pc), post_barrier);
     }
 
-    const agx_kernel * k_p2 = get_full_phase2_kernel(pool);
+    const agx_kernel * k_p2 = get_full_phase2_kernel(pool, args.head_dim);
     if (!k_p2) {
         return false;
+    }
+
+    // Protect shared pool->split_partial_bo across consecutive split-K calls in the same CDM stream!
+    if (!agx_cdm_is_empty(stream)) {
+        agx_cdm_barrier_usc(stream);
     }
 
     // Phase 1: Split-K across all 40 cores -> SLC-pinned partial scratch
@@ -778,8 +800,11 @@ bool agx_kv_hybrid_dispatch_full_attn(agx_kv_hybrid_pool *        pool,
     }
 
     // Phase 2: Reduction + single-application sink + FWHT64 + sigmoid(Qgate)
+    const agx_barrier_mode p2_bar = (post_barrier == AGX_BARRIER_NONE)
+        ? AGX_BARRIER_STRONG_USC
+        : post_barrier;
     return agx_cdm_dispatch(stream, k_p2, args.n_head_q, args.n_tokens, 1u,
-                            &pc, sizeof(pc), post_barrier);
+                            &pc, sizeof(pc), p2_bar);
 }
 
 bool agx_kv_hybrid_dispatch_attn(agx_kv_hybrid_pool *        pool,
@@ -816,11 +841,8 @@ static bool ggml_type_to_ext_kv(ggml_type t, agx_kv_dtype * out) {
     }
 }
 
-bool agx_kv_hybrid_dispatch_ggml_flash_attn(agx_kv_hybrid_pool *       pool,
-                                            agx_cdm_stream *           stream,
-                                            const struct ggml_tensor * dst,
-                                            agx_barrier_mode           post_barrier) {
-    if (!pool || !stream || !dst || dst->op != GGML_OP_FLASH_ATTN_EXT) {
+bool agx_kv_hybrid_supports_ggml_flash_attn(const struct ggml_tensor * dst) {
+    if (!dst || dst->op != GGML_OP_FLASH_ATTN_EXT) {
         return false;
     }
     const ggml_tensor * q     = dst->src[0]; // [D, N, Hq, B]
@@ -829,59 +851,133 @@ bool agx_kv_hybrid_dispatch_ggml_flash_attn(agx_kv_hybrid_pool *       pool,
     const ggml_tensor * mask  = dst->src[3]; // optional [KV, N, Hmask, B]
     const ggml_tensor * sinks = dst->src[4]; // optional [Hq]
 
-    if (!q || !k || !v || q->ne[0] != 128 || k->ne[0] != 128 || v->ne[0] != 128) {
+    if (!q || !k || !v) {
         return false;
     }
-    if (q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1) {
-        return false; // multi-stream batched path handled by looping over stream index
+    // Reject sparse kv_rows / bias_table / bias_indices extensions not implemented on GPU
+    if (dst->src[5] || dst->src[6] || dst->src[7]) {
+        return false;
     }
-
+    if (q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (q->nb[0] != sizeof(float) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    if (q->ne[0] != k->ne[0] || k->ne[0] != v->ne[0] || dst->ne[0] != v->ne[0]) {
+        return false;
+    }
+    if (q->ne[0] != 64 && q->ne[0] != 128) {
+        return false;
+    }
+    if (k->ne[1] != v->ne[1] || k->ne[2] != v->ne[2] || k->ne[2] <= 0 ||
+        (q->ne[2] % k->ne[2]) != 0) {
+        return false;
+    }
+    if (k->ne[3] <= 0 || v->ne[3] <= 0 || (q->ne[3] % k->ne[3]) != 0 || (q->ne[3] % v->ne[3]) != 0) {
+        return false;
+    }
+    if (k->nb[0] != ggml_type_size(k->type) || v->nb[0] != ggml_type_size(v->type)) {
+        return false;
+    }
     agx_kv_dtype k_dt, v_dt;
-    if (!ggml_type_to_ext_kv(k->type, &k_dt) || !ggml_type_to_ext_kv(v->type, &v_dt) || k_dt != v_dt) {
+    if (!ggml_type_to_ext_kv(k->type, &k_dt) || !ggml_type_to_ext_kv(v->type, &v_dt)) {
         return false;
     }
+    if (mask) {
+        if ((mask->type != GGML_TYPE_F16 && mask->type != GGML_TYPE_F32) ||
+            mask->nb[0] != ggml_type_size(mask->type) || mask->ne[0] < k->ne[1] ||
+            mask->ne[1] < q->ne[1] || mask->ne[2] <= 0 || mask->ne[3] <= 0) {
+            return false;
+        }
+    }
+    if (sinks && (sinks->type != GGML_TYPE_F32 || !ggml_is_contiguous(sinks))) {
+        return false;
+    }
+    return true;
+}
+
+bool agx_kv_hybrid_dispatch_ggml_flash_attn(agx_kv_hybrid_pool *       pool,
+                                            agx_cdm_stream *           stream,
+                                            const struct ggml_tensor * dst,
+                                            agx_barrier_mode           post_barrier) {
+    if (!pool || !stream || !agx_kv_hybrid_supports_ggml_flash_attn(dst)) {
+        return false;
+    }
+    const ggml_tensor * q     = dst->src[0]; // [D, N, Hq, B]
+    const ggml_tensor * k     = dst->src[1]; // [D, KV, Hkv, B]
+    const ggml_tensor * v     = dst->src[2]; // [D, KV, Hkv, B]
+    const ggml_tensor * mask  = dst->src[3]; // optional [KV, N, Hmask, B]
+    const ggml_tensor * sinks = dst->src[4]; // optional [Hq]
+
+    agx_kv_dtype k_dt = AGX_KV_F16;
+    agx_kv_dtype v_dt = AGX_KV_F16;
+    ggml_type_to_ext_kv(k->type, &k_dt);
+    ggml_type_to_ext_kv(v->type, &v_dt);
 
     float scale = 1.0f, max_bias = 0.0f, logit_softcap = 0.0f;
     std::memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
     std::memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
     std::memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
-    agx_attn_stage_args args = {};
-    args.n_tokens      = static_cast<uint32_t>(q->ne[1]);
-    args.n_kv          = static_cast<uint32_t>(k->ne[1]);
-    args.n_head_q      = static_cast<uint32_t>(q->ne[2]);
-    args.n_head_kv     = static_cast<uint32_t>(k->ne[2]);
-    args.head_dim      = 128u;
-    args.kq_scale      = (logit_softcap != 0.0f) ? (scale / logit_softcap) : scale;
-    args.max_bias      = max_bias;
-    args.logit_softcap = logit_softcap;
-    args.flags         = (logit_softcap != 0.0f ? AGX_ATTN_FLAG_SOFTCAP : 0u)
-                       | (q->type == GGML_TYPE_F16 ? AGX_ATTN_FLAG_Q_F16 : 0u)
-                       | (dst->type == GGML_TYPE_F16 ? AGX_ATTN_FLAG_OUT_F16 : 0u);
+    const uint64_t base_q_va    = agx_tensor_gpu_va(q);
+    const uint64_t base_k_va    = agx_tensor_gpu_va(k);
+    const uint64_t base_v_va    = agx_tensor_gpu_va(v);
+    const uint64_t base_out_va  = agx_tensor_gpu_va(dst);
+    const uint64_t base_mask_va = mask  ? agx_tensor_gpu_va(mask)  : 0;
+    const uint64_t sinks_va     = sinks ? agx_tensor_gpu_va(sinks) : 0;
 
-    args.q_va          = agx_tensor_gpu_va(q);
-    args.q_nb1         = static_cast<uint32_t>(q->nb[1]);
-    args.q_nb2         = static_cast<uint32_t>(q->nb[2]);
-    args.out_va        = agx_tensor_gpu_va(dst);
-    args.ext_k_dtype   = k_dt;
-    args.ext_v_dtype   = v_dt;
-    args.ext_k_va      = agx_tensor_gpu_va(k);
-    args.ext_v_va      = agx_tensor_gpu_va(v);
-    args.ext_k_nb1     = static_cast<uint32_t>(k->nb[1]);
-    args.ext_k_nb2     = static_cast<uint32_t>(k->nb[2]);
-    args.ext_v_nb1     = static_cast<uint32_t>(v->nb[1]);
-    args.ext_v_nb2     = static_cast<uint32_t>(v->nb[2]);
-
-    if (mask) {
-        args.kq_mask_va   = agx_tensor_gpu_va(mask);
-        args.ext_mask_nb1 = static_cast<uint32_t>(mask->nb[1]);
-        args.ext_mask_nb2 = (mask->ne[2] > 1) ? static_cast<uint32_t>(mask->nb[2]) : 0u;
-        args.flags       |= (mask->type == GGML_TYPE_F16) ? AGX_ATTN_FLAG_HAS_MASK_F16 : AGX_ATTN_FLAG_HAS_MASK_F32;
-    }
-    if (sinks) {
-        args.sinks_va = agx_tensor_gpu_va(sinks);
-        args.flags   |= AGX_ATTN_FLAG_SINK_PER_HEAD;
+    if (!base_q_va || !base_k_va || !base_v_va || !base_out_va || (mask && !base_mask_va) || (sinks && !sinks_va)) {
+        return false;
     }
 
-    return agx_kv_hybrid_dispatch_full_attn(pool, stream, args, post_barrier);
+    const int64_t B   = q->ne[3];
+    const int64_t rk3 = q->ne[3] / k->ne[3];
+    const int64_t rv3 = q->ne[3] / v->ne[3];
+
+    for (int64_t b = 0; b < B; ++b) {
+        agx_attn_stage_args args = {};
+        args.n_tokens      = static_cast<uint32_t>(q->ne[1]);
+        args.n_kv          = static_cast<uint32_t>(k->ne[1]);
+        args.n_head_q      = static_cast<uint32_t>(q->ne[2]);
+        args.n_head_kv     = static_cast<uint32_t>(k->ne[2]);
+        args.head_dim      = static_cast<uint32_t>(q->ne[0]);
+        args.kq_scale      = (logit_softcap != 0.0f) ? (scale / logit_softcap) : scale;
+        args.max_bias      = max_bias;
+        args.logit_softcap = logit_softcap;
+        args.flags         = (logit_softcap != 0.0f ? AGX_ATTN_FLAG_SOFTCAP : 0u)
+                           | (q->type == GGML_TYPE_F16 ? AGX_ATTN_FLAG_Q_F16 : 0u)
+                           | (dst->type == GGML_TYPE_F16 ? AGX_ATTN_FLAG_OUT_F16 : 0u);
+
+        args.q_va          = base_q_va   + static_cast<uint64_t>(b) * q->nb[3];
+        args.q_nb1         = static_cast<uint32_t>(q->nb[1]);
+        args.q_nb2         = static_cast<uint32_t>(q->nb[2]);
+        args.out_va        = base_out_va + static_cast<uint64_t>(b) * dst->nb[3];
+        args.ext_k_dtype   = k_dt;
+        args.ext_v_dtype   = v_dt;
+        args.ext_k_va      = base_k_va + static_cast<uint64_t>(b / rk3) * k->nb[3];
+        args.ext_v_va      = base_v_va + static_cast<uint64_t>(b / rv3) * v->nb[3];
+        args.ext_k_nb1     = static_cast<uint32_t>(k->nb[1]);
+        args.ext_k_nb2     = static_cast<uint32_t>(k->nb[2]);
+        args.ext_v_nb1     = static_cast<uint32_t>(v->nb[1]);
+        args.ext_v_nb2     = static_cast<uint32_t>(v->nb[2]);
+
+        if (mask) {
+            args.kq_mask_va   = base_mask_va + static_cast<uint64_t>(b % mask->ne[3]) * mask->nb[3];
+            args.ext_mask_nb1 = static_cast<uint32_t>(mask->nb[1]);
+            args.ext_mask_nb2 = (mask->ne[2] > 1) ? static_cast<uint32_t>(mask->nb[2]) : 0u;
+            args.ext_mask_ne2 = static_cast<uint32_t>(mask->ne[2]);
+            args.flags       |= (mask->type == GGML_TYPE_F16) ? AGX_ATTN_FLAG_HAS_MASK_F16 : AGX_ATTN_FLAG_HAS_MASK_F32;
+        }
+        if (sinks) {
+            args.sinks_va = sinks_va;
+            args.flags   |= AGX_ATTN_FLAG_SINK_PER_HEAD;
+        }
+
+        const agx_barrier_mode b_bar = (b + 1 == B) ? post_barrier : AGX_BARRIER_NONE;
+        if (!agx_kv_hybrid_dispatch_full_attn(pool, stream, args, b_bar)) {
+            return false;
+        }
+    }
+    return true;
 }
