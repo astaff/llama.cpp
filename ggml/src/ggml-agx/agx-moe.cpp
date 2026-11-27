@@ -69,7 +69,7 @@ struct agx_push_moe_exec {
     uint32_t flags;
     float    situ_beta;
     float    situ_linear_beta;
-    uint32_t pad0;
+    uint32_t ids_row_stride; // PASS_STAGE=4: int32 elems between token rows in ids (0 -> top_k)
 };
 static_assert(sizeof(agx_push_moe_exec) == 112, "agx_push_moe_exec size check");
 
@@ -591,37 +591,40 @@ bool agx_moe_dispatch_mul_mat_id(agx_moe_runner *           r,
         (ggml_prec_get_src(dst, 0) == GGML_PREC_F32);
 
     // ------------------------------------------------------------------------
-    // M == 1 Direct Roofline Fastpath (ALL 96 MoE nodes in B=1 decode!):
+    // M = 1..8 Direct Roofline Fastpath (B=1 decode + M=2..8 DSpark verify!):
     //   - ZERO bucketing, ZERO dst zero-fill, ZERO indirect grid, ZERO meta_bo barrier!
-    //   - NVFP4_32x16: 64 rows/WG SWAR2 ffma16 (~36 GPR32, 2x WG occupancy on all 40 cores!)
-    //   - Q8_0_8BLK:   8 rows/WG 16B uvec4 coalesced loads (~515 GB/s roofline layout)
+    //   - Eliminates 3 dispatches + 2 STRONG_USC barriers per MoE op across all 96 ops!
+    //   - NVFP4_32x16: 64 rows/WG SWAR2 ffma16 + 2x K-unroll (<=56 GPR32, 0:0 spills)
+    //   - Q8_0_8BLK:   8 rows/WG 16B uvec4 coalesced + 2x chunk-unroll (515 GB/s layout)
+    //   - Exact eid < 0 / OOB -> 0.0f skip guard in-kernel; grid_z = M, grid_y = top_k.
     // ------------------------------------------------------------------------
-    if (M == 1u) {
-        const agx_kernel * k_m1 = get_moe_exec_kernel(r, 4u, layout, 1u, req_prec_f32);
-        if (!k_m1) return false;
+    if (M <= AGX_MOE_DIRECT_MAX_M) {
+        const agx_kernel * k_direct = get_moe_exec_kernel(r, 4u, layout, 1u, req_prec_f32);
+        if (!k_direct) return false;
 
         agx_push_moe_exec p = {};
-        p.buckets_va = agx_tensor_gpu_va(ids);
-        p.x_va       = agx_tensor_gpu_va(x);
-        p.w_gate_va  = agx_tensor_gpu_va(w);
-        p.y_va       = agx_tensor_gpu_va(dst);
-        p.w_slice_B  = slice_B;
-        p.K          = K;
-        p.N          = N;
-        p.n_ff       = n_expert; // n_expert bounds check for negative/OOB IDs
-        p.top_k      = top_k;
-        p.flags      = AGX_MOE_FLAG_RAW_MMID | (per_slot ? AGX_MOE_FLAG_RAW_MMID_PERSLOT : 0u);
+        p.buckets_va     = agx_tensor_gpu_va(ids);
+        p.x_va           = agx_tensor_gpu_va(x);
+        p.w_gate_va      = agx_tensor_gpu_va(w);
+        p.y_va           = agx_tensor_gpu_va(dst);
+        p.w_slice_B      = slice_B;
+        p.K              = K;
+        p.N              = N;
+        p.n_ff           = n_expert; // n_expert bounds check for negative/OOB IDs
+        p.top_k          = top_k;
+        p.flags          = AGX_MOE_FLAG_RAW_MMID | (per_slot ? AGX_MOE_FLAG_RAW_MMID_PERSLOT : 0u);
+        p.ids_row_stride = static_cast<uint32_t>(ids->nb[1] / sizeof(int32_t));
 
         const uint32_t rows_per_wg = (layout == AGX_WEIGHT_NVFP4_REPACKED) ? 64u
                                    : (layout == AGX_WEIGHT_Q8_0_REPACKED)  ? 8u
                                                                            : 4u;
         const uint32_t grid_x = (N + rows_per_wg - 1u) / rows_per_wg;
-        return agx_cdm_dispatch(stream, k_m1, grid_x, top_k, 1u, &p, sizeof(p), post_barrier);
+        return agx_cdm_dispatch(stream, k_direct, grid_x, top_k, M, &p, sizeof(p), post_barrier);
     }
 
     const bool force_fp32_vecmat =
         req_prec_f32 ||
-        (M < AGX_MOE_GEMM_MIN_M) ||
+        (M < 16u) ||
         (K < 32u) || ((K & 3u) != 0u);
 
     const uint32_t bcap          = AGX_MOE_VECMAT_MAX_M;

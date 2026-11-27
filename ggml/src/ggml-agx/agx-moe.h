@@ -40,6 +40,7 @@
 //          `simdgroup_matrix` (`GL_KHR_cooperative_matrix`) GEMM (`<= 88` GPRs, `0:0` spills).
 
 #define AGX_MOE_MAX_EXPERTS      256u
+#define AGX_MOE_DIRECT_MAX_M     1u  // M=1 direct fastpath (M>=2 deduplicates shared experts via bitonic bucket!)
 #define AGX_MOE_VECMAT_MAX_M     5u
 #define AGX_MOE_GEMM_MIN_M       6u
 #define AGX_MOE_GEMM_TILE_M      32u

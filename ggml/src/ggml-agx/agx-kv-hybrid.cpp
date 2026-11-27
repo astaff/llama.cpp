@@ -248,7 +248,8 @@ struct agx_kv_hybrid_pool {
     const agx_kernel * k_swa_attn[3]          = {}; // F8_E4M3, Q8_0_PLANAR, F16
     const agx_kernel * k_full_phase1[2][5][5] = {}; // [head_slot][k_dt][v_dt]
     const agx_kernel * k_full_phase2[2]       = {}; // [head_slot]
-    const agx_kernel * k_full_prefill[5][5]   = {}; // D128 tiled multi-Q prefill [k_dt][v_dt]
+    const agx_kernel * k_full_prefill[5][5]   = {}; // D128 BQ=32 coopmat prefill [k_dt][v_dt]
+    const agx_kernel * k_full_prefill_m8[5][5]= {}; // D128 BQ=8 split-K coopmat (M=2..15 DSpark!) [k_dt][v_dt]
     const agx_kernel * k_kv_append[3]         = {}; // F8_E4M3, Q8_0_PLANAR, F16
 };
 
@@ -338,6 +339,30 @@ static const agx_kernel * get_full_prefill_kernel(agx_kv_hybrid_pool * pool,
             pool->compiler, name.c_str(), "fused_full_flash_decode.comp", opts);
     }
     return pool->k_full_prefill[ik][iv];
+}
+
+static const agx_kernel * get_full_prefill_m8_kernel(agx_kv_hybrid_pool * pool,
+                                                     agx_kv_dtype         k_dt,
+                                                     agx_kv_dtype         v_dt) {
+    const uint32_t ik = static_cast<uint32_t>(k_dt);
+    const uint32_t iv = static_cast<uint32_t>(v_dt);
+    if (ik >= 5u || iv >= 5u) {
+        return nullptr;
+    }
+    if (!pool->k_full_prefill_m8[ik][iv] && pool->compiler) {
+        agx_compile_opts opts;
+        opts.defines.push_back("PASS_MODE=4");
+        opts.defines.push_back("HEAD_DIM=128");
+        opts.defines.push_back("KV_DTYPE_K=" + std::to_string(ik));
+        opts.defines.push_back("KV_DTYPE_V=" + std::to_string(iv));
+        opts.is_hot_kernel     = true;
+        opts.strict_zero_spill = true;
+        const std::string name = "fused_full_flash_m8_d128_k" + std::to_string(ik)
+                               + "_v" + std::to_string(iv);
+        pool->k_full_prefill_m8[ik][iv] = agx_compiler_compile_file(
+            pool->compiler, name.c_str(), "fused_full_flash_decode.comp", opts);
+    }
+    return pool->k_full_prefill_m8[ik][iv];
 }
 
 static const agx_kernel * get_kv_append_kernel(agx_kv_hybrid_pool * pool, agx_kv_dtype dt) {
@@ -804,7 +829,7 @@ bool agx_kv_hybrid_dispatch_full_attn(agx_kv_hybrid_pool *        pool,
         pc.ext_mask_ne2  = args.ext_mask_ne2 ? args.ext_mask_ne2 : 1u;
     }
 
-    // Tiled Multi-Q Prefill fastpath (8 queries/WG sharing 16-key K/V in 8 KB SRAM + causal skip!)
+    // Tiled Multi-Q 8x8 FP16 Coopmat Prefill fastpath (32 Q/WG, 16 KV/tile, FP32 online softmax + causal skip!)
     // Triggers for non-paged D=128 prefill with F16/F8_E4M3/Q8_0 KV (preserves full F32 accuracy for F32 KV).
     if (!is_paged && args.head_dim == 128u && args.n_tokens >= 16u && args.n_kv >= 32u &&
         k_dt != AGX_KV_F32 && v_dt != AGX_KV_F32 &&
@@ -812,9 +837,57 @@ bool agx_kv_hybrid_dispatch_full_attn(agx_kv_hybrid_pool *        pool,
         const agx_kernel * k_pf = get_full_prefill_kernel(pool, k_dt, v_dt);
         if (k_pf) {
             pc.n_splits = 1u;
-            const uint32_t grid_y = (args.n_tokens + 7u) / 8u;
+            const uint32_t grid_y = (args.n_tokens + 31u) / 32u;
             return agx_cdm_dispatch(stream, k_pf, args.n_head_q, grid_y, 1u,
                                     &pc, sizeof(pc), post_barrier);
+        }
+    }
+
+    // DSpark M=2..15 Split-K 8x8 FP16 Coopmat fastpath (1 sg = 8 Q/WG, 8x KV reuse, 0 WG barriers!)
+    // Eliminates 8x redundant KV DRAM loads during speculative verify (M=5..8)!
+    if (!is_paged && args.head_dim == 128u && args.n_tokens >= 2u && args.n_tokens < 16u &&
+        args.n_kv >= 32u && k_dt != AGX_KV_F32 && v_dt != AGX_KV_F32 &&
+        (args.flags & (AGX_ATTN_FLAG_CAUSAL | AGX_ATTN_FLAG_HAS_REL_TABLE)) == 0u) {
+        const agx_kernel * k_pf4 = get_full_prefill_m8_kernel(pool, k_dt, v_dt);
+        if (k_pf4) {
+            const uint32_t grid_y   = (args.n_tokens + 7u) / 8u;
+            const uint32_t base_wgs = std::max<uint32_t>(1u, args.n_head_q * grid_y);
+            uint32_t pf4_splits = 1u;
+            if (args.n_kv > 128u) {
+                const uint32_t max_by_kv = std::max<uint32_t>(1u, (args.n_kv + 63u) / 64u);
+                const uint32_t want      = (base_wgs >= 160u) ? 1u : ((160u + base_wgs - 1u) / base_wgs);
+                pf4_splits = std::max<uint32_t>(want, (args.n_kv + 255u) / 256u);
+                pf4_splits = std::min<uint32_t>(pf4_splits, max_by_kv);
+                pf4_splits = std::min<uint32_t>(pf4_splits, AGX_KV_MAX_SPLITS);
+                pf4_splits = std::max<uint32_t>(1u, pf4_splits);
+            }
+            if (pf4_splits == 1u) {
+                pc.n_splits   = 1u;
+                pc.partial_va = 0;
+                return agx_cdm_dispatch(stream, k_pf4, args.n_head_q, grid_y, 1u,
+                                        &pc, sizeof(pc), post_barrier);
+            }
+            if (!ensure_split_partial_bo(pool, args.n_tokens, args.n_head_q, pf4_splits)) {
+                return false;
+            }
+            const agx_kernel * k_p2_m8 = get_full_phase2_kernel(pool, args.head_dim);
+            if (!k_p2_m8) {
+                return false;
+            }
+            pc.n_splits   = pf4_splits;
+            pc.partial_va = pool->split_partial_bo->gpu_va;
+            if (!agx_cdm_is_empty(stream)) {
+                agx_cdm_barrier_usc(stream);
+            }
+            if (!agx_cdm_dispatch(stream, k_pf4, args.n_head_q, grid_y, pf4_splits,
+                                  &pc, sizeof(pc), AGX_BARRIER_STRONG_USC)) {
+                return false;
+            }
+            const agx_barrier_mode p2_bar = (post_barrier == AGX_BARRIER_NONE)
+                ? AGX_BARRIER_STRONG_USC
+                : post_barrier;
+            return agx_cdm_dispatch(stream, k_p2_m8, args.n_head_q, args.n_tokens, 1u,
+                                    &pc, sizeof(pc), p2_bar);
         }
     }
 

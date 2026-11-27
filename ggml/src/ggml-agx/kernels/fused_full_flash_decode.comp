@@ -1,15 +1,21 @@
 #version 450
+#extension GL_GOOGLE_include_directive : enable
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference2 : require
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+
+#include "dequant_supertile.glsl"
 
 // ============================================================================
 // Pillar 4: Fused Full-Attention Split-K Flash-Decoding (1M-Context Paged +
@@ -24,7 +30,8 @@
 //   PASS_MODE  = 1 : Phase 2 Split-K Reduction + single-application sink + FWHT64 + Qgate
 //   PASS_MODE  = 2 : Fused KV-Append (quantizes F32/F16 K/V -> F8_E4M3 / Q8_0_PLANAR / F16
 //                    into SWA-1024 ring OR 64-token paged full-attn pool + pos table)
-//   PASS_MODE  = 3 : Tiled Multi-Q Prefill Flash-Attention (HEAD_DIM=128, 8 Q/WG, TILE_KV=16)
+//   PASS_MODE  = 3 : 8x8 FP16 Coopmat Prefill Flash-Attention (HEAD_DIM=128, 32 Q/WG,
+//                    TILE_KV=16, FP32 online softmax, 14.76 KB SRAM, 0:0 spills!)
 //
 //   HEAD_DIM   = 128 (default, vec4/lane) or 64 (vec2/lane)
 //   KV_DTYPE   = 0 (F8_E4M3), 1 (Q8_0_PLANAR), 2 (F16), 3 (F32), 4 (Q8_0_GGML)
@@ -67,6 +74,8 @@
 
 #if PASS_MODE == 0 || PASS_MODE == 3
 layout(local_size_x = 32, local_size_y = N_SG, local_size_z = 1) in;
+#elif PASS_MODE == 4
+layout(local_size_x = 32, local_size_y = 2, local_size_z = 1) in;
 #else
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 #endif
@@ -188,7 +197,7 @@ vec4 fwht64_in_reg(vec4 v, uint lane) {
 }
 #endif
 
-#if PASS_MODE == 0 || PASS_MODE == 1 || PASS_MODE == 3
+#if PASS_MODE == 0 || PASS_MODE == 1 || PASS_MODE == 3 || PASS_MODE == 4
 
 // Push constants for Phase 1 & Phase 2: 192 bytes (exact multiple of 8, <= 256 B!)
 layout(push_constant) uniform PushAttn {
@@ -303,9 +312,9 @@ void get_sink_info(uint tok, uint h_q, out bool has_sink, out float eff_sink) {
     }
 }
 
-#endif // PASS_MODE == 0 || PASS_MODE == 1 || PASS_MODE == 3
+#endif // PASS_MODE == 0 || PASS_MODE == 1 || PASS_MODE == 3 || PASS_MODE == 4
 
-#if PASS_MODE == 0 || PASS_MODE == 3
+#if PASS_MODE == 0 || PASS_MODE == 3 || PASS_MODE == 4
 
 #if PASS_MODE == 0
 shared float sh_m[N_SG];
@@ -323,12 +332,7 @@ vec4 load_paged_kv(uint64_t page_va, uint v_or_k_off_B, uint sc_off_B, uint in_p
 #elif KV_DTYPE_K == 1
     uint packed = BufU32(data_va).d[head_idx * 32u + lane];
     float sc = float(BufF16(page_va + uint64_t(sc_off_B)).d[head_idx * 4u + (lane >> 3)]);
-    return vec4(
-        float(bitfieldExtract(int(packed),  0, 8)),
-        float(bitfieldExtract(int(packed),  8, 8)),
-        float(bitfieldExtract(int(packed), 16, 8)),
-        float(bitfieldExtract(int(packed), 24, 8))
-    ) * sc;
+    return vec4(agx_q8_u32_magic_to_f16vec4(packed)) * sc;
 #elif KV_DTYPE_K == 2
     uvec2 p = BufUvec2(data_va).d[head_idx * 32u + lane];
     return vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y));
@@ -348,10 +352,7 @@ vec2 load_paged_kv(uint64_t page_va, uint v_or_k_off_B, uint sc_off_B, uint in_p
 #elif KV_DTYPE_K == 1
     uint packed = uint(BufU16(data_va).d[head_idx * 32u + lane]);
     float sc = float(BufF16(page_va + uint64_t(sc_off_B)).d[head_idx * 2u + (lane >> 4)]);
-    return vec2(
-        float(bitfieldExtract(int(packed), 0, 8)),
-        float(bitfieldExtract(int(packed), 8, 8))
-    ) * sc;
+    return vec2(agx_q8_u16_magic_to_f16vec2(packed)) * sc;
 #elif KV_DTYPE_K == 2
     uint p = BufU32(data_va).d[head_idx * 32u + lane];
     return unpackHalf2x16(p);
@@ -362,41 +363,6 @@ vec2 load_paged_kv(uint64_t page_va, uint v_or_k_off_B, uint sc_off_B, uint in_p
 #endif
 }
 #endif
-
-// Macro-parameterized external KV loader supporting independent K and V dtypes & D=64/128
-#define DEFINE_LOAD_EXT_KV(FN_NAME, DT) \
-VEC_T FN_NAME(uint64_t base_va, uint nb1, uint nb2, uint kv_idx, uint h_kv, uint lane) { \
-    const uint64_t row_va = base_va + uint64_t(kv_idx) * uint64_t(nb1) + uint64_t(h_kv) * uint64_t(nb2); \
-    if (DT == 0) { \
-        return (HEAD_DIM == 64) ? VEC_T(decode_e4m3_u16(uint(BufU16(row_va).d[lane]))) \
-                                : VEC_T(decode_e4m3_u32(BufU32(row_va).d[lane])); \
-    } else if (DT == 2) { \
-        return (HEAD_DIM == 64) ? VEC_T(unpackHalf2x16(BufU32(row_va).d[lane])) \
-                                : VEC_T(unpackHalf2x16(BufUvec2(row_va).d[lane].x), \
-                                        unpackHalf2x16(BufUvec2(row_va).d[lane].y)); \
-    } else if (DT == 3) { \
-        BufF32 fb = BufF32(row_va); \
-        uint o = lane * ELEMS_PER_LANE; \
-        return (HEAD_DIM == 64) ? VEC_T(fb.d[o + 0u], fb.d[o + 1u]) \
-                                : VEC_T(fb.d[o + 0u], fb.d[o + 1u], fb.d[o + 2u], fb.d[o + 3u]); \
-    } else { \
-        /* Standard ggml block_q8_0: 34 bytes per 32 elements (2B fp16 d + 32B int8 qs) */ \
-        uint blk = (HEAD_DIM == 64) ? (lane >> 4) : (lane >> 3); \
-        uint sub = (HEAD_DIM == 64) ? ((lane & 15u) * 2u) : ((lane & 7u) * 4u); \
-        uint64_t blk_va = row_va + uint64_t(blk) * 34ul; \
-        float sc = float(BufF16(blk_va).d[0]); \
-        BufU8 qb = BufU8(blk_va + 2ul); \
-        int q0 = bitfieldExtract(int(uint(qb.d[sub + 0u])), 0, 8); \
-        int q1 = bitfieldExtract(int(uint(qb.d[sub + 1u])), 0, 8); \
-        if (HEAD_DIM == 64) { \
-            return VEC_T(float(q0), float(q1)) * sc; \
-        } else { \
-            int q2 = bitfieldExtract(int(uint(qb.d[sub + 2u])), 0, 8); \
-            int q3 = bitfieldExtract(int(uint(qb.d[sub + 3u])), 0, 8); \
-            return VEC_T(float(q0), float(q1), float(q2), float(q3)) * sc; \
-        } \
-    } \
-}
 
 #if HEAD_DIM == 64
 vec2 load_ext_k(uint64_t base_va, uint nb1, uint nb2, uint kv_idx, uint h_kv, uint lane) {
@@ -410,14 +376,13 @@ vec2 load_ext_k(uint64_t base_va, uint nb1, uint nb2, uint kv_idx, uint h_kv, ui
     uint o = lane * 2u;
     return vec2(fb.d[o + 0u], fb.d[o + 1u]);
 #elif KV_DTYPE_K == 4
+    // ggml block_q8_0 (34B = 2B fp16 d + 32B int8 qs): 2B-aligned u16 load + magic-bias decode!
     uint blk = lane >> 4;
-    uint sub = (lane & 15u) * 2u;
+    uint sub16 = lane & 15u;
     uint64_t blk_va = row_va + uint64_t(blk) * 34ul;
     float sc = float(BufF16(blk_va).d[0]);
-    BufU8 qb = BufU8(blk_va + 2ul);
-    int q0 = bitfieldExtract(int(uint(qb.d[sub + 0u])), 0, 8);
-    int q1 = bitfieldExtract(int(uint(qb.d[sub + 1u])), 0, 8);
-    return vec2(float(q0), float(q1)) * sc;
+    uint p16 = uint(BufU16(blk_va + 2ul).d[sub16]);
+    return vec2(agx_q8_u16_magic_to_f16vec2(p16)) * sc;
 #else
     return unpackHalf2x16(BufU32(row_va).d[lane]);
 #endif
@@ -435,13 +400,11 @@ vec2 load_ext_v(uint64_t base_va, uint nb1, uint nb2, uint kv_idx, uint h_kv, ui
     return vec2(fb.d[o + 0u], fb.d[o + 1u]);
 #elif KV_DTYPE_V == 4
     uint blk = lane >> 4;
-    uint sub = (lane & 15u) * 2u;
+    uint sub16 = lane & 15u;
     uint64_t blk_va = row_va + uint64_t(blk) * 34ul;
     float sc = float(BufF16(blk_va).d[0]);
-    BufU8 qb = BufU8(blk_va + 2ul);
-    int q0 = bitfieldExtract(int(uint(qb.d[sub + 0u])), 0, 8);
-    int q1 = bitfieldExtract(int(uint(qb.d[sub + 1u])), 0, 8);
-    return vec2(float(q0), float(q1)) * sc;
+    uint p16 = uint(BufU16(blk_va + 2ul).d[sub16]);
+    return vec2(agx_q8_u16_magic_to_f16vec2(p16)) * sc;
 #else
     return unpackHalf2x16(BufU32(row_va).d[lane]);
 #endif
@@ -459,16 +422,15 @@ vec4 load_ext_k(uint64_t base_va, uint nb1, uint nb2, uint kv_idx, uint h_kv, ui
     uint o = lane * 4u;
     return vec4(fb.d[o + 0u], fb.d[o + 1u], fb.d[o + 2u], fb.d[o + 3u]);
 #elif KV_DTYPE_K == 4
+    // ggml block_q8_0 (34B = 2B fp16 d + 32B int8 qs): 2x 2B-aligned u16 loads + magic-bias decode!
     uint blk = lane >> 3;
-    uint sub = (lane & 7u) * 4u;
+    uint sub16 = (lane & 7u) * 2u;
     uint64_t blk_va = row_va + uint64_t(blk) * 34ul;
     float sc = float(BufF16(blk_va).d[0]);
-    BufU8 qb = BufU8(blk_va + 2ul);
-    int q0 = bitfieldExtract(int(uint(qb.d[sub + 0u])), 0, 8);
-    int q1 = bitfieldExtract(int(uint(qb.d[sub + 1u])), 0, 8);
-    int q2 = bitfieldExtract(int(uint(qb.d[sub + 2u])), 0, 8);
-    int q3 = bitfieldExtract(int(uint(qb.d[sub + 3u])), 0, 8);
-    return vec4(float(q0), float(q1), float(q2), float(q3)) * sc;
+    BufU16 qb = BufU16(blk_va + 2ul);
+    f16vec2 lo = agx_q8_u16_magic_to_f16vec2(uint(qb.d[sub16 + 0u]));
+    f16vec2 hi = agx_q8_u16_magic_to_f16vec2(uint(qb.d[sub16 + 1u]));
+    return vec4(lo, hi) * sc;
 #else
     uvec2 p = BufUvec2(row_va).d[lane];
     return vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y));
@@ -488,15 +450,13 @@ vec4 load_ext_v(uint64_t base_va, uint nb1, uint nb2, uint kv_idx, uint h_kv, ui
     return vec4(fb.d[o + 0u], fb.d[o + 1u], fb.d[o + 2u], fb.d[o + 3u]);
 #elif KV_DTYPE_V == 4
     uint blk = lane >> 3;
-    uint sub = (lane & 7u) * 4u;
+    uint sub16 = (lane & 7u) * 2u;
     uint64_t blk_va = row_va + uint64_t(blk) * 34ul;
     float sc = float(BufF16(blk_va).d[0]);
-    BufU8 qb = BufU8(blk_va + 2ul);
-    int q0 = bitfieldExtract(int(uint(qb.d[sub + 0u])), 0, 8);
-    int q1 = bitfieldExtract(int(uint(qb.d[sub + 1u])), 0, 8);
-    int q2 = bitfieldExtract(int(uint(qb.d[sub + 2u])), 0, 8);
-    int q3 = bitfieldExtract(int(uint(qb.d[sub + 3u])), 0, 8);
-    return vec4(float(q0), float(q1), float(q2), float(q3)) * sc;
+    BufU16 qb = BufU16(blk_va + 2ul);
+    f16vec2 lo = agx_q8_u16_magic_to_f16vec2(uint(qb.d[sub16 + 0u]));
+    f16vec2 hi = agx_q8_u16_magic_to_f16vec2(uint(qb.d[sub16 + 1u]));
+    return vec4(lo, hi) * sc;
 #else
     uvec2 p = BufUvec2(row_va).d[lane];
     return vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y));
@@ -667,23 +627,90 @@ void main() {
     }
 }
 
-#elif PASS_MODE == 3
+#elif PASS_MODE == 3 || PASS_MODE == 4
 
 // ============================================================================
-// Phase 3: Tiled Multi-Q Prefill Flash-Attention (HEAD_DIM=128, 8 Q/WG, TILE_KV=16)
-//   - 4 simdgroups x 2 Q-tokens/sg = 8 queries sharing K/V[16, 128] in 8 KB TG SRAM
-//   - 8x KV load reuse + parallel 128-thread masked tile skip (2x causal speedup!)
+// Shared FP16 External KV Loaders for 8x8 Coopmat Prefill (Mode 3 & Mode 4)
 // ============================================================================
-shared uvec2 sh_k[16][32];
-shared uvec2 sh_v[16][32];
-shared uint  sh_any_valid;
+f16vec4 load_ext_k_f16(uint64_t base_va, uint nb1, uint nb2, uint kv_idx, uint h_kv, uint lane) {
+    const uint64_t row_va = base_va + uint64_t(kv_idx) * uint64_t(nb1) + uint64_t(h_kv) * uint64_t(nb2);
+#if KV_DTYPE_K == 0
+    return agx_e4m3_u32_to_f16vec4(BufU32(row_va).d[lane]);
+#elif KV_DTYPE_K == 2
+    uvec2 p = BufUvec2(row_va).d[lane];
+    return f16vec4(unpackFloat2x16(p.x), unpackFloat2x16(p.y));
+#elif KV_DTYPE_K == 4
+    uint blk = lane >> 3;
+    uint sub16 = (lane & 7u) * 2u;
+    uint64_t blk_va = row_va + uint64_t(blk) * 34ul;
+    float sc = float(BufF16(blk_va).d[0]);
+    BufU16 qb = BufU16(blk_va + 2ul);
+    f16vec2 lo = agx_q8_u16_magic_to_f16vec2(uint(qb.d[sub16 + 0u]));
+    f16vec2 hi = agx_q8_u16_magic_to_f16vec2(uint(qb.d[sub16 + 1u]));
+    return f16vec4(clamp(vec4(lo, hi) * sc, vec4(-65504.0f), vec4(65504.0f)));
+#elif KV_DTYPE_K == 3
+    BufF32 fb = BufF32(row_va);
+    uint o = lane * 4u;
+    return f16vec4(clamp(vec4(fb.d[o + 0u], fb.d[o + 1u], fb.d[o + 2u], fb.d[o + 3u]),
+                         vec4(-65504.0f), vec4(65504.0f)));
+#else
+    uvec2 p = BufUvec2(row_va).d[lane];
+    return f16vec4(unpackFloat2x16(p.x), unpackFloat2x16(p.y));
+#endif
+}
+
+f16vec4 load_ext_v_f16(uint64_t base_va, uint nb1, uint nb2, uint kv_idx, uint h_kv, uint lane) {
+    const uint64_t row_va = base_va + uint64_t(kv_idx) * uint64_t(nb1) + uint64_t(h_kv) * uint64_t(nb2);
+#if KV_DTYPE_V == 0
+    return agx_e4m3_u32_to_f16vec4(BufU32(row_va).d[lane]);
+#elif KV_DTYPE_V == 2
+    uvec2 p = BufUvec2(row_va).d[lane];
+    return f16vec4(unpackFloat2x16(p.x), unpackFloat2x16(p.y));
+#elif KV_DTYPE_V == 4
+    uint blk = lane >> 3;
+    uint sub16 = (lane & 7u) * 2u;
+    uint64_t blk_va = row_va + uint64_t(blk) * 34ul;
+    float sc = float(BufF16(blk_va).d[0]);
+    BufU16 qb = BufU16(blk_va + 2ul);
+    f16vec2 lo = agx_q8_u16_magic_to_f16vec2(uint(qb.d[sub16 + 0u]));
+    f16vec2 hi = agx_q8_u16_magic_to_f16vec2(uint(qb.d[sub16 + 1u]));
+    return f16vec4(clamp(vec4(lo, hi) * sc, vec4(-65504.0f), vec4(65504.0f)));
+#elif KV_DTYPE_V == 3
+    BufF32 fb = BufF32(row_va);
+    uint o = lane * 4u;
+    return f16vec4(clamp(vec4(fb.d[o + 0u], fb.d[o + 1u], fb.d[o + 2u], fb.d[o + 3u]),
+                         vec4(-65504.0f), vec4(65504.0f)));
+#else
+    uvec2 p = BufUvec2(row_va).d[lane];
+    return f16vec4(unpackFloat2x16(p.x), unpackFloat2x16(p.y));
+#endif
+}
+
+#if PASS_MODE == 3
+
+// ============================================================================
+// Phase 3: Hardware 8x8 FP16 Coopmat Prefill Flash-Attention (HEAD_DIM=128)
+//   - 4 simdgroups x 8 Q-tokens/sg = 32 Q/WG, TILE_KV = 16 -> 32x KV reuse!
+//   - Q[8,128] x K^T[16,128] -> S[8,16] (FP32) via 8x8 hardware f32matmad8x8
+//   - In-register FP32 online softmax via 2 shuffles (^1, ^8) along layout_8!
+//   - P[8,16] (FP16) x V[16,128] -> O[8,128] (FP32) via 8x8 hardware f32matmad8x8
+//   - 14.76 KB TG SRAM (< 16 KB -> 2 WGs/core = 8 sgs/core!), <= 72 GPR32, 0:0 spills
+// ============================================================================
+#define PF_BQ   32u
+#define PF_BK   16u
+#define PF_SH_D 136u // 128 + 8 halfs bank-conflict-free padding (272 B = 16B aligned)
+
+shared float16_t sh_q[PF_BQ * PF_SH_D];   // 8,704 B
+shared float16_t sh_kv[PF_BK * PF_SH_D];  // 4,352 B (reused for K then V per tile)
+shared float     sh_ep[N_SG * 128u];      // 2,048 B (per-sg epilogue staging, 0 WG barriers!)
+shared uint      sh_any_valid[2];         // 8 B (double-buffered causal tile skip -> 1 barrier!)
 
 void main() {
     const uint lane  = gl_LocalInvocationID.x; // 0..31
     const uint sg    = gl_LocalInvocationID.y; // 0..3
     const uint tid   = sg * 32u + lane;        // 0..127
     const uint h_q   = gl_WorkGroupID.x;
-    const uint wg_q0 = gl_WorkGroupID.y * 8u;
+    const uint wg_q0 = gl_WorkGroupID.y * PF_BQ;
 
     if (h_q >= pc.n_head_q || wg_q0 >= pc.n_tokens) {
         return;
@@ -692,159 +719,630 @@ void main() {
     const uint gqa_ratio = pc.n_head_q / pc.n_head_kv;
     const uint h_kv      = h_q / gqa_ratio;
 
-    const uint tok0  = wg_q0 + sg * 2u;
-    const uint tok1  = tok0 + 1u;
-    const bool v0_ok = (tok0 < pc.n_tokens);
-    const bool v1_ok = (tok1 < pc.n_tokens);
+    const uint sg_q0  = wg_q0 + sg * 8u;
+    const bool sg_ok  = (sg_q0 < pc.n_tokens);
+    const uint lr     = agx_cmat8_row(lane);   // 0..7
+    const uint lc0    = agx_cmat8_col0(lane);  // 0, 2, 4, 6
+    const uint tok    = sg_q0 + lr;
+    const bool tok_ok = (tok < pc.n_tokens);
 
-    vec4 q0 = vec4(0.0f);
-    vec4 q1 = vec4(0.0f);
-    if (v0_ok) {
-        uint64_t qva = pc.q_va + uint64_t(tok0) * uint64_t(pc.q_nb1) + uint64_t(h_q) * uint64_t(pc.q_nb2);
-        if ((pc.flags & FLAG_Q_F16) != 0u) {
-            uvec2 qp = BufUvec2(qva).d[lane];
-            q0 = vec4(unpackHalf2x16(qp.x), unpackHalf2x16(qp.y)) * pc.kq_scale;
-        } else {
-            BufF32 qb = BufF32(qva);
-            uint o = lane * 4u;
-            q0 = vec4(qb.d[o + 0u], qb.d[o + 1u], qb.d[o + 2u], qb.d[o + 3u]) * pc.kq_scale;
+    // Cooperative load of Q[wg_q0..+32, 0..127] * kq_scale -> sh_q (8 rows/sg, 4 elems/lane)
+    const bool q_is_f16 = (pc.flags & FLAG_Q_F16) != 0u;
+    for (uint r = 0u; r < 8u; ++r) {
+        const uint ql   = sg * 8u + r;
+        const uint qtok = wg_q0 + ql;
+        f16vec4 q4 = f16vec4(float16_t(0.0));
+        if (qtok < pc.n_tokens) {
+            uint64_t qva = pc.q_va + uint64_t(qtok) * uint64_t(pc.q_nb1) + uint64_t(h_q) * uint64_t(pc.q_nb2);
+            vec4 qf;
+            if (q_is_f16) {
+                uvec2 qp = BufUvec2(qva).d[lane];
+                qf = vec4(unpackHalf2x16(qp.x), unpackHalf2x16(qp.y)) * pc.kq_scale;
+            } else {
+                BufF32 qb = BufF32(qva);
+                uint o = lane * 4u;
+                qf = vec4(qb.d[o + 0u], qb.d[o + 1u], qb.d[o + 2u], qb.d[o + 3u]) * pc.kq_scale;
+            }
+            q4 = f16vec4(clamp(qf, vec4(-65504.0f), vec4(65504.0f)));
         }
+        const uint dst = ql * PF_SH_D + lane * 4u;
+        sh_q[dst + 0u] = q4.x;
+        sh_q[dst + 1u] = q4.y;
+        sh_q[dst + 2u] = q4.z;
+        sh_q[dst + 3u] = q4.w;
     }
-    if (v1_ok) {
-        uint64_t qva = pc.q_va + uint64_t(tok1) * uint64_t(pc.q_nb1) + uint64_t(h_q) * uint64_t(pc.q_nb2);
-        if ((pc.flags & FLAG_Q_F16) != 0u) {
-            uvec2 qp = BufUvec2(qva).d[lane];
-            q1 = vec4(unpackHalf2x16(qp.x), unpackHalf2x16(qp.y)) * pc.kq_scale;
-        } else {
-            BufF32 qb = BufF32(qva);
-            uint o = lane * 4u;
-            q1 = vec4(qb.d[o + 0u], qb.d[o + 1u], qb.d[o + 2u], qb.d[o + 3u]) * pc.kq_scale;
-        }
+
+    if (tid < 2u) {
+        sh_any_valid[tid] = 0u;
     }
+    barrier();
 
     const bool has_mask_f16 = (pc.flags & FLAG_HAS_MASK_F16) != 0u && (pc.kq_mask_va != 0ul);
     const bool has_mask_f32 = (pc.flags & FLAG_HAS_MASK_F32) != 0u && (pc.kq_mask_va != 0ul);
+    const bool has_mask     = has_mask_f16 || has_mask_f32;
     const bool has_softcap  = (pc.flags & FLAG_SOFTCAP) != 0u && (pc.logit_softcap != 0.0f);
     const float slope       = compute_alibi_slope(h_q);
     const uint h_mask       = (pc.ext_mask_ne2 > 1u) ? (h_q % pc.ext_mask_ne2) : 0u;
     const uint64_t mask_head_va = pc.kq_mask_va + uint64_t(h_mask) * uint64_t(pc.ext_mask_nb2);
-    const uint64_t mask0_va = mask_head_va + uint64_t(tok0) * uint64_t(pc.ext_mask_nb1);
-    const uint64_t mask1_va = mask_head_va + uint64_t(tok1) * uint64_t(pc.ext_mask_nb1);
+    const uint64_t mask_row_va  = mask_head_va + uint64_t(tok) * uint64_t(pc.ext_mask_nb1);
 
-    float m0 = -3.402823466e+38f * 0.5f;
-    float l0 = 0.0f;
-    vec4  o0 = vec4(0.0f);
+    const float neg_inf = -3.402823466e+38f * 0.5f;
+    float m_i = neg_inf;
+    float l_i = 0.0f;
 
-    float m1 = -3.402823466e+38f * 0.5f;
-    float l1 = 0.0f;
-    vec4  o1 = vec4(0.0f);
+    coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> O[16];
+    for (uint dv = 0u; dv < 16u; ++dv) {
+        O[dv] = coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0.0);
+    }
 
-    for (uint kv0 = 0u; kv0 < pc.n_kv; kv0 += 16u) {
-        const uint tile_len = min(16u, pc.n_kv - kv0);
+    const uint q_sg_off = (sg * 8u) * PF_SH_D;
 
-        // Parallel 128-thread masked tile skip (skips 100% of upper-triangular causal tiles!)
-        if (has_mask_f16 || has_mask_f32) {
-            if (tid == 0u) sh_any_valid = 0u;
+    for (uint kv0 = 0u; kv0 < pc.n_kv; kv0 += PF_BK) {
+        const uint tile_len = min(PF_BK, pc.n_kv - kv0);
+
+        // 1-barrier double-buffered parallel mask tile skip (also separates previous tile's V reads!)
+        const uint ping = (kv0 >> 4) & 1u;
+        if (has_mask) {
+            bool any_ok = false;
+            for (uint step = 0u; step < 4u; ++step) {
+                const uint idx = tid + step * 128u;
+                const uint ql  = idx >> 4;   // 0..31
+                const uint kl  = idx & 15u;  // 0..15
+                if (wg_q0 + ql < pc.n_tokens && kl < tile_len) {
+                    uint64_t mva = mask_head_va + uint64_t(wg_q0 + ql) * uint64_t(pc.ext_mask_nb1);
+                    float mv = has_mask_f16
+                        ? float(BufF16(mva).d[kv0 + kl]) * slope
+                        : BufF32(mva).d[kv0 + kl] * slope;
+                    if (mv > -1.0e30f) {
+                        any_ok = true;
+                    }
+                }
+            }
+            if (any_ok) {
+                sh_any_valid[ping] = 1u;
+            }
             barrier();
-            const uint ql = tid >> 4;   // 0..7
-            const uint kl = tid & 15u;  // 0..15
-            if (wg_q0 + ql < pc.n_tokens && kl < tile_len) {
-                uint64_t mva = mask_head_va + uint64_t(wg_q0 + ql) * uint64_t(pc.ext_mask_nb1);
-                float mv = has_mask_f16
-                    ? float(BufF16(mva).d[kv0 + kl]) * slope
-                    : BufF32(mva).d[kv0 + kl] * slope;
-                if (mv > -1.0e30f) {
-                    sh_any_valid = 1u;
+            if (sh_any_valid[ping] == 0u) {
+                continue;
+            }
+        }
+
+        // Cooperative 128-thread load of K[kv0..+16, 0..127] into 4.25 KB sh_kv
+        for (uint kl = sg; kl < PF_BK; kl += 4u) {
+            f16vec4 kv_k = (kl < tile_len)
+                ? load_ext_k_f16(pc.k_or_pt_va, pc.ext_k_nb1, pc.ext_k_nb2, kv0 + kl, h_kv, lane)
+                : f16vec4(float16_t(0.0));
+            const uint dst = kl * PF_SH_D + lane * 4u;
+            sh_kv[dst + 0u] = kv_k.x;
+            sh_kv[dst + 1u] = kv_k.y;
+            sh_kv[dst + 2u] = kv_k.z;
+            sh_kv[dst + 3u] = kv_k.w;
+        }
+        barrier();
+
+        // All threads have exited mask-skip check -> race-free reset of sh_any_valid[ping]
+        if (has_mask && tid == 0u) {
+            sh_any_valid[ping] = 0u;
+        }
+
+        // Hardware 8x8 FP16 coopmat: S[8, 16] = Q[8, 128] x K^T[16, 128] + FP32 online softmax
+        coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> P0 =
+            coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA>(float16_t(0.0));
+        coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> P1 =
+            coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA>(float16_t(0.0));
+        bool sg_active = false;
+
+        if (sg_ok) {
+            coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> S0 =
+                coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0.0);
+            coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> S1 =
+                coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0.0);
+
+            for (uint kd = 0u; kd < 128u; kd += 8u) {
+                coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> matQ;
+                coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> matK0, matK1;
+                coopMatLoad(matQ,  sh_q,  q_sg_off + kd,     PF_SH_D, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(matK0, sh_kv, 0u * PF_SH_D + kd, PF_SH_D, gl_CooperativeMatrixLayoutColumnMajor);
+                coopMatLoad(matK1, sh_kv, 8u * PF_SH_D + kd, PF_SH_D, gl_CooperativeMatrixLayoutColumnMajor);
+                S0 = coopMatMulAdd(matQ, matK0, S0);
+                S1 = coopMatMulAdd(matQ, matK1, S1);
+            }
+
+            float s00 = S0[0];
+            float s01 = S0[1];
+            float s10 = S1[0];
+            float s11 = S1[1];
+
+            const uint k00 = lc0;
+            const uint k01 = lc0 + 1u;
+            const uint k10 = 8u + lc0;
+            const uint k11 = 8u + lc0 + 1u;
+
+            bool ok00 = tok_ok && (k00 < tile_len);
+            bool ok01 = tok_ok && (k01 < tile_len);
+            bool ok10 = tok_ok && (k10 < tile_len);
+            bool ok11 = tok_ok && (k11 < tile_len);
+
+            if (has_softcap) {
+                s00 = pc.logit_softcap * tanh(s00);
+                s01 = pc.logit_softcap * tanh(s01);
+                s10 = pc.logit_softcap * tanh(s10);
+                s11 = pc.logit_softcap * tanh(s11);
+            }
+
+            if (has_mask_f16) {
+                BufF16 mb = BufF16(mask_row_va);
+                if (ok00) { float mv = float(mb.d[kv0 + k00]) * slope; if (mv > -1.0e30f) s00 += mv; else ok00 = false; }
+                if (ok01) { float mv = float(mb.d[kv0 + k01]) * slope; if (mv > -1.0e30f) s01 += mv; else ok01 = false; }
+                if (ok10) { float mv = float(mb.d[kv0 + k10]) * slope; if (mv > -1.0e30f) s10 += mv; else ok10 = false; }
+                if (ok11) { float mv = float(mb.d[kv0 + k11]) * slope; if (mv > -1.0e30f) s11 += mv; else ok11 = false; }
+            } else if (has_mask_f32) {
+                BufF32 mb = BufF32(mask_row_va);
+                if (ok00) { float mv = mb.d[kv0 + k00] * slope; if (mv > -1.0e30f) s00 += mv; else ok00 = false; }
+                if (ok01) { float mv = mb.d[kv0 + k01] * slope; if (mv > -1.0e30f) s01 += mv; else ok01 = false; }
+                if (ok10) { float mv = mb.d[kv0 + k10] * slope; if (mv > -1.0e30f) s10 += mv; else ok10 = false; }
+                if (ok11) { float mv = mb.d[kv0 + k11] * slope; if (mv > -1.0e30f) s11 += mv; else ok11 = false; }
+            }
+
+            if (!ok00) s00 = neg_inf;
+            if (!ok01) s01 = neg_inf;
+            if (!ok10) s10 = neg_inf;
+            if (!ok11) s11 = neg_inf;
+
+            // Row-wise max across all 16 columns of row `lr` via 2 shuffles (^1, ^8)!
+            float tile_max = max(max(s00, s01), max(s10, s11));
+            tile_max = max(tile_max, subgroupShuffleXor(tile_max, 1u));
+            tile_max = max(tile_max, subgroupShuffleXor(tile_max, 8u));
+
+            if (tile_max > -1.0e30f) {
+                float m_new = max(m_i, tile_max);
+                float alpha = (l_i > 0.0f) ? exp(m_i - m_new) : 0.0f;
+                float p00   = ok00 ? exp(s00 - m_new) : 0.0f;
+                float p01   = ok01 ? exp(s01 - m_new) : 0.0f;
+                float p10   = ok10 ? exp(s10 - m_new) : 0.0f;
+                float p11   = ok11 ? exp(s11 - m_new) : 0.0f;
+
+                float rsum = (p00 + p01) + (p10 + p11);
+                rsum += subgroupShuffleXor(rsum, 1u);
+                rsum += subgroupShuffleXor(rsum, 8u);
+
+                if (l_i > 0.0f && alpha != 1.0f) {
+                    for (uint dv = 0u; dv < 16u; ++dv) {
+                        O[dv][0] *= alpha;
+                        O[dv][1] *= alpha;
+                    }
+                }
+                l_i = l_i * alpha + rsum;
+                m_i = m_new;
+
+                P0[0] = float16_t(p00);
+                P0[1] = float16_t(p01);
+                P1[0] = float16_t(p10);
+                P1[1] = float16_t(p11);
+            }
+
+            sg_active = subgroupMax(tile_max) > -1.0e30f;
+        }
+        barrier();
+
+        // Cooperative 128-thread load of V[kv0..+16, 0..127] into sh_kv
+        for (uint kl = sg; kl < PF_BK; kl += 4u) {
+            f16vec4 kv_v = (kl < tile_len)
+                ? load_ext_v_f16(pc.v_va, pc.ext_v_nb1, pc.ext_v_nb2, kv0 + kl, h_kv, lane)
+                : f16vec4(float16_t(0.0));
+            const uint dst = kl * PF_SH_D + lane * 4u;
+            sh_kv[dst + 0u] = kv_v.x;
+            sh_kv[dst + 1u] = kv_v.y;
+            sh_kv[dst + 2u] = kv_v.z;
+            sh_kv[dst + 3u] = kv_v.w;
+        }
+        barrier();
+
+        // Hardware 8x8 FP16 coopmat: O[8, 128] += P[8, 16] x V[16, 128]
+        if (sg_active) {
+            for (uint dv = 0u; dv < 16u; ++dv) {
+                const uint d_off = dv * 8u;
+                coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> matV0, matV1;
+                coopMatLoad(matV0, sh_kv, 0u * PF_SH_D + d_off, PF_SH_D, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(matV1, sh_kv, 8u * PF_SH_D + d_off, PF_SH_D, gl_CooperativeMatrixLayoutRowMajor);
+                O[dv] = coopMatMulAdd(P0, matV0, O[dv]);
+                O[dv] = coopMatMulAdd(P1, matV1, O[dv]);
+            }
+        }
+        if (!has_mask) {
+            barrier();
+        }
+    }
+
+    // Per-simdgroup epilogue: sink + normalize + coalesced sh_ep staging -> apply_epilogue_and_store
+    if (sg_ok) {
+        float scale_o = 0.0f;
+        if (tok_ok) {
+            bool has_sink;
+            float eff_sink;
+            get_sink_info(tok, h_q, has_sink, eff_sink);
+            if (has_sink) {
+                float mf = (l_i > 0.0f) ? max(m_i, eff_sink) : eff_sink;
+                float wo = (l_i > 0.0f) ? exp(m_i - mf) : 0.0f;
+                float lf = l_i * wo + exp(eff_sink - mf);
+                scale_o  = (lf > 0.0f) ? (wo / lf) : 0.0f;
+            } else {
+                scale_o  = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;
+            }
+        }
+        for (uint dv = 0u; dv < 16u; ++dv) {
+            O[dv][0] *= scale_o;
+            O[dv][1] *= scale_o;
+        }
+
+        const uint ep_base = sg * 128u;
+        for (uint r = 0u; r < 8u; ++r) {
+            const uint out_tok = sg_q0 + r;
+            if (out_tok >= pc.n_tokens) {
+                break;
+            }
+            if (lr == r) {
+                for (uint dv = 0u; dv < 16u; ++dv) {
+                    const uint d_idx = ep_base + dv * 8u + lc0;
+                    sh_ep[d_idx + 0u] = O[dv][0];
+                    sh_ep[d_idx + 1u] = O[dv][1];
+                }
+            }
+            controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+            const uint o4 = ep_base + lane * 4u;
+            vec4 out_v = vec4(sh_ep[o4 + 0u], sh_ep[o4 + 1u], sh_ep[o4 + 2u], sh_ep[o4 + 3u]);
+            apply_epilogue_and_store(out_v, out_tok, h_q, lane);
+            controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+        }
+    }
+}
+
+#else // PASS_MODE == 4
+
+// ============================================================================
+// Phase 4: DSpark M=2..15 Split-K 2-SG D-Split 8x8 FP16 Coopmat Attention (D=128)
+//   - 2 simdgroups (64 threads) splitting D = 64 + 64 -> ONLY O[8] (16 GPR32!)
+//   - BQ = 8 Q/WG, BK = 16 KV/tile -> 8x KV reuse, <= 72 GPR32, 0:0 spills across ALL dtypes!
+//   - 7.95 KB TG SRAM (4 WGs/core = 8 sgs/core!), feeds PASS_MODE=1 Phase 2 when n_splits > 1.
+// ============================================================================
+#define PF4_BQ   8u
+#define PF4_BK   16u
+#define PF4_SH_D 136u
+
+shared float16_t sh4_q[PF4_BQ * PF4_SH_D];   // 2,176 B
+shared float16_t sh4_kv[PF4_BK * PF4_SH_D];  // 4,352 B
+shared float     sh4_s[2u * 128u];           // 1,024 B (S_lo + S_hi cross-sg merge)
+shared float     sh4_ep[128u];               // 512 B
+shared float     sh4_m[PF4_BQ];              // 32 B
+shared float     sh4_l[PF4_BQ];              // 32 B
+shared uint      sh4_any[2];                 // 8 B (double-buffered causal tile skip)
+
+void main() {
+    const uint lane      = gl_LocalInvocationID.x; // 0..31
+    const uint sg        = gl_LocalInvocationID.y; // 0 (D=0..63) or 1 (D=64..127)
+    const uint tid       = sg * 32u + lane;        // 0..63
+    const uint d_sg_base = sg * 64u;
+    const uint h_q       = gl_WorkGroupID.x;
+    const uint wg_q0     = gl_WorkGroupID.y * PF4_BQ;
+    const uint split     = gl_WorkGroupID.z;
+
+    if (h_q >= pc.n_head_q || wg_q0 >= pc.n_tokens || split >= pc.n_splits) {
+        return;
+    }
+
+    const uint gqa_ratio = pc.n_head_q / pc.n_head_kv;
+    const uint h_kv      = h_q / gqa_ratio;
+
+    const uint lr     = agx_cmat8_row(lane);   // 0..7
+    const uint lc0    = agx_cmat8_col0(lane);  // 0, 2, 4, 6
+    const uint tok    = wg_q0 + lr;
+    const bool tok_ok = (tok < pc.n_tokens);
+
+    // Cooperative 64-thread load of Q[wg_q0..+8, 0..127] * kq_scale -> sh4_q (4 rows/sg)
+    const bool q_is_f16 = (pc.flags & FLAG_Q_F16) != 0u;
+    for (uint r = sg; r < PF4_BQ; r += 2u) {
+        const uint qtok = wg_q0 + r;
+        f16vec4 q4 = f16vec4(float16_t(0.0));
+        if (qtok < pc.n_tokens) {
+            uint64_t qva = pc.q_va + uint64_t(qtok) * uint64_t(pc.q_nb1) + uint64_t(h_q) * uint64_t(pc.q_nb2);
+            vec4 qf;
+            if (q_is_f16) {
+                uvec2 qp = BufUvec2(qva).d[lane];
+                qf = vec4(unpackHalf2x16(qp.x), unpackHalf2x16(qp.y)) * pc.kq_scale;
+            } else {
+                BufF32 qb = BufF32(qva);
+                uint o = lane * 4u;
+                qf = vec4(qb.d[o + 0u], qb.d[o + 1u], qb.d[o + 2u], qb.d[o + 3u]) * pc.kq_scale;
+            }
+            q4 = f16vec4(clamp(qf, vec4(-65504.0f), vec4(65504.0f)));
+        }
+        const uint dst = r * PF4_SH_D + lane * 4u;
+        sh4_q[dst + 0u] = q4.x;
+        sh4_q[dst + 1u] = q4.y;
+        sh4_q[dst + 2u] = q4.z;
+        sh4_q[dst + 3u] = q4.w;
+    }
+    if (tid < 2u) {
+        sh4_any[tid] = 0u;
+    }
+    barrier();
+
+    const uint k_start = uint((uint64_t(split)      * uint64_t(pc.n_kv)) / uint64_t(pc.n_splits));
+    const uint k_end   = uint((uint64_t(split + 1u) * uint64_t(pc.n_kv)) / uint64_t(pc.n_splits));
+
+    const bool has_mask_f16 = (pc.flags & FLAG_HAS_MASK_F16) != 0u && (pc.kq_mask_va != 0ul);
+    const bool has_mask_f32 = (pc.flags & FLAG_HAS_MASK_F32) != 0u && (pc.kq_mask_va != 0ul);
+    const bool has_mask     = has_mask_f16 || has_mask_f32;
+    const bool has_softcap  = (pc.flags & FLAG_SOFTCAP) != 0u && (pc.logit_softcap != 0.0f);
+    const float slope       = compute_alibi_slope(h_q);
+    const uint h_mask       = (pc.ext_mask_ne2 > 1u) ? (h_q % pc.ext_mask_ne2) : 0u;
+    const uint64_t mask_head_va = pc.kq_mask_va + uint64_t(h_mask) * uint64_t(pc.ext_mask_nb2);
+
+    const float neg_inf = -3.402823466e+38f * 0.5f;
+    float m_i = neg_inf;
+    float l_i = 0.0f;
+
+    // ONLY 8 FP32 8x8 coopmat accumulators per simdgroup (16 GPR32 -> 0:0 spills across ALL KV dtypes!)
+    coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> O[8];
+    for (uint dv = 0u; dv < 8u; ++dv) {
+        O[dv] = coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0.0);
+    }
+
+    for (uint kv0 = k_start; kv0 < k_end; kv0 += PF4_BK) {
+        const uint tile_len = min(PF4_BK, k_end - kv0);
+        const uint ping     = ((kv0 - k_start) >> 4) & 1u;
+
+        // 1-barrier double-buffered 64-thread mask tile skip (also separates prev tile V reads!)
+        if (has_mask) {
+            bool any_ok = false;
+            for (uint step = 0u; step < 2u; ++step) {
+                const uint idx = tid + step * 64u;
+                const uint ql  = idx >> 4;   // 0..7
+                const uint kl  = idx & 15u;  // 0..15
+                if (wg_q0 + ql < pc.n_tokens && kl < tile_len) {
+                    uint64_t mva = mask_head_va + uint64_t(wg_q0 + ql) * uint64_t(pc.ext_mask_nb1);
+                    float mv = has_mask_f16
+                        ? float(BufF16(mva).d[kv0 + kl]) * slope
+                        : BufF32(mva).d[kv0 + kl] * slope;
+                    if (mv > -1.0e30f) {
+                        any_ok = true;
+                    }
+                }
+            }
+            if (any_ok) {
+                sh4_any[ping] = 1u;
+            }
+            barrier();
+            if (sh4_any[ping] == 0u) {
+                continue;
+            }
+        }
+
+        // Cooperative 64-thread load of K[kv0..+16, 0..127] -> sh4_kv (8 rows/sg)
+        for (uint kl = sg; kl < PF4_BK; kl += 2u) {
+            f16vec4 kv_k = (kl < tile_len)
+                ? load_ext_k_f16(pc.k_or_pt_va, pc.ext_k_nb1, pc.ext_k_nb2, kv0 + kl, h_kv, lane)
+                : f16vec4(float16_t(0.0));
+            const uint dst = kl * PF4_SH_D + lane * 4u;
+            sh4_kv[dst + 0u] = kv_k.x;
+            sh4_kv[dst + 1u] = kv_k.y;
+            sh4_kv[dst + 2u] = kv_k.z;
+            sh4_kv[dst + 3u] = kv_k.w;
+        }
+        barrier();
+
+        if (has_mask && tid == 0u) {
+            sh4_any[ping] = 0u;
+        }
+
+        // Split-D 8x8 coopmat: sg 0 computes D=0..63, sg 1 computes D=64..127 in parallel!
+        coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> S0 =
+            coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0.0);
+        coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> S1 =
+            coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0.0);
+
+        for (uint kd = d_sg_base; kd < d_sg_base + 64u; kd += 8u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> matQ;
+            coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> matK0, matK1;
+            coopMatLoad(matQ,  sh4_q,  kd,                 PF4_SH_D, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(matK0, sh4_kv, 0u * PF4_SH_D + kd, PF4_SH_D, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(matK1, sh4_kv, 8u * PF4_SH_D + kd, PF4_SH_D, gl_CooperativeMatrixLayoutColumnMajor);
+            S0 = coopMatMulAdd(matQ, matK0, S0);
+            S1 = coopMatMulAdd(matQ, matK1, S1);
+        }
+
+        const uint s_off = sg * 128u + lane * 4u;
+        sh4_s[s_off + 0u] = S0[0];
+        sh4_s[s_off + 1u] = S0[1];
+        sh4_s[s_off + 2u] = S1[0];
+        sh4_s[s_off + 3u] = S1[1];
+        barrier();
+
+        // Merge S_lo + S_hi; both sgs run identical FP32 online softmax (barrier above frees sh4_kv!)
+        const uint l4 = lane * 4u;
+        float s00 = sh4_s[l4 + 0u] + sh4_s[128u + l4 + 0u];
+        float s01 = sh4_s[l4 + 1u] + sh4_s[128u + l4 + 1u];
+        float s10 = sh4_s[l4 + 2u] + sh4_s[128u + l4 + 2u];
+        float s11 = sh4_s[l4 + 3u] + sh4_s[128u + l4 + 3u];
+
+        bool ok00 = tok_ok && (lc0       < tile_len);
+        bool ok01 = tok_ok && (lc0 + 1u  < tile_len);
+        bool ok10 = tok_ok && (lc0 + 8u  < tile_len);
+        bool ok11 = tok_ok && (lc0 + 9u  < tile_len);
+
+        if (has_softcap) {
+            s00 = pc.logit_softcap * tanh(s00);
+            s01 = pc.logit_softcap * tanh(s01);
+            s10 = pc.logit_softcap * tanh(s10);
+            s11 = pc.logit_softcap * tanh(s11);
+        }
+
+        if (has_mask_f16) {
+            BufF16 mb = BufF16(mask_head_va + uint64_t(tok) * uint64_t(pc.ext_mask_nb1));
+            if (ok00) { float mv = float(mb.d[kv0 + lc0     ]) * slope; if (mv > -1.0e30f) s00 += mv; else ok00 = false; }
+            if (ok01) { float mv = float(mb.d[kv0 + lc0 + 1u]) * slope; if (mv > -1.0e30f) s01 += mv; else ok01 = false; }
+            if (ok10) { float mv = float(mb.d[kv0 + lc0 + 8u]) * slope; if (mv > -1.0e30f) s10 += mv; else ok10 = false; }
+            if (ok11) { float mv = float(mb.d[kv0 + lc0 + 9u]) * slope; if (mv > -1.0e30f) s11 += mv; else ok11 = false; }
+        } else if (has_mask_f32) {
+            BufF32 mb = BufF32(mask_head_va + uint64_t(tok) * uint64_t(pc.ext_mask_nb1));
+            if (ok00) { float mv = mb.d[kv0 + lc0     ] * slope; if (mv > -1.0e30f) s00 += mv; else ok00 = false; }
+            if (ok01) { float mv = mb.d[kv0 + lc0 + 1u] * slope; if (mv > -1.0e30f) s01 += mv; else ok01 = false; }
+            if (ok10) { float mv = mb.d[kv0 + lc0 + 8u] * slope; if (mv > -1.0e30f) s10 += mv; else ok10 = false; }
+            if (ok11) { float mv = mb.d[kv0 + lc0 + 9u] * slope; if (mv > -1.0e30f) s11 += mv; else ok11 = false; }
+        }
+
+        if (!ok00) s00 = neg_inf;
+        if (!ok01) s01 = neg_inf;
+        if (!ok10) s10 = neg_inf;
+        if (!ok11) s11 = neg_inf;
+
+        float tile_max = max(max(s00, s01), max(s10, s11));
+        tile_max = max(tile_max, subgroupShuffleXor(tile_max, 1u));
+        tile_max = max(tile_max, subgroupShuffleXor(tile_max, 8u));
+
+        if (subgroupMax(tile_max) <= -1.0e30f) {
+            if (!has_mask) {
+                barrier();
+            }
+            continue;
+        }
+
+        coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> P0 =
+            coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA>(float16_t(0.0));
+        coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> P1 =
+            coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA>(float16_t(0.0));
+
+        if (tile_max > -1.0e30f) {
+            float m_new = max(m_i, tile_max);
+            float alpha = (l_i > 0.0f) ? exp(m_i - m_new) : 0.0f;
+            float p00   = ok00 ? exp(s00 - m_new) : 0.0f;
+            float p01   = ok01 ? exp(s01 - m_new) : 0.0f;
+            float p10   = ok10 ? exp(s10 - m_new) : 0.0f;
+            float p11   = ok11 ? exp(s11 - m_new) : 0.0f;
+
+            float rsum = (p00 + p01) + (p10 + p11);
+            rsum += subgroupShuffleXor(rsum, 1u);
+            rsum += subgroupShuffleXor(rsum, 8u);
+
+            if (l_i > 0.0f && alpha != 1.0f) {
+                for (uint dv = 0u; dv < 8u; ++dv) {
+                    O[dv][0] *= alpha;
+                    O[dv][1] *= alpha;
+                }
+            }
+            l_i = l_i * alpha + rsum;
+            m_i = m_new;
+
+            P0[0] = float16_t(p00);
+            P0[1] = float16_t(p01);
+            P1[0] = float16_t(p10);
+            P1[1] = float16_t(p11);
+        }
+
+        // Cooperative 64-thread load of V[kv0..+16, 0..127] -> sh4_kv (8 rows/sg)
+        for (uint kl = sg; kl < PF4_BK; kl += 2u) {
+            f16vec4 kv_v = (kl < tile_len)
+                ? load_ext_v_f16(pc.v_va, pc.ext_v_nb1, pc.ext_v_nb2, kv0 + kl, h_kv, lane)
+                : f16vec4(float16_t(0.0));
+            const uint dst = kl * PF4_SH_D + lane * 4u;
+            sh4_kv[dst + 0u] = kv_v.x;
+            sh4_kv[dst + 1u] = kv_v.y;
+            sh4_kv[dst + 2u] = kv_v.z;
+            sh4_kv[dst + 3u] = kv_v.w;
+        }
+        barrier();
+
+        // Split-D 8x8 coopmat: sg 0 updates D=0..63, sg 1 updates D=64..127!
+        for (uint dv = 0u; dv < 8u; ++dv) {
+            const uint d_off = d_sg_base + dv * 8u;
+            coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> matV0, matV1;
+            coopMatLoad(matV0, sh4_kv, 0u * PF4_SH_D + d_off, PF4_SH_D, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(matV1, sh4_kv, 8u * PF4_SH_D + d_off, PF4_SH_D, gl_CooperativeMatrixLayoutRowMajor);
+            O[dv] = coopMatMulAdd(P0, matV0, O[dv]);
+            O[dv] = coopMatMulAdd(P1, matV1, O[dv]);
+        }
+        if (!has_mask) {
+            barrier();
+        }
+    }
+
+    if (pc.n_splits == 1u) {
+        float scale_o = 0.0f;
+        if (tok_ok) {
+            bool has_sink;
+            float eff_sink;
+            get_sink_info(tok, h_q, has_sink, eff_sink);
+            if (has_sink) {
+                float mf = (l_i > 0.0f) ? max(m_i, eff_sink) : eff_sink;
+                float wo = (l_i > 0.0f) ? exp(m_i - mf) : 0.0f;
+                float lf = l_i * wo + exp(eff_sink - mf);
+                scale_o  = (lf > 0.0f) ? (wo / lf) : 0.0f;
+            } else {
+                scale_o  = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;
+            }
+        }
+        for (uint dv = 0u; dv < 8u; ++dv) {
+            O[dv][0] *= scale_o;
+            O[dv][1] *= scale_o;
+        }
+
+        for (uint r = 0u; r < PF4_BQ; ++r) {
+            const uint out_tok = wg_q0 + r;
+            if (out_tok >= pc.n_tokens) {
+                break;
+            }
+            if (lr == r) {
+                for (uint dv = 0u; dv < 8u; ++dv) {
+                    const uint d_idx = d_sg_base + dv * 8u + lc0;
+                    sh4_ep[d_idx + 0u] = O[dv][0];
+                    sh4_ep[d_idx + 1u] = O[dv][1];
                 }
             }
             barrier();
-            if (sh_any_valid == 0u) {
-                continue;
+            if (sg == 0u) {
+                const uint o4 = lane * 4u;
+                vec4 out_v = vec4(sh4_ep[o4 + 0u], sh4_ep[o4 + 1u], sh4_ep[o4 + 2u], sh4_ep[o4 + 3u]);
+                apply_epilogue_and_store(out_v, out_tok, h_q, lane);
             }
+            barrier();
         }
-
-        // Cooperative 128-thread load of K[kv0..+tile_len] & V[kv0..+tile_len] into 8 KB SRAM
-        for (uint kl = sg; kl < tile_len; kl += 4u) {
-            vec4 kv_k = load_ext_k(pc.k_or_pt_va, pc.ext_k_nb1, pc.ext_k_nb2, kv0 + kl, h_kv, lane);
-            vec4 kv_v = load_ext_v(pc.v_va,       pc.ext_v_nb1, pc.ext_v_nb2, kv0 + kl, h_kv, lane);
-            sh_k[kl][lane] = uvec2(packHalf2x16(kv_k.xy), packHalf2x16(kv_k.zw));
-            sh_v[kl][lane] = uvec2(packHalf2x16(kv_v.xy), packHalf2x16(kv_v.zw));
+    } else {
+        if (sg == 0u && lc0 == 0u) {
+            sh4_m[lr] = m_i;
+            sh4_l[lr] = l_i;
         }
-        barrier();
-
-        // Evaluate BOTH query tokens per simdgroup against all keys in SRAM
-        for (uint kl = 0u; kl < tile_len; ++kl) {
-            const uint kv = kv0 + kl;
-            float mv0 = 0.0f;
-            float mv1 = 0.0f;
-            bool ok0 = v0_ok;
-            bool ok1 = v1_ok;
-            if (has_mask_f16) {
-                if (ok0) { mv0 = float(BufF16(mask0_va).d[kv]) * slope; ok0 = (mv0 > -1.0e30f); }
-                if (ok1) { mv1 = float(BufF16(mask1_va).d[kv]) * slope; ok1 = (mv1 > -1.0e30f); }
-            } else if (has_mask_f32) {
-                if (ok0) { mv0 = BufF32(mask0_va).d[kv] * slope; ok0 = (mv0 > -1.0e30f); }
-                if (ok1) { mv1 = BufF32(mask1_va).d[kv] * slope; ok1 = (mv1 > -1.0e30f); }
+        BufF32W pb = BufF32W(pc.partial_va);
+        for (uint r = 0u; r < PF4_BQ; ++r) {
+            const uint out_tok = wg_q0 + r;
+            if (out_tok >= pc.n_tokens) {
+                break;
             }
-            if (!ok0 && !ok1) {
-                continue;
+            if (lr == r) {
+                for (uint dv = 0u; dv < 8u; ++dv) {
+                    const uint d_idx = d_sg_base + dv * 8u + lc0;
+                    sh4_ep[d_idx + 0u] = O[dv][0];
+                    sh4_ep[d_idx + 1u] = O[dv][1];
+                }
             }
-
-            uvec2 pk = sh_k[kl][lane];
-            vec4  kr = vec4(unpackHalf2x16(pk.x), unpackHalf2x16(pk.y));
-            uvec2 pv = sh_v[kl][lane];
-            vec4  vr = vec4(unpackHalf2x16(pv.x), unpackHalf2x16(pv.y));
-
-            if (ok0) {
-                float s0 = subgroupAdd(dot(q0, kr));
-                if (has_softcap) s0 = pc.logit_softcap * tanh(s0);
-                s0 += mv0;
-                float mn = max(m0, s0);
-                float a  = exp(m0 - mn);
-                float p  = exp(s0 - mn);
-                o0 = o0 * a + vr * p;
-                l0 = l0 * a + p;
-                m0 = mn;
+            barrier();
+            if (sg == 0u) {
+                const uint base = ((out_tok * pc.n_head_q + h_q) * pc.n_splits + split) * PARTIAL_STRIDE;
+                const uint o4   = lane * 4u;
+                pb.d[base + o4 + 0u] = sh4_ep[o4 + 0u];
+                pb.d[base + o4 + 1u] = sh4_ep[o4 + 1u];
+                pb.d[base + o4 + 2u] = sh4_ep[o4 + 2u];
+                pb.d[base + o4 + 3u] = sh4_ep[o4 + 3u];
+                if (lane == 0u) {
+                    pb.d[base + 128u] = sh4_m[r];
+                    pb.d[base + 129u] = sh4_l[r];
+                }
             }
-            if (ok1) {
-                float s1 = subgroupAdd(dot(q1, kr));
-                if (has_softcap) s1 = pc.logit_softcap * tanh(s1);
-                s1 += mv1;
-                float mn = max(m1, s1);
-                float a  = exp(m1 - mn);
-                float p  = exp(s1 - mn);
-                o1 = o1 * a + vr * p;
-                l1 = l1 * a + p;
-                m1 = mn;
-            }
+            barrier();
         }
-        barrier();
-    }
-
-    if (v0_ok) {
-        bool has_sink; float eff_sink;
-        get_sink_info(tok0, h_q, has_sink, eff_sink);
-        if (has_sink) {
-            float mf = (l0 > 0.0f) ? max(m0, eff_sink) : eff_sink;
-            float wo = (l0 > 0.0f) ? exp(m0 - mf) : 0.0f;
-            o0 *= wo;
-            l0  = l0 * wo + exp(eff_sink - mf);
-        }
-        apply_epilogue_and_store((l0 > 0.0f) ? (o0 / l0) : vec4(0.0f), tok0, h_q, lane);
-    }
-    if (v1_ok) {
-        bool has_sink; float eff_sink;
-        get_sink_info(tok1, h_q, has_sink, eff_sink);
-        if (has_sink) {
-            float mf = (l1 > 0.0f) ? max(m1, eff_sink) : eff_sink;
-            float wo = (l1 > 0.0f) ? exp(m1 - mf) : 0.0f;
-            o1 *= wo;
-            l1  = l1 * wo + exp(eff_sink - mf);
-        }
-        apply_epilogue_and_store((l1 > 0.0f) ? (o1 / l1) : vec4(0.0f), tok1, h_q, lane);
     }
 }
-#endif // PASS_MODE == 0 vs 3
+#endif // PASS_MODE == 3 vs 4
+#endif // PASS_MODE == 0 vs 3/4
 
 #elif PASS_MODE == 1
 

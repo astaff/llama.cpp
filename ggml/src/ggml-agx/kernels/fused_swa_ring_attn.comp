@@ -1,15 +1,19 @@
 #version 450
+#extension GL_GOOGLE_include_directive : enable
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference2 : require
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
+
+#include "dequant_supertile.glsl"
 
 // ============================================================================
 // Pillar 4: Fused SWA-1024 Ring Attention + Banded Rel-Pos + Learned Sink
@@ -118,14 +122,10 @@ vec4 load_kv_vec4(uint64_t data_va, uint64_t scale_va, uint head_idx, uint lane)
     uint packed = BufU32(data_va).d[head_idx * 32u + lane];
     return decode_e4m3_u32(packed);
 #elif KV_DTYPE == 1
-    // Q8_0 planar: 128B int8 qs + 4 FP16 scales per head (lane>>3 selects 32-elem block!)
+    // Q8_0 planar: 128B int8 qs + 4 FP16 scales per head (magic-bias decode, 0 spills!)
     uint packed = BufU32(data_va).d[head_idx * 32u + lane];
     float sc = float(BufF16(scale_va).d[head_idx * 4u + (lane >> 3)]);
-    int q0 = bitfieldExtract(int(packed),  0, 8);
-    int q1 = bitfieldExtract(int(packed),  8, 8);
-    int q2 = bitfieldExtract(int(packed), 16, 8);
-    int q3 = bitfieldExtract(int(packed), 24, 8);
-    return vec4(float(q0), float(q1), float(q2), float(q3)) * sc;
+    return vec4(agx_q8_u32_magic_to_f16vec4(packed)) * sc;
 #else
     // F16: 256 bytes/head = 32 uvec2s -> 2 coalesced 128B cache lines per simdgroup!
     uvec2 p = BufUvec2(data_va).d[head_idx * 32u + lane];

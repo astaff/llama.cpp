@@ -114,7 +114,7 @@ layout(push_constant) uniform PushMoe {
     uint     flags;
     float    situ_beta;
     float    situ_linear_beta;
-    uint     pad0;
+    uint     ids_row_stride;  // PASS_STAGE=4: int32 stride between token rows in ids (0 -> top_k)
 } pc;
 
 void atomicAddF32(uint64_t addr_va, uint idx, float val) {
@@ -155,37 +155,85 @@ float moe_dot_e2m1_u32_f32x2(uint w32, vec4 x0, vec4 x1) {
 }
 
 #if PREC_F32 == 0
-float moe_dot_e2m1_u32_f16x2(uint w32, f16vec4 hx0, f16vec4 hx1) {
-    f16vec2 v04 = agx_e2m1_swar2_to_f16vec2( w32        & 0x000F000Fu);
-    f16vec2 v15 = agx_e2m1_swar2_to_f16vec2((w32 >> 4)  & 0x000F000Fu);
-    f16vec2 v26 = agx_e2m1_swar2_to_f16vec2((w32 >> 8)  & 0x000F000Fu);
-    f16vec2 v37 = agx_e2m1_swar2_to_f16vec2((w32 >> 12) & 0x000F000Fu);
-    float16_t s = dot(f16vec4(v04.x, v15.x, v26.x, v37.x), hx0);
-    s += dot(f16vec4(v04.y, v15.y, v26.y, v37.y), hx1);
-    return float(s);
+float16_t moe_dot_e2m1_u32_f16x2(uint w32, f16vec4 hx0, f16vec4 hx1) {
+    // 6-op SWAR2 masks bits [3:0] & [19:16] internally (no pre-mask needed!)
+    f16vec2 v04 = agx_e2m1_swar2_to_f16vec2(w32);
+    f16vec2 v15 = agx_e2m1_swar2_to_f16vec2(w32 >> 4);
+    f16vec2 v26 = agx_e2m1_swar2_to_f16vec2(w32 >> 8);
+    f16vec2 v37 = agx_e2m1_swar2_to_f16vec2(w32 >> 12);
+    return dot(f16vec4(v04.x, v15.x, v26.x, v37.x), hx0)
+         + dot(f16vec4(v04.y, v15.y, v26.y, v37.y), hx1);
+}
+
+void moe_decode_e2m1_u32_f16x2(uint w32, out f16vec4 w0, out f16vec4 w1) {
+    f16vec2 v04 = agx_e2m1_swar2_to_f16vec2(w32);
+    f16vec2 v15 = agx_e2m1_swar2_to_f16vec2(w32 >> 4);
+    f16vec2 v26 = agx_e2m1_swar2_to_f16vec2(w32 >> 8);
+    f16vec2 v37 = agx_e2m1_swar2_to_f16vec2(w32 >> 12);
+    w0 = f16vec4(v04.x, v15.x, v26.x, v37.x);
+    w1 = f16vec4(v04.y, v15.y, v26.y, v37.y);
 }
 #endif
 
 // ============================================================================
-// Stage 4: Direct M=1 Roofline MUL_MAT_ID Fastpath (Zero Bucket / Zero Barriers)
+// Stage 4: Direct M=1..8 Roofline MUL_MAT_ID Fastpath (Zero Bucket / Barriers)
+//   - grid_x = ceil(N / rows_per_wg), grid_y = top_k, grid_z = M (1..8)
+//   - Direct read of ids[tok * ids_row_stride + k_slot], exact eid < 0 -> 0.0f
+//   - NVFP4_32x16: 64 rows/WG SWAR2 ffma16 + 2x K-unroll pipelining (<=56 GPR32)
+//   - Q8_0_8BLK:   8 rows/WG 16B uvec4 coalesced + 2x chunk-unroll (515 GB/s)
 // ============================================================================
 #if PASS_STAGE == 4
+
+#if WEIGHT_MODE == 0
+void moe_nvfp4_accum_st(uint16_t dp, uvec4 qs, uint col4, AgxBufVec4R x_buf4, inout float acc) {
+    const vec2 sc = agx_ue4m3_pair_to_vec2(dp);
+#if PREC_F32 == 0
+    float16_t d0 = moe_dot_e2m1_u32_f16x2(qs.x, f16vec4(x_buf4.v[col4 + 0u]), f16vec4(x_buf4.v[col4 + 1u]))
+                 + moe_dot_e2m1_u32_f16x2(qs.y, f16vec4(x_buf4.v[col4 + 2u]), f16vec4(x_buf4.v[col4 + 3u]));
+    acc = fma(float(d0), sc.x, acc);
+
+    float16_t d1 = moe_dot_e2m1_u32_f16x2(qs.z, f16vec4(x_buf4.v[col4 + 4u]), f16vec4(x_buf4.v[col4 + 5u]))
+                 + moe_dot_e2m1_u32_f16x2(qs.w, f16vec4(x_buf4.v[col4 + 6u]), f16vec4(x_buf4.v[col4 + 7u]));
+    acc = fma(float(d1), sc.y, acc);
+#else
+    float d0 = moe_dot_e2m1_u32_f32x2(qs.x, x_buf4.v[col4 + 0u], x_buf4.v[col4 + 1u])
+             + moe_dot_e2m1_u32_f32x2(qs.y, x_buf4.v[col4 + 2u], x_buf4.v[col4 + 3u]);
+    acc = fma(d0, sc.x, acc);
+
+    float d1 = moe_dot_e2m1_u32_f32x2(qs.z, x_buf4.v[col4 + 4u], x_buf4.v[col4 + 5u])
+             + moe_dot_e2m1_u32_f32x2(qs.w, x_buf4.v[col4 + 6u], x_buf4.v[col4 + 7u]);
+    acc = fma(d1, sc.y, acc);
+#endif
+}
+#elif WEIGHT_MODE == 2
+void moe_q8_accum_chk(uvec4 qv, uint16_t d16, uint col4, AgxBufVec4R x_buf4, inout float acc) {
+    const float d = float(unpackFloat2x16(uint(d16)).x);
+    float dp = dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.x)), x_buf4.v[col4 + 0u])
+             + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.y)), x_buf4.v[col4 + 1u])
+             + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.z)), x_buf4.v[col4 + 2u])
+             + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.w)), x_buf4.v[col4 + 3u]);
+    acc = fma(dp, d, acc);
+}
+#endif
 
 void main() {
     const uint lane   = gl_SubgroupInvocationID; // 0..31
     const uint sg_id  = gl_SubgroupID;           // 0..3
     const uint k_slot = gl_WorkGroupID.y;        // 0..top_k-1
+    const uint tok    = gl_WorkGroupID.z;        // 0..M-1
 
     if (k_slot >= pc.top_k) {
         return;
     }
 
-    const int raw_eid = BufI32R(pc.buckets_va).d[k_slot];
-    const bool valid_eid = (raw_eid >= 0) && (uint(raw_eid) < pc.n_ff);
-    const bool per_slot  = (pc.flags & MOE_FLAG_RAW_MMID_PERSLOT) != 0u;
-    const uint row_x     = per_slot ? k_slot : 0u;
-    const uint64_t x_row_va = pc.x_va + uint64_t(row_x) * uint64_t(pc.K) * 4ul;
-    const uint64_t y_row_va = pc.y_va + uint64_t(k_slot) * uint64_t(pc.N) * 4ul;
+    const uint ids_stride = (pc.ids_row_stride != 0u) ? pc.ids_row_stride : pc.top_k;
+    const int  raw_eid    = BufI32R(pc.buckets_va).d[tok * ids_stride + k_slot];
+    const bool valid_eid  = (raw_eid >= 0) && (uint(raw_eid) < pc.n_ff);
+    const bool per_slot   = (pc.flags & MOE_FLAG_RAW_MMID_PERSLOT) != 0u;
+    const uint y_slot     = tok * pc.top_k + k_slot;
+    const uint row_x      = per_slot ? y_slot : tok;
+    const uint64_t x_row_va = pc.x_va + uint64_t(row_x)  * uint64_t(pc.K) * 4ul;
+    const uint64_t y_row_va = pc.y_va + uint64_t(y_slot) * uint64_t(pc.N) * 4ul;
 
     AgxBufF32R  x_buf  = AgxBufF32R(x_row_va);
     AgxBufVec4R x_buf4 = AgxBufVec4R(x_row_va);
@@ -193,7 +241,7 @@ void main() {
 
 #if WEIGHT_MODE == 0
     // AGX_NVFP4_32x16: 64 rows/WG (4 sgs x 1 half-tile = 16 rows/sg -> 2x WG count across all 40 cores!)
-    // SWAR2 + 2x-rate AGX3B ffma16 sub-block dot + FP32 scale accum (~36 GPR32 -> max occupancy!)
+    // SWAR2 + 2x-rate AGX3B ffma16 + 2x K-unroll super-tile prefetch (<=56 GPR32, 0:0 spills!)
     const uint half_idx = gl_WorkGroupID.x * 4u + sg_id;
     const uint tn       = half_idx >> 1;
     const uint sub_s    = half_idx & 1u;
@@ -216,30 +264,25 @@ void main() {
         const uint nb_k       = pc.K >> 6;
         const uint st_base    = tn * nb_k;
         const uint l_idx      = sub_s * 32u + lane;
+        const uint kh_col4    = kh * 8u;
 
-        for (uint tk = 0u; tk < nb_k; ++tk) {
-            const uint st_idx = st_base + tk;
-            const vec2 sc     = agx_ue4m3_pair_to_vec2(st_buf.st[st_idx].d[l_idx]);
-            const uvec4 qs    = st_buf.st[st_idx].qs[l_idx];
-            const uint col4   = (tk * 64u + kh * 32u) >> 2;
-
-#if PREC_F32 == 0
-            float d0 = moe_dot_e2m1_u32_f16x2(qs.x, f16vec4(x_buf4.v[col4 + 0u]), f16vec4(x_buf4.v[col4 + 1u]))
-                     + moe_dot_e2m1_u32_f16x2(qs.y, f16vec4(x_buf4.v[col4 + 2u]), f16vec4(x_buf4.v[col4 + 3u]));
-            acc = fma(d0, sc.x, acc);
-
-            float d1 = moe_dot_e2m1_u32_f16x2(qs.z, f16vec4(x_buf4.v[col4 + 4u]), f16vec4(x_buf4.v[col4 + 5u]))
-                     + moe_dot_e2m1_u32_f16x2(qs.w, f16vec4(x_buf4.v[col4 + 6u]), f16vec4(x_buf4.v[col4 + 7u]));
-            acc = fma(d1, sc.y, acc);
-#else
-            float d0 = moe_dot_e2m1_u32_f32x2(qs.x, x_buf4.v[col4 + 0u], x_buf4.v[col4 + 1u])
-                     + moe_dot_e2m1_u32_f32x2(qs.y, x_buf4.v[col4 + 2u], x_buf4.v[col4 + 3u]);
-            acc = fma(d0, sc.x, acc);
-
-            float d1 = moe_dot_e2m1_u32_f32x2(qs.z, x_buf4.v[col4 + 4u], x_buf4.v[col4 + 5u])
-                     + moe_dot_e2m1_u32_f32x2(qs.w, x_buf4.v[col4 + 6u], x_buf4.v[col4 + 7u]);
-            acc = fma(d1, sc.y, acc);
-#endif
+        uint tk = 0u;
+        for (; tk + 1u < nb_k; tk += 2u) {
+            const uint     st0 = st_base + tk;
+            const uint     st1 = st0 + 1u;
+            const uint16_t dp0 = st_buf.st[st0].d[l_idx];
+            const uvec4    qs0 = st_buf.st[st0].qs[l_idx];
+            const uint16_t dp1 = st_buf.st[st1].d[l_idx];
+            const uvec4    qs1 = st_buf.st[st1].qs[l_idx];
+            const uint col4_0  = tk * 16u + kh_col4;
+            moe_nvfp4_accum_st(dp0, qs0, col4_0,       x_buf4, acc);
+            moe_nvfp4_accum_st(dp1, qs1, col4_0 + 16u, x_buf4, acc);
+        }
+        if (tk < nb_k) {
+            const uint     st0 = st_base + tk;
+            const uint16_t dp0 = st_buf.st[st0].d[l_idx];
+            const uvec4    qs0 = st_buf.st[st0].qs[l_idx];
+            moe_nvfp4_accum_st(dp0, qs0, tk * 16u + kh_col4, x_buf4, acc);
         }
     }
 
@@ -250,7 +293,7 @@ void main() {
     }
 
 #elif WEIGHT_MODE == 2
-    // AGX_Q8_0_8BLK (515 GB/s layout): 8 rows/WG (2 rows/sg, 16 lanes/row, 1 x uvec4/lane!)
+    // AGX_Q8_0_8BLK (515 GB/s layout): 8 rows/WG (2 rows/sg, 16 lanes/row, 2x chunk-unroll!)
     const uint row    = (gl_WorkGroupID.x * 4u + sg_id) * 2u + (lane >> 4);
     const uint lane16 = lane & 15u;
 
@@ -263,21 +306,31 @@ void main() {
     if (row < pc.N) {
         const uint64_t w_base = pc.w_gate_va + uint64_t(raw_eid) * pc.w_slice_B;
         AgxBufQ8_8Blk w_buf   = AgxBufQ8_8Blk(w_base);
+        const uint n_full     = pc.K >> 8;
         const uint n_chunks   = (pc.K + 255u) >> 8;
         const uint row_c0     = row * n_chunks;
+        const uint d_slot     = lane16 >> 1;
+        const uint l16_col4   = lane16 * 4u;
 
-        for (uint c = 0u; c < n_chunks; ++c) {
-            const uint chk_idx = row_c0 + c;
-            const uvec4 qv     = w_buf.blk[chk_idx].qs[lane16];
-            const float d      = float(unpackFloat2x16(uint(w_buf.blk[chk_idx].d[lane16 >> 1])).x);
-            const uint k0      = c * 256u + lane16 * 16u;
+        uint c = 0u;
+        for (; c + 1u < n_full; c += 2u) {
+            const uint     chk0 = row_c0 + c;
+            const uint     chk1 = chk0 + 1u;
+            const uvec4    qv0  = w_buf.blk[chk0].qs[lane16];
+            const uint16_t d0   = w_buf.blk[chk0].d[d_slot];
+            const uvec4    qv1  = w_buf.blk[chk1].qs[lane16];
+            const uint16_t d1   = w_buf.blk[chk1].d[d_slot];
+            const uint col4_0   = c * 64u + l16_col4;
+            moe_q8_accum_chk(qv0, d0, col4_0,       x_buf4, acc);
+            moe_q8_accum_chk(qv1, d1, col4_0 + 64u, x_buf4, acc);
+        }
+        for (; c < n_chunks; ++c) {
+            const uint k0 = c * 256u + lane16 * 16u;
             if (k0 < pc.K) {
-                const uint col4 = k0 >> 2;
-                float dp = dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.x)), x_buf4.v[col4 + 0u])
-                         + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.y)), x_buf4.v[col4 + 1u])
-                         + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.z)), x_buf4.v[col4 + 2u])
-                         + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.w)), x_buf4.v[col4 + 3u]);
-                acc = fma(dp, d, acc);
+                const uint     chk_idx = row_c0 + c;
+                const uvec4    qv      = w_buf.blk[chk_idx].qs[lane16];
+                const uint16_t d0      = w_buf.blk[chk_idx].d[d_slot];
+                moe_q8_accum_chk(qv, d0, k0 >> 2, x_buf4, acc);
             }
         }
     }
@@ -406,7 +459,7 @@ void vecmat_16rows(
     const uint  K4     = pc.K >> 2;
 
 #if WEIGHT_MODE == 0
-    // AGX_NVFP4_32x16 super-tile: direct-to-FP32 decode across all m_cnt tokens!
+    // AGX_NVFP4_32x16 super-tile: precomputed x_base4 + 6-op SWAR2 + dedicated m_cnt==1 2x K-unroll!
     const uint half_idx = row_base >> 4;
     const uint tn       = half_idx >> 1;
     const uint sub_s    = half_idx & 1u;
@@ -420,133 +473,275 @@ void vecmat_16rows(
         const uint nb_k        = pc.K >> 6;
         const uint st_row_base = tn * nb_k;
         const uint l_idx       = sub_s * 32u + lane;
+        const uint kh_col4     = kh * 8u;
 
-        for (uint tk = 0u; tk < nb_k; ++tk) {
-            const uint st_idx = st_row_base + tk;
-            const vec2 scales = agx_ue4m3_pair_to_vec2(st_buf.st[st_idx].d[l_idx]);
-            const uvec4 qs    = st_buf.st[st_idx].qs[l_idx];
-            const uint col4   = (tk * 64u + kh * 32u) >> 2;
-
-#if PREC_F32 == 0
-            {
-                f16vec4 w0 = f16vec4(agx_e2m1_byte_to_f16vec2(qs.x & 0xFFu),         agx_e2m1_byte_to_f16vec2((qs.x >> 8)  & 0xFFu));
-                f16vec4 w1 = f16vec4(agx_e2m1_byte_to_f16vec2((qs.x >> 16) & 0xFFu), agx_e2m1_byte_to_f16vec2((qs.x >> 24) & 0xFFu));
-                f16vec4 w2 = f16vec4(agx_e2m1_byte_to_f16vec2(qs.y & 0xFFu),         agx_e2m1_byte_to_f16vec2((qs.y >> 8)  & 0xFFu));
-                f16vec4 w3 = f16vec4(agx_e2m1_byte_to_f16vec2((qs.y >> 16) & 0xFFu), agx_e2m1_byte_to_f16vec2((qs.y >> 24) & 0xFFu));
-                for (uint m = 0u; m < uint(BATCH_CAP); ++m) {
-                    if (m < m_cnt) {
-                        const uint row_x = x_is_contiguous_assign ? (tok_off + m) : tok_ids[m];
-                        const uint xo    = row_x * K4 + col4;
-                        float16_t d0 = dot(w0, f16vec4(x_buf4.v[xo + 0u])) + dot(w1, f16vec4(x_buf4.v[xo + 1u]))
-                                     + dot(w2, f16vec4(x_buf4.v[xo + 2u])) + dot(w3, f16vec4(x_buf4.v[xo + 3u]));
-                        res_out[m] = fma(float(d0), scales.x, res_out[m]);
-                    }
-                }
-            }
-            {
-                f16vec4 w0 = f16vec4(agx_e2m1_byte_to_f16vec2(qs.z & 0xFFu),         agx_e2m1_byte_to_f16vec2((qs.z >> 8)  & 0xFFu));
-                f16vec4 w1 = f16vec4(agx_e2m1_byte_to_f16vec2((qs.z >> 16) & 0xFFu), agx_e2m1_byte_to_f16vec2((qs.z >> 24) & 0xFFu));
-                f16vec4 w2 = f16vec4(agx_e2m1_byte_to_f16vec2(qs.w & 0xFFu),         agx_e2m1_byte_to_f16vec2((qs.w >> 8)  & 0xFFu));
-                f16vec4 w3 = f16vec4(agx_e2m1_byte_to_f16vec2((qs.w >> 16) & 0xFFu), agx_e2m1_byte_to_f16vec2((qs.w >> 24) & 0xFFu));
-                for (uint m = 0u; m < uint(BATCH_CAP); ++m) {
-                    if (m < m_cnt) {
-                        const uint row_x = x_is_contiguous_assign ? (tok_off + m) : tok_ids[m];
-                        const uint xo    = row_x * K4 + col4 + 4u;
-                        float16_t d1 = dot(w0, f16vec4(x_buf4.v[xo + 0u])) + dot(w1, f16vec4(x_buf4.v[xo + 1u]))
-                                     + dot(w2, f16vec4(x_buf4.v[xo + 2u])) + dot(w3, f16vec4(x_buf4.v[xo + 3u]));
-                        res_out[m] = fma(float(d1), scales.y, res_out[m]);
-                    }
-                }
-            }
-#else
-            {
-                vec4 w0 = agx_e2m1_u16_to_vec4(qs.x & 0xFFFFu);
-                vec4 w1 = agx_e2m1_u16_to_vec4(qs.x >> 16);
-                vec4 w2 = agx_e2m1_u16_to_vec4(qs.y & 0xFFFFu);
-                vec4 w3 = agx_e2m1_u16_to_vec4(qs.y >> 16);
-                for (uint m = 0u; m < uint(BATCH_CAP); ++m) {
-                    if (m < m_cnt) {
-                        const uint row_x = x_is_contiguous_assign ? (tok_off + m) : tok_ids[m];
-                        const uint xo    = row_x * K4 + col4;
-                        float d0 = dot(w0, x_buf4.v[xo + 0u]) + dot(w1, x_buf4.v[xo + 1u])
-                                 + dot(w2, x_buf4.v[xo + 2u]) + dot(w3, x_buf4.v[xo + 3u]);
-                        res_out[m] = fma(d0, scales.x, res_out[m]);
-                    }
-                }
-            }
-            {
-                vec4 w0 = agx_e2m1_u16_to_vec4(qs.z & 0xFFFFu);
-                vec4 w1 = agx_e2m1_u16_to_vec4(qs.z >> 16);
-                vec4 w2 = agx_e2m1_u16_to_vec4(qs.w & 0xFFFFu);
-                vec4 w3 = agx_e2m1_u16_to_vec4(qs.w >> 16);
-                for (uint m = 0u; m < uint(BATCH_CAP); ++m) {
-                    if (m < m_cnt) {
-                        const uint row_x = x_is_contiguous_assign ? (tok_off + m) : tok_ids[m];
-                        const uint xo    = row_x * K4 + col4 + 4u;
-                        float d1 = dot(w0, x_buf4.v[xo + 0u]) + dot(w1, x_buf4.v[xo + 1u])
-                                 + dot(w2, x_buf4.v[xo + 2u]) + dot(w3, x_buf4.v[xo + 3u]);
-                        res_out[m] = fma(d1, scales.y, res_out[m]);
-                    }
-                }
-            }
-#endif
+        uint x_base4[BATCH_CAP];
+        for (uint m = 0u; m < uint(BATCH_CAP); ++m) {
+            const uint rx = x_is_contiguous_assign ? (tok_off + m) : tok_ids[m];
+            x_base4[m] = rx * K4;
         }
 
-        for (uint m = 0u; m < uint(BATCH_CAP); ++m) {
-            res_out[m] += subgroupShuffleXor(res_out[m], 1u);
+        if (m_cnt == 1u) {
+            // 1-token bucket fastpath (45%+ of DSpark M=8 buckets!): 2x K-unroll super-tile prefetch!
+            const uint xb0 = x_base4[0];
+            float a0 = 0.0f;
+            uint tk = 0u;
+            for (; tk + 1u < nb_k; tk += 2u) {
+                const uint     st0 = st_row_base + tk;
+                const uint     st1 = st0 + 1u;
+                const uint16_t dp0 = st_buf.st[st0].d[l_idx];
+                const uvec4    qs0 = st_buf.st[st0].qs[l_idx];
+                const uint16_t dp1 = st_buf.st[st1].d[l_idx];
+                const uvec4    qs1 = st_buf.st[st1].qs[l_idx];
+                const uint col4_0  = xb0 + tk * 16u + kh_col4;
+                const vec2 sc0     = agx_ue4m3_pair_to_vec2(dp0);
+#if PREC_F32 == 0
+                float16_t d0 = moe_dot_e2m1_u32_f16x2(qs0.x, f16vec4(x_buf4.v[col4_0 + 0u]), f16vec4(x_buf4.v[col4_0 + 1u]))
+                             + moe_dot_e2m1_u32_f16x2(qs0.y, f16vec4(x_buf4.v[col4_0 + 2u]), f16vec4(x_buf4.v[col4_0 + 3u]));
+                a0 = fma(float(d0), sc0.x, a0);
+                float16_t d1 = moe_dot_e2m1_u32_f16x2(qs0.z, f16vec4(x_buf4.v[col4_0 + 4u]), f16vec4(x_buf4.v[col4_0 + 5u]))
+                             + moe_dot_e2m1_u32_f16x2(qs0.w, f16vec4(x_buf4.v[col4_0 + 6u]), f16vec4(x_buf4.v[col4_0 + 7u]));
+                a0 = fma(float(d1), sc0.y, a0);
+                const vec2 sc1 = agx_ue4m3_pair_to_vec2(dp1);
+                d0 = moe_dot_e2m1_u32_f16x2(qs1.x, f16vec4(x_buf4.v[col4_0 + 16u]), f16vec4(x_buf4.v[col4_0 + 17u]))
+                   + moe_dot_e2m1_u32_f16x2(qs1.y, f16vec4(x_buf4.v[col4_0 + 18u]), f16vec4(x_buf4.v[col4_0 + 19u]));
+                a0 = fma(float(d0), sc1.x, a0);
+                d1 = moe_dot_e2m1_u32_f16x2(qs1.z, f16vec4(x_buf4.v[col4_0 + 20u]), f16vec4(x_buf4.v[col4_0 + 21u]))
+                   + moe_dot_e2m1_u32_f16x2(qs1.w, f16vec4(x_buf4.v[col4_0 + 22u]), f16vec4(x_buf4.v[col4_0 + 23u]));
+                a0 = fma(float(d1), sc1.y, a0);
+#else
+                float d0 = moe_dot_e2m1_u32_f32x2(qs0.x, x_buf4.v[col4_0 + 0u], x_buf4.v[col4_0 + 1u])
+                         + moe_dot_e2m1_u32_f32x2(qs0.y, x_buf4.v[col4_0 + 2u], x_buf4.v[col4_0 + 3u]);
+                a0 = fma(d0, sc0.x, a0);
+                float d1 = moe_dot_e2m1_u32_f32x2(qs0.z, x_buf4.v[col4_0 + 4u], x_buf4.v[col4_0 + 5u])
+                         + moe_dot_e2m1_u32_f32x2(qs0.w, x_buf4.v[col4_0 + 6u], x_buf4.v[col4_0 + 7u]);
+                a0 = fma(d1, sc0.y, a0);
+                const vec2 sc1 = agx_ue4m3_pair_to_vec2(dp1);
+                d0 = moe_dot_e2m1_u32_f32x2(qs1.x, x_buf4.v[col4_0 + 16u], x_buf4.v[col4_0 + 17u])
+                   + moe_dot_e2m1_u32_f32x2(qs1.y, x_buf4.v[col4_0 + 18u], x_buf4.v[col4_0 + 19u]);
+                a0 = fma(d0, sc1.x, a0);
+                d1 = moe_dot_e2m1_u32_f32x2(qs1.z, x_buf4.v[col4_0 + 20u], x_buf4.v[col4_0 + 21u])
+                   + moe_dot_e2m1_u32_f32x2(qs1.w, x_buf4.v[col4_0 + 22u], x_buf4.v[col4_0 + 23u]);
+                a0 = fma(d1, sc1.y, a0);
+#endif
+            }
+            if (tk < nb_k) {
+                const uint st0 = st_row_base + tk;
+                const vec2 sc0 = agx_ue4m3_pair_to_vec2(st_buf.st[st0].d[l_idx]);
+                const uvec4 qs0 = st_buf.st[st0].qs[l_idx];
+                const uint col4_0 = xb0 + tk * 16u + kh_col4;
+#if PREC_F32 == 0
+                float16_t d0 = moe_dot_e2m1_u32_f16x2(qs0.x, f16vec4(x_buf4.v[col4_0 + 0u]), f16vec4(x_buf4.v[col4_0 + 1u]))
+                             + moe_dot_e2m1_u32_f16x2(qs0.y, f16vec4(x_buf4.v[col4_0 + 2u]), f16vec4(x_buf4.v[col4_0 + 3u]));
+                a0 = fma(float(d0), sc0.x, a0);
+                float16_t d1 = moe_dot_e2m1_u32_f16x2(qs0.z, f16vec4(x_buf4.v[col4_0 + 4u]), f16vec4(x_buf4.v[col4_0 + 5u]))
+                             + moe_dot_e2m1_u32_f16x2(qs0.w, f16vec4(x_buf4.v[col4_0 + 6u]), f16vec4(x_buf4.v[col4_0 + 7u]));
+                a0 = fma(float(d1), sc0.y, a0);
+#else
+                float d0 = moe_dot_e2m1_u32_f32x2(qs0.x, x_buf4.v[col4_0 + 0u], x_buf4.v[col4_0 + 1u])
+                         + moe_dot_e2m1_u32_f32x2(qs0.y, x_buf4.v[col4_0 + 2u], x_buf4.v[col4_0 + 3u]);
+                a0 = fma(d0, sc0.x, a0);
+                float d1 = moe_dot_e2m1_u32_f32x2(qs0.z, x_buf4.v[col4_0 + 4u], x_buf4.v[col4_0 + 5u])
+                         + moe_dot_e2m1_u32_f32x2(qs0.w, x_buf4.v[col4_0 + 6u], x_buf4.v[col4_0 + 7u]);
+                a0 = fma(d1, sc0.y, a0);
+#endif
+            }
+            res_out[0] = a0 + subgroupShuffleXor(a0, 1u);
+        } else {
+            // Multi-token bucket (m_cnt = 2..BATCH_CAP): stream 8 weights via 6-op SWAR2 (4 GPR32!)
+            for (uint tk = 0u; tk < nb_k; ++tk) {
+                const uint st_idx = st_row_base + tk;
+                const vec2 scales = agx_ue4m3_pair_to_vec2(st_buf.st[st_idx].d[l_idx]);
+                const uvec4 qs    = st_buf.st[st_idx].qs[l_idx];
+                const uint col4   = tk * 16u + kh_col4;
+
+#if PREC_F32 == 0
+                f16vec4 w0, w1;
+                moe_decode_e2m1_u32_f16x2(qs.x, w0, w1);
+                for (uint m = 0u; m < uint(BATCH_CAP); ++m) {
+                    if (m < m_cnt) {
+                        const uint xo = x_base4[m] + col4;
+                        float16_t d = dot(w0, f16vec4(x_buf4.v[xo + 0u])) + dot(w1, f16vec4(x_buf4.v[xo + 1u]));
+                        res_out[m] = fma(float(d), scales.x, res_out[m]);
+                    }
+                }
+                moe_decode_e2m1_u32_f16x2(qs.y, w0, w1);
+                for (uint m = 0u; m < uint(BATCH_CAP); ++m) {
+                    if (m < m_cnt) {
+                        const uint xo = x_base4[m] + col4 + 2u;
+                        float16_t d = dot(w0, f16vec4(x_buf4.v[xo + 0u])) + dot(w1, f16vec4(x_buf4.v[xo + 1u]));
+                        res_out[m] = fma(float(d), scales.x, res_out[m]);
+                    }
+                }
+                moe_decode_e2m1_u32_f16x2(qs.z, w0, w1);
+                for (uint m = 0u; m < uint(BATCH_CAP); ++m) {
+                    if (m < m_cnt) {
+                        const uint xo = x_base4[m] + col4 + 4u;
+                        float16_t d = dot(w0, f16vec4(x_buf4.v[xo + 0u])) + dot(w1, f16vec4(x_buf4.v[xo + 1u]));
+                        res_out[m] = fma(float(d), scales.y, res_out[m]);
+                    }
+                }
+                moe_decode_e2m1_u32_f16x2(qs.w, w0, w1);
+                for (uint m = 0u; m < uint(BATCH_CAP); ++m) {
+                    if (m < m_cnt) {
+                        const uint xo = x_base4[m] + col4 + 6u;
+                        float16_t d = dot(w0, f16vec4(x_buf4.v[xo + 0u])) + dot(w1, f16vec4(x_buf4.v[xo + 1u]));
+                        res_out[m] = fma(float(d), scales.y, res_out[m]);
+                    }
+                }
+#else
+                vec4 w0 = agx_e2m1_u16_to_vec4(qs.x & 0xFFFFu);
+                vec4 w1 = agx_e2m1_u16_to_vec4(qs.x >> 16);
+                for (uint m = 0u; m < uint(BATCH_CAP); ++m) {
+                    if (m < m_cnt) {
+                        const uint xo = x_base4[m] + col4;
+                        res_out[m] = fma(dot(w0, x_buf4.v[xo + 0u]) + dot(w1, x_buf4.v[xo + 1u]), scales.x, res_out[m]);
+                    }
+                }
+                w0 = agx_e2m1_u16_to_vec4(qs.y & 0xFFFFu);
+                w1 = agx_e2m1_u16_to_vec4(qs.y >> 16);
+                for (uint m = 0u; m < uint(BATCH_CAP); ++m) {
+                    if (m < m_cnt) {
+                        const uint xo = x_base4[m] + col4 + 2u;
+                        res_out[m] = fma(dot(w0, x_buf4.v[xo + 0u]) + dot(w1, x_buf4.v[xo + 1u]), scales.x, res_out[m]);
+                    }
+                }
+                w0 = agx_e2m1_u16_to_vec4(qs.z & 0xFFFFu);
+                w1 = agx_e2m1_u16_to_vec4(qs.z >> 16);
+                for (uint m = 0u; m < uint(BATCH_CAP); ++m) {
+                    if (m < m_cnt) {
+                        const uint xo = x_base4[m] + col4 + 4u;
+                        res_out[m] = fma(dot(w0, x_buf4.v[xo + 0u]) + dot(w1, x_buf4.v[xo + 1u]), scales.y, res_out[m]);
+                    }
+                }
+                w0 = agx_e2m1_u16_to_vec4(qs.w & 0xFFFFu);
+                w1 = agx_e2m1_u16_to_vec4(qs.w >> 16);
+                for (uint m = 0u; m < uint(BATCH_CAP); ++m) {
+                    if (m < m_cnt) {
+                        const uint xo = x_base4[m] + col4 + 6u;
+                        res_out[m] = fma(dot(w0, x_buf4.v[xo + 0u]) + dot(w1, x_buf4.v[xo + 1u]), scales.y, res_out[m]);
+                    }
+                }
+#endif
+            }
+
+            for (uint m = 0u; m < uint(BATCH_CAP); ++m) {
+                res_out[m] += subgroupShuffleXor(res_out[m], 1u);
+            }
         }
     }
 #elif WEIGHT_MODE == 2
     // AGX_Q8_0_8BLK: 2 rows in parallel per iteration (16 lanes/row, 1 x uvec4 = 16 int8s/lane!)
-    // 8 iterations cover 16 rows with full 16B coalesced loads!
+    // Dedicated m_cnt==1 2x chunk-unroll + precomputed x_base4 for multi-token buckets!
     const uint lane16 = lane & 15u;
     const uint r_half = lane >> 4; // 0 or 1
     out_row_idx       = row_base + lane;
     lane_writes       = (lane < 16u) && (out_row_idx < row_limit);
 
+    const uint n_full   = pc.K >> 8;
     const uint n_chunks = (pc.K + 255u) >> 8;
+    const uint d_slot   = lane16 >> 1;
+    const uint l16_col4 = lane16 * 4u;
     AgxBufQ8_8Blk qbuf  = AgxBufQ8_8Blk(w_base);
 
-    for (uint r2 = 0u; r2 < 16u; r2 += 2u) {
-        const uint row = row_base + r2 + r_half;
-        float acc[BATCH_CAP];
-        for (uint m = 0u; m < uint(BATCH_CAP); ++m) acc[m] = 0.0f;
+    uint x_base4[BATCH_CAP];
+    for (uint m = 0u; m < uint(BATCH_CAP); ++m) {
+        const uint rx = x_is_contiguous_assign ? (tok_off + m) : tok_ids[m];
+        x_base4[m] = rx * K4;
+    }
 
-        if (row < row_limit) {
-            const uint row_c0 = row * n_chunks;
-            for (uint c = 0u; c < n_chunks; ++c) {
-                const uint cidx = row_c0 + c;
-                const uvec4 qv  = qbuf.blk[cidx].qs[lane16];
-                const float sc  = float(unpackFloat2x16(uint(qbuf.blk[cidx].d[lane16 >> 1])).x);
-                const uint k0   = c * 256u + lane16 * 16u;
-                if (k0 < pc.K) {
-                    const vec4 w0 = vec4(agx_q8_u32_magic_to_f16vec4(qv.x));
-                    const vec4 w1 = vec4(agx_q8_u32_magic_to_f16vec4(qv.y));
-                    const vec4 w2 = vec4(agx_q8_u32_magic_to_f16vec4(qv.z));
-                    const vec4 w3 = vec4(agx_q8_u32_magic_to_f16vec4(qv.w));
-                    const uint col4 = k0 >> 2;
-                    for (uint m = 0u; m < uint(BATCH_CAP); ++m) {
-                        if (m < m_cnt) {
-                            const uint row_x = x_is_contiguous_assign ? (tok_off + m) : tok_ids[m];
-                            const uint xo    = row_x * K4 + col4;
-                            float dp = dot(w0, x_buf4.v[xo + 0u]) + dot(w1, x_buf4.v[xo + 1u])
-                                     + dot(w2, x_buf4.v[xo + 2u]) + dot(w3, x_buf4.v[xo + 3u]);
-                            acc[m] = fma(dp, sc, acc[m]);
+    if (m_cnt == 1u) {
+        const uint xb0 = x_base4[0];
+        for (uint r2 = 0u; r2 < 16u; r2 += 2u) {
+            const uint row = row_base + r2 + r_half;
+            float a0 = 0.0f;
+            if (row < row_limit) {
+                const uint row_c0 = row * n_chunks;
+                uint c = 0u;
+                for (; c + 1u < n_full; c += 2u) {
+                    const uint     chk0 = row_c0 + c;
+                    const uint     chk1 = chk0 + 1u;
+                    const uvec4    qv0  = qbuf.blk[chk0].qs[lane16];
+                    const uint16_t d0   = qbuf.blk[chk0].d[d_slot];
+                    const uvec4    qv1  = qbuf.blk[chk1].qs[lane16];
+                    const uint16_t d1   = qbuf.blk[chk1].d[d_slot];
+                    const uint col4_0   = xb0 + c * 64u + l16_col4;
+                    float dp0 = dot(vec4(agx_q8_u32_magic_to_f16vec4(qv0.x)), x_buf4.v[col4_0 + 0u])
+                              + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv0.y)), x_buf4.v[col4_0 + 1u])
+                              + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv0.z)), x_buf4.v[col4_0 + 2u])
+                              + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv0.w)), x_buf4.v[col4_0 + 3u]);
+                    a0 = fma(dp0, float(unpackFloat2x16(uint(d0)).x), a0);
+                    float dp1 = dot(vec4(agx_q8_u32_magic_to_f16vec4(qv1.x)), x_buf4.v[col4_0 + 64u])
+                              + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv1.y)), x_buf4.v[col4_0 + 65u])
+                              + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv1.z)), x_buf4.v[col4_0 + 66u])
+                              + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv1.w)), x_buf4.v[col4_0 + 67u]);
+                    a0 = fma(dp1, float(unpackFloat2x16(uint(d1)).x), a0);
+                }
+                for (; c < n_chunks; ++c) {
+                    const uint k0 = c * 256u + lane16 * 16u;
+                    if (k0 < pc.K) {
+                        const uint cidx = row_c0 + c;
+                        const uvec4 qv  = qbuf.blk[cidx].qs[lane16];
+                        const float sc  = float(unpackFloat2x16(uint(qbuf.blk[cidx].d[d_slot])).x);
+                        const uint xo   = xb0 + (k0 >> 2);
+                        float dp = dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.x)), x_buf4.v[xo + 0u])
+                                 + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.y)), x_buf4.v[xo + 1u])
+                                 + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.z)), x_buf4.v[xo + 2u])
+                                 + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.w)), x_buf4.v[xo + 3u]);
+                        a0 = fma(dp, sc, a0);
+                    }
+                }
+            }
+            a0 += subgroupShuffleXor(a0, 1u);
+            a0 += subgroupShuffleXor(a0, 2u);
+            a0 += subgroupShuffleXor(a0, 4u);
+            a0 += subgroupShuffleXor(a0, 8u);
+            float v_lo = subgroupShuffle(a0, 0u);
+            float v_hi = subgroupShuffle(a0, 16u);
+            if (lane == r2)      res_out[0] = v_lo;
+            if (lane == r2 + 1u) res_out[0] = v_hi;
+        }
+    } else {
+        for (uint r2 = 0u; r2 < 16u; r2 += 2u) {
+            const uint row = row_base + r2 + r_half;
+            float acc[BATCH_CAP];
+            for (uint m = 0u; m < uint(BATCH_CAP); ++m) acc[m] = 0.0f;
+
+            if (row < row_limit) {
+                const uint row_c0 = row * n_chunks;
+                for (uint c = 0u; c < n_chunks; ++c) {
+                    const uint k0 = c * 256u + lane16 * 16u;
+                    if (k0 < pc.K) {
+                        const uint cidx = row_c0 + c;
+                        const uvec4 qv  = qbuf.blk[cidx].qs[lane16];
+                        const float sc  = float(unpackFloat2x16(uint(qbuf.blk[cidx].d[d_slot])).x);
+                        const vec4 w0   = vec4(agx_q8_u32_magic_to_f16vec4(qv.x));
+                        const vec4 w1   = vec4(agx_q8_u32_magic_to_f16vec4(qv.y));
+                        const vec4 w2   = vec4(agx_q8_u32_magic_to_f16vec4(qv.z));
+                        const vec4 w3   = vec4(agx_q8_u32_magic_to_f16vec4(qv.w));
+                        const uint col4 = k0 >> 2;
+                        for (uint m = 0u; m < uint(BATCH_CAP); ++m) {
+                            if (m < m_cnt) {
+                                const uint xo = x_base4[m] + col4;
+                                float dp = dot(w0, x_buf4.v[xo + 0u]) + dot(w1, x_buf4.v[xo + 1u])
+                                         + dot(w2, x_buf4.v[xo + 2u]) + dot(w3, x_buf4.v[xo + 3u]);
+                                acc[m] = fma(dp, sc, acc[m]);
+                            }
                         }
                     }
                 }
             }
-        }
 
-        for (uint m = 0u; m < uint(BATCH_CAP); ++m) {
-            acc[m] += subgroupShuffleXor(acc[m], 1u);
-            acc[m] += subgroupShuffleXor(acc[m], 2u);
-            acc[m] += subgroupShuffleXor(acc[m], 4u);
-            acc[m] += subgroupShuffleXor(acc[m], 8u);
-            float v_lo = subgroupShuffle(acc[m], 0u);
-            float v_hi = subgroupShuffle(acc[m], 16u);
-            if (lane == r2)      res_out[m] = v_lo;
-            if (lane == r2 + 1u) res_out[m] = v_hi;
+            for (uint m = 0u; m < uint(BATCH_CAP); ++m) {
+                acc[m] += subgroupShuffleXor(acc[m], 1u);
+                acc[m] += subgroupShuffleXor(acc[m], 2u);
+                acc[m] += subgroupShuffleXor(acc[m], 4u);
+                acc[m] += subgroupShuffleXor(acc[m], 8u);
+                float v_lo = subgroupShuffle(acc[m], 0u);
+                float v_hi = subgroupShuffle(acc[m], 16u);
+                if (lane == r2)      res_out[m] = v_lo;
+                if (lane == r2 + 1u) res_out[m] = v_hi;
+            }
         }
     }
 #else
