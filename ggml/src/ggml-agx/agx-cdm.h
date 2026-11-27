@@ -46,9 +46,9 @@ struct agx_cdm_stream;
 // - GPU timestamp BO (`AGX_BO_TIMESTAMPS`)
 // - SLC-pinned 128B sense-reversing atomic barrier scratchpad BO (`AGX_BO_SLC_PIN`)
 agx_cdm_stream * agx_cdm_stream_create(agx_drm_device * dev,
-                                       size_t           cmd_bytes  = 256u * 1024u,
-                                       size_t           ioto_bytes = 2u * 1024u * 1024u,
-                                       size_t           arg_bytes  = 4u * 1024u * 1024u);
+                                       size_t           cmd_bytes  = 2u  * 1024u * 1024u,
+                                       size_t           ioto_bytes = 24u * 1024u * 1024u,
+                                       size_t           arg_bytes  = 32u * 1024u * 1024u);
 void             agx_cdm_stream_destroy(agx_cdm_stream * stream);
 
 // Reset stream cursors for recording a fresh submission (waits if in-flight).

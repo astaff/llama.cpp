@@ -485,6 +485,7 @@ struct agx_cdm_stream {
     agx_barrier_mode last_barrier_mode = AGX_BARRIER_NONE;
     bool             last_launch_elidable = false;
     bool             terminated       = false;
+    bool             has_external_args = false;
 
     uint64_t         in_flight_point  = 0;
     agx_cdm_stats    stats            = {};
@@ -549,9 +550,10 @@ void agx_cdm_stream_reset(agx_cdm_stream * s) {
     s->last_barrier_mode    = AGX_BARRIER_NONE;
     s->last_launch_elidable = false;
     s->terminated           = false;
+    s->has_external_args    = false;
 }
 
-uint64_t agx_cdm_alloc_args(agx_cdm_stream * s, size_t bytes, size_t align, void ** out_cpu_ptr) {
+static uint64_t alloc_args_internal(agx_cdm_stream * s, size_t bytes, size_t align, void ** out_cpu_ptr) {
     if (!s || !s->arg_bo || bytes == 0) {
         return 0;
     }
@@ -566,6 +568,37 @@ uint64_t agx_cdm_alloc_args(agx_cdm_stream * s, size_t bytes, size_t align, void
         *out_cpu_ptr = static_cast<uint8_t *>(s->arg_bo->cpu_ptr) + off;
     }
     return s->arg_bo->gpu_va + off;
+}
+
+uint64_t agx_cdm_alloc_args(agx_cdm_stream * s, size_t bytes, size_t align, void ** out_cpu_ptr) {
+    const uint64_t va = alloc_args_internal(s, bytes, align, out_cpu_ptr);
+    if (va != 0) {
+        s->has_external_args = true;
+    }
+    return va;
+}
+
+static bool maybe_auto_flush_chunk(agx_cdm_stream * s,
+                                   size_t           need_cmd,
+                                   size_t           need_ioto,
+                                   size_t           need_arg) {
+    if (!s || s->terminated || s->cmd_offset == 0 || s->has_external_args) {
+        return true;
+    }
+    const size_t cmd_need  = s->cmd_offset + need_cmd + AGX3_CDM_BARRIER_BYTES + AGX3_CDM_TERMINATE_BYTES;
+    const size_t ioto_need = agx_align_up(s->ioto_offset, AGX_IOTO_PROGRAM_ALIGN) + need_ioto;
+    const size_t arg_need  = agx_align_up(s->arg_offset, 16u) + need_arg;
+    if (cmd_need <= s->cmd_bo->alloc_size &&
+        ioto_need <= s->ioto_bo->alloc_size &&
+        arg_need <= s->arg_bo->alloc_size) {
+        return true;
+    }
+    if (agx_cdm_submit(s, true, nullptr) != 0) {
+        AGX_LOG_ERROR("CDM auto-flush chunk submit failed");
+        return false;
+    }
+    agx_cdm_stream_reset(s);
+    return true;
 }
 
 static bool prepare_launch_ioto(agx_cdm_stream *   s,
@@ -590,7 +623,7 @@ static bool prepare_launch_ioto(agx_cdm_stream *   s,
             kernel->root_size_bytes,
             static_cast<size_t>(kernel->push_offset_bytes) + agx_align_up(push_bytes, 16u));
         void * root_cpu = nullptr;
-        root_va = agx_cdm_alloc_args(s, std::max<size_t>(root_size, 64u), 16u, &root_cpu);
+        root_va = alloc_args_internal(s, std::max<size_t>(root_size, 64u), 16u, &root_cpu);
         if (root_va == 0) {
             return false;
         }
@@ -699,6 +732,12 @@ bool agx_cdm_dispatch_threads(agx_cdm_stream *   s,
     if (global_x == 0 || global_y == 0 || global_z == 0) {
         return true;
     }
+    const size_t est_root_bytes = std::max<size_t>(
+        kernel->root_size_bytes,
+        static_cast<size_t>(kernel->push_offset_bytes) + agx_align_up(push_bytes, 16u));
+    if (!maybe_auto_flush_chunk(s, AGX3_CDM_DIRECT_LAUNCH_BYTES, 4096u, std::max<size_t>(est_root_bytes, 64u))) {
+        return false;
+    }
     if (s->cmd_offset + AGX3_CDM_DIRECT_LAUNCH_BYTES + AGX3_CDM_BARRIER_BYTES + AGX3_CDM_TERMINATE_BYTES >
         s->cmd_bo->alloc_size) {
         AGX_LOG_ERROR("CDM command buffer overflow (%zu / %zu)", s->cmd_offset, s->cmd_bo->alloc_size);
@@ -777,6 +816,16 @@ bool agx_cdm_dispatch_indirect(agx_cdm_stream *   s,
                                size_t             push_bytes,
                                agx_barrier_mode   post_barrier) {
     if (!s || !kernel || s->terminated || geometry_va == 0) {
+        return false;
+    }
+    const size_t est_root_bytes = std::max<size_t>(
+        kernel->root_size_bytes,
+        static_cast<size_t>(kernel->push_offset_bytes) + agx_align_up(push_bytes, 16u));
+    const bool geom_in_arg_bo = s->arg_bo &&
+        geometry_va >= s->arg_bo->gpu_va &&
+        geometry_va < s->arg_bo->gpu_va + s->arg_bo->alloc_size;
+    if (!geom_in_arg_bo &&
+        !maybe_auto_flush_chunk(s, AGX3_CDM_INDIRECT_LAUNCH_BYTES, 4096u, std::max<size_t>(est_root_bytes, 64u))) {
         return false;
     }
     if (s->cmd_offset + AGX3_CDM_INDIRECT_LAUNCH_BYTES + AGX3_CDM_BARRIER_BYTES + AGX3_CDM_TERMINATE_BYTES >

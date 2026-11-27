@@ -299,6 +299,21 @@ static ggml_backend_buffer_t agx_buft_alloc_buffer(ggml_backend_buffer_type_t bu
         return nullptr;
     }
 
+    // Zero-size probe buffers (used by llama-model-loader::weight_buft_supported and
+    // llama-model::buft_supported) carry only buft/repack metadata with zero DRM ioctls.
+    if (size == 0) {
+        auto * bctx = new agx_buffer_ctx();
+        bctx->dev            = drm;
+        bctx->bo             = nullptr;
+        bctx->gpu_va         = 0;
+        bctx->cpu_ptr        = nullptr;
+        bctx->size           = 0;
+        bctx->policy         = ctx->is_repack ? AGX_CACHE_SLC_STREAM : AGX_CACHE_SLC_PIN;
+        bctx->is_repacked    = ctx->is_repack;
+        bctx->is_host_import = false;
+        return ggml_backend_buffer_init(buft, g_agx_buf_iface, bctx, 0);
+    }
+
     const size_t alloc_size = std::max<size_t>(size, AGX_CACHE_LINE_BYTES);
 
     // Pillar 4: Partition BO/VM cache policy between 48 MB SLC-pinned hot working sets
@@ -354,10 +369,11 @@ static size_t agx_buft_get_alignment(ggml_backend_buffer_type_t buft) {
 
 static size_t agx_buft_get_max_size(ggml_backend_buffer_type_t buft) {
     auto * ctx = static_cast<agx_buft_ctx *>(buft->context);
+    constexpr size_t kMaxBoBytes = 4ULL * 1024ULL * 1024ULL * 1024ULL; // 4 GiB per DRM BO
     if (ctx && ctx->dev_state && ctx->dev_state->info.client_memory_limit > 0) {
-        return ctx->dev_state->info.client_memory_limit;
+        return std::min<size_t>(ctx->dev_state->info.client_memory_limit, kMaxBoBytes);
     }
-    return 16ULL * 1024ULL * 1024ULL * 1024ULL;
+    return kMaxBoBytes;
 }
 
 static size_t agx_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
@@ -609,7 +625,29 @@ static bool agx_dev_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor
     if (!drm || !op) {
         return false;
     }
-    return agx_supports_op(drm, op);
+    if (!agx_supports_op(drm, op)) {
+        return false;
+    }
+
+    // During model weight placement (`llama-model-loader.cpp:weight_buft_supported`),
+    // `make_gpu_buft_list` probes `AGX0` (default) before `AGX0_Repack` (extra_bufts[0])
+    // using a zero-size probe buffer (`bctx->bo == nullptr`). For repackable NVFP4/Q8_0
+    // weight matrices used by MUL_MAT / MUL_MAT_ID, decline the default probe so
+    // `select_weight_buft` advances directly to `AGX0_Repack` (128B super-tiles + Pillar 4
+    // SLC streaming). Unallocated `test-backend-ops` probes (`w->buffer == nullptr`) and
+    // real allocated buffers (`bctx->bo != nullptr`) are unaffected.
+    if ((op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) &&
+        op->src[0] && op->src[0]->buffer && op->src[0]->buffer->context &&
+        std::getenv("GGML_AGX_NO_REPACK") == nullptr) {
+        const auto * bctx = static_cast<const agx_buffer_ctx *>(op->src[0]->buffer->context);
+        if (bctx->bo == nullptr && bctx->size == 0 && !bctx->is_repacked &&
+            op->src[0]->buffer->buft == &st->buft_default &&
+            agx_repack_supports_tensor(op->src[0])) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 static bool agx_dev_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
