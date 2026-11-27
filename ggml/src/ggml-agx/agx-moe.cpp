@@ -116,12 +116,14 @@ struct agx_moe_runner {
     const agx_kernel * k_zero_skipped     = nullptr;
 
     // Indexed by [weight_mode][batch_slot: 0=(cap 1), 1=(cap 5)]
-    const agx_kernel * k_gu_vecmat[AGX_MOE_WEIGHT_MODES][2]   = {};
-    const agx_kernel * k_down_vecmat[AGX_MOE_WEIGHT_MODES][2] = {};
+    const agx_kernel * k_gu_vecmat[AGX_MOE_WEIGHT_MODES][2]       = {};
+    const agx_kernel * k_down_vecmat[AGX_MOE_WEIGHT_MODES][2]     = {};
+    const agx_kernel * k_down_vecmat_f32[AGX_MOE_WEIGHT_MODES][2] = {};
     // Indexed by [weight_mode]
-    const agx_kernel * k_gu_gemm[AGX_MOE_WEIGHT_MODES]        = {};
-    const agx_kernel * k_down_gemm[AGX_MOE_WEIGHT_MODES]      = {};
-    const agx_kernel * k_direct_m1[AGX_MOE_WEIGHT_MODES]      = {};
+    const agx_kernel * k_gu_gemm[AGX_MOE_WEIGHT_MODES]            = {};
+    const agx_kernel * k_down_gemm[AGX_MOE_WEIGHT_MODES]          = {};
+    const agx_kernel * k_direct_m1[AGX_MOE_WEIGHT_MODES]          = {};
+    const agx_kernel * k_direct_m1_f32[AGX_MOE_WEIGHT_MODES]      = {};
 };
 
 static bool ensure_meta_bo(agx_moe_runner * r, size_t req_assigns) {
@@ -210,20 +212,22 @@ static const agx_kernel * get_bucket_kernel(agx_moe_runner * r, uint32_t mode) {
 static const agx_kernel * get_moe_exec_kernel(agx_moe_runner *  r,
                                               uint32_t          stage,
                                               agx_weight_layout layout,
-                                              uint32_t          batch_cap) {
+                                              uint32_t          batch_cap,
+                                              bool              prec_f32 = false) {
     if (!r->compiler) return nullptr;
     const uint32_t wm = static_cast<uint32_t>(layout);
     if (wm >= AGX_MOE_WEIGHT_MODES) return nullptr;
 
     const uint32_t bslot = (batch_cap <= 1u) ? 0u : 1u;
     const uint32_t bcap  = (bslot == 0u) ? 1u : AGX_MOE_VECMAT_MAX_M;
+    const bool use_f32   = prec_f32 && (layout == AGX_WEIGHT_NVFP4_REPACKED) && (stage == 1u || stage == 4u);
 
     const agx_kernel ** slot = nullptr;
     if      (stage == 0u) slot = &r->k_gu_vecmat[wm][bslot];
-    else if (stage == 1u) slot = &r->k_down_vecmat[wm][bslot];
+    else if (stage == 1u) slot = use_f32 ? &r->k_down_vecmat_f32[wm][bslot] : &r->k_down_vecmat[wm][bslot];
     else if (stage == 2u) slot = &r->k_gu_gemm[wm];
     else if (stage == 3u) slot = &r->k_down_gemm[wm];
-    else if (stage == 4u) slot = &r->k_direct_m1[wm];
+    else if (stage == 4u) slot = use_f32 ? &r->k_direct_m1_f32[wm] : &r->k_direct_m1[wm];
     else return nullptr;
 
     if (!*slot) {
@@ -233,11 +237,15 @@ static const agx_kernel * get_moe_exec_kernel(agx_moe_runner *  r,
         if (stage <= 1u) {
             opts.defines.push_back("BATCH_CAP=" + std::to_string(bcap));
         }
+        if (use_f32) {
+            opts.defines.push_back("PREC_F32=1");
+        }
         opts.is_hot_kernel     = true;
         opts.strict_zero_spill = true;
         const std::string kname = "fused_moe_s" + std::to_string(stage)
                                 + "_w" + std::to_string(wm)
-                                + (stage <= 1u ? ("_b" + std::to_string(bcap)) : "");
+                                + (stage <= 1u ? ("_b" + std::to_string(bcap)) : "")
+                                + (use_f32 ? "_f32" : "");
         *slot = agx_compiler_compile_file(
             r->compiler, kname.c_str(), "fused_moe_gate_up_situ_down.comp", opts);
     }
@@ -575,14 +583,21 @@ bool agx_moe_dispatch_mul_mat_id(agx_moe_runner *           r,
         ? static_cast<uint64_t>(agx_repack_slice_stride(w->type, w->ne[0], w->ne[1]))
         : static_cast<uint64_t>(w->nb[2]);
 
+    // Force pure FP32 decode when F32 or BF16 src1 dynamic range is requested (avoids FP16
+    // overflow on MUL_MAT_ID_PREC_SRC1_{BF16,F32}!).
+    const bool req_prec_f32 =
+        (ggml_prec_get_src(dst, 1) == GGML_PREC_BF16) ||
+        (ggml_prec_get_src(dst, 1) == GGML_PREC_F32)  ||
+        (ggml_prec_get_src(dst, 0) == GGML_PREC_F32);
+
     // ------------------------------------------------------------------------
     // M == 1 Direct Roofline Fastpath (ALL 96 MoE nodes in B=1 decode!):
     //   - ZERO bucketing, ZERO dst zero-fill, ZERO indirect grid, ZERO meta_bo barrier!
-    //   - NVFP4_32x16: 128 rows/WG dual-half-tile direct-FP32 (2x fewer X loads, ~36 GPR32)
+    //   - NVFP4_32x16: 64 rows/WG SWAR2 ffma16 (~36 GPR32, 2x WG occupancy on all 40 cores!)
     //   - Q8_0_8BLK:   8 rows/WG 16B uvec4 coalesced loads (~515 GB/s roofline layout)
     // ------------------------------------------------------------------------
     if (M == 1u) {
-        const agx_kernel * k_m1 = get_moe_exec_kernel(r, 4u, layout, 1u);
+        const agx_kernel * k_m1 = get_moe_exec_kernel(r, 4u, layout, 1u, req_prec_f32);
         if (!k_m1) return false;
 
         agx_push_moe_exec p = {};
@@ -597,19 +612,15 @@ bool agx_moe_dispatch_mul_mat_id(agx_moe_runner *           r,
         p.top_k      = top_k;
         p.flags      = AGX_MOE_FLAG_RAW_MMID | (per_slot ? AGX_MOE_FLAG_RAW_MMID_PERSLOT : 0u);
 
-        const uint32_t rows_per_wg = (layout == AGX_WEIGHT_NVFP4_REPACKED) ? 128u
+        const uint32_t rows_per_wg = (layout == AGX_WEIGHT_NVFP4_REPACKED) ? 64u
                                    : (layout == AGX_WEIGHT_Q8_0_REPACKED)  ? 8u
                                                                            : 4u;
         const uint32_t grid_x = (N + rows_per_wg - 1u) / rows_per_wg;
         return agx_cdm_dispatch(stream, k_m1, grid_x, top_k, 1u, &p, sizeof(p), post_barrier);
     }
 
-    // Force pure FP32 vec-mat when F32 or BF16 src1 dynamic range is requested (avoids FP16 coopmat
-    // overflow on MUL_MAT_ID_PREC_SRC1_{BF16,F32}!), or when M < 6, or for small/odd K.
     const bool force_fp32_vecmat =
-        (ggml_prec_get_src(dst, 1) == GGML_PREC_BF16) ||
-        (ggml_prec_get_src(dst, 1) == GGML_PREC_F32)  ||
-        (ggml_prec_get_src(dst, 0) == GGML_PREC_F32)  ||
+        req_prec_f32 ||
         (M < AGX_MOE_GEMM_MIN_M) ||
         (K < 32u) || ((K & 3u) != 0u);
 
@@ -633,7 +644,7 @@ bool agx_moe_dispatch_mul_mat_id(agx_moe_runner *           r,
     }
 
     const uint64_t base_va = r->meta_bo->gpu_va;
-    const agx_kernel * k_vm = get_moe_exec_kernel(r, 1u, layout, bcap);
+    const agx_kernel * k_vm = get_moe_exec_kernel(r, 1u, layout, bcap, req_prec_f32);
     const agx_kernel * k_zs = get_bucket_kernel(r, 3u);
     if (!k_vm || !k_zs) return false;
 
