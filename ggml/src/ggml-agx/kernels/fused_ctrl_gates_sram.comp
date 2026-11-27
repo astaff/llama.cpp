@@ -110,7 +110,9 @@ float wg_sum(float val, uint sg_id, uint lane_id) {
         }
     }
     barrier();
-    return s_red[0];
+    float res = s_red[0];
+    barrier();
+    return res;
 }
 
 // Load a single dequantized FP32 weight from a row (supports F32/F16/BF16/Q8_0_RAW/Q8_0_8BLK)

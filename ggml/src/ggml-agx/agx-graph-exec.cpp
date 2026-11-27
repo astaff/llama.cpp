@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -166,7 +167,15 @@ void main() {
         case 20u: r = x / (1.0 + exp(-x)); break;
         case 21u: r = exp(x); break;
         case 22u: r = exp(x) - 1.0; break;
-        case 23u: r = (x > 20.0) ? x : log(1.0 + exp(x)); break;
+        case 23u: {
+            // Exact softplus = max(x, 0) + log1p(exp(-|x|)) without 1+t cancellation
+            // (immune to fast-math folding (1+t)-1 -> t for x in [-16.6, -16.0]).
+            float t = exp(-abs(x));
+            float lp = (t < 0.05)
+                ? (t * (1.0 + t * (-0.5 + t * (0.3333333333 + t * (-0.25 + t * 0.2)))))
+                : log(1.0 + t);
+            r = max(x, 0.0) + lp;
+        } break;
         case 24u: r = 0.5 * x * (1.0 + erf_approx(x * 0.7071067811865475)); break;
         case 25u: r = floor(x); break;
         case 26u: r = ceil(x); break;
@@ -198,6 +207,8 @@ static const char * k_glsl_cpy_cast = R"GLSL(
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -207,17 +218,20 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufI32 { int
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufI32 { int v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 2) buffer BufU16 { uint16_t v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 2) readonly buffer ConstBufU16 { uint16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer BufF16 { float16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) readonly buffer ConstBufF16 { float16_t v[]; };
 
 layout(push_constant) uniform PushArgs {
     uint64_t src_va;
     uint64_t dst_va;
-    uint     ne0, ne1, ne2, ne3;       // src logical shape (or dst shape)
+    uint     ne0, ne1, ne2, ne3;         // src logical shape
+    uint     d_ne0, d_ne1, d_ne2, d_ne3; // dst logical shape
     uint     s_nb0, s_nb1, s_nb2, s_nb3; // byte strides
     uint     d_nb0, d_nb1, d_nb2, d_nb3; // byte strides
     uint     src_type; // 0=F32, 1=F16, 2=BF16, 3=I32
     uint     dst_type; // 0=F32, 1=F16, 2=BF16, 3=I32
     uint     total;
-    uint     d_is_linear; // 1 = write linearly by idx (supports reshape-on-cpy)
+    uint     d_is_linear; // 1 = write linearly by idx
 } pc;
 
 void main() {
@@ -233,25 +247,38 @@ void main() {
 
     uint64_t s_off = uint64_t(i0) * pc.s_nb0 + uint64_t(i1) * pc.s_nb1 +
                      uint64_t(i2) * pc.s_nb2 + uint64_t(i3) * pc.s_nb3;
-    uint64_t d_off = (pc.d_is_linear != 0u)
-        ? uint64_t(idx) * uint64_t(pc.d_nb0)
-        : (uint64_t(i0) * pc.d_nb0 + uint64_t(i1) * pc.d_nb1 +
-           uint64_t(i2) * pc.d_nb2 + uint64_t(i3) * pc.d_nb3);
+    uint64_t d_off;
+    if (pc.d_is_linear != 0u) {
+        d_off = uint64_t(idx) * uint64_t(pc.d_nb0);
+    } else {
+        uint d0 = idx % pc.d_ne0;
+        uint u1 = idx / pc.d_ne0;
+        uint d1 = u1 % pc.d_ne1;
+        uint u2 = u1 / pc.d_ne1;
+        uint d2 = u2 % pc.d_ne2;
+        uint d3 = u2 / pc.d_ne2;
+        d_off = uint64_t(d0) * pc.d_nb0 + uint64_t(d1) * pc.d_nb1 +
+                uint64_t(d2) * pc.d_nb2 + uint64_t(d3) * pc.d_nb3;
+    }
 
-    // Exact bit-preserving copy when I32 -> I32
+    // Exact bit-preserving copy when types match (I32/F16/BF16)
     if (pc.src_type == 3u && pc.dst_type == 3u) {
         BufI32(pc.dst_va + d_off).v[0] = ConstBufI32(pc.src_va + s_off).v[0];
+        return;
+    }
+    if ((pc.src_type == 1u && pc.dst_type == 1u) || (pc.src_type == 2u && pc.dst_type == 2u)) {
+        BufU16(pc.dst_va + d_off).v[0] = ConstBufU16(pc.src_va + s_off).v[0];
         return;
     }
 
     float val = 0.0;
     if      (pc.src_type == 0u) val = ConstBufF32(pc.src_va + s_off).v[0];
-    else if (pc.src_type == 1u) val = unpackHalf2x16(uint(ConstBufU16(pc.src_va + s_off).v[0])).x;
+    else if (pc.src_type == 1u) val = float(ConstBufF16(pc.src_va + s_off).v[0]);
     else if (pc.src_type == 2u) val = uintBitsToFloat(uint(ConstBufU16(pc.src_va + s_off).v[0]) << 16u);
     else                        val = float(ConstBufI32(pc.src_va + s_off).v[0]);
 
     if      (pc.dst_type == 0u) BufF32(pc.dst_va + d_off).v[0] = val;
-    else if (pc.dst_type == 1u) BufU16(pc.dst_va + d_off).v[0] = uint16_t(packHalf2x16(vec2(val, 0.0)) & 0xFFFFu);
+    else if (pc.dst_type == 1u) BufF16(pc.dst_va + d_off).v[0] = float16_t(val);
     else if (pc.dst_type == 2u) {
         uint bits = floatBitsToUint(val);
         uint rbit = 0x7FFFu + ((bits >> 16u) & 1u);
@@ -265,6 +292,7 @@ void main() {
 struct cpy_cast_push {
     uint64_t src_va, dst_va;
     uint32_t ne0, ne1, ne2, ne3;
+    uint32_t d_ne0, d_ne1, d_ne2, d_ne3;
     uint32_t s_nb0, s_nb1, s_nb2, s_nb3;
     uint32_t d_nb0, d_nb1, d_nb2, d_nb3;
     uint32_t src_type, dst_type, total, d_is_linear;
@@ -311,7 +339,9 @@ float wg_sum(float val, uint sg_id, uint lane_id) {
         if (lane_id == 0u) s_red[0] = t;
     }
     barrier();
-    return s_red[0];
+    float res = s_red[0];
+    barrier();
+    return res;
 }
 
 void main() {
@@ -469,7 +499,9 @@ float wg_max(float val, uint sg, uint ln) {
         if (ln == 0u) s_red[0] = t;
     }
     barrier();
-    return s_red[0];
+    float res = s_red[0];
+    barrier();
+    return res;
 }
 
 float wg_sum(float val, uint sg, uint ln) {
@@ -482,7 +514,9 @@ float wg_sum(float val, uint sg, uint ln) {
         if (ln == 0u) s_red[0] = t;
     }
     barrier();
-    return s_red[0];
+    float res = s_red[0];
+    barrier();
+    return res;
 }
 
 float load_mask(uint m_base, uint i) {
@@ -531,13 +565,16 @@ void main() {
     float sum_e = 0.0;
     for (uint i = tid; i < pc.ne0; i += 256u) {
         float x = ConstBufF32(pc.src_va).v[base + i] * pc.scale + slope * load_mask(m_base, i);
-        float e = exp(x - maxv);
+        float e = (x <= -1e30 || maxv <= -1e30) ? 0.0 : exp(x - maxv);
         BufF32(pc.dst_va).v[base + i] = e;
         sum_e += e;
     }
     sum_e = wg_sum(sum_e, sg, ln);
     if (pc.sinks_va != 0ul) {
-        sum_e += exp(ConstBufF32(pc.sinks_va).v[i2] - maxv);
+        float sv = ConstBufF32(pc.sinks_va).v[i2];
+        if (sv > -1e30 && maxv > -1e30) {
+            sum_e += exp(sv - maxv);
+        }
     }
     float inv_s = (sum_e > 0.0) ? (1.0 / sum_e) : 0.0;
     for (uint i = tid; i < pc.ne0; i += 256u) {
@@ -634,6 +671,8 @@ static const char * k_glsl_set_rows = R"GLSL(
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -641,7 +680,7 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufF32 { flo
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufF32 { float v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer ConstBufI64 { int64_t v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufI32 { int v[]; };
-layout(buffer_reference, std430, buffer_reference_align = 2) buffer BufU16 { uint16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer BufF16 { float16_t v[]; };
 
 layout(push_constant) uniform PushArgs {
     uint64_t src_va;
@@ -676,7 +715,7 @@ void main() {
     if (pc.dst_type == 0u) {
         BufF32(d_row).v[col] = val;
     } else {
-        BufU16(d_row).v[col] = uint16_t(packHalf2x16(vec2(val, 0.0)) & 0xFFFFu);
+        BufF16(d_row).v[col] = float16_t(val);
     }
 }
 )GLSL";
@@ -1010,9 +1049,9 @@ void main() {
         float cu = clamp(u, -pc.limit, pc.limit);
         r = (cg / (1.0 + exp(-pc.alpha * cg))) * (cu + 1.0);
     } else {
-        float cg = min(g / (1.0 + exp(-g)), pc.limit);
+        float cg = min(g, pc.limit);
         float cu = clamp(u, -pc.limit, pc.limit);
-        r = cg * cu;
+        r = (cg / (1.0 + exp(-cg))) * cu;
     }
     BufF32(pc.d_va).v[row * pc.d_nb1 + col] = r;
 }
@@ -1057,7 +1096,7 @@ void main() {
 
     int eid = ConstBufI32(pc.ids_va).v[i2 * pc.i_nb1 + i1];
     float a = ConstBufF32(pc.a_va).v[i2 * pc.a_nb2 + i1 * pc.a_nb1 + i0];
-    float b = ConstBufF32(pc.b_va).v[uint(max(eid, 0)) * pc.b_nb1 + i0];
+    float b = (eid < 0) ? 0.0 : ConstBufF32(pc.b_va).v[uint(eid) * pc.b_nb1 + i0];
     BufF32(pc.d_va).v[i2 * pc.d_nb2 + i1 * pc.d_nb1 + i0] = a + b;
 }
 )GLSL";
@@ -1173,14 +1212,42 @@ static bool cpy_type_code(enum ggml_type t, uint32_t * out) {
     }
 }
 
+static size_t tensor_byte_span(const struct ggml_tensor * x) {
+    size_t span = ggml_nbytes(x);
+    if (x->ne[0] > 0 && x->ne[1] > 0 && x->ne[2] > 0 && x->ne[3] > 0) {
+        const size_t blk = ggml_blck_size(x->type);
+        const size_t n0_blks = ((size_t) x->ne[0] + blk - 1u) / blk;
+        const size_t last =
+            (n0_blks > 0 ? (n0_blks - 1u) : 0u) * x->nb[0] +
+            (size_t) (x->ne[1] - 1) * x->nb[1] +
+            (size_t) (x->ne[2] - 1) * x->nb[2] +
+            (size_t) (x->ne[3] - 1) * x->nb[3] +
+            ggml_type_size(x->type);
+        if (last > span) span = last;
+    }
+    return span ? span : 4u;
+}
+
 static agx_va_range tensor_va_range(const struct ggml_tensor * t) {
+    if (!t) return { 0, 0 };
     uint64_t va = agx_tensor_gpu_va(t);
     if (!va) return { 0, 0 };
-    const struct ggml_tensor * root = t->view_src ? t->view_src : t;
-    size_t sz = ggml_nbytes(root);
-    if (sz == 0) sz = 4;
-    uint64_t rva = agx_tensor_gpu_va(root);
-    return { rva ? rva : va, (rva ? rva : va) + sz };
+    // Walk multi-hop view chains (e.g. RESHAPE(VIEW(PERMUTE(x)))) to the root allocation
+    const struct ggml_tensor * root = t;
+    while (root->view_src) {
+        root = root->view_src;
+    }
+    const uint64_t t_beg = va;
+    const uint64_t t_end = va + tensor_byte_span(t);
+    if (root != t) {
+        const uint64_t rva = agx_tensor_gpu_va(root);
+        if (rva) {
+            const uint64_t r_beg = rva;
+            const uint64_t r_end = rva + tensor_byte_span(root);
+            return { std::min(t_beg, r_beg), std::max(t_end, r_end) };
+        }
+    }
+    return { t_beg, t_end };
 }
 
 static bool ranges_overlap(const std::vector<agx_va_range> & dirty, agx_va_range q) {
@@ -1361,8 +1428,7 @@ bool agx_supports_op(const agx_drm_device * dev, const struct ggml_tensor * op) 
             return agx_moe_supports_mul_mat_id(op);
 
         case GGML_OP_FLASH_ATTN_EXT:
-            return s0 && s0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
-                   (s0->ne[0] == 64 || s0->ne[0] == 128);
+            return agx_kv_hybrid_supports_ggml_flash_attn(op);
 
         default:
             return false;
@@ -1422,30 +1488,69 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
     agx_cdm_stream * stream = ctx->stream;
     agx_cdm_stream_reset(stream);
 
-    std::vector<agx_va_range> dirty_vas;
-    dirty_vas.reserve(64);
-    bool has_dispatched = false;
+    const bool force_barrier = (std::getenv("GGML_AGX_FORCE_BARRIER") != nullptr &&
+                                std::getenv("GGML_AGX_FORCE_BARRIER")[0] == '1');
+    const bool no_fusion     = (std::getenv("GGML_AGX_NO_FUSION") != nullptr &&
+                                std::getenv("GGML_AGX_NO_FUSION")[0] == '1');
 
-    auto ensure_inputs_ready = [&](const struct ggml_tensor * const * srcs, int n_srcs) {
-        bool hazard = false;
-        for (int s = 0; s < n_srcs; ++s) {
-            if (!srcs[s]) continue;
-            if (ranges_overlap(dirty_vas, tensor_va_range(srcs[s]))) {
+    std::vector<agx_va_range> dirty_vas;
+    std::vector<agx_va_range> read_vas;
+    dirty_vas.reserve(64);
+    read_vas.reserve(128);
+    bool has_dispatched    = false;
+    bool used_moe_scratch  = false;
+    bool used_attn_scratch = false;
+
+    auto ensure_node_ready = [&](const struct ggml_tensor * const * srcs, int n_srcs,
+                                 const struct ggml_tensor * dst,
+                                 bool needs_moe_scratch, bool needs_attn_scratch) {
+        bool hazard = force_barrier;
+        if (!hazard && has_dispatched) {
+            if ((needs_moe_scratch && used_moe_scratch) ||
+                (needs_attn_scratch && used_attn_scratch)) {
                 hazard = true;
-                break;
+            }
+            // RAW: any input overlaps an unflushed write
+            for (int s = 0; !hazard && s < n_srcs; ++s) {
+                if (!srcs[s]) continue;
+                if (ranges_overlap(dirty_vas, tensor_va_range(srcs[s]))) {
+                    hazard = true;
+                }
+            }
+            // WAW & WAR: output overlaps an unflushed write OR an unflushed read
+            if (!hazard && dst) {
+                const agx_va_range dr = tensor_va_range(dst);
+                if (ranges_overlap(dirty_vas, dr) || ranges_overlap(read_vas, dr)) {
+                    hazard = true;
+                }
             }
         }
         if (hazard && has_dispatched) {
             agx_cdm_barrier_usc(stream);
             dirty_vas.clear();
+            read_vas.clear();
+            used_moe_scratch  = false;
+            used_attn_scratch = false;
         } else if (has_dispatched) {
             st->stats.barriers_elided++;
         }
     };
 
-    auto record_output = [&](const struct ggml_tensor * dst) {
+    auto record_dispatch = [&](const struct ggml_tensor * const * srcs, int n_srcs,
+                               const struct ggml_tensor * dst,
+                               bool uses_moe_scratch, bool uses_attn_scratch) {
         has_dispatched = true;
-        dirty_vas.push_back(tensor_va_range(dst));
+        for (int s = 0; s < n_srcs; ++s) {
+            if (!srcs[s]) continue;
+            const agx_va_range sr = tensor_va_range(srcs[s]);
+            if (sr.beg != sr.end) read_vas.push_back(sr);
+        }
+        if (dst) {
+            const agx_va_range dr = tensor_va_range(dst);
+            if (dr.beg != dr.end) dirty_vas.push_back(dr);
+        }
+        if (uses_moe_scratch)  used_moe_scratch  = true;
+        if (uses_attn_scratch) used_attn_scratch = true;
     };
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
@@ -1472,7 +1577,7 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
         // --------------------------------------------------------------------
         // Fastpath Fusion 1: Inkling 2 Exact L2 Clip (`L2_NORM(t) -> SCALE(t)`)
         // --------------------------------------------------------------------
-        if (node->op == GGML_OP_L2_NORM && i + 1 < cgraph->n_nodes &&
+        if (!no_fusion && node->op == GGML_OP_L2_NORM && i + 1 < cgraph->n_nodes &&
             ggml_can_fuse(cgraph, i, { GGML_OP_L2_NORM, GGML_OP_SCALE })) {
             struct ggml_tensor * sc_node = cgraph->nodes[i + 1];
             float thresh = 0.0f, sc = 0.0f, bias = 0.0f;
@@ -1481,11 +1586,11 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
             std::memcpy(&bias,   (const char *) sc_node->op_params + 4, sizeof(float));
             if (bias == 0.0f && std::fabs(thresh - sc) < 1e-6f && thresh > 0.0f &&
                 ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(sc_node) &&
-                node->src[0]->ne[0] <= 128) {
+                agx_tensor_gpu_va(sc_node) != 0 && node->src[0]->ne[0] <= 128) {
                 auto * eng = agx_graph_exec_get_inkling2(ctx);
                 if (eng) {
                     const struct ggml_tensor * srcs[1] = { node->src[0] };
-                    ensure_inputs_ready(srcs, 1);
+                    ensure_node_ready(srcs, 1, sc_node, false, false);
 
                     agx_conv_clip_fwht_push cpc{};
                     cpc.src_va       = agx_tensor_gpu_va(node->src[0]);
@@ -1499,7 +1604,7 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                     if (!agx_inkling2_dispatch_conv_clip_fwht(eng, stream, cpc, AGX_BARRIER_NONE)) {
                         return GGML_STATUS_FAILED;
                     }
-                    record_output(sc_node);
+                    record_dispatch(srcs, 1, sc_node, false, false);
                     st->stats.fused_l2_clip_hits++;
                     st->stats.nodes_executed += 2;
                     ++i; // consumed SCALE node
@@ -1511,7 +1616,7 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
         // --------------------------------------------------------------------
         // Fastpath Fusion 2: Inkling 2 Logit Softcap (`SCALE(1/c) -> TANH -> SCALE(c)`)
         // --------------------------------------------------------------------
-        if (node->op == GGML_OP_SCALE && i + 2 < cgraph->n_nodes &&
+        if (!no_fusion && node->op == GGML_OP_SCALE && i + 2 < cgraph->n_nodes &&
             ggml_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE })) {
             struct ggml_tensor * u_node  = cgraph->nodes[i + 1];
             struct ggml_tensor * s2_node = cgraph->nodes[i + 2];
@@ -1522,11 +1627,12 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
             std::memcpy(&b2, (const char *) s2_node->op_params + 4, sizeof(float));
             if (ggml_get_unary_op(u_node) == GGML_UNARY_OP_TANH &&
                 b1 == 0.0f && b2 == 0.0f && s2 > 0.0f && std::fabs(s1 * s2 - 1.0f) < 1e-4f &&
-                ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(s2_node)) {
+                ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(s2_node) &&
+                agx_tensor_gpu_va(s2_node) != 0) {
                 auto * eng = agx_graph_exec_get_inkling2(ctx);
                 if (eng) {
                     const struct ggml_tensor * srcs[1] = { node->src[0] };
-                    ensure_inputs_ready(srcs, 1);
+                    ensure_node_ready(srcs, 1, s2_node, false, false);
 
                     const uint32_t ne0 = (uint32_t) s2_node->ne[0];
                     const uint32_t nr  = (uint32_t) ggml_nrows(s2_node);
@@ -1536,7 +1642,7 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                             0ull, ne0, ne0, nr, s2, false, AGX_BARRIER_NONE)) {
                         return GGML_STATUS_FAILED;
                     }
-                    record_output(s2_node);
+                    record_dispatch(srcs, 1, s2_node, false, false);
                     st->stats.fused_softcap_hits++;
                     st->stats.nodes_executed += 3;
                     i += 2; // consumed TANH + SCALE
@@ -1545,8 +1651,10 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
             }
         }
 
-        // Standard RAW hazard check across all node inputs
-        ensure_inputs_ready(node->src, GGML_MAX_SRC);
+        // Standard RAW + WAR + WAW + internal-scratch hazard check across inputs & dst
+        const bool is_moe_op  = (node->op == GGML_OP_MUL_MAT_ID);
+        const bool is_attn_op = (node->op == GGML_OP_FLASH_ATTN_EXT);
+        ensure_node_ready(node->src, GGML_MAX_SRC, node, is_moe_op, is_attn_op);
 
         bool ok = false;
         switch (node->op) {
@@ -1635,6 +1743,8 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                 pc.dst_va = agx_tensor_gpu_va(node);
                 pc.ne0    = (uint32_t) s->ne[0]; pc.ne1 = (uint32_t) s->ne[1];
                 pc.ne2    = (uint32_t) s->ne[2]; pc.ne3 = (uint32_t) s->ne[3];
+                pc.d_ne0  = (uint32_t) node->ne[0]; pc.d_ne1 = (uint32_t) node->ne[1];
+                pc.d_ne2  = (uint32_t) node->ne[2]; pc.d_ne3 = (uint32_t) node->ne[3];
                 pc.s_nb0  = (uint32_t) s->nb[0]; pc.s_nb1 = (uint32_t) s->nb[1];
                 pc.s_nb2  = (uint32_t) s->nb[2]; pc.s_nb3 = (uint32_t) s->nb[3];
                 pc.d_nb0  = (uint32_t) node->nb[0]; pc.d_nb1 = (uint32_t) node->nb[1];
@@ -1661,7 +1771,16 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                 pc.ne0  = (uint32_t) a->ne[0]; pc.ne1 = (uint32_t) a->ne[1];
                 pc.ne2  = (uint32_t) a->ne[2]; pc.ne3 = (uint32_t) a->ne[3];
                 pc.nb01 = (uint32_t) (a->nb[1] / 4); pc.nb02 = (uint32_t) (a->nb[2] / 4); pc.nb03 = (uint32_t) (a->nb[3] / 4);
-                pc.nb1  = (uint32_t) (node->nb[1] / 4); pc.nb2 = (uint32_t) (node->nb[2] / 4); pc.nb3 = (uint32_t) (node->nb[3] / 4);
+                if (node->op == GGML_OP_ARGMAX) {
+                    // ggml_argmax drops dim 0: node->ne = [a->ne[1], a->ne[2], a->ne[3], 1]
+                    pc.nb1 = (uint32_t) (node->nb[0] / 4);
+                    pc.nb2 = (uint32_t) (node->nb[1] / 4);
+                    pc.nb3 = (uint32_t) (node->nb[2] / 4);
+                } else {
+                    pc.nb1 = (uint32_t) (node->nb[1] / 4);
+                    pc.nb2 = (uint32_t) (node->nb[2] / 4);
+                    pc.nb3 = (uint32_t) (node->nb[3] / 4);
+                }
                 if (node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_NORM || node->op == GGML_OP_L2_NORM) {
                     std::memcpy(&pc.eps, node->op_params, sizeof(float));
                 }
@@ -1880,7 +1999,7 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
 
             case GGML_OP_MUL_MAT: {
                 // Fastpath: in-register FWHT_{64,128} when GGML_HINT_SRC0_IS_HADAMARD is set!
-                if (ggml_get_op_params_i32(node, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+                if (!no_fusion && ggml_get_op_params_i32(node, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
                     node->src[1] && node->src[1]->type == GGML_TYPE_F32 &&
                     ggml_is_contiguous(node->src[1]) &&
                     (node->src[1]->ne[0] == 64 || node->src[1]->ne[0] == 128)) {
@@ -1933,7 +2052,7 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
             AGX_LOG_ERROR("agx_graph_compute: dispatch failed for node %d (%s)", i, ggml_op_name(node->op));
             return GGML_STATUS_FAILED;
         }
-        record_output(node);
+        record_dispatch(node->src, GGML_MAX_SRC, node, is_moe_op, is_attn_op);
         st->stats.nodes_executed++;
     }
 

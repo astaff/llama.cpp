@@ -89,7 +89,9 @@ float wg_sum(float val, uint sg_id, uint lane_id) {
         if (lane_id == 0u) s_red[0] = tot;
     }
     barrier();
-    return s_red[0];
+    float res = s_red[0];
+    barrier();
+    return res;
 }
 
 void main() {
