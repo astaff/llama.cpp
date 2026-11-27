@@ -171,6 +171,11 @@ bool agx_gemm_precompile_all(agx_backend_context * ctx) {
         ok &= (get_or_compile_mma_gemm(ctx, wl, 0u, false) != nullptr);
         ok &= (get_or_compile_mma_gemm(ctx, wl, 1u, false) != nullptr);
     }
+    // Wave 5 M=2..8 native 8x8 MMA tiles (TILE_MODE=3 large-N 128x8, TILE_MODE=4 medium-N 32x8 K-split)
+    for (agx_weight_layout wl : {AGX_WEIGHT_NVFP4_REPACKED, AGX_WEIGHT_Q8_0_REPACKED}) {
+        ok &= (get_or_compile_mma_gemm(ctx, wl, 3u, false) != nullptr);
+        ok &= (get_or_compile_mma_gemm(ctx, wl, 4u, false) != nullptr);
+    }
     // FP32 full-range 8x8 MMA variants (incl. narrow-N TILE_MODE=2 for 4608x64 ctrl_down!)
     ok &= (get_or_compile_mma_gemm(ctx, AGX_WEIGHT_F32,  0u, true) != nullptr);
     ok &= (get_or_compile_mma_gemm(ctx, AGX_WEIGHT_F32,  2u, true) != nullptr);
@@ -237,22 +242,48 @@ bool agx_gemm_dispatch(agx_backend_context * ctx,
     pc.y_slice_elems = desc.y_slice_elems;
     pc.w_bcast_div   = std::max(1u, desc.w_bcast_div);
 
-    // Crossover: M <= 8 -> predicated K-coalesced vec-mat (fused 2-row/lane 2x-rate
-    // ffma16 for M=2..8 DSpark verify & LM head!); M >= 9 -> 8x8 MMA GEMM.
+    // Wave 5 M=2..8 Coalesced-Load sh_w-Staged 8x8 MMA fast path (Theorem W5.2):
+    //   - TILE_MODE=3 (64N x 8M): large-N (e.g. Q8_0 LM head 201024 -> 3,141 WGs, 1x sh_x per 64 rows!)
+    //   - TILE_MODE=4 (32N x 8M): medium-N (e.g. NVFP4 2304x2304 -> 72 WGs, W_attn_in 8984 -> 281 WGs!)
+    const bool use_m8_mma = !desc.force_vecmat && !desc.prec_f32 &&
+                            (desc.layout == AGX_WEIGHT_NVFP4_REPACKED || desc.layout == AGX_WEIGHT_Q8_0_REPACKED) &&
+                            (desc.M >= 2u && desc.M <= 8u) &&
+                            (desc.N > 256u) &&
+                            (desc.K >= 256u && ((desc.K & 31u) == 0u)) &&
+                            (desc.layout == AGX_WEIGHT_Q8_0_REPACKED || (desc.K & 63u) == 0u) &&
+                            ((x_stride & 3u) == 0u);
+    if (use_m8_mma) {
+        const uint32_t tile_mode = (desc.N * batch_z >= 16384u) ? 3u : 4u;
+        const uint32_t wg_n      = (desc.layout == AGX_WEIGHT_Q8_0_REPACKED)
+                                     ? 32u
+                                     : ((tile_mode == 3u) ? 64u : 16u);
+        const agx_kernel * k     = get_or_compile_mma_gemm(ctx, desc.layout, tile_mode, false);
+        if (!k) {
+            return false;
+        }
+        const uint32_t gx = (desc.N + wg_n - 1u) / wg_n;
+        return agx_cdm_dispatch(stream, k, gx, 1u, batch_z, &pc, sizeof(pc), desc.post_barrier);
+    }
+
+    // Crossover: M <= 8 -> predicated K-coalesced vec-mat; M >= 9 -> 8x8 MMA GEMM.
     const bool use_mma = desc.force_mma || (!desc.force_vecmat && desc.M >= 9u);
 
     if (use_mma) {
         // Select tile geometry to saturate all 40 M4 Max cores:
         //   - TILE_MODE=2 (16x16, 2x2): narrow N <= 128 (e.g. 4608x64 ctrl_down -> 128 WGs!)
-        //   - TILE_MODE=1 (32x16, 4x1): medium M <= 32 (72-144 WGs on N=2304)
-        //   - TILE_MODE=0 (64x32, 4x1, 128T): high-occupancy RowMajor sh_x prefill (5.0 KB SRAM = 6 WGs/core!)
+        //   - TILE_MODE=1 (32x16, 4x1): medium M <= 48 (72-216 WGs on N=2304)
+        //   - TILE_MODE=0: sh_w-staged 64x64 for FP16 repacked NVFP4/Q8_0 (9.5 KB = 3 WGs/core!),
+        //                  64x32 for PREC_F32 / non-repacked layouts.
         const uint32_t tile_mode = (desc.N <= 128u && batch_z <= 2u) ? 2u
-                                 : (desc.M <= 32u)                   ? 1u
+                                 : (desc.M <= 48u)                   ? 1u
                                                                      : 0u;
+        const bool pf_64x64      = (tile_mode == 0u) && !desc.prec_f32 &&
+                                   (desc.layout == AGX_WEIGHT_NVFP4_REPACKED ||
+                                    desc.layout == AGX_WEIGHT_Q8_0_REPACKED);
         const uint32_t wg_n      = (tile_mode == 2u) ? 16u
                                  : (tile_mode == 1u) ? 32u
                                                      : 64u;
-        const uint32_t wg_m      = (tile_mode == 0u) ? 32u : 16u;
+        const uint32_t wg_m      = pf_64x64 ? 64u : ((tile_mode == 0u) ? 32u : 16u);
 
         const agx_kernel * k = get_or_compile_mma_gemm(ctx, desc.layout, tile_mode, desc.prec_f32);
         if (!k) {

@@ -78,7 +78,8 @@ bool agx_gemm_precompile_all(agx_backend_context * ctx);
 // Infer weight layout from a ggml_tensor (honors agx_tensor_is_repacked(w))
 bool agx_gemm_infer_weight_layout(const struct ggml_tensor * w, agx_weight_layout * out_layout);
 
-// Raw-VA CDM-stream dispatch (selects predicated vec-mat for M<=8, 8x8 MMA GEMM for M>=9)
+// Raw-VA CDM-stream dispatch (M=1 vec-mat; M=2..8 repacked NVFP4/Q8_0 native 8x8 MMA
+// TILE_MODE=3/4; M>=9 8x8 MMA GEMM TILE_MODE=0/1/2)
 bool agx_gemm_dispatch(agx_backend_context * ctx,
                        agx_cdm_stream *      stream,
                        const agx_gemm_desc & desc);
