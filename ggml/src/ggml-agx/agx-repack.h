@@ -142,6 +142,41 @@ void   agx_repack_set_tensor(struct ggml_tensor * tensor, const void * data, siz
 void   agx_repack_get_tensor(const struct ggml_tensor * tensor, void * data, size_t offset, size_t size);
 
 // ----------------------------------------------------------------------------
+// Wave 4 Theorem W4.1: Load-Time Vertical Weight Coalescing (Q8_0_8BLK)
+// ----------------------------------------------------------------------------
+// Concatenates up to AGX_COALESCED_MAX_MATS 2D Q8_0 matrices sharing input dim K
+// (e.g. wq, wqkv_gate, attn_rel, attn_sink_proj, wk, wv -> 8,984 x 2,448 B) into
+// ONE contiguous AGX_BO_SLC_STREAM | AGX_BO_READONLY GPU BO in Q8_0_8BLK layout,
+// preserving 16B row alignment, 0 extra VRAM bloat, and 0-ULP GEMV equivalence.
+
+#define AGX_COALESCED_MAX_MATS 16u
+
+struct agx_drm_device;
+struct agx_bo;
+
+struct agx_coalesced_weight {
+    struct agx_bo * bo;
+    uint64_t        gpu_va;
+    void *          cpu_ptr;
+    uint32_t        K;
+    uint32_t        total_rows;
+    uint32_t        row_stride_b;
+    size_t          total_bytes;
+    uint32_t        n_mats;
+    uint32_t        row_offsets[AGX_COALESCED_MAX_MATS];
+    uint32_t        row_counts[AGX_COALESCED_MAX_MATS];
+    size_t          byte_offsets[AGX_COALESCED_MAX_MATS];
+};
+
+bool agx_repack_coalesce_q8_0_matrices(struct agx_drm_device *            dev,
+                                       const struct ggml_tensor * const * mats,
+                                       uint32_t                           n_mats,
+                                       struct agx_coalesced_weight *      out);
+
+void agx_repack_coalesced_free(struct agx_drm_device *       dev,
+                               struct agx_coalesced_weight * w);
+
+// ----------------------------------------------------------------------------
 // Host-side bit-exact reference implementations of our branchless FTZ-safe
 // GPU GPR decoders (guaranteed identical to kernels/dequant_supertile.*)
 // ----------------------------------------------------------------------------

@@ -1,5 +1,6 @@
 #include "agx-repack.h"
 #include "agx-common.h"
+#include "agx-drm.h"
 
 #include <algorithm>
 #include <cmath>
@@ -647,6 +648,145 @@ void agx_repack_get_tensor(const struct ggml_tensor * tensor, void * data, size_
                       static_cast<long long>(tensor->ne[2]), static_cast<long long>(tensor->ne[3]),
                       offset, size);
     }
+}
+
+// ============================================================================
+// Wave 4 Theorem W4.1: Load-Time Vertical Weight Coalescing (Q8_0_8BLK)
+// ============================================================================
+
+static void pack_q8_0_rows_contiguous(const block_q8_0 * src_blocks,
+                                      uint8_t *          dst_bytes,
+                                      int64_t            K,
+                                      int64_t            N) {
+    const int64_t nb_k     = K / QK8_0;
+    const int64_t n_chunks = (nb_k + AGX_Q8_0_CHUNK_BLOCKS - 1) / AGX_Q8_0_CHUNK_BLOCKS;
+    const size_t  row_b    = static_cast<size_t>(n_chunks) * AGX_Q8_0_CHUNK_BYTES;
+
+    for (int64_t row = 0; row < N; ++row) {
+        const block_q8_0 * row_src = src_blocks + row * nb_k;
+        auto * row_dst = reinterpret_cast<agx_q8_0_8blk *>(dst_bytes + static_cast<size_t>(row) * row_b);
+
+        for (int64_t c = 0; c < n_chunks; ++c) {
+            agx_q8_0_8blk & chk = row_dst[c];
+            const int64_t b0    = c * AGX_Q8_0_CHUNK_BLOCKS;
+            const int64_t count = std::min<int64_t>(AGX_Q8_0_CHUNK_BLOCKS, nb_k - b0);
+            if (count < AGX_Q8_0_CHUNK_BLOCKS) {
+                std::memset(&chk, 0, sizeof(chk));
+            }
+            for (int64_t j = 0; j < count; ++j) {
+                const block_q8_0 & blk = row_src[b0 + j];
+                std::memcpy(&chk.d[j], &blk.d, sizeof(uint16_t));
+                std::memcpy(&chk.qs[j * QK8_0], blk.qs, QK8_0);
+            }
+        }
+    }
+}
+
+bool agx_repack_coalesce_q8_0_matrices(struct agx_drm_device *            dev,
+                                       const struct ggml_tensor * const * mats,
+                                       uint32_t                           n_mats,
+                                       struct agx_coalesced_weight *      out) {
+    if (!dev || !mats || !out || n_mats == 0u || n_mats > AGX_COALESCED_MAX_MATS) {
+        return false;
+    }
+    std::memset(out, 0, sizeof(*out));
+
+    int64_t shared_k   = -1;
+    uint64_t total_rows = 0;
+
+    // Pass 1: validate all slices share K (multiple of QK8_0) and are 2D contiguous Q8_0
+    for (uint32_t i = 0; i < n_mats; ++i) {
+        const ggml_tensor * t = mats[i];
+        if (!t) {
+            continue;
+        }
+        if (t->type != GGML_TYPE_Q8_0 || !t->data || !ggml_is_contiguous(t)) {
+            return false;
+        }
+        if (t->ne[0] <= 0 || t->ne[1] <= 0 || t->ne[2] != 1 || t->ne[3] != 1) {
+            return false;
+        }
+        if ((t->ne[0] % QK8_0) != 0) {
+            return false;
+        }
+        if (shared_k < 0) {
+            shared_k = t->ne[0];
+        } else if (t->ne[0] != shared_k) {
+            return false;
+        }
+        total_rows += static_cast<uint64_t>(t->ne[1]);
+    }
+
+    if (shared_k <= 0 || total_rows == 0 || total_rows > UINT32_MAX) {
+        return false;
+    }
+
+    const int64_t  nb_k         = shared_k / QK8_0;
+    const int64_t  n_chunks     = (nb_k + AGX_Q8_0_CHUNK_BLOCKS - 1) / AGX_Q8_0_CHUNK_BLOCKS;
+    const uint32_t row_stride_b = static_cast<uint32_t>(n_chunks * AGX_Q8_0_CHUNK_BYTES);
+    const size_t   used_bytes   = static_cast<size_t>(total_rows) * static_cast<size_t>(row_stride_b);
+    const size_t   total_bytes  = agx_align_up(used_bytes, AGX_CACHE_LINE_BYTES);
+
+    agx_bo * bo = agx_bo_alloc(dev, total_bytes, AGX_BO_SLC_STREAM | AGX_BO_READONLY, "w_coalesced_q8_0");
+    if (!bo || !bo->cpu_ptr || bo->gpu_va == 0) {
+        if (bo) {
+            agx_bo_free(dev, bo);
+        }
+        return false;
+    }
+
+    auto * dst_base = static_cast<uint8_t *>(bo->cpu_ptr);
+    uint32_t cur_row = 0;
+
+    // Pass 2: fast row-range copy (already AGX0_Repack Q8_0_8BLK) or on-the-fly repack (raw Q8_0)
+    for (uint32_t i = 0; i < n_mats; ++i) {
+        const ggml_tensor * t = mats[i];
+        out->row_offsets[i]  = cur_row;
+        out->byte_offsets[i] = static_cast<size_t>(cur_row) * static_cast<size_t>(row_stride_b);
+        if (!t) {
+            out->row_counts[i] = 0;
+            continue;
+        }
+        const uint32_t nrows     = static_cast<uint32_t>(t->ne[1]);
+        const size_t   slice_len = static_cast<size_t>(nrows) * static_cast<size_t>(row_stride_b);
+        uint8_t *      dst_ptr   = dst_base + out->byte_offsets[i];
+
+        if (agx_tensor_is_repacked(t) && agx_repack_supports_tensor(t)) {
+            std::memcpy(dst_ptr, t->data, slice_len);
+        } else {
+            pack_q8_0_rows_contiguous(static_cast<const block_q8_0 *>(t->data), dst_ptr, shared_k, nrows);
+        }
+
+        out->row_counts[i] = nrows;
+        cur_row += nrows;
+    }
+
+    if (total_bytes > used_bytes) {
+        std::memset(dst_base + used_bytes, 0, total_bytes - used_bytes);
+    }
+    // Drain ARM64 write-combine stores before returning the GPU BO for immediate CDM dispatch
+    __sync_synchronize();
+
+    out->bo           = bo;
+    out->gpu_va       = bo->gpu_va;
+    out->cpu_ptr      = bo->cpu_ptr;
+    out->K            = static_cast<uint32_t>(shared_k);
+    out->total_rows   = cur_row;
+    out->row_stride_b = row_stride_b;
+    out->total_bytes  = total_bytes;
+    out->n_mats       = n_mats;
+    return true;
+}
+
+void agx_repack_coalesced_free(struct agx_drm_device *       dev,
+                               struct agx_coalesced_weight * w) {
+    if (!w) {
+        return;
+    }
+    if (dev && w->bo) {
+        agx_bo_free(dev, w->bo);
+    }
+    std::memset(w, 0, sizeof(*w));
 }
 
 // ============================================================================

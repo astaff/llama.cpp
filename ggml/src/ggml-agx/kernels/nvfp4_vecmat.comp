@@ -42,7 +42,9 @@
 #define PREC_F32 0
 #endif
 
-#if K_SGS == 1
+#define FAST_SHX_BATCH (REPACKED == 1 && K_SGS == 4 && BATCH_M > 1 && PREC_F32 == 0)
+
+#if K_SGS == 1 || FAST_SHX_BATCH
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 #else
 // 8 rows/WG with 4-way K-split across 2 simdgroups x 2 16-lane K-groups (64 threads)
@@ -65,7 +67,30 @@ layout(push_constant, scalar) uniform PushArgs {
     uint     _pad;
 } pc;
 
-#if K_SGS > 1
+#if FAST_SHX_BATCH
+// Packed <= 8,192 B (for BATCH_M=2..8) = 4 WGs/core on 32 KB SRAM, reused for epilogue SG reduce!
+// Requires x_stride % 4 == 0 (checked by agx-gemm.cpp; K % 64 == 0 is always 4-aligned for NVFP4)
+// -> eliminates x_buf + scalar fallback + cuts ~16 GPR32 vs Pass-1/Pass-2!
+shared uvec2 sh_mem[2 * BATCH_M * 64];
+
+void load_nvfp4_sh_x(AgxBufVec4R x_buf4,
+                     uint        tid,
+                     uint        buf_base,
+                     uint        tk_base,
+                     uint        x_stride4) {
+    const uint total_e = uint(BATCH_M) * 64u;
+    const uint k4_base = tk_base * 16u;
+    for (uint e = tid; e < total_e; e += 128u) {
+        const uint lm   = e >> 6;
+        const uint idx  = e & 63u;
+        const uint col4 = k4_base + idx;
+        f16vec4 hv = (lm < pc.M && (col4 << 2) < pc.K)
+            ? f16vec4(x_buf4.v[lm * x_stride4 + col4])
+            : f16vec4(float16_t(0.0));
+        sh_mem[buf_base + e] = uvec2(packFloat2x16(hv.xy), packFloat2x16(hv.zw));
+    }
+}
+#elif K_SGS > 1
 shared float sh_reduce[2][BATCH_M][8];
 #endif
 
@@ -110,7 +135,110 @@ void main() {
 
     const uint nb_k = pc.K >> 6; // K / 64
 
-#if REPACKED == 1 && K_SGS == 1 && BATCH_M == 1
+#if FAST_SHX_BATCH
+    // ------------------------------------------------------------------------
+    // Wave 4 DSpark M=2..8 Roofline NVFP4_32x16 Kernel (1x W read, lean GPRs!):
+    //   - 16 rows/WG (128T = 4 sgs, 4-way K-split, 144 WGs on N=2304 = 1 wave!)
+    //   - Double-buffered 0-bank-conflict sh_mem (<= 8 KB = 4 WGs/core), 0 scalar
+    //     fallback bloat, deferred UE4M3 scale decode -> <= 64 GPR32, 0:0 spills!
+    // ------------------------------------------------------------------------
+    const uint tid         = gl_LocalInvocationIndex;
+    const uint half_idx    = gl_WorkGroupID.x;
+    const uint tn          = half_idx >> 1;
+    const uint sub_s       = half_idx & 1u;
+    const uint row_in_h    = lane >> 1; // 0..15
+    const uint kh          = lane & 1u; // 0 or 1
+    const uint row         = half_idx * 16u + row_in_h;
+    const uint l_idx       = sub_s * 32u + lane;
+    const bool tile_valid  = (half_idx * 16u < pc.N);
+
+    const uint x_stride4   = pc.x_stride >> 2;
+    const uint st_row_base = tn * nb_k;
+    const uint x_lane_off  = sg_id * 16u + kh * 8u;
+    const uint slab_u2     = uint(BATCH_M) * 64u;
+
+    AgxBufNvfp4ST st_buf = AgxBufNvfp4ST(w_base);
+
+    float acc[BATCH_M];
+    for (uint m = 0u; m < uint(BATCH_M); ++m) {
+        acc[m] = 0.0;
+    }
+
+    if (nb_k > 0u) {
+        load_nvfp4_sh_x(x_buf4, tid, 0u, 0u, x_stride4);
+    }
+    barrier();
+
+    uint buf = 0u;
+    for (uint tk_base = 0u; tk_base < nb_k; tk_base += 4u) {
+        const uint tk       = tk_base + sg_id;
+        const bool do_comp  = tile_valid && (tk < nb_k);
+        const bool has_next = (tk_base + 4u < nb_k);
+
+        uvec4    qs     = uvec4(0u);
+        uint16_t d_pair = uint16_t(0u);
+        if (do_comp) {
+            const uint st_idx = st_row_base + tk;
+            qs     = st_buf.st[st_idx].qs[l_idx];
+            d_pair = st_buf.st[st_idx].d[l_idx];
+        }
+
+        if (has_next) {
+            load_nvfp4_sh_x(x_buf4, tid, (buf ^ 1u) * slab_u2, tk_base + 4u, x_stride4);
+        }
+
+        if (do_comp) {
+            const vec2 scales   = agx_ue4m3_pair_to_vec2(d_pair);
+            const uint buf_base = buf * slab_u2 + x_lane_off;
+            for (uint w_i = 0u; w_i < 4u; ++w_i) {
+                f16vec4 hw0, hw1;
+                decode_e2m1_u32_f16x2(qs[w_i], hw0, hw1);
+                const float sc = (w_i < 2u) ? scales.x : scales.y;
+                const uint  xb = buf_base + w_i * 2u;
+                for (uint m = 0u; m < uint(BATCH_M); ++m) {
+                    const uvec2 r0 = sh_mem[xb + m * 64u + 0u];
+                    const uvec2 r1 = sh_mem[xb + m * 64u + 1u];
+                    float16_t dp = dot(hw0, f16vec4(unpackFloat2x16(r0.x), unpackFloat2x16(r0.y)))
+                                 + dot(hw1, f16vec4(unpackFloat2x16(r1.x), unpackFloat2x16(r1.y)));
+                    acc[m] = fma(float(dp), sc, acc[m]);
+                }
+            }
+        }
+
+        if (has_next) {
+            barrier();
+            buf ^= 1u;
+        }
+    }
+
+    for (uint m = 0u; m < uint(BATCH_M); ++m) {
+        acc[m] += subgroupShuffleXor(acc[m], 1u);
+    }
+
+    barrier();
+    const uint red_sg_stride = uint(BATCH_M) * 16u;
+    if (sg_id > 0u && kh == 0u) {
+        const uint base_r = (sg_id - 1u) * red_sg_stride + row_in_h;
+        for (uint m = 0u; m < uint(BATCH_M); ++m) {
+            sh_mem[base_r + m * 16u].x = floatBitsToUint(acc[m]);
+        }
+    }
+    barrier();
+
+    if (sg_id == 0u && kh == 0u && row < pc.N) {
+        for (uint m = 0u; m < uint(BATCH_M); ++m) {
+            if (m < pc.M) {
+                const uint off_r = m * 16u + row_in_h;
+                float sum = acc[m]
+                          + uintBitsToFloat(sh_mem[0u * red_sg_stride + off_r].x)
+                          + uintBitsToFloat(sh_mem[1u * red_sg_stride + off_r].x)
+                          + uintBitsToFloat(sh_mem[2u * red_sg_stride + off_r].x);
+                y_buf.v[m * pc.y_stride + row] = sum;
+            }
+        }
+    }
+
+#elif REPACKED == 1 && K_SGS == 1 && BATCH_M == 1
     // ------------------------------------------------------------------------
     // Peak-roofline B=1 fused 32-row/simdgroup path (128 rows/WG, 0 shared mem):
     // Verified 482.30 GB/s DRAM roofline on 2304 x 65536!

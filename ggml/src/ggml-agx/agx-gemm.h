@@ -83,6 +83,19 @@ bool agx_gemm_dispatch(agx_backend_context * ctx,
                        agx_cdm_stream *      stream,
                        const agx_gemm_desc & desc);
 
+// Raw-VA Q8_0_8BLK single-dispatch helper (e.g. Wave 4 coalesced W_attn_in)
+bool agx_gemm_dispatch_raw_q8_0(agx_backend_context * ctx,
+                                agx_cdm_stream *      stream,
+                                uint64_t              w_va,
+                                uint64_t              x_va,
+                                uint64_t              y_va,
+                                uint32_t              M,
+                                uint32_t              N,
+                                uint32_t              K,
+                                agx_barrier_mode      post_barrier   = AGX_BARRIER_STRONG_USC,
+                                uint32_t              x_stride_elems = 0,
+                                uint32_t              y_stride_elems = 0);
+
 // Direct ggml_tensor MUL_MAT helpers
 bool agx_gemm_supports_mul_mat(const struct ggml_tensor * dst);
 bool agx_gemm_mul_mat(agx_backend_context *      ctx,
