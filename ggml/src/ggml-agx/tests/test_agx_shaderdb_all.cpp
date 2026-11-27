@@ -48,6 +48,8 @@ int main() {
         { "nvfp4_vecmat_repack_m8",  "nvfp4_vecmat.comp",           {"REPACKED=1", "BATCH_M=8", "K_SGS=4"}, true },
         { "nvfp4_vecmat_raw_m1",     "nvfp4_vecmat.comp",           {"REPACKED=0", "BATCH_M=1", "K_SGS=1"}, true },
         { "q8_0_vecmat_repack_m1",   "mxfp8_q8_vecmat.comp",        {"QUANT_MODE=0", "BATCH_M=1"}, true },
+        { "q8_0_vecmat_repack_m4_g4","mxfp8_q8_vecmat.comp",        {"QUANT_MODE=0", "BATCH_M=4", "K_SPLIT_ROW=0", "WG_SGS=4", "X_ALIGNED4=1"}, true },
+        { "q8_0_vecmat_repack_m4_g8","mxfp8_q8_vecmat.comp",        {"QUANT_MODE=0", "BATCH_M=4", "K_SPLIT_ROW=0", "WG_SGS=8", "X_ALIGNED4=1"}, true },
         { "q8_0_vecmat_repack_m8",   "mxfp8_q8_vecmat.comp",        {"QUANT_MODE=0", "BATCH_M=8", "WG_SGS=8"}, true },
         { "q8_0_vecmat_repack_m8_16","mxfp8_q8_vecmat.comp",        {"QUANT_MODE=0", "BATCH_M=8", "WG_SGS=16"}, true },
         { "q8_0_vecmat_raw_m1",      "mxfp8_q8_vecmat.comp",        {"QUANT_MODE=1", "BATCH_M=1"}, true },
@@ -110,6 +112,10 @@ int main() {
         { "w5_hybrid_post_attn_rtr_nl",   "agx_inkling2_hybrid_b1.comp",  {"HYBRID_MODE=1", "HAS_LOOP=0"}, true },
         { "w5_hybrid_post_attn_rtr_lp",   "agx_inkling2_hybrid_b1.comp",  {"HYBRID_MODE=1", "HAS_LOOP=1"}, true },
         { "w5_hybrid_post_ffn_ctrl",      "agx_inkling2_hybrid_b1.comp",  {"HYBRID_MODE=2", "HAS_LOOP=1"}, true },
+        // Wave 6 Task 6D: Multi-Token (M=2..8 DSpark Verify) 40-WG SENSE_BARRIER Hybrid Super-Stages
+        { "w6_hybrid_post_attn_rtr_m_nl", "agx_inkling2_hybrid_b1.comp",  {"HYBRID_MODE=3", "HAS_LOOP=0"}, true },
+        { "w6_hybrid_post_attn_rtr_m_lp", "agx_inkling2_hybrid_b1.comp",  {"HYBRID_MODE=3", "HAS_LOOP=1"}, true },
+        { "w6_hybrid_post_ffn_ctrl_m",    "agx_inkling2_hybrid_b1.comp",  {"HYBRID_MODE=4", "HAS_LOOP=1"}, true },
         { "w5_attn_in_b1",                "agx_inkling2_attn_in_b1.comp", {}, true },
 
         // Pillar 4 & 5: Hybrid SWA/Full Attention, Bitonic MoE Bucket, Fused MoE
