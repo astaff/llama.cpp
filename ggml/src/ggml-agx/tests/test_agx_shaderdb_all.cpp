@@ -50,8 +50,10 @@ int main() {
         { "mxfp8_vecmat_repack_m1",  "mxfp8_q8_vecmat.comp",        {"QUANT_MODE=2", "BATCH_M=1"}, true },
         { "bf16_vecmat_m1",          "mxfp8_q8_vecmat.comp",        {"QUANT_MODE=4", "BATCH_M=1"}, true },
         { "f32_vecmat_m1",           "mxfp8_q8_vecmat.comp",        {"QUANT_MODE=6", "BATCH_M=1"}, true },
+        { "f32_vecmat_ksplit_m1",    "mxfp8_q8_vecmat.comp",        {"QUANT_MODE=6", "BATCH_M=1", "K_SPLIT_ROW=1"}, true },
         { "agx_mma_gemm_prefill",    "agx_mma_gemm.comp",           {"TILE_MODE=0"}, true },
         { "agx_mma_gemm_dspark",     "agx_mma_gemm.comp",           {"TILE_MODE=1"}, true },
+        { "agx_mma_gemm_narrow_n",   "agx_mma_gemm.comp",           {"TILE_MODE=2"}, true },
 
         // Pillar 3: Fused Inkling-2 loop prep, rank-64 SRAM gates, softcap/argmax, DSpark MTP
         { "fused_ctrl_gates_sram",   "fused_ctrl_gates_sram.comp",  {}, true },
@@ -70,10 +72,16 @@ int main() {
         // Pillar 4 & 5: Hybrid SWA/Full Attention, Bitonic MoE Bucket, Fused MoE
         { "fused_swa_ring_attn",     "fused_swa_ring_attn.comp",    {}, true },
         { "fused_full_flash_decode", "fused_full_flash_decode.comp",{}, true },
+        { "fused_full_flash_prefill","fused_full_flash_decode.comp",{"PASS_MODE=3", "HEAD_DIM=128"}, true },
         { "moe_bitonic_bucket",      "moe_bitonic_bucket.comp",     {}, true },
+        { "moe_zero_skipped",        "moe_bitonic_bucket.comp",     {"BUCKET_MODE=3"}, true },
         { "fused_moe_nvfp4_m1",      "fused_moe_gate_up_situ_down.comp", {"WEIGHT_LAYOUT=0", "BATCH_CAP=1"}, true },
         { "fused_moe_nvfp4_m5",      "fused_moe_gate_up_situ_down.comp", {"WEIGHT_LAYOUT=0", "BATCH_CAP=5"}, true },
         { "fused_moe_q8_0_m1",       "fused_moe_gate_up_situ_down.comp", {"WEIGHT_LAYOUT=2", "BATCH_CAP=1"}, true },
+        { "fused_moe_direct_nvfp4",  "fused_moe_gate_up_situ_down.comp", {"PASS_STAGE=4", "WEIGHT_LAYOUT=0"}, true },
+        { "fused_moe_direct_q8_0",   "fused_moe_gate_up_situ_down.comp", {"PASS_STAGE=4", "WEIGHT_LAYOUT=2"}, true },
+        { "fused_moe_gemm32_nvfp4",  "fused_moe_gate_up_situ_down.comp", {"PASS_STAGE=2", "WEIGHT_LAYOUT=0"}, true },
+        { "fused_moe_gemm32_q8_0",   "fused_moe_gate_up_situ_down.comp", {"PASS_STAGE=2", "WEIGHT_LAYOUT=2"}, true },
     };
 
     int compile_fails = 0;
