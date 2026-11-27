@@ -62,6 +62,7 @@ struct agx_gemm_desc {
     uint32_t          batch_count    = 1; // grid_z slices (ne2 * ne3)
     uint32_t          w_bcast_div    = 1; // w_slice = slice / max(1, w_bcast_div)
     agx_weight_layout layout         = AGX_WEIGHT_F32;
+    bool              prec_f32       = false; // use native FP32 8x8 MMA (no FP16 downcast/overflow)
     bool              force_mma      = false;
     bool              force_vecmat   = false;
     agx_barrier_mode  post_barrier   = AGX_BARRIER_STRONG_USC;

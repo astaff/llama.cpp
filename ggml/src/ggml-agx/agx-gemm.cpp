@@ -97,14 +97,15 @@ static const agx_kernel * get_or_compile_q8_mxfp8_vecmat(agx_backend_context * c
 
 static const agx_kernel * get_or_compile_mma_gemm(agx_backend_context * ctx,
                                                   agx_weight_layout     layout,
-                                                  uint32_t              tile_mode) {
+                                                  uint32_t              tile_mode,
+                                                  bool                  prec_f32) {
     auto * st = get_gemm_state(ctx);
     if (!st || !ctx->compiler) {
         return nullptr;
     }
     char name[96];
-    std::snprintf(name, sizeof(name), "agx_mma_gemm_w%u_t%u",
-                  static_cast<uint32_t>(layout), tile_mode);
+    std::snprintf(name, sizeof(name), "agx_mma_gemm_w%u_t%u_p%u",
+                  static_cast<uint32_t>(layout), tile_mode, prec_f32 ? 1u : 0u);
     auto it = st->cache.find(name);
     if (it != st->cache.end()) {
         return it->second;
@@ -113,6 +114,7 @@ static const agx_kernel * get_or_compile_mma_gemm(agx_backend_context * ctx,
     agx_compile_opts opts;
     opts.defines.push_back(std::string("WEIGHT_MODE=") + std::to_string(static_cast<uint32_t>(layout)));
     opts.defines.push_back(std::string("TILE_MODE=") + std::to_string(tile_mode));
+    opts.defines.push_back(std::string("PREC_F32=") + (prec_f32 ? "1" : "0"));
     opts.push_constant_bytes = sizeof(agx_gemm_push_args);
     opts.is_hot_kernel       = true;
     opts.strict_zero_spill   = true;
@@ -149,9 +151,12 @@ bool agx_gemm_precompile_all(agx_backend_context * ctx) {
              AGX_WEIGHT_BF16,
              AGX_WEIGHT_F16,
              AGX_WEIGHT_F32}) {
-        ok &= (get_or_compile_mma_gemm(ctx, wl, 0u) != nullptr);
-        ok &= (get_or_compile_mma_gemm(ctx, wl, 1u) != nullptr);
+        ok &= (get_or_compile_mma_gemm(ctx, wl, 0u, false) != nullptr);
+        ok &= (get_or_compile_mma_gemm(ctx, wl, 1u, false) != nullptr);
     }
+    // FP32 full-range 8x8 MMA variants (BF16/F32/Q8_0/NVFP4)
+    ok &= (get_or_compile_mma_gemm(ctx, AGX_WEIGHT_F32, 0u, true) != nullptr);
+    ok &= (get_or_compile_mma_gemm(ctx, AGX_WEIGHT_BF16, 0u, true) != nullptr);
     return ok;
 }
 
@@ -219,9 +224,9 @@ bool agx_gemm_dispatch(agx_backend_context * ctx,
     if (use_mma) {
         const uint32_t tile_mode = (desc.M <= 24u) ? 1u : 0u;
         const uint32_t wg_n      = 64u;
-        const uint32_t wg_m      = (tile_mode == 1u) ? 16u : 64u;
+        const uint32_t wg_m      = (tile_mode == 1u) ? 16u : (desc.prec_f32 ? 32u : 64u);
 
-        const agx_kernel * k = get_or_compile_mma_gemm(ctx, desc.layout, tile_mode);
+        const agx_kernel * k = get_or_compile_mma_gemm(ctx, desc.layout, tile_mode, desc.prec_f32);
         if (!k) {
             return false;
         }
@@ -237,7 +242,8 @@ bool agx_gemm_dispatch(agx_backend_context * ctx,
     if (desc.layout == AGX_WEIGHT_NVFP4_REPACKED || desc.layout == AGX_WEIGHT_NVFP4_RAW) {
         const bool repacked = (desc.layout == AGX_WEIGHT_NVFP4_REPACKED);
         // Use K_SGS=4 (4 simdgroups splitting K over 16 rows) when N*batch_z is medium
-        // so all 40 GPU cores stay saturated; use K_SGS=1 (64 rows/WG, zero barrier) for huge N!
+        // so all 40 GPU cores stay saturated; use K_SGS=1 (zero barrier; fused 32 rows/sg
+        // = 128 rows/WG for repacked B=1!) for huge N!
         const uint32_t n_halves = (desc.N + 15u) / 16u;
         const uint32_t k_sgs    = ((n_halves * batch_z) < 640u && desc.K >= 256u) ? 4u : 1u;
 
@@ -245,7 +251,10 @@ bool agx_gemm_dispatch(agx_backend_context * ctx,
         if (!k) {
             return false;
         }
-        const uint32_t gx = (k_sgs == 1u) ? ((n_halves + 3u) / 4u) : n_halves;
+        const bool fused_32row = repacked && (k_sgs == 1u) && (m_spec == 1u);
+        const uint32_t gx = fused_32row
+            ? ((desc.N + 127u) / 128u)
+            : ((k_sgs == 1u) ? ((n_halves + 3u) / 4u) : n_halves);
 
         if (desc.M <= 5u) {
             return agx_cdm_dispatch(stream, k, gx, 1u, batch_z, &pc, sizeof(pc), desc.post_barrier);
@@ -312,15 +321,17 @@ bool agx_gemm_supports_mul_mat(const struct ggml_tensor * dst) {
     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous_rows(src1) || !ggml_is_contiguous(dst)) {
         return false;
     }
+    if ((src1->nb[1] % sizeof(float)) != 0 ||
+        (src1->nb[2] % sizeof(float)) != 0 ||
+        (src1->nb[3] % sizeof(float)) != 0) {
+        return false;
+    }
     if (src0->ne[0] != src1->ne[0]) {
         return false;
     }
-    // Support 2D, 3D, and 4D broadcast matching ggml MUL_MAT semantics (ne2/ne3 divisible)
-    if (src1->ne[2] % src0->ne[2] != 0 || src1->ne[3] % src0->ne[3] != 0) {
-        return false;
-    }
-    // Keep 3D/4D simple: if ne3 > 1, require matching broadcast ratios cleanly
-    if (src0->ne[3] > 1 && src1->ne[2] != src0->ne[2]) {
+    // Support full 2D, 3D, and 4D broadcast matching ggml MUL_MAT semantics (ne2/ne3 divisible)
+    if (src0->ne[2] <= 0 || src0->ne[3] <= 0 ||
+        src1->ne[2] % src0->ne[2] != 0 || src1->ne[3] % src0->ne[3] != 0) {
         return false;
     }
 
@@ -350,36 +361,67 @@ bool agx_gemm_mul_mat(agx_backend_context *      ctx,
         return false;
     }
 
-    const int64_t K = src0->ne[0];
-    const int64_t N = src0->ne[1];
-    const int64_t M = src1->ne[1];
+    const int64_t K    = src0->ne[0];
+    const int64_t N    = src0->ne[1];
+    const int64_t M    = src1->ne[1];
+    const int64_t ne02 = src0->ne[2];
+    const int64_t ne03 = src0->ne[3];
+    const int64_t ne12 = src1->ne[2];
+    const int64_t ne13 = src1->ne[3];
+    const int64_t r2   = ne12 / ne02;
+    const int64_t r3   = ne13 / ne03;
 
-    const int64_t w_slices = src0->ne[2] * src0->ne[3];
-    const int64_t x_slices = src1->ne[2] * src1->ne[3];
-
-    uint32_t w_slice_bytes = 0;
+    uint64_t w_nb2 = 0;
+    uint64_t w_nb3 = 0;
     if (layout == AGX_WEIGHT_NVFP4_REPACKED || layout == AGX_WEIGHT_Q8_0_REPACKED) {
-        w_slice_bytes = static_cast<uint32_t>(agx_repack_slice_stride(src0->type, K, N));
+        w_nb2 = static_cast<uint64_t>(agx_repack_slice_stride(src0->type, K, N));
+        w_nb3 = w_nb2 * static_cast<uint64_t>(ne02);
     } else {
-        w_slice_bytes = static_cast<uint32_t>(src0->nb[2]);
+        w_nb2 = static_cast<uint64_t>(src0->nb[2]);
+        w_nb3 = static_cast<uint64_t>(src0->nb[3]);
     }
 
+    const enum ggml_prec p_src0 = ggml_prec_get_src(dst, 0);
+    const enum ggml_prec p_src1 = ggml_prec_get_src(dst, 1);
+
     agx_gemm_desc desc{};
-    desc.w_va           = w_va;
-    desc.x_va           = x_va;
-    desc.y_va           = y_va;
     desc.M              = static_cast<uint32_t>(M);
     desc.N              = static_cast<uint32_t>(N);
     desc.K              = static_cast<uint32_t>(K);
     desc.x_stride_elems = static_cast<uint32_t>(src1->nb[1] / sizeof(float));
     desc.y_stride_elems = static_cast<uint32_t>(dst->nb[1] / sizeof(float));
-    desc.w_slice_bytes  = w_slice_bytes;
+    desc.w_slice_bytes  = static_cast<uint32_t>(w_nb2);
     desc.x_slice_elems  = static_cast<uint32_t>(src1->nb[2] / sizeof(float));
     desc.y_slice_elems  = static_cast<uint32_t>(dst->nb[2] / sizeof(float));
-    desc.batch_count    = static_cast<uint32_t>(x_slices);
-    desc.w_bcast_div    = static_cast<uint32_t>(std::max<int64_t>(1, x_slices / std::max<int64_t>(1, w_slices)));
+    desc.batch_count    = static_cast<uint32_t>(ne12);
+    desc.w_bcast_div    = static_cast<uint32_t>(r2);
     desc.layout         = layout;
-    desc.post_barrier   = post_barrier;
+    // Honor GGML precision policy: never downcast src0/src1 to FP16 when F32 or BF16
+    // range/precision is requested (prevents FP16 >65504 overflow / NaN on BF16/F32 inputs!).
+    desc.prec_f32       = (p_src1 == GGML_PREC_F32 || p_src1 == GGML_PREC_BF16 ||
+                           p_src0 == GGML_PREC_F32 || p_src0 == GGML_PREC_BF16 ||
+                           src0->type == GGML_TYPE_F32);
 
-    return agx_gemm_dispatch(ctx, stream, desc);
+    // Fast path for 2D/3D (ne13 == 1): single CDM dispatch
+    if (ne13 == 1) {
+        desc.w_va         = w_va;
+        desc.x_va         = x_va;
+        desc.y_va         = y_va;
+        desc.post_barrier = post_barrier;
+        return agx_gemm_dispatch(ctx, stream, desc);
+    }
+
+    // Exact 4D broadcast & arbitrary src1 permutation (e.g. per=[0,2,1,3]) across ne13:
+    // Independent i3 slices overlap with AGX_BARRIER_NONE until final slice's post_barrier.
+    for (int64_t i3 = 0; i3 < ne13; ++i3) {
+        const int64_t w_i3 = i3 / r3;
+        desc.w_va         = w_va + static_cast<uint64_t>(w_i3) * w_nb3;
+        desc.x_va         = x_va + static_cast<uint64_t>(i3)   * static_cast<uint64_t>(src1->nb[3]);
+        desc.y_va         = y_va + static_cast<uint64_t>(i3)   * static_cast<uint64_t>(dst->nb[3]);
+        desc.post_barrier = (i3 + 1 == ne13) ? post_barrier : AGX_BARRIER_NONE;
+        if (!agx_gemm_dispatch(ctx, stream, desc)) {
+            return false;
+        }
+    }
+    return true;
 }

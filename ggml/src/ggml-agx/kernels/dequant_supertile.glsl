@@ -112,22 +112,40 @@ layout(buffer_reference, scalar, buffer_reference_align = 2) readonly buffer Agx
 };
 
 // ----------------------------------------------------------------------------
-// 1. Branchless FTZ-Safe E2M1 -> FP16 Normal-Exponent Shift Decode
+// 1. Branchless FTZ-Safe E2M1 -> FP16 / FP32 Normal-Exponent Shift Decode
 // ----------------------------------------------------------------------------
-// Maps 4-bit E2M1 nibble (0..15) -> exact normal IEEE FP16:
+// Maps 4-bit E2M1 nibble (0..15) -> exact normal IEEE FP16 / FP32:
 //   {0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0} with sign bit from bit 3.
-// NEVER constructs 0x0200 subnormal; 100% immune to FTZ on AGX3B coopmat.
+// NEVER constructs subnormals; 100% immune to FTZ on AGX3B ALU & f32matmad8x8.
 float16_t agx_e2m1_to_f16(uint nib) {
     uint sign = (nib & 8u) << 12;
     uint mag  = nib & 7u;
-    uint norm = 0x3800u + (mag << 9);
-    uint fix1 = (mag == 1u) ? 0x3800u : norm;
-    uint h    = (mag == 0u) ? 0u : fix1;
+    uint h    = (mag < 2u) ? (mag * 0x3800u) : (0x3800u + (mag << 9));
     return unpackFloat2x16(sign | h).x;
+}
+
+float agx_e2m1_to_f32(uint nib) {
+    uint sign = (nib & 8u) << 28;
+    uint mag  = nib & 7u;
+    uint h    = (mag < 2u) ? (mag * 0x3F000000u) : (0x3F000000u + (mag << 22));
+    return uintBitsToFloat(sign | h);
+}
+
+vec4 agx_e2m1_u16_to_vec4(uint w16) {
+    return vec4(
+        agx_e2m1_to_f32( w16        & 0xFu),
+        agx_e2m1_to_f32((w16 >> 4)  & 0xFu),
+        agx_e2m1_to_f32((w16 >> 8)  & 0xFu),
+        agx_e2m1_to_f32((w16 >> 12) & 0xFu)
+    );
 }
 
 f16vec2 agx_e2m1_byte_to_f16vec2(uint b) {
     return f16vec2(agx_e2m1_to_f16(b & 0xFu), agx_e2m1_to_f16((b >> 4) & 0xFu));
+}
+
+vec2 agx_e2m1_byte_to_vec2(uint b) {
+    return vec2(agx_e2m1_to_f32(b & 0xFu), agx_e2m1_to_f32((b >> 4) & 0xFu));
 }
 
 f16vec4 agx_e2m1_u16_to_f16vec4(uint w16) {
@@ -145,9 +163,9 @@ void agx_e2m1_u32_to_f16x8(uint w, out f16vec4 lo, out f16vec4 hi) {
 }
 
 // ----------------------------------------------------------------------------
-// 2. Branchless FTZ-Safe UE4M3 -> FP16 Decode (256/256 bit-exact, 0 LUT)
+// 2. Branchless FTZ-Safe UE4M3 -> FP16 / FP32 Decode (256/256 bit-exact, 0 LUT)
 // ----------------------------------------------------------------------------
-// Matches 2.0 * ggml_ue4m3_to_fp32(u) so that agx_e2m1_to_f16(n) * agx_ue4m3_to_f16(u)
+// Matches 2.0 * ggml_ue4m3_to_fp32(u) so that agx_e2m1_to_f*(n) * agx_ue4m3_to_f*(u)
 // equals kvalues_fp4[n] * ggml_ue4m3_to_fp32(u) with 0 ULP error.
 float16_t agx_ue4m3_to_f16(uint u) {
     uint u7 = u & 0x7Fu;
@@ -157,9 +175,22 @@ float16_t agx_ue4m3_to_f16(uint u) {
     return (u == 0u || u == 0x7Fu) ? float16_t(0.0) : val;
 }
 
+float agx_ue4m3_to_f32(uint u) {
+    uint u7 = u & 0x7Fu;
+    float sub_v  = float(u7) * (1.0 / 512.0);
+    float norm_v = uintBitsToFloat(0x3C000000u + (u7 << 20));
+    float val    = (u7 < 8u) ? sub_v : norm_v;
+    return (u == 0u || u == 0x7Fu) ? 0.0 : val;
+}
+
 f16vec2 agx_ue4m3_pair_to_f16vec2(uint16_t d_pair) {
     uint p = uint(d_pair);
     return f16vec2(agx_ue4m3_to_f16(p & 0xFFu), agx_ue4m3_to_f16(p >> 8));
+}
+
+vec2 agx_ue4m3_pair_to_vec2(uint16_t d_pair) {
+    uint p = uint(d_pair);
+    return vec2(agx_ue4m3_to_f32(p & 0xFFu), agx_ue4m3_to_f32(p >> 8));
 }
 
 // ----------------------------------------------------------------------------
