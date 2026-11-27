@@ -1,4 +1,5 @@
 #include "llama.h"
+#include "ggml.h"
 #include "ggml-backend.h"
 
 #include <cmath>
@@ -12,6 +13,37 @@
 // Deterministic differential-logit dumper & 0-NaN/Inf verifier for Inkling 2 Mini.
 // Usage:
 //   test_agx_diff_logits <model.gguf> <device: CPU|AGX0> <out_logits.bin> [n_gen=4]
+
+struct StepTraceState {
+    bool active = false;
+};
+
+static bool step_trace_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    auto * st = static_cast<StepTraceState *>(user_data);
+    if (!st || !st->active) return false;
+    static const char * kNames[] = {
+        "embd", "Qcur-0", "kqv_out-0", "attn_out-0", "ffn_inp-0", "ffn_norm-0",
+        "ffn_moe_weights_scaled-0", "ffn_out-0",
+        "l_out-0", "l_out-1", "l_out-5", "l_out-6", "l_out-17",
+        "l_out-24", "l_out-35", "l_out-36", "l_out-47", "l_out-23", "result_norm"
+    };
+    bool match = false;
+    for (const char * nm : kNames) {
+        if (std::strcmp(t->name, nm) == 0) { match = true; break; }
+    }
+    if (ask) return match;
+    if (!match || t->type != GGML_TYPE_F32) return true;
+    const size_t n = ggml_nelements(t);
+    std::vector<float> buf(n);
+    if (t->buffer) ggml_backend_tensor_get(t, buf.data(), 0, n * sizeof(float));
+    else if (t->data) std::memcpy(buf.data(), t->data, n * sizeof(float));
+    double s2 = 0.0;
+    for (float v : buf) s2 += static_cast<double>(v) * v;
+    std::fprintf(stderr, "[TRACE S1] %-24s n=%-5zu l2=%10.5f v=[%9.5f %9.5f %9.5f %9.5f]\n",
+                 t->name, n, std::sqrt(s2),
+                 n > 0 ? buf[0] : 0.f, n > 1 ? buf[1] : 0.f, n > 2 ? buf[2] : 0.f, n > 3 ? buf[3] : 0.f);
+    return true;
+}
 
 int main(int argc, char ** argv) {
     if (argc < 4) {
@@ -59,6 +91,13 @@ int main(int argc, char ** argv) {
     cparams.n_threads = 8;
     cparams.n_threads_batch = 8;
     cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    StepTraceState trace_st;
+    const char * trace_env = std::getenv("GGML_AGX_TRACE_STEP1");
+    const bool want_trace = (trace_env && trace_env[0] && trace_env[0] != '0');
+    if (want_trace) {
+        cparams.cb_eval = step_trace_cb;
+        cparams.cb_eval_user_data = &trace_st;
+    }
 
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (!ctx) {
@@ -116,11 +155,13 @@ int main(int argc, char ** argv) {
 
     // Greedy decode steps
     for (int s = 1; s <= n_gen; ++s) {
+        trace_st.active = (want_trace && s == 1);
         llama_batch b1 = llama_batch_get_one(&next, 1);
         if (llama_decode(ctx, b1) != 0) {
             std::fprintf(stderr, "FAIL: decode step %d failed\n", s);
             return 1;
         }
+        trace_st.active = false;
         next = check_and_write(s, llama_get_logits_ith(ctx, -1));
     }
 
