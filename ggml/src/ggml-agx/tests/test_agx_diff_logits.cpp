@@ -28,6 +28,13 @@ int main(int argc, char ** argv) {
     llama_model_params mparams = llama_model_default_params();
     ggml_backend_dev_t devs[2] = { nullptr, nullptr };
     if (std::strcmp(dev_name, "CPU") == 0) {
+        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (!cpu_dev) {
+            std::fprintf(stderr, "FAIL: CPU backend device not found\n");
+            return 1;
+        }
+        devs[0] = cpu_dev;
+        mparams.devices = devs;
         mparams.n_gpu_layers = 0;
     } else {
         ggml_backend_dev_t dev = ggml_backend_dev_by_name(dev_name);

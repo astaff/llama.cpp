@@ -15,10 +15,12 @@ for t in test_agx_roofline test_agx_shaderdb_all test_agx_gemm_roofline; do
     echo "BUILT ${BUILD}/bin/${t}"
 done
 
-g++ -O2 -std=c++17 -Wall -Wextra -Wno-deprecated-declarations \
-    -I"${REPO}/include" -I"${REPO}/ggml/include" \
-    "${REPO}/ggml/src/ggml-agx/tests/test_agx_diff_logits.cpp" \
-    "${BUILD}/bin/libllama.so" "${BUILD}/bin/libggml.so" "${BUILD}/bin/libggml-base.so" \
-    -Wl,-rpath,"${BUILD}/bin" -lpthread \
-    -o "${BUILD}/bin/test_agx_diff_logits"
-echo "BUILT ${BUILD}/bin/test_agx_diff_logits"
+for t in test_agx_diff_logits test_agx_bisect test_agx_profile; do
+    g++ -O2 -std=c++17 -Wall -Wextra -Wno-deprecated-declarations \
+        -I"${REPO}/include" -I"${REPO}/ggml/include" \
+        "${REPO}/ggml/src/ggml-agx/tests/${t}.cpp" \
+        "${BUILD}/bin/libllama.so" "${BUILD}/bin/libggml.so" "${BUILD}/bin/libggml-base.so" \
+        -Wl,-rpath,"${BUILD}/bin" -lpthread \
+        -o "${BUILD}/bin/${t}"
+    echo "BUILT ${BUILD}/bin/${t}"
+done

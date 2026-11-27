@@ -266,6 +266,9 @@ int main() {
     fails += bench_nvfp4(&ctx, 2304, 2304, 5, 4);
     fails += bench_nvfp4(&ctx, 1152, 2304, 1, 8);
     fails += bench_q8_0 (&ctx, 2304, 3072, 1, 8);
+    // Prefill 8x8 simdgroup_matrix MMA TFLOPS roofline (M=512)
+    fails += bench_nvfp4(&ctx, 2304, 2304, 512, 1);
+    fails += bench_q8_0 (&ctx, 2304, 2304, 512, 1);
 
     agx_gemm_cleanup(&ctx);
     agx_cdm_stream_destroy(ctx.stream);
