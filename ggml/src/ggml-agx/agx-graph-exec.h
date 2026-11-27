@@ -36,6 +36,10 @@ struct agx_graph_exec_stats {
     uint64_t fused_situ_hits;
     uint64_t fused_add_scale_hits;
     uint64_t fused_sig_mul_hits;
+    uint64_t fused_mix_hits;
+    uint64_t fused_moe_wsum_hits;
+    uint64_t fused_ssm_res_hits;
+    uint64_t fused_moe_norm_hits;
     uint64_t inkling2_fastpath_hits;
     uint64_t barriers_elided;
     uint64_t total_gpu_ns;
