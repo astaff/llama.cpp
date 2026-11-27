@@ -40,6 +40,10 @@
 #define K_SGS 4
 #endif
 
+#ifndef PREC_F32
+#define PREC_F32 0
+#endif
+
 #if K_SGS == 1
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 #else
@@ -72,6 +76,15 @@ float dot_e2m1_u32_x2(uint w32, vec4 x0, vec4 x1) {
     s += dot(agx_e2m1_u16_to_vec4(w32 >> 16), x1);
     return s;
 }
+
+#if PREC_F32 == 0
+// 2x-rate AGX3B FP16 FMA dot of 8 E2M1 weights against pre-cast f16vec4 activations
+float dot_e2m1_u32_f16x2(uint w32, f16vec4 hx0, f16vec4 hx1) {
+    float16_t s = dot(agx_e2m1_u16_to_f16vec4(w32 & 0xFFFFu), hx0);
+    s += dot(agx_e2m1_u16_to_f16vec4(w32 >> 16), hx1);
+    return float(s);
+}
+#endif
 
 void main() {
     const uint lane  = gl_SubgroupInvocationID; // 0..31
@@ -121,6 +134,32 @@ void main() {
             const uint col4 = (tk * 64u + kh * 32u) >> 2;
 
             // Sub-block 0 (weights 0..15): stream 8 floats of X at a time for both s=0 & s=1
+            // When PREC_F32==0, cast X to f16vec4 ONCE and use 2x-rate AGX3B ffma16!
+#if PREC_F32 == 0
+            f16vec4 hx0 = f16vec4(x_buf4.v[col4 + 0u]);
+            f16vec4 hx1 = f16vec4(x_buf4.v[col4 + 1u]);
+            float d0_a = dot_e2m1_u32_f16x2(qs0.x, hx0, hx1);
+            float d1_a = dot_e2m1_u32_f16x2(qs1.x, hx0, hx1);
+
+            hx0 = f16vec4(x_buf4.v[col4 + 2u]);
+            hx1 = f16vec4(x_buf4.v[col4 + 3u]);
+            d0_a += dot_e2m1_u32_f16x2(qs0.y, hx0, hx1);
+            d1_a += dot_e2m1_u32_f16x2(qs1.y, hx0, hx1);
+
+            acc0 = fma(d0_a, sc0.x, acc0);
+            acc1 = fma(d1_a, sc1.x, acc1);
+
+            // Sub-block 1 (weights 16..31)
+            hx0 = f16vec4(x_buf4.v[col4 + 4u]);
+            hx1 = f16vec4(x_buf4.v[col4 + 5u]);
+            float d0_b = dot_e2m1_u32_f16x2(qs0.z, hx0, hx1);
+            float d1_b = dot_e2m1_u32_f16x2(qs1.z, hx0, hx1);
+
+            hx0 = f16vec4(x_buf4.v[col4 + 6u]);
+            hx1 = f16vec4(x_buf4.v[col4 + 7u]);
+            d0_b += dot_e2m1_u32_f16x2(qs0.w, hx0, hx1);
+            d1_b += dot_e2m1_u32_f16x2(qs1.w, hx0, hx1);
+#else
             vec4 x0 = x_buf4.v[col4 + 0u];
             vec4 x1 = x_buf4.v[col4 + 1u];
             float d0_a = dot_e2m1_u32_x2(qs0.x, x0, x1);
@@ -144,6 +183,7 @@ void main() {
             x1 = x_buf4.v[col4 + 7u];
             d0_b += dot_e2m1_u32_x2(qs0.w, x0, x1);
             d1_b += dot_e2m1_u32_x2(qs1.w, x0, x1);
+#endif
 
             acc0 = fma(d0_b, sc0.y, acc0);
             acc1 = fma(d1_b, sc1.y, acc1);

@@ -39,14 +39,15 @@ void agx_gemm_cleanup(agx_backend_context * ctx) {
 static const agx_kernel * get_or_compile_nvfp4_vecmat(agx_backend_context * ctx,
                                                       bool                  repacked,
                                                       uint32_t              batch_m,
-                                                      uint32_t              k_sgs) {
+                                                      uint32_t              k_sgs,
+                                                      bool                  prec_f32) {
     auto * st = get_gemm_state(ctx);
     if (!st || !ctx->compiler) {
         return nullptr;
     }
     char name[96];
-    std::snprintf(name, sizeof(name), "nvfp4_vecmat_r%u_m%u_k%u",
-                  repacked ? 1u : 0u, batch_m, k_sgs);
+    std::snprintf(name, sizeof(name), "nvfp4_vecmat_r%u_m%u_k%u_p%u",
+                  repacked ? 1u : 0u, batch_m, k_sgs, prec_f32 ? 1u : 0u);
     auto it = st->cache.find(name);
     if (it != st->cache.end()) {
         return it->second;
@@ -56,6 +57,7 @@ static const agx_kernel * get_or_compile_nvfp4_vecmat(agx_backend_context * ctx,
     opts.defines.push_back(std::string("REPACKED=") + (repacked ? "1" : "0"));
     opts.defines.push_back(std::string("BATCH_M=") + std::to_string(batch_m));
     opts.defines.push_back(std::string("K_SGS=") + std::to_string(k_sgs));
+    opts.defines.push_back(std::string("PREC_F32=") + (prec_f32 ? "1" : "0"));
     opts.push_constant_bytes = sizeof(agx_gemm_push_args);
     opts.is_hot_kernel       = true;
     opts.strict_zero_spill   = true;
@@ -69,13 +71,15 @@ static const agx_kernel * get_or_compile_nvfp4_vecmat(agx_backend_context * ctx,
 
 static const agx_kernel * get_or_compile_q8_mxfp8_vecmat(agx_backend_context * ctx,
                                                          uint32_t              quant_mode,
-                                                         uint32_t              batch_m) {
+                                                         uint32_t              batch_m,
+                                                         bool                  k_split_row) {
     auto * st = get_gemm_state(ctx);
     if (!st || !ctx->compiler) {
         return nullptr;
     }
     char name[96];
-    std::snprintf(name, sizeof(name), "mxfp8_q8_vecmat_q%u_m%u", quant_mode, batch_m);
+    std::snprintf(name, sizeof(name), "mxfp8_q8_vecmat_q%u_m%u_s%u",
+                  quant_mode, batch_m, k_split_row ? 1u : 0u);
     auto it = st->cache.find(name);
     if (it != st->cache.end()) {
         return it->second;
@@ -84,6 +88,7 @@ static const agx_kernel * get_or_compile_q8_mxfp8_vecmat(agx_backend_context * c
     agx_compile_opts opts;
     opts.defines.push_back(std::string("QUANT_MODE=") + std::to_string(quant_mode));
     opts.defines.push_back(std::string("BATCH_M=") + std::to_string(batch_m));
+    opts.defines.push_back(std::string("K_SPLIT_ROW=") + (k_split_row ? "1" : "0"));
     opts.push_constant_bytes = sizeof(agx_gemm_push_args);
     opts.is_hot_kernel       = true;
     opts.strict_zero_spill   = true;
@@ -132,18 +137,22 @@ bool agx_gemm_precompile_all(agx_backend_context * ctx) {
     }
     bool ok = true;
     // NVFP4 repacked vec-mat: B=1 (K_SGS=1 & K_SGS=4), B=5 (DSpark verify)
-    ok &= (get_or_compile_nvfp4_vecmat(ctx, true, 1u, 1u) != nullptr);
-    ok &= (get_or_compile_nvfp4_vecmat(ctx, true, 1u, 4u) != nullptr);
-    ok &= (get_or_compile_nvfp4_vecmat(ctx, true, 5u, 1u) != nullptr);
+    ok &= (get_or_compile_nvfp4_vecmat(ctx, true, 1u, 1u, false) != nullptr);
+    ok &= (get_or_compile_nvfp4_vecmat(ctx, true, 1u, 4u, false) != nullptr);
+    ok &= (get_or_compile_nvfp4_vecmat(ctx, true, 5u, 1u, false) != nullptr);
 
     // Q8_0 repacked, MXFP8 repacked, F8_E4M3, BF16, F16, F32 B=1 vec-mat
     for (uint32_t qm : {0u, 2u, 3u, 4u, 5u, 6u}) {
-        ok &= (get_or_compile_q8_mxfp8_vecmat(ctx, qm, 1u) != nullptr);
+        ok &= (get_or_compile_q8_mxfp8_vecmat(ctx, qm, 1u, false) != nullptr);
+    }
+    // Narrow-N K-split variants for Q8_0 / BF16 / F32 (ctrl_down, router)
+    for (uint32_t qm : {0u, 4u, 6u}) {
+        ok &= (get_or_compile_q8_mxfp8_vecmat(ctx, qm, 1u, true) != nullptr);
     }
     // Q8_0 repacked B=5 (DSpark verify)
-    ok &= (get_or_compile_q8_mxfp8_vecmat(ctx, 0u, 5u) != nullptr);
+    ok &= (get_or_compile_q8_mxfp8_vecmat(ctx, 0u, 5u, false) != nullptr);
 
-    // 8x8 simdgroup_matrix MMA GEMM (both large prefill tile=0 & medium/DSpark tile=1)
+    // 8x8 simdgroup_matrix MMA GEMM (prefill tile=0, medium tile=1, narrow-N tile=2)
     for (agx_weight_layout wl : {
              AGX_WEIGHT_NVFP4_REPACKED,
              AGX_WEIGHT_Q8_0_REPACKED,
@@ -154,9 +163,11 @@ bool agx_gemm_precompile_all(agx_backend_context * ctx) {
         ok &= (get_or_compile_mma_gemm(ctx, wl, 0u, false) != nullptr);
         ok &= (get_or_compile_mma_gemm(ctx, wl, 1u, false) != nullptr);
     }
-    // FP32 full-range 8x8 MMA variants (BF16/F32/Q8_0/NVFP4)
-    ok &= (get_or_compile_mma_gemm(ctx, AGX_WEIGHT_F32, 0u, true) != nullptr);
+    // FP32 full-range 8x8 MMA variants (incl. narrow-N TILE_MODE=2 for 4608x64 ctrl_down!)
+    ok &= (get_or_compile_mma_gemm(ctx, AGX_WEIGHT_F32,  0u, true) != nullptr);
+    ok &= (get_or_compile_mma_gemm(ctx, AGX_WEIGHT_F32,  2u, true) != nullptr);
     ok &= (get_or_compile_mma_gemm(ctx, AGX_WEIGHT_BF16, 0u, true) != nullptr);
+    ok &= (get_or_compile_mma_gemm(ctx, AGX_WEIGHT_BF16, 2u, true) != nullptr);
     return ok;
 }
 
@@ -222,9 +233,16 @@ bool agx_gemm_dispatch(agx_backend_context * ctx,
     const bool use_mma = desc.force_mma || (!desc.force_vecmat && desc.M >= 6u);
 
     if (use_mma) {
-        const uint32_t tile_mode = (desc.M <= 24u) ? 1u : 0u;
-        const uint32_t wg_n      = 64u;
-        const uint32_t wg_m      = (tile_mode == 1u) ? 16u : (desc.prec_f32 ? 32u : 64u);
+        // Select tile geometry to saturate all 40 M4 Max cores:
+        //   - TILE_MODE=2 (16x16): narrow N <= 128 (e.g. 4608x64 ctrl_down -> 128 WGs vs 16 WGs!)
+        //   - TILE_MODE=1 (64x16): medium M <= 24 (DSpark / small batch)
+        //   - TILE_MODE=0 (64x64 FP16 / 64x32 FP32): large prefill
+        const uint32_t tile_mode = (desc.N <= 128u && batch_z <= 2u) ? 2u
+                                 : (desc.M <= 24u)                   ? 1u
+                                                                     : 0u;
+        const uint32_t wg_n      = (tile_mode == 2u) ? 16u : 64u;
+        const uint32_t wg_m      = (tile_mode == 2u || tile_mode == 1u) ? 16u
+                                 : (desc.prec_f32 ? 32u : 64u);
 
         const agx_kernel * k = get_or_compile_mma_gemm(ctx, desc.layout, tile_mode, desc.prec_f32);
         if (!k) {
@@ -241,13 +259,10 @@ bool agx_gemm_dispatch(agx_backend_context * ctx,
 
     if (desc.layout == AGX_WEIGHT_NVFP4_REPACKED || desc.layout == AGX_WEIGHT_NVFP4_RAW) {
         const bool repacked = (desc.layout == AGX_WEIGHT_NVFP4_REPACKED);
-        // Use K_SGS=4 (4 simdgroups splitting K over 16 rows) when N*batch_z is medium
-        // so all 40 GPU cores stay saturated; use K_SGS=1 (zero barrier; fused 32 rows/sg
-        // = 128 rows/WG for repacked B=1!) for huge N!
         const uint32_t n_halves = (desc.N + 15u) / 16u;
         const uint32_t k_sgs    = ((n_halves * batch_z) < 640u && desc.K >= 256u) ? 4u : 1u;
 
-        const agx_kernel * k = get_or_compile_nvfp4_vecmat(ctx, repacked, m_spec, k_sgs);
+        const agx_kernel * k = get_or_compile_nvfp4_vecmat(ctx, repacked, m_spec, k_sgs, desc.prec_f32);
         if (!k) {
             return false;
         }
@@ -273,24 +288,27 @@ bool agx_gemm_dispatch(agx_backend_context * ctx,
     }
 
     // Q8_0 / MXFP8 / F8_E4M3 / BF16 / F16 / F32 vec-mat
-    uint32_t quant_mode = 6u;
-    uint32_t rows_per_wg = 4u; // 4 simdgroups x 1 row/sg
+    uint32_t quant_mode  = 6u;
+    uint32_t rows_per_wg = 4u;
+    bool     can_ksplit  = false;
     switch (desc.layout) {
-        case AGX_WEIGHT_Q8_0_REPACKED:  quant_mode = 0u; rows_per_wg = 8u; break; // 4 sg x 2 rows/sg
+        case AGX_WEIGHT_Q8_0_REPACKED:  quant_mode = 0u; rows_per_wg = 8u; can_ksplit = ((desc.K & 3u) == 0u && (x_stride & 3u) == 0u); break;
         case AGX_WEIGHT_Q8_0_RAW:       quant_mode = 1u; rows_per_wg = 4u; break;
         case AGX_WEIGHT_MXFP8_REPACKED: quant_mode = 2u; rows_per_wg = 4u; break;
         case AGX_WEIGHT_F8_E4M3:        quant_mode = 3u; rows_per_wg = 4u; break;
-        case AGX_WEIGHT_BF16:           quant_mode = 4u; rows_per_wg = 4u; break;
-        case AGX_WEIGHT_F16:            quant_mode = 5u; rows_per_wg = 4u; break;
-        case AGX_WEIGHT_F32:            quant_mode = 6u; rows_per_wg = 4u; break;
+        case AGX_WEIGHT_BF16:           quant_mode = 4u; rows_per_wg = 4u; can_ksplit = true; break;
+        case AGX_WEIGHT_F16:            quant_mode = 5u; rows_per_wg = 4u; can_ksplit = true; break;
+        case AGX_WEIGHT_F32:            quant_mode = 6u; rows_per_wg = 4u; can_ksplit = true; break;
         default: return false;
     }
 
-    const agx_kernel * k = get_or_compile_q8_mxfp8_vecmat(ctx, quant_mode, m_spec);
+    // Use K_SPLIT_ROW (all 4 sgs split K over 1 row -> 4x core occupancy!) on narrow-N, large-K
+    const bool k_split_row = can_ksplit && (desc.N * batch_z <= 256u) && (desc.K >= 512u);
+    const agx_kernel * k = get_or_compile_q8_mxfp8_vecmat(ctx, quant_mode, m_spec, k_split_row);
     if (!k) {
         return false;
     }
-    const uint32_t gx = (desc.N + rows_per_wg - 1u) / rows_per_wg;
+    const uint32_t gx = k_split_row ? desc.N : ((desc.N + rows_per_wg - 1u) / rows_per_wg);
 
     if (desc.M <= 5u) {
         return agx_cdm_dispatch(stream, k, gx, 1u, batch_z, &pc, sizeof(pc), desc.post_barrier);

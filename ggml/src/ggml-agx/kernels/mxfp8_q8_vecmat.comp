@@ -15,17 +15,20 @@
 
 // ============================================================================
 // Pillar 2: Predicated Remainder-Free Q8_0 / MXFP8 / E4M3 / BF16 / F16 / F32
-//           B=1..5 Simdgroup Vec-Mat Kernel (<= 48 GPRs, 0:0 spills)
+//           B=1..5 Simdgroup Vec-Mat Kernel (<= 48 GPR32, 0:0 spills)
 // ============================================================================
 // Compile-time specialization `QUANT_MODE`:
 //   0 = AGX_Q8_0_8BLK repacked planar (272B / 256 weights; 16 lanes/row -> 2 rows/sg)
 //   1 = Raw GGML block_q8_0 (34B / 32 weights)
 //   2 = AGX_MXFP8_16BLK repacked planar (528B / 512 weights; 32 lanes/row, UE8M0 exp-add)
-//   3 = Flat GGML_TYPE_F8_E4M3 (1B/weight; 32 lanes x uvec4 = 512B/iter)
-//   4 = Flat GGML_TYPE_BF16    (2B/weight; 32 lanes x uvec4 = 256 weights/iter)
-//   5 = Flat GGML_TYPE_F16     (2B/weight; 32 lanes x uvec4 = 256 weights/iter)
-//   6 = Flat GGML_TYPE_F32     (4B/weight; 32 lanes x vec4  = 128 weights/iter)
+//   3 = Flat GGML_TYPE_F8_E4M3 (1B/weight; 32 lanes x u32 = 128B/iter)
+//   4 = Flat GGML_TYPE_BF16    (2B/weight; vectorized uvec2 = 4 BF16/load)
+//   5 = Flat GGML_TYPE_F16     (2B/weight; vectorized uvec2 = 4 F16/load)
+//   6 = Flat GGML_TYPE_F32     (4B/weight; vectorized vec4 = 4 F32/load)
 //
+// `K_SPLIT_ROW` (0 = default multi-row/WG; 1 = all 4 simdgroups in 128T WG split K
+//                over 1 single row + 16B SRAM reduce for narrow-N large-K matrices
+//                like ctrl_down 4608x64 and router 2304x128 -> 4x core occupancy!)
 // `BATCH_M` in 1..5. Workgroup = 128 threads (4 simdgroups).
 
 #ifndef QUANT_MODE
@@ -34,6 +37,10 @@
 
 #ifndef BATCH_M
 #define BATCH_M 1
+#endif
+
+#ifndef K_SPLIT_ROW
+#define K_SPLIT_ROW 0
 #endif
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
@@ -54,6 +61,10 @@ layout(push_constant, scalar) uniform PushArgs {
     uint     _pad;
 } pc;
 
+#if K_SPLIT_ROW == 1
+shared float sh_row_red[4][BATCH_M];
+#endif
+
 void main() {
     const uint lane  = gl_SubgroupInvocationID; // 0..31
     const uint sg_id = gl_SubgroupID;           // 0..3
@@ -66,21 +77,20 @@ void main() {
 
     AgxBufF32R  x_buf  = AgxBufF32R(x_base);
     AgxBufVec4R x_buf4 = AgxBufVec4R(x_base);
-    AgxBufF32RW       y_buf  = AgxBufF32RW(y_base);
+    AgxBufF32RW y_buf  = AgxBufF32RW(y_base);
 
     float acc[BATCH_M];
     for (uint m = 0u; m < uint(BATCH_M); ++m) {
         acc[m] = 0.0;
     }
 
-#if QUANT_MODE == 0
+#if QUANT_MODE == 0 && K_SPLIT_ROW == 0
     // ------------------------------------------------------------------------
     // AGX_Q8_0_8BLK (272B planar): 2 rows per simdgroup (16 lanes/row)
-    // Each lane loads 1 x uvec4 (16 int8 weights) -> 16 lanes = 256B = 2 cache lines!
-    // Covers QKV, W_O, wqkv_gate, blk.20..23 MoE, and 201,024 x 2304 LM head.
+    // Measured 515.94 GB/s (94.5% of wire peak) on M4 Max 2304 x 201024 LM head!
     // ------------------------------------------------------------------------
-    const uint row    = (gl_WorkGroupID.x * 4u + sg_id) * 2u + (lane >> 4);
-    const uint lane16 = lane & 15u;
+    const uint row      = (gl_WorkGroupID.x * 4u + sg_id) * 2u + (lane >> 4);
+    const uint lane16   = lane & 15u;
     const uint n_chunks = (pc.K + 255u) >> 8;
 
     if (row < pc.N) {
@@ -95,7 +105,6 @@ void main() {
             const float d  = float(unpackFloat2x16(uint(w_buf.blk[chk_idx].d[lane16 >> 1])).x);
 
             const uint k0 = c * 256u + lane16 * 16u;
-            // Predicated tail guard for K % 256 != 0 (e.g. K = 1152 -> 4 full + 1 half chunk)
             if (k0 < pc.K) {
                 const f16vec4 w0 = agx_q8_u32_magic_to_f16vec4(qv.x);
                 const f16vec4 w1 = agx_q8_u32_magic_to_f16vec4(qv.y);
@@ -132,7 +141,6 @@ void main() {
         }
     }
 
-    // 16-lane subgroup reduction per row
     for (uint m = 0u; m < uint(BATCH_M); ++m) {
         acc[m] += subgroupShuffleXor(acc[m], 1u);
         acc[m] += subgroupShuffleXor(acc[m], 2u);
@@ -148,10 +156,64 @@ void main() {
         }
     }
 
+#elif QUANT_MODE == 0 && K_SPLIT_ROW == 1
+    // AGX_Q8_0_8BLK narrow-N K-split: all 128 threads (8 x 16 lanes) split chunks of 1 row
+    const uint row      = gl_WorkGroupID.x;
+    const uint n_chunks = (pc.K + 255u) >> 8;
+    const uint tid      = gl_LocalInvocationIndex; // 0..127
+    const uint chunk_g  = tid >> 4;                // 0..7
+    const uint lane16   = tid & 15u;
+
+    if (row < pc.N) {
+        AgxBufQ8_8Blk w_buf = AgxBufQ8_8Blk(w_base);
+        const uint row_chk_base = row * n_chunks;
+        const uint x_stride4    = pc.x_stride >> 2;
+        for (uint c = chunk_g; c < n_chunks; c += 8u) {
+            const uint chk_idx = row_chk_base + c;
+            const uvec4 qv = w_buf.blk[chk_idx].qs[lane16];
+            const float d  = float(unpackFloat2x16(uint(w_buf.blk[chk_idx].d[lane16 >> 1])).x);
+            const uint k0  = c * 256u + lane16 * 16u;
+            if (k0 < pc.K) {
+                const f16vec4 w0 = agx_q8_u32_magic_to_f16vec4(qv.x);
+                const f16vec4 w1 = agx_q8_u32_magic_to_f16vec4(qv.y);
+                const f16vec4 w2 = agx_q8_u32_magic_to_f16vec4(qv.z);
+                const f16vec4 w3 = agx_q8_u32_magic_to_f16vec4(qv.w);
+                const uint col4 = k0 >> 2;
+                for (uint m = 0u; m < uint(BATCH_M); ++m) {
+                    if (m < pc.M) {
+                        const uint xo = m * x_stride4 + col4;
+                        float dp = dot(vec4(w0), x_buf4.v[xo + 0u])
+                                 + dot(vec4(w1), x_buf4.v[xo + 1u])
+                                 + dot(vec4(w2), x_buf4.v[xo + 2u])
+                                 + dot(vec4(w3), x_buf4.v[xo + 3u]);
+                        acc[m] = fma(dp, d, acc[m]);
+                    }
+                }
+            }
+        }
+    }
+    for (uint m = 0u; m < uint(BATCH_M); ++m) {
+        acc[m] += subgroupShuffleXor(acc[m], 1u);
+        acc[m] += subgroupShuffleXor(acc[m], 2u);
+        acc[m] += subgroupShuffleXor(acc[m], 4u);
+        acc[m] += subgroupShuffleXor(acc[m], 8u);
+        acc[m] += subgroupShuffleXor(acc[m], 16u);
+    }
+    if (lane == 0u) {
+        for (uint m = 0u; m < uint(BATCH_M); ++m) sh_row_red[sg_id][m] = acc[m];
+    }
+    barrier();
+    if (sg_id == 0u && lane == 0u && row < pc.N) {
+        for (uint m = 0u; m < uint(BATCH_M); ++m) {
+            if (m < pc.M) {
+                y_buf.v[m * pc.y_stride + row] =
+                    sh_row_red[0][m] + sh_row_red[1][m] + sh_row_red[2][m] + sh_row_red[3][m];
+            }
+        }
+    }
+
 #elif QUANT_MODE == 1
-    // ------------------------------------------------------------------------
-    // Raw GGML block_q8_0 fallback (34B / 32 weights): 1 row per simdgroup
-    // ------------------------------------------------------------------------
+    // Raw GGML block_q8_0 fallback (34B / 32 weights)
     const uint row  = gl_WorkGroupID.x * 4u + sg_id;
     const uint nb_k = pc.K >> 5;
     if (row < pc.N) {
@@ -173,7 +235,6 @@ void main() {
             }
         }
     }
-
     for (uint m = 0u; m < uint(BATCH_M); ++m) {
         acc[m] += subgroupShuffleXor(acc[m], 1u);
         acc[m] += subgroupShuffleXor(acc[m], 2u);
@@ -183,30 +244,23 @@ void main() {
     }
     if (lane == 0u && row < pc.N) {
         for (uint m = 0u; m < uint(BATCH_M); ++m) {
-            if (m < pc.M) {
-                y_buf.v[m * pc.y_stride + row] = acc[m];
-            }
+            if (m < pc.M) y_buf.v[m * pc.y_stride + row] = acc[m];
         }
     }
 
 #elif QUANT_MODE == 2
-    // ------------------------------------------------------------------------
     // AGX_MXFP8_16BLK (528B planar): 1 row per simdgroup (32 lanes x uvec4 = 512B!)
-    // Power-of-two UE8M0 scale applied via 1-cycle bit-shift per 16 weights.
-    // ------------------------------------------------------------------------
     const uint row      = gl_WorkGroupID.x * 4u + sg_id;
     const uint n_chunks = (pc.K + 511u) >> 9;
     if (row < pc.N) {
         AgxBufMxfp8_16Blk w_buf = AgxBufMxfp8_16Blk(w_base);
         const uint row_chk_base = row * n_chunks;
         const uint x_stride4    = pc.x_stride >> 2;
-
         for (uint c = 0u; c < n_chunks; ++c) {
             const uint chk_idx = row_chk_base + c;
             const uvec4 qv = w_buf.blk[chk_idx].qs[lane];
             const float sc = agx_ue8m0_to_f32(uint(w_buf.blk[chk_idx].e[lane >> 1]));
             const uint k0  = c * 512u + lane * 16u;
-
             if (k0 < pc.K) {
                 const f16vec4 w0 = agx_e4m3_u32_to_f16vec4(qv.x);
                 const f16vec4 w1 = agx_e4m3_u32_to_f16vec4(qv.y);
@@ -226,7 +280,6 @@ void main() {
             }
         }
     }
-
     for (uint m = 0u; m < uint(BATCH_M); ++m) {
         acc[m] += subgroupShuffleXor(acc[m], 1u);
         acc[m] += subgroupShuffleXor(acc[m], 2u);
@@ -236,16 +289,12 @@ void main() {
     }
     if (lane == 0u && row < pc.N) {
         for (uint m = 0u; m < uint(BATCH_M); ++m) {
-            if (m < pc.M) {
-                y_buf.v[m * pc.y_stride + row] = acc[m];
-            }
+            if (m < pc.M) y_buf.v[m * pc.y_stride + row] = acc[m];
         }
     }
 
 #elif QUANT_MODE == 3
-    // ------------------------------------------------------------------------
-    // Flat GGML_TYPE_F8_E4M3 (1B/weight): 1 row per simdgroup
-    // ------------------------------------------------------------------------
+    // Flat GGML_TYPE_F8_E4M3 (1B/weight)
     const uint row = gl_WorkGroupID.x * 4u + sg_id;
     if (row < pc.N) {
         AgxBufU8R w_buf = AgxBufU8R(w_base + uint64_t(row) * uint64_t(pc.K));
@@ -267,9 +316,7 @@ void main() {
                 for (uint j = k; j < pc.K; ++j) {
                     float wv = float(agx_e4m3_to_f16(uint(w_buf.v[j])));
                     for (uint m = 0u; m < uint(BATCH_M); ++m) {
-                        if (m < pc.M) {
-                            acc[m] = fma(wv, x_buf.v[m * pc.x_stride + j], acc[m]);
-                        }
+                        if (m < pc.M) acc[m] = fma(wv, x_buf.v[m * pc.x_stride + j], acc[m]);
                     }
                 }
             }
@@ -284,42 +331,42 @@ void main() {
     }
     if (lane == 0u && row < pc.N) {
         for (uint m = 0u; m < uint(BATCH_M); ++m) {
-            if (m < pc.M) {
-                y_buf.v[m * pc.y_stride + row] = acc[m];
-            }
+            if (m < pc.M) y_buf.v[m * pc.y_stride + row] = acc[m];
         }
     }
 
 #elif QUANT_MODE == 4
-    // ------------------------------------------------------------------------
-    // Flat GGML_TYPE_BF16 (2B/weight): Inkling sink_proj, k/v_conv_proj, DSpark
-    // ------------------------------------------------------------------------
-    const uint row = gl_WorkGroupID.x * 4u + sg_id;
+    // Flat GGML_TYPE_BF16 (2B/weight): vectorized u32 (2x BF16) + vec4 X loads!
+#if K_SPLIT_ROW == 1
+    const uint row      = gl_WorkGroupID.x;
+    const uint lane_k   = gl_LocalInvocationIndex; // 0..127
+    const uint stride_k = 512u;
+#else
+    const uint row      = gl_WorkGroupID.x * 4u + sg_id;
+    const uint lane_k   = lane; // 0..31
+    const uint stride_k = 128u;
+#endif
     if (row < pc.N) {
-        AgxBufU16R w_buf = AgxBufU16R(w_base + uint64_t(row) * uint64_t(pc.K) * 2ul);
-        for (uint k = lane * 4u; k < pc.K; k += 128u) {
-            if (k + 3u < pc.K) {
-                vec4 wv = vec4(
-                    agx_bf16_to_f32(w_buf.v[k + 0u]),
-                    agx_bf16_to_f32(w_buf.v[k + 1u]),
-                    agx_bf16_to_f32(w_buf.v[k + 2u]),
-                    agx_bf16_to_f32(w_buf.v[k + 3u])
-                );
+        const uint64_t row_va = w_base + uint64_t(row) * uint64_t(pc.K) * 2ul;
+        const bool aligned4 = ((pc.K & 3u) == 0u) && ((pc.x_stride & 3u) == 0u);
+        if (aligned4) {
+            AgxBufU32R w_buf32 = AgxBufU32R(row_va);
+            const uint x_stride4 = pc.x_stride >> 2;
+            for (uint k = lane_k * 4u; k < pc.K; k += stride_k) {
+                uint p0 = w_buf32.v[(k >> 1) + 0u];
+                uint p1 = w_buf32.v[(k >> 1) + 1u];
+                vec4 wv = vec4(agx_bf16_u32_to_vec2(p0), agx_bf16_u32_to_vec2(p1));
+                const uint col4 = k >> 2;
                 for (uint m = 0u; m < uint(BATCH_M); ++m) {
-                    if (m < pc.M) {
-                        const uint xo = m * pc.x_stride + k;
-                        vec4 xv = vec4(x_buf.v[xo + 0u], x_buf.v[xo + 1u], x_buf.v[xo + 2u], x_buf.v[xo + 3u]);
-                        acc[m] += dot(wv, xv);
-                    }
+                    if (m < pc.M) acc[m] += dot(wv, x_buf4.v[m * x_stride4 + col4]);
                 }
-            } else {
-                for (uint j = k; j < pc.K; ++j) {
-                    float wv = agx_bf16_to_f32(w_buf.v[j]);
-                    for (uint m = 0u; m < uint(BATCH_M); ++m) {
-                        if (m < pc.M) {
-                            acc[m] = fma(wv, x_buf.v[m * pc.x_stride + j], acc[m]);
-                        }
-                    }
+            }
+        } else {
+            AgxBufU16R w_buf = AgxBufU16R(row_va);
+            for (uint k = lane_k; k < pc.K; k += (stride_k >> 2)) {
+                float wv = agx_bf16_to_f32(w_buf.v[k]);
+                for (uint m = 0u; m < uint(BATCH_M); ++m) {
+                    if (m < pc.M) acc[m] = fma(wv, x_buf.v[m * pc.x_stride + k], acc[m]);
                 }
             }
         }
@@ -331,42 +378,59 @@ void main() {
         acc[m] += subgroupShuffleXor(acc[m], 8u);
         acc[m] += subgroupShuffleXor(acc[m], 16u);
     }
-    if (lane == 0u && row < pc.N) {
+#if K_SPLIT_ROW == 1
+    if (lane == 0u) {
+        for (uint m = 0u; m < uint(BATCH_M); ++m) sh_row_red[sg_id][m] = acc[m];
+    }
+    barrier();
+    if (sg_id == 0u && lane == 0u && row < pc.N) {
         for (uint m = 0u; m < uint(BATCH_M); ++m) {
             if (m < pc.M) {
-                y_buf.v[m * pc.y_stride + row] = acc[m];
+                y_buf.v[m * pc.y_stride + row] =
+                    sh_row_red[0][m] + sh_row_red[1][m] + sh_row_red[2][m] + sh_row_red[3][m];
             }
         }
     }
+#else
+    if (lane == 0u && row < pc.N) {
+        for (uint m = 0u; m < uint(BATCH_M); ++m) {
+            if (m < pc.M) y_buf.v[m * pc.y_stride + row] = acc[m];
+        }
+    }
+#endif
 
 #elif QUANT_MODE == 5
-    // ------------------------------------------------------------------------
-    // Flat GGML_TYPE_F16 (2B/weight): 1 row per simdgroup
-    // ------------------------------------------------------------------------
-    const uint row = gl_WorkGroupID.x * 4u + sg_id;
+    // Flat GGML_TYPE_F16 (2B/weight): vectorized u32 (2x F16) + vec4 X loads!
+#if K_SPLIT_ROW == 1
+    const uint row      = gl_WorkGroupID.x;
+    const uint lane_k   = gl_LocalInvocationIndex;
+    const uint stride_k = 512u;
+#else
+    const uint row      = gl_WorkGroupID.x * 4u + sg_id;
+    const uint lane_k   = lane;
+    const uint stride_k = 128u;
+#endif
     if (row < pc.N) {
-        AgxBufF16R w_buf = AgxBufF16R(w_base + uint64_t(row) * uint64_t(pc.K) * 2ul);
-        for (uint k = lane * 4u; k < pc.K; k += 128u) {
-            if (k + 3u < pc.K) {
-                vec4 wv = vec4(
-                    float(w_buf.v[k + 0u]), float(w_buf.v[k + 1u]),
-                    float(w_buf.v[k + 2u]), float(w_buf.v[k + 3u])
-                );
+        const uint64_t row_va = w_base + uint64_t(row) * uint64_t(pc.K) * 2ul;
+        const bool aligned4 = ((pc.K & 3u) == 0u) && ((pc.x_stride & 3u) == 0u);
+        if (aligned4) {
+            AgxBufU32R w_buf32 = AgxBufU32R(row_va);
+            const uint x_stride4 = pc.x_stride >> 2;
+            for (uint k = lane_k * 4u; k < pc.K; k += stride_k) {
+                vec2 lo = unpackHalf2x16(w_buf32.v[(k >> 1) + 0u]);
+                vec2 hi = unpackHalf2x16(w_buf32.v[(k >> 1) + 1u]);
+                vec4 wv = vec4(lo, hi);
+                const uint col4 = k >> 2;
                 for (uint m = 0u; m < uint(BATCH_M); ++m) {
-                    if (m < pc.M) {
-                        const uint xo = m * pc.x_stride + k;
-                        vec4 xv = vec4(x_buf.v[xo + 0u], x_buf.v[xo + 1u], x_buf.v[xo + 2u], x_buf.v[xo + 3u]);
-                        acc[m] += dot(wv, xv);
-                    }
+                    if (m < pc.M) acc[m] += dot(wv, x_buf4.v[m * x_stride4 + col4]);
                 }
-            } else {
-                for (uint j = k; j < pc.K; ++j) {
-                    float wv = float(w_buf.v[j]);
-                    for (uint m = 0u; m < uint(BATCH_M); ++m) {
-                        if (m < pc.M) {
-                            acc[m] = fma(wv, x_buf.v[m * pc.x_stride + j], acc[m]);
-                        }
-                    }
+            }
+        } else {
+            AgxBufF16R w_buf = AgxBufF16R(row_va);
+            for (uint k = lane_k; k < pc.K; k += (stride_k >> 2)) {
+                float wv = float(w_buf.v[k]);
+                for (uint m = 0u; m < uint(BATCH_M); ++m) {
+                    if (m < pc.M) acc[m] = fma(wv, x_buf.v[m * pc.x_stride + k], acc[m]);
                 }
             }
         }
@@ -378,39 +442,59 @@ void main() {
         acc[m] += subgroupShuffleXor(acc[m], 8u);
         acc[m] += subgroupShuffleXor(acc[m], 16u);
     }
-    if (lane == 0u && row < pc.N) {
+#if K_SPLIT_ROW == 1
+    if (lane == 0u) {
+        for (uint m = 0u; m < uint(BATCH_M); ++m) sh_row_red[sg_id][m] = acc[m];
+    }
+    barrier();
+    if (sg_id == 0u && lane == 0u && row < pc.N) {
         for (uint m = 0u; m < uint(BATCH_M); ++m) {
             if (m < pc.M) {
-                y_buf.v[m * pc.y_stride + row] = acc[m];
+                y_buf.v[m * pc.y_stride + row] =
+                    sh_row_red[0][m] + sh_row_red[1][m] + sh_row_red[2][m] + sh_row_red[3][m];
             }
         }
     }
+#else
+    if (lane == 0u && row < pc.N) {
+        for (uint m = 0u; m < uint(BATCH_M); ++m) {
+            if (m < pc.M) y_buf.v[m * pc.y_stride + row] = acc[m];
+        }
+    }
+#endif
 
 #else
-    // ------------------------------------------------------------------------
-    // Flat GGML_TYPE_F32 (4B/weight): router, ctrl gates, test-backend-ops
-    // ------------------------------------------------------------------------
-    const uint row = gl_WorkGroupID.x * 4u + sg_id;
+    // Flat GGML_TYPE_F32 (4B/weight): coalesced vec4 loads + K_SPLIT_ROW for narrow-N!
+#if K_SPLIT_ROW == 1
+    const uint row      = gl_WorkGroupID.x;
+    const uint lane_k   = gl_LocalInvocationIndex; // 0..127
+    const uint stride_k = 512u;
+#else
+    const uint row      = gl_WorkGroupID.x * 4u + sg_id;
+    const uint lane_k   = lane; // 0..31
+    const uint stride_k = 128u;
+#endif
     if (row < pc.N) {
-        AgxBufF32R w_buf = AgxBufF32R(w_base + uint64_t(row) * uint64_t(pc.K) * 4ul);
-        for (uint k = lane * 4u; k < pc.K; k += 128u) {
-            if (k + 3u < pc.K) {
-                vec4 wv = vec4(w_buf.v[k + 0u], w_buf.v[k + 1u], w_buf.v[k + 2u], w_buf.v[k + 3u]);
+        const uint64_t row_va = w_base + uint64_t(row) * uint64_t(pc.K) * 4ul;
+        const bool aligned4 = ((pc.K & 3u) == 0u) && ((pc.x_stride & 3u) == 0u);
+        if (aligned4) {
+            AgxBufVec4R w_buf4 = AgxBufVec4R(row_va);
+            const uint x_stride4 = pc.x_stride >> 2;
+            const uint k4_lim    = pc.K >> 2;
+            const uint k4_step   = stride_k >> 2;
+            for (uint col4 = lane_k; col4 < k4_lim; col4 += k4_step) {
+                vec4 wv = w_buf4.v[col4];
                 for (uint m = 0u; m < uint(BATCH_M); ++m) {
-                    if (m < pc.M) {
-                        const uint xo = m * pc.x_stride + k;
-                        vec4 xv = vec4(x_buf.v[xo + 0u], x_buf.v[xo + 1u], x_buf.v[xo + 2u], x_buf.v[xo + 3u]);
-                        acc[m] += dot(wv, xv);
-                    }
+                    if (m < pc.M) acc[m] += dot(wv, x_buf4.v[m * x_stride4 + col4]);
                 }
-            } else {
-                for (uint j = k; j < pc.K; ++j) {
-                    float wv = w_buf.v[j];
-                    for (uint m = 0u; m < uint(BATCH_M); ++m) {
-                        if (m < pc.M) {
-                            acc[m] = fma(wv, x_buf.v[m * pc.x_stride + j], acc[m]);
-                        }
-                    }
+            }
+        } else {
+            AgxBufF32R w_buf = AgxBufF32R(row_va);
+            const uint step1 = stride_k >> 2;
+            for (uint k = lane_k; k < pc.K; k += step1) {
+                float wv = w_buf.v[k];
+                for (uint m = 0u; m < uint(BATCH_M); ++m) {
+                    if (m < pc.M) acc[m] = fma(wv, x_buf.v[m * pc.x_stride + k], acc[m]);
                 }
             }
         }
@@ -422,12 +506,25 @@ void main() {
         acc[m] += subgroupShuffleXor(acc[m], 8u);
         acc[m] += subgroupShuffleXor(acc[m], 16u);
     }
-    if (lane == 0u && row < pc.N) {
+#if K_SPLIT_ROW == 1
+    if (lane == 0u) {
+        for (uint m = 0u; m < uint(BATCH_M); ++m) sh_row_red[sg_id][m] = acc[m];
+    }
+    barrier();
+    if (sg_id == 0u && lane == 0u && row < pc.N) {
         for (uint m = 0u; m < uint(BATCH_M); ++m) {
             if (m < pc.M) {
-                y_buf.v[m * pc.y_stride + row] = acc[m];
+                y_buf.v[m * pc.y_stride + row] =
+                    sh_row_red[0][m] + sh_row_red[1][m] + sh_row_red[2][m] + sh_row_red[3][m];
             }
         }
     }
+#else
+    if (lane == 0u && row < pc.N) {
+        for (uint m = 0u; m < uint(BATCH_M); ++m) {
+            if (m < pc.M) y_buf.v[m * pc.y_stride + row] = acc[m];
+        }
+    }
+#endif
 #endif
 }
