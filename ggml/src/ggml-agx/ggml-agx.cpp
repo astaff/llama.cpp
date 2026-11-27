@@ -5,7 +5,14 @@
 #include "agx-compiler.h"
 
 #include "ggml-backend-impl.h"
+#if defined(__GNUC__) || defined(__clang__)
+#    pragma GCC diagnostic push
+#    pragma GCC diagnostic ignored "-Wunused-function"
+#endif
 #include "ggml-impl.h"
+#if defined(__GNUC__) || defined(__clang__)
+#    pragma GCC diagnostic pop
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -55,6 +62,12 @@ AGX_WEAK void agx_repack_get_tensor(const struct ggml_tensor * tensor, void * da
 AGX_WEAK bool agx_supports_op(const agx_drm_device * dev, const struct ggml_tensor * op) {
     (void) dev;
     (void) op;
+    return false;
+}
+
+AGX_WEAK bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_cgraph * cgraph) {
+    (void) ctx;
+    (void) cgraph;
     return false;
 }
 
@@ -416,6 +429,10 @@ static void agx_backend_free(ggml_backend_t backend) {
             agx_cdm_wait(ctx->stream, nullptr);
         }
         agx_graph_exec_cleanup(ctx);
+        if (ctx->slc_arena) {
+            agx_slc_arena_destroy(ctx->drm, ctx->slc_arena);
+            ctx->slc_arena = nullptr;
+        }
         if (ctx->stream) {
             agx_cdm_stream_destroy(ctx->stream);
             ctx->stream = nullptr;
@@ -455,6 +472,11 @@ static bool agx_backend_cpy_tensor_async(ggml_backend_t backend_src, ggml_backen
     return agx_buf_cpy_tensor(dst->buffer, src, dst);
 }
 
+static bool agx_megakernel_enabled() {
+    const char * v = std::getenv("GGML_AGX_NO_MEGAKERNEL");
+    return !(v && v[0] && v[0] != '0');
+}
+
 static enum ggml_status agx_backend_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     auto * ctx = static_cast<agx_backend_context *>(backend->context);
     if (!ctx || !ctx->drm || !ctx->stream) {
@@ -464,6 +486,11 @@ static enum ggml_status agx_backend_graph_compute(ggml_backend_t backend, struct
         return GGML_STATUS_SUCCESS;
     }
 
+    const bool use_megakernel = agx_megakernel_enabled();
+    if (ctx->last_replay_megakernel != use_megakernel) {
+        agx_cdm_stream_invalidate_replay(ctx->stream);
+    }
+
     const bool can_replay = !ctx->debug && !ctx->profile &&
                             cgraph->uid != 0 &&
                             agx_cdm_replay_enabled();
@@ -471,6 +498,9 @@ static enum ggml_status agx_backend_graph_compute(ggml_backend_t backend, struct
         const void * first_node = cgraph->nodes[0];
         const void * last_node  = cgraph->nodes[cgraph->n_nodes - 1];
         const uint64_t bo_epoch = agx_drm_get_bo_epoch(ctx->drm);
+        if (ctx->slc_arena) {
+            agx_slc_arena_prepare_sense_barrier_replay(ctx->slc_arena);
+        }
         int replay_ret = 0;
         if (agx_cdm_stream_try_replay(ctx->stream, cgraph->uid, cgraph->n_nodes,
                                       first_node, last_node, bo_epoch,
@@ -484,7 +514,21 @@ static enum ggml_status agx_backend_graph_compute(ggml_backend_t backend, struct
     }
 
     const uint64_t submits_before = agx_cdm_stream_submit_count(ctx->stream);
-    const enum ggml_status st = agx_graph_compute(ctx, cgraph);
+    enum ggml_status st = GGML_STATUS_FAILED;
+    bool handled = false;
+    if (use_megakernel) {
+        if (agx_inkling2_try_execute(ctx, cgraph)) {
+            handled = true;
+            st = (agx_drm_vm_error(ctx->drm) == 0) ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
+        } else if (agx_drm_vm_error(ctx->drm) != 0) {
+            handled = true;
+            st = GGML_STATUS_FAILED;
+        }
+    }
+    if (!handled) {
+        st = agx_graph_compute(ctx, cgraph);
+    }
+
     if (st == GGML_STATUS_SUCCESS && can_replay) {
         const uint64_t submits_after = agx_cdm_stream_submit_count(ctx->stream);
         if (submits_after == submits_before + 1ULL &&
@@ -494,6 +538,7 @@ static enum ggml_status agx_backend_graph_compute(ggml_backend_t backend, struct
             agx_cdm_stream_tag_replay(ctx->stream, cgraph->uid, cgraph->n_nodes,
                                       cgraph->nodes[0], cgraph->nodes[cgraph->n_nodes - 1],
                                       bo_epoch_after);
+            ctx->last_replay_megakernel = use_megakernel;
         } else {
             agx_cdm_stream_invalidate_replay(ctx->stream);
         }
@@ -674,17 +719,20 @@ static bool agx_dev_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor
 
     // During model weight placement (`llama-model-loader.cpp:weight_buft_supported`),
     // `make_gpu_buft_list` probes `AGX0` (default) before `AGX0_Repack` (extra_bufts[0])
-    // using a zero-size probe buffer (`bctx->bo == nullptr`). For repackable NVFP4/Q8_0
+    // using a zero-size dummy buffer (`ggml_backend_buft_alloc_buffer(buft, 0)` short-circuits
+    // with `buf->size == 0` and `buf->context == nullptr`). For repackable NVFP4/Q8_0
     // weight matrices used by MUL_MAT / MUL_MAT_ID, decline the default probe so
     // `select_weight_buft` advances directly to `AGX0_Repack` (128B super-tiles + Pillar 4
     // SLC streaming). Unallocated `test-backend-ops` probes (`w->buffer == nullptr`) and
-    // real allocated buffers (`bctx->bo != nullptr`) are unaffected.
+    // real allocated buffers (`buf->size > 0 && bctx->bo != nullptr`) are unaffected.
     if ((op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) &&
-        op->src[0] && op->src[0]->buffer && op->src[0]->buffer->context &&
+        op->src[0] && op->src[0]->buffer &&
         std::getenv("GGML_AGX_NO_REPACK") == nullptr) {
-        const auto * bctx = static_cast<const agx_buffer_ctx *>(op->src[0]->buffer->context);
-        if (bctx->bo == nullptr && bctx->size == 0 && !bctx->is_repacked &&
-            op->src[0]->buffer->buft == &st->buft_default &&
+        const ggml_backend_buffer_t buf = op->src[0]->buffer;
+        const auto * bctx = static_cast<const agx_buffer_ctx *>(buf->context);
+        const bool is_zero_probe = (buf->size == 0 && (bctx == nullptr || bctx->bo == nullptr));
+        if (is_zero_probe &&
+            buf->buft == &st->buft_default &&
             agx_repack_supports_tensor(op->src[0])) {
             return false;
         }
@@ -803,11 +851,17 @@ static void * agx_reg_get_proc_address(ggml_backend_reg_t reg, const char * name
     }
     if (std::strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
         ggml_backend_dev_get_extra_bufts_t fn = agx_dev_get_extra_bufts;
-        return reinterpret_cast<void *>(fn);
+        void * p = nullptr;
+        static_assert(sizeof(p) == sizeof(fn), "function pointer size mismatch");
+        std::memcpy(&p, &fn, sizeof(p));
+        return p;
     }
     if (std::strcmp(name, "ggml_backend_get_features") == 0) {
         ggml_backend_get_features_t fn = agx_reg_get_features;
-        return reinterpret_cast<void *>(fn);
+        void * p = nullptr;
+        static_assert(sizeof(p) == sizeof(fn), "function pointer size mismatch");
+        std::memcpy(&p, &fn, sizeof(p));
+        return p;
     }
     return nullptr;
 }

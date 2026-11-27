@@ -112,3 +112,18 @@ int32_t  agx_drm_vm_error(agx_drm_device * dev);
 uint64_t agx_drm_get_bo_epoch(const agx_drm_device * dev);
 uint64_t agx_drm_get_gpu_time_ns(agx_drm_device * dev);
 uint64_t agx_drm_ticks_to_ns(const agx_drm_device * dev, uint64_t ticks);
+
+// Wave 4: Static 8 MiB AGX_BO_SLC_PIN activation arena + 128B sense-reversing barrier
+agx_slc_arena * agx_slc_arena_create(agx_drm_device * dev);
+void            agx_slc_arena_destroy(agx_drm_device * dev, agx_slc_arena * arena);
+// Zero the entire 128B sense_barrier cache line (arrived=0, sense=0, epoch=0, n_workgroups=0).
+void            agx_slc_arena_zero_sense_barrier(agx_slc_arena * arena);
+// Zero the 128B sense_barrier cache line and program participating workgroup count (e.g. 40).
+void            agx_slc_arena_reset_sense_barrier(agx_slc_arena * arena, uint32_t n_workgroups = 0);
+// Reset dynamic barrier counters (arrived=0, sense=0, epoch=0, stage=0, pass=0) while preserving
+// n_workgroups; safe to invoke immediately before replaying a recorded persistent CDM stream.
+void            agx_slc_arena_prepare_sense_barrier_replay(agx_slc_arena * arena);
+// Zero the 48-slot shortconv history region inside the arena.
+void            agx_slc_arena_reset_sconv_state(agx_slc_arena * arena);
+// Lazily allocate and return `ctx->slc_arena` (freed automatically in `agx_backend_free`).
+agx_slc_arena * agx_backend_get_slc_arena(agx_backend_context * ctx);

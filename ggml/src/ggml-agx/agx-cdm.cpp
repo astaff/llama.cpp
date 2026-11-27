@@ -586,6 +586,7 @@ struct agx_cdm_stream {
     bool             terminated       = false;
     bool             has_external_args = false;
     bool             last_submit_has_ts = false;
+    bool             allow_replay     = true;
 
     uint64_t         in_flight_point  = 0;
     uint64_t         record_gen       = 0;
@@ -672,6 +673,7 @@ void agx_cdm_stream_reset(agx_cdm_stream * s) {
     s->last_launch_elidable = false;
     s->terminated           = false;
     s->has_external_args    = false;
+    s->allow_replay         = true;
     s->submits_since_reset  = 0;
     s->record_gen++;
     s->replay.valid         = false;
@@ -1346,6 +1348,15 @@ uint64_t agx_cdm_get_sense_barrier_va(agx_cdm_stream * s) {
     return (s && s->sense_barrier_bo) ? s->sense_barrier_bo->gpu_va : 0;
 }
 
+void agx_cdm_zero_sense_barrier(agx_cdm_stream * s) {
+    if (!s || !s->sense_barrier_bo) {
+        return;
+    }
+    auto * st = static_cast<agx_sense_barrier_state *>(s->sense_barrier_bo->cpu_ptr);
+    std::memset(st, 0, sizeof(*st));
+    __sync_synchronize();
+}
+
 void agx_cdm_reset_sense_barrier(agx_cdm_stream * s, uint32_t n_workgroups) {
     if (!s || !s->sense_barrier_bo) {
         return;
@@ -1386,7 +1397,16 @@ uint64_t agx_cdm_stream_submit_count(const agx_cdm_stream * s) {
 }
 
 bool agx_cdm_stream_is_replayable(const agx_cdm_stream * s) {
-    return s && s->terminated && s->cmd_offset > 0 && s->submits_since_reset >= 1u;
+    return s && s->allow_replay && s->terminated && s->cmd_offset > 0 && s->submits_since_reset >= 1u;
+}
+
+void agx_cdm_stream_set_replayable(agx_cdm_stream * s, bool replayable) {
+    if (s) {
+        s->allow_replay = replayable;
+        if (!replayable) {
+            s->replay.valid = false;
+        }
+    }
 }
 
 void agx_cdm_stream_invalidate_replay(agx_cdm_stream * s) {
@@ -1431,6 +1451,7 @@ bool agx_cdm_stream_try_replay(agx_cdm_stream * s,
     const auto t_enter = emit_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
     if (!s->replay.valid ||
+        !s->allow_replay ||
         s->replay.graph_uid != graph_uid ||
         s->replay.n_nodes != n_nodes ||
         s->replay.first_node != first_node ||
@@ -1442,6 +1463,18 @@ bool agx_cdm_stream_try_replay(agx_cdm_stream * s,
         !agx_cdm_replay_enabled() ||
         agx_drm_vm_error(s->dev) != 0) {
         return false;
+    }
+
+    // Reset stream sense-reversing barrier counters (arrived=0, sense=0, epoch=0)
+    // while preserving n_workgroups so replaying an odd-phase persistent megakernel
+    // never races against a leftover sense=1 from the previous submission.
+    if (s->sense_barrier_bo && s->sense_barrier_bo->cpu_ptr) {
+        auto * st = static_cast<agx_sense_barrier_state *>(s->sense_barrier_bo->cpu_ptr);
+        st->arrived = 0u;
+        st->sense   = 0u;
+        st->epoch   = 0u;
+        st->stage   = 0u;
+        st->pass    = 0u;
     }
 
     const auto t_sub = emit_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

@@ -1464,3 +1464,123 @@ uint64_t agx_drm_ticks_to_ns(const agx_drm_device * dev, uint64_t ticks) {
     }
     return (ticks * dev->ts_mul) / dev->ts_div;
 }
+
+// ============================================================================
+// Wave 4: Static 8 MiB AGX_BO_SLC_PIN Activation Arena + 128B Sense Barrier
+// ============================================================================
+
+agx_slc_arena * agx_slc_arena_create(agx_drm_device * dev) {
+    if (!dev) {
+        return nullptr;
+    }
+
+    agx_bo * bo = agx_bo_alloc(dev,
+                               static_cast<size_t>(AGX_SLC_ARENA_TOTAL_BYTES),
+                               AGX_BO_SLC_PIN | AGX_BO_WRITEBACK | AGX_BO_ZERO,
+                               "agx-slc-arena");
+    if (!bo) {
+        AGX_LOG_ERROR("agx_slc_arena_create: failed to allocate %llu-byte AGX_BO_SLC_PIN arena",
+                      (unsigned long long) AGX_SLC_ARENA_TOTAL_BYTES);
+        return nullptr;
+    }
+
+    auto * arena = new agx_slc_arena{};
+    arena->bo                  = bo;
+    arena->base_va             = bo->gpu_va;
+    arena->cpu_base            = bo->cpu_ptr;
+    arena->total_bytes         = static_cast<size_t>(AGX_SLC_ARENA_TOTAL_BYTES);
+    arena->used_bytes          = static_cast<size_t>(AGX_SLC_ARENA_USED_BYTES);
+    arena->max_m               = AGX_SLC_ARENA_MAX_M;
+
+    const uint64_t base        = bo->gpu_va;
+    arena->sense_barrier_va    = base + AGX_SLC_ARENA_OFF_SENSE_BARRIER;
+    arena->h_cur               = base + AGX_SLC_ARENA_OFF_H_CUR;
+    arena->h_msg               = base + AGX_SLC_ARENA_OFF_H_MSG;
+    for (uint32_t b = 0; b < AGX_SLC_ARENA_RES_BLOCKS; ++b) {
+        arena->res_blocks[b]   = base + AGX_SLC_ARENA_OFF_RES_BLOCKS +
+                                 static_cast<uint64_t>(b) * AGX_SLC_ARENA_RES_BLOCK_BYTES;
+    }
+    arena->qkv_buf             = base + AGX_SLC_ARENA_OFF_QKV_BUF;
+    arena->attn_out            = base + AGX_SLC_ARENA_OFF_ATTN_OUT;
+    arena->ctrl_scratch        = base + AGX_SLC_ARENA_OFF_CTRL_SCRATCH;
+    arena->moe_inter           = base + AGX_SLC_ARENA_OFF_MOE_INTER;
+    arena->router_topk         = base + AGX_SLC_ARENA_OFF_ROUTER_TOPK;
+    arena->router_topk_w       = arena->router_topk + AGX_SLC_ARENA_ROUTER_W_OFFSET;
+    arena->sconv_state         = base + AGX_SLC_ARENA_OFF_SCONV_STATE;
+    arena->extra_scratch       = base + AGX_SLC_ARENA_OFF_EXTRA_SCRATCH;
+    arena->extra_scratch_bytes = arena->total_bytes - arena->used_bytes;
+
+    arena->sense_barrier_cpu   = reinterpret_cast<agx_sense_barrier_state *>(
+        static_cast<uint8_t *>(bo->cpu_ptr) + AGX_SLC_ARENA_OFF_SENSE_BARRIER);
+
+    agx_slc_arena_zero_sense_barrier(arena);
+
+    AGX_LOG_INFO("Allocated Wave 4 SLC_PIN arena: va=0x%llx size=%.2f MiB (used=%.2f MiB, extra=%.2f MiB, sense_va=0x%llx)",
+                 (unsigned long long) arena->base_va,
+                 static_cast<double>(arena->total_bytes) / (1024.0 * 1024.0),
+                 static_cast<double>(arena->used_bytes) / (1024.0 * 1024.0),
+                 static_cast<double>(arena->extra_scratch_bytes) / (1024.0 * 1024.0),
+                 (unsigned long long) arena->sense_barrier_va);
+    return arena;
+}
+
+void agx_slc_arena_destroy(agx_drm_device * dev, agx_slc_arena * arena) {
+    if (!arena) {
+        return;
+    }
+    if (arena->bo) {
+        agx_bo_free(dev ? dev : arena->bo->dev, arena->bo);
+        arena->bo = nullptr;
+    }
+    delete arena;
+}
+
+void agx_slc_arena_zero_sense_barrier(agx_slc_arena * arena) {
+    if (!arena || !arena->sense_barrier_cpu) {
+        return;
+    }
+    std::memset(arena->sense_barrier_cpu, 0, sizeof(agx_sense_barrier_state));
+    __sync_synchronize();
+}
+
+void agx_slc_arena_reset_sense_barrier(agx_slc_arena * arena, uint32_t n_workgroups) {
+    if (!arena || !arena->sense_barrier_cpu) {
+        return;
+    }
+    std::memset(arena->sense_barrier_cpu, 0, sizeof(agx_sense_barrier_state));
+    arena->sense_barrier_cpu->n_workgroups = n_workgroups;
+    __sync_synchronize();
+}
+
+void agx_slc_arena_prepare_sense_barrier_replay(agx_slc_arena * arena) {
+    if (!arena || !arena->sense_barrier_cpu) {
+        return;
+    }
+    agx_sense_barrier_state * st = arena->sense_barrier_cpu;
+    st->arrived = 0u;
+    st->sense   = 0u;
+    st->epoch   = 0u;
+    st->stage   = 0u;
+    st->pass    = 0u;
+    __sync_synchronize();
+}
+
+void agx_slc_arena_reset_sconv_state(agx_slc_arena * arena) {
+    if (!arena || !arena->cpu_base) {
+        return;
+    }
+    std::memset(static_cast<uint8_t *>(arena->cpu_base) + AGX_SLC_ARENA_OFF_SCONV_STATE,
+                0,
+                AGX_SLC_ARENA_SCONV_STATE_BYTES);
+    __sync_synchronize();
+}
+
+agx_slc_arena * agx_backend_get_slc_arena(agx_backend_context * ctx) {
+    if (!ctx || !ctx->drm) {
+        return nullptr;
+    }
+    if (!ctx->slc_arena) {
+        ctx->slc_arena = agx_slc_arena_create(ctx->drm);
+    }
+    return ctx->slc_arena;
+}

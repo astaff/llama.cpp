@@ -126,7 +126,8 @@ int              agx_cdm_wait(agx_cdm_stream * stream, uint64_t * out_gpu_ns = n
 // Access the stream's SLC-pinned 128B sense-reversing barrier scratchpad BO.
 agx_bo *         agx_cdm_get_sense_barrier_bo(agx_cdm_stream * stream);
 uint64_t         agx_cdm_get_sense_barrier_va(agx_cdm_stream * stream);
-void             agx_cdm_reset_sense_barrier(agx_cdm_stream * stream, uint32_t n_workgroups);
+void             agx_cdm_zero_sense_barrier(agx_cdm_stream * stream);
+void             agx_cdm_reset_sense_barrier(agx_cdm_stream * stream, uint32_t n_workgroups = 0);
 
 // Diagnostics & counters
 void             agx_cdm_get_stats(const agx_cdm_stream * stream, agx_cdm_stats * out);
@@ -141,6 +142,7 @@ bool             agx_cdm_replay_enabled();
 uint64_t         agx_cdm_stream_record_gen(const agx_cdm_stream * stream);
 uint64_t         agx_cdm_stream_submit_count(const agx_cdm_stream * stream);
 bool             agx_cdm_stream_is_replayable(const agx_cdm_stream * stream);
+void             agx_cdm_stream_set_replayable(agx_cdm_stream * stream, bool replayable);
 bool             agx_cdm_stream_try_replay(agx_cdm_stream * stream,
                                            uint64_t         graph_uid,
                                            int              n_nodes,
