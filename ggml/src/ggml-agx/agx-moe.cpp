@@ -117,10 +117,10 @@ struct agx_moe_runner {
     const agx_kernel * k_zero_out         = nullptr;
     const agx_kernel * k_zero_skipped     = nullptr;
 
-    // Indexed by [weight_mode][batch_slot: 0=(cap 1), 1=(cap 4)]
-    const agx_kernel * k_gu_vecmat[AGX_MOE_WEIGHT_MODES][2]       = {};
-    const agx_kernel * k_down_vecmat[AGX_MOE_WEIGHT_MODES][2]     = {};
-    const agx_kernel * k_down_vecmat_f32[AGX_MOE_WEIGHT_MODES][2] = {};
+    // Indexed by [weight_mode][batch_slot: 0=(cap 1), 1=(cap 4), 2=(cap 8)]
+    const agx_kernel * k_gu_vecmat[AGX_MOE_WEIGHT_MODES][3]       = {};
+    const agx_kernel * k_down_vecmat[AGX_MOE_WEIGHT_MODES][3]     = {};
+    const agx_kernel * k_down_vecmat_f32[AGX_MOE_WEIGHT_MODES][3] = {};
     // Indexed by [weight_mode]
     const agx_kernel * k_gu_gemm[AGX_MOE_WEIGHT_MODES]            = {};
     const agx_kernel * k_down_gemm[AGX_MOE_WEIGHT_MODES]          = {};
@@ -152,7 +152,11 @@ static bool ensure_meta_bo(agx_moe_runner * r, size_t req_assigns) {
     const size_t off_skip = agx_align_up(off, 128u); off = off_skip + cap       * sizeof(uint32_t);
     const size_t total_B  = agx_align_up(off, AGX_PAGE_SIZE);
 
-    r->meta_bo = agx_bo_alloc(r->dev, total_B, AGX_BO_SLC_PIN | AGX_BO_WRITEBACK | AGX_BO_ZERO, "moe-bucket-slc");
+    // Pin hot meta_bo in SLC when <= 8 MiB; stream for huge stress tests (e.g. M=65536 -> 34 MiB!)
+    const uint32_t meta_flags = (total_B <= 8u * 1024u * 1024u)
+        ? (AGX_BO_SLC_PIN | AGX_BO_WRITEBACK | AGX_BO_ZERO)
+        : (AGX_BO_SLC_STREAM | AGX_BO_WRITEBACK | AGX_BO_ZERO);
+    r->meta_bo = agx_bo_alloc(r->dev, total_B, meta_flags, "moe-bucket-slc");
     if (!r->meta_bo) {
         return false;
     }
@@ -222,8 +226,10 @@ static const agx_kernel * get_moe_exec_kernel(agx_moe_runner *  r,
     const uint32_t wm = static_cast<uint32_t>(layout);
     if (wm >= AGX_MOE_WEIGHT_MODES) return nullptr;
 
-    const uint32_t bslot = (batch_cap <= 1u) ? 0u : 1u;
-    const uint32_t bcap  = (bslot == 0u) ? 1u : AGX_MOE_VECMAT_MAX_M;
+    const uint32_t bslot = (batch_cap <= 1u) ? 0u
+                         : (batch_cap <= AGX_MOE_VECMAT_MAX_M) ? 1u : 2u;
+    const uint32_t bcap  = (bslot == 0u) ? 1u
+                         : (bslot == 1u) ? AGX_MOE_VECMAT_MAX_M : AGX_MOE_VECMAT_DSPARK_M;
     const bool use_f32   = prec_f32 &&
                            (layout == AGX_WEIGHT_NVFP4_REPACKED || layout == AGX_WEIGHT_Q8_0_REPACKED) &&
                            (stage == 1u || stage == 4u);
@@ -301,6 +307,10 @@ bool agx_moe_precompile_inkling2(agx_moe_runner * r) {
         ok &= (get_moe_exec_kernel(r, 0u, wm, AGX_MOE_VECMAT_MAX_M) != nullptr);
         ok &= (get_moe_exec_kernel(r, 1u, wm, 1u) != nullptr);
         ok &= (get_moe_exec_kernel(r, 1u, wm, AGX_MOE_VECMAT_MAX_M) != nullptr);
+        if (wm == AGX_WEIGHT_NVFP4_REPACKED || wm == AGX_WEIGHT_Q8_0_REPACKED) {
+            ok &= (get_moe_exec_kernel(r, 0u, wm, AGX_MOE_VECMAT_DSPARK_M) != nullptr);
+            ok &= (get_moe_exec_kernel(r, 1u, wm, AGX_MOE_VECMAT_DSPARK_M) != nullptr);
+        }
         ok &= (get_moe_exec_kernel(r, 2u, wm, AGX_MOE_VECMAT_MAX_M) != nullptr);
         ok &= (get_moe_exec_kernel(r, 3u, wm, AGX_MOE_VECMAT_MAX_M) != nullptr);
         ok &= (get_moe_exec_kernel(r, 4u, wm, 1u) != nullptr);
@@ -373,12 +383,20 @@ static bool dispatch_bucket_internal(agx_moe_runner *           r,
     return agx_cdm_dispatch(stream, k_bkt, 1u, 1u, 1u, &pb, sizeof(pb), post_barrier);
 }
 
+static bool moe_use_dspark_bcap8(uint32_t n_tokens, agx_weight_layout lay0, agx_weight_layout lay1) {
+    const bool r0 = (lay0 == AGX_WEIGHT_NVFP4_REPACKED || lay0 == AGX_WEIGHT_Q8_0_REPACKED);
+    const bool r1 = (lay1 == AGX_WEIGHT_NVFP4_REPACKED || lay1 == AGX_WEIGHT_Q8_0_REPACKED);
+    return (n_tokens > AGX_MOE_VECMAT_MAX_M) && (n_tokens <= AGX_MOE_VECMAT_DSPARK_M) && r0 && r1;
+}
+
 bool agx_moe_dispatch_bucket(agx_moe_runner *           r,
                              agx_cdm_stream *           stream,
                              const agx_moe_stage_args & args,
                              agx_barrier_mode           post_barrier) {
-    const uint32_t max_vm = (args.n_tokens == 1u) ? 1u : AGX_MOE_VECMAT_MAX_M;
-    const uint32_t gm_min = (args.n_tokens >= AGX_MOE_GEMM_MIN_M) ? AGX_MOE_GEMM_MIN_M : 0xFFFFFFFFu;
+    const bool use_b8     = moe_use_dspark_bcap8(args.n_tokens, args.gate_up_layout, args.down_layout);
+    const uint32_t max_vm = (args.n_tokens == 1u) ? 1u
+                          : use_b8 ? AGX_MOE_VECMAT_DSPARK_M : AGX_MOE_VECMAT_MAX_M;
+    const uint32_t gm_min = (!use_b8 && args.n_tokens >= AGX_MOE_GEMM_MIN_M) ? AGX_MOE_GEMM_MIN_M : 0xFFFFFFFFu;
     return dispatch_bucket_internal(r, stream, args, max_vm, gm_min, post_barrier);
 }
 
@@ -436,8 +454,10 @@ bool agx_moe_dispatch(agx_moe_runner *           r,
     if (args.gate_up_va == 0)            act_flags |= AGX_MOE_FLAG_SEPARATE_GU;
     if (args.x_is_f16)                   act_flags |= AGX_MOE_FLAG_X_F16;
 
-    const uint32_t bcap = (args.n_tokens == 1u) ? 1u : AGX_MOE_VECMAT_MAX_M;
-    const bool may_have_gemm = (args.n_tokens >= AGX_MOE_GEMM_MIN_M);
+    const bool     use_b8        = moe_use_dspark_bcap8(args.n_tokens, args.gate_up_layout, args.down_layout);
+    const uint32_t bcap          = (args.n_tokens == 1u) ? 1u
+                                 : use_b8 ? AGX_MOE_VECMAT_DSPARK_M : AGX_MOE_VECMAT_MAX_M;
+    const bool     may_have_gemm = (!use_b8 && args.n_tokens >= AGX_MOE_GEMM_MIN_M);
 
     // 2. Stage A: Fused Gate+Up + Exact SiTU (writes SLC-resident moe_inter / hidden_bo)
     //    - Vec-mat indirect dispatch for all buckets with M_bucket <= 4
@@ -751,14 +771,21 @@ bool agx_moe_dispatch_mul_mat_id(agx_moe_runner *           r,
 
     const bool is_repacked_quant =
         (layout == AGX_WEIGHT_NVFP4_REPACKED) || (layout == AGX_WEIGHT_Q8_0_REPACKED);
+    // Wave 5 DSpark M=5..8 fastpath: route ALL cnt=1..8 buckets into single-pass sh_x BATCH_CAP=8
+    // vec-mat (0:0 spills, <=56 GPR32, 1x weight DRAM read, ZERO GEMM dispatches!)
+    const bool use_dspark_b8 =
+        !req_prec_f32 && is_repacked_quant &&
+        (M > AGX_MOE_VECMAT_MAX_M) && (M <= AGX_MOE_VECMAT_DSPARK_M);
+
     const uint32_t min_m_for_gemm = is_repacked_quant ? AGX_MOE_GEMM_MIN_M : 16u;
 
     const bool force_fp32_vecmat =
         req_prec_f32 ||
+        use_dspark_b8 ||
         (M < min_m_for_gemm) ||
         (K < 32u) || ((K & 3u) != 0u);
 
-    const uint32_t bcap          = AGX_MOE_VECMAT_MAX_M;
+    const uint32_t bcap          = use_dspark_b8 ? AGX_MOE_VECMAT_DSPARK_M : AGX_MOE_VECMAT_MAX_M;
     const bool     may_have_gemm = !force_fp32_vecmat;
     const uint32_t gemm_min_m    = may_have_gemm ? AGX_MOE_GEMM_MIN_M : 0xFFFFFFFFu;
 

@@ -41,8 +41,9 @@
 
 #define AGX_MOE_MAX_EXPERTS      256u
 #define AGX_MOE_DIRECT_MAX_M     1u  // M=1 direct fastpath (M>=2 deduplicates shared experts via bitonic bucket!)
-#define AGX_MOE_VECMAT_MAX_M     4u  // Lean 4-scalar BATCH_CAP=4 (<=52 GPR32, 0:0 spills, 2x+ occupancy!)
-#define AGX_MOE_GEMM_MIN_M       5u  // M_bucket >= 5 -> 8x8 MMA gemm32 (1x weight DRAM for ALL M=1..8 experts!)
+#define AGX_MOE_VECMAT_MAX_M     4u  // Lean 4-scalar BATCH_CAP=4 for M>=9 tail buckets & M<=4 (<=52 GPR32, 0:0 spills)
+#define AGX_MOE_VECMAT_DSPARK_M  8u  // Wave 5: 8-way sh_x BATCH_CAP=8 for M=5..8 DSpark (1x W load, 0 GEMM dispatches!)
+#define AGX_MOE_GEMM_MIN_M       5u  // M >= 9 prefill: M_bucket >= 5 -> 64N x 32M RowMajor 8x8 MMA GEMM
 #define AGX_MOE_GEMM_TILE_M      32u
 #define AGX_MOE_VECMAT_WG_PAIRS  32u // 32 (gate,up) pairs/WG for gate_up vec-mat (Q8_0_8BLK uses 4 pairs/WG)
 #define AGX_MOE_VECMAT_WG_OUT    64u // 64 output rows/WG for down vec-mat (Q8_0_8BLK uses 8 rows/WG)

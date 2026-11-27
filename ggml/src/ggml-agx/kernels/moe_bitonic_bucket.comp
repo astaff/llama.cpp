@@ -124,11 +124,19 @@ void write_indirect_grids(uint n_active, uint n_vm, uint n_gt, uint total_valid,
     const uint safe_skip = max(n_skip, 1u);
     const uint wg_zero_row = (pc.n_embd + 127u) / 128u;
 
-    hdr.grid_gate_up_vecmat = AgxIndirectGrid(pc.wg_gate_up_vecmat * 128u, safe_vm,   1u, 128u, 1u, 1u);
-    hdr.grid_down_vecmat    = AgxIndirectGrid(pc.wg_down_vecmat    * 128u, safe_vm,   1u, 128u, 1u, 1u);
-    hdr.grid_gate_up_gemm   = AgxIndirectGrid(pc.wg_gate_up_gemm   * 128u, safe_gt,   1u, 128u, 1u, 1u);
-    hdr.grid_down_gemm      = AgxIndirectGrid(pc.wg_down_gemm      * 128u, safe_gt,   1u, 128u, 1u, 1u);
-    hdr.grid_zero_skipped   = AgxIndirectGrid(max(wg_zero_row, 1u) * 128u, safe_skip, 1u, 128u, 1u, 1u);
+    // When a side has 0 active buckets/tiles (e.g. n_vm==0 on pp2048 or n_gt==0 on M<=4),
+    // shrink global_x to 1 WG (128T) instead of launching 36..288 dummy WGs!
+    const uint vm_gx_gu = (n_vm   > 0u) ? (pc.wg_gate_up_vecmat * 128u) : 128u;
+    const uint vm_gx_dn = (n_vm   > 0u) ? (pc.wg_down_vecmat    * 128u) : 128u;
+    const uint gt_gx_gu = (n_gt   > 0u) ? (pc.wg_gate_up_gemm   * 128u) : 128u;
+    const uint gt_gx_dn = (n_gt   > 0u) ? (pc.wg_down_gemm      * 128u) : 128u;
+    const uint zs_gx    = (n_skip > 0u) ? (max(wg_zero_row, 1u) * 128u) : 128u;
+
+    hdr.grid_gate_up_vecmat = AgxIndirectGrid(vm_gx_gu, safe_vm,   1u, 128u, 1u, 1u);
+    hdr.grid_down_vecmat    = AgxIndirectGrid(vm_gx_dn, safe_vm,   1u, 128u, 1u, 1u);
+    hdr.grid_gate_up_gemm   = AgxIndirectGrid(gt_gx_gu, safe_gt,   1u, 128u, 1u, 1u);
+    hdr.grid_down_gemm      = AgxIndirectGrid(gt_gx_dn, safe_gt,   1u, 128u, 1u, 1u);
+    hdr.grid_zero_skipped   = AgxIndirectGrid(zs_gx,    safe_skip, 1u, 128u, 1u, 1u);
 }
 
 #if BUCKET_MODE == 0
