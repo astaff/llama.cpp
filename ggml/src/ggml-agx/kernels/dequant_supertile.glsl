@@ -44,6 +44,10 @@ layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer Agx
     uint v[];
 };
 
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer AgxBufU32x2R {
+    uvec2 v[];
+};
+
 layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer AgxBufU32x4R {
     uvec4 v[];
 };
@@ -118,17 +122,15 @@ layout(buffer_reference, scalar, buffer_reference_align = 2) readonly buffer Agx
 //   {0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0} with sign bit from bit 3.
 // NEVER constructs subnormals; 100% immune to FTZ on AGX3B ALU & f32matmad8x8.
 float16_t agx_e2m1_to_f16(uint nib) {
-    uint sign = (nib & 8u) << 12;
-    uint mag  = nib & 7u;
-    uint h    = (mag < 2u) ? (mag * 0x3800u) : (0x3800u + (mag << 9));
-    return unpackFloat2x16(sign | h).x;
+    float16_t raw = unpackFloat2x16(0x3800u + ((nib & 7u) << 9)).x;
+    float16_t mag = min(raw, fma(raw, float16_t(2.0), float16_t(-1.0)));
+    return unpackFloat2x16(packFloat2x16(f16vec2(mag, float16_t(0.0))) | ((nib & 8u) << 12)).x;
 }
 
 float agx_e2m1_to_f32(uint nib) {
-    uint sign = (nib & 8u) << 28;
-    uint mag  = nib & 7u;
-    uint h    = (mag < 2u) ? (mag * 0x3F000000u) : (0x3F000000u + (mag << 22));
-    return uintBitsToFloat(sign | h);
+    float raw = uintBitsToFloat(0x3F000000u + ((nib & 7u) << 22));
+    float mag = min(raw, fma(raw, 2.0, -1.0));
+    return uintBitsToFloat(floatBitsToUint(mag) | ((nib & 8u) << 28));
 }
 
 vec4 agx_e2m1_u16_to_vec4(uint w16) {
@@ -140,20 +142,18 @@ vec4 agx_e2m1_u16_to_vec4(uint w16) {
     );
 }
 
-// SWAR2 branchless E2M1 -> f16vec2 (zero compares, zero multiplies, zero denormals, zero LUT!):
-// Expects nibble 0 in bits [3:0] and nibble 1 in bits [19:16] of `p`.
+// SWAR2 branchless E2M1 -> f16vec2 (0-ULP bit-exact, 0 denormals, 0 LUT, 0 shuffles!):
+// Expects nibble 0 in bits [3:0] and nibble 1 in bits [19:16] of `p` (other bits ignored).
+// Identity: raw = {0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0},
+//           min(raw, 2*raw - 1) = {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0} EXACT!
 f16vec2 agx_e2m1_swar2_to_f16vec2(uint p) {
-    uint s2   = (p & 0x00080008u) << 12;
-    uint m2   = p & 0x00070007u;
-    uint nz   = (m2 + 0x00070007u) & 0x00080008u; // 0x0008 iff mag >= 1
-    uint ge2  = (m2 + 0x00060006u) & 0x00080008u; // 0x0008 iff mag >= 2
-    uint base = (nz << 11) - (nz << 8);           // 0x3800 iff mag >= 1, else 0
-    uint adj  = m2 & ((ge2 >> 3) | 0xFFFEFFFEu);  // clears mag==1 -> 0, keeps 2..7
-    return unpackFloat2x16(s2 | (base + (adj << 9)));
+    f16vec2 raw = unpackFloat2x16(0x38003800u + ((p & 0x00070007u) << 9));
+    f16vec2 mag = min(raw, fma(raw, f16vec2(float16_t(2.0)), f16vec2(float16_t(-1.0))));
+    return unpackFloat2x16(packFloat2x16(mag) | ((p & 0x00080008u) << 12));
 }
 
 f16vec2 agx_e2m1_byte_to_f16vec2(uint b) {
-    return agx_e2m1_swar2_to_f16vec2((b & 0xFu) | ((b & 0xF0u) << 12));
+    return agx_e2m1_swar2_to_f16vec2(b | (b << 12));
 }
 
 vec2 agx_e2m1_byte_to_vec2(uint b) {
@@ -184,7 +184,7 @@ float16_t agx_ue4m3_to_f16(uint u) {
     float16_t sub_v  = unpackFloat2x16(0x2400u | (u7 << 7)).x - float16_t(0.015625);
     float16_t norm_v = unpackFloat2x16(0x2000u + (u7 << 7)).x;
     float16_t val    = (u7 < 8u) ? sub_v : norm_v;
-    return (u == 0u || u == 0x7Fu) ? float16_t(0.0) : val;
+    return (u == 0x7Fu) ? float16_t(0.0) : val;
 }
 
 float agx_ue4m3_to_f32(uint u) {
@@ -192,7 +192,7 @@ float agx_ue4m3_to_f32(uint u) {
     float sub_v  = float(u7) * (1.0 / 512.0);
     float norm_v = uintBitsToFloat(0x3C000000u + (u7 << 20));
     float val    = (u7 < 8u) ? sub_v : norm_v;
-    return (u == 0u || u == 0x7Fu) ? 0.0 : val;
+    return (u == 0x7Fu) ? 0.0 : val;
 }
 
 f16vec2 agx_ue4m3_pair_to_f16vec2(uint16_t d_pair) {
@@ -221,6 +221,15 @@ f16vec4 agx_q8_u32_magic_to_f16vec4(uint w) {
     uint u = w ^ 0x80808080u;
     f16vec2 p02 = unpackFloat2x16((u & 0x00FF00FFu) | 0x64006400u) - f16vec2(float16_t(1152.0));
     f16vec2 p13 = unpackFloat2x16(((u >> 8) & 0x00FF00FFu) | 0x64006400u) - f16vec2(float16_t(1152.0));
+    return f16vec4(p02.x, p13.x, p02.y, p13.y);
+}
+
+// Decodes 4 packed signed int8 bytes in `w` -> exact f16vec4(q) / 128.0 in [-1.0, +0.9921875]
+// via as_f16(0x4800 | (b ^ 0x80)) - 9.0hf (0 ULP, 0 denormals, overflow-proof for ffma16 dots!)
+f16vec4 agx_q8_u32_magic_norm_to_f16vec4(uint w) {
+    uint u = w ^ 0x80808080u;
+    f16vec2 p02 = unpackFloat2x16((u & 0x00FF00FFu) | 0x48004800u) - f16vec2(float16_t(9.0));
+    f16vec2 p13 = unpackFloat2x16(((u >> 8) & 0x00FF00FFu) | 0x48004800u) - f16vec2(float16_t(9.0));
     return f16vec4(p02.x, p13.x, p02.y, p13.y);
 }
 

@@ -136,10 +136,11 @@ bool agx_gemm_precompile_all(agx_backend_context * ctx) {
         return false;
     }
     bool ok = true;
-    // NVFP4 repacked vec-mat: B=1 (K_SGS=1 & K_SGS=4), B=5 (DSpark verify)
+    // NVFP4 repacked vec-mat: B=1 (K_SGS=1 & K_SGS=4), B=5 & B=8 (DSpark verify)
     ok &= (get_or_compile_nvfp4_vecmat(ctx, true, 1u, 1u, false) != nullptr);
     ok &= (get_or_compile_nvfp4_vecmat(ctx, true, 1u, 4u, false) != nullptr);
-    ok &= (get_or_compile_nvfp4_vecmat(ctx, true, 5u, 1u, false) != nullptr);
+    ok &= (get_or_compile_nvfp4_vecmat(ctx, true, 5u, 4u, false) != nullptr);
+    ok &= (get_or_compile_nvfp4_vecmat(ctx, true, 8u, 4u, false) != nullptr);
 
     // Q8_0 repacked, MXFP8 repacked, F8_E4M3, BF16, F16, F32 B=1 vec-mat
     for (uint32_t qm : {0u, 2u, 3u, 4u, 5u, 6u}) {
@@ -149,8 +150,9 @@ bool agx_gemm_precompile_all(agx_backend_context * ctx) {
     for (uint32_t qm : {0u, 4u, 6u}) {
         ok &= (get_or_compile_q8_mxfp8_vecmat(ctx, qm, 1u, true) != nullptr);
     }
-    // Q8_0 repacked B=5 (DSpark verify)
+    // Q8_0 repacked B=5 & B=8 (DSpark verify M=2..8 at full DRAM BW!)
     ok &= (get_or_compile_q8_mxfp8_vecmat(ctx, 0u, 5u, false) != nullptr);
+    ok &= (get_or_compile_q8_mxfp8_vecmat(ctx, 0u, 8u, false) != nullptr);
 
     // 8x8 simdgroup_matrix MMA GEMM (prefill tile=0, medium tile=1, narrow-N tile=2)
     for (agx_weight_layout wl : {
@@ -229,20 +231,22 @@ bool agx_gemm_dispatch(agx_backend_context * ctx,
     pc.y_slice_elems = desc.y_slice_elems;
     pc.w_bcast_div   = std::max(1u, desc.w_bcast_div);
 
-    // Crossover: M <= 5 -> predicated K-coalesced vec-mat; M >= 6 -> 8x8 simdgroup_matrix MMA
-    const bool use_mma = desc.force_mma || (!desc.force_vecmat && desc.M >= 6u);
+    // Crossover: M <= 8 -> predicated K-coalesced vec-mat (fused 2-row/lane 2x-rate
+    // ffma16 for M=2..8 DSpark verify & LM head!); M >= 9 -> 8x8 MMA GEMM.
+    const bool use_mma = desc.force_mma || (!desc.force_vecmat && desc.M >= 9u);
 
     if (use_mma) {
         // Select tile geometry to saturate all 40 M4 Max cores:
-        //   - TILE_MODE=2 (16x16): narrow N <= 128 (e.g. 4608x64 ctrl_down -> 128 WGs vs 16 WGs!)
-        //   - TILE_MODE=1 (64x16): medium M <= 24 (DSpark / small batch)
-        //   - TILE_MODE=0 (64x64 FP16 / 64x32 FP32): large prefill
+        //   - TILE_MODE=2 (16x16, 2x2): narrow N <= 128 (e.g. 4608x64 ctrl_down -> 128 WGs!)
+        //   - TILE_MODE=1 (32x16, 4x1): medium M <= 32 (72-144 WGs on N=2304)
+        //   - TILE_MODE=0 (64x32, 4x1): split-phase software-pipelined prefill (576 WGs on 2304x2304!)
         const uint32_t tile_mode = (desc.N <= 128u && batch_z <= 2u) ? 2u
-                                 : (desc.M <= 24u)                   ? 1u
+                                 : (desc.M <= 32u)                   ? 1u
                                                                      : 0u;
-        const uint32_t wg_n      = (tile_mode == 2u) ? 16u : 64u;
-        const uint32_t wg_m      = (tile_mode == 2u || tile_mode == 1u) ? 16u
-                                 : (desc.prec_f32 ? 32u : 64u);
+        const uint32_t wg_n      = (tile_mode == 2u) ? 16u
+                                 : (tile_mode == 1u) ? 32u
+                                                     : 64u;
+        const uint32_t wg_m      = (tile_mode == 0u) ? 32u : 16u;
 
         const agx_kernel * k = get_or_compile_mma_gemm(ctx, desc.layout, tile_mode, desc.prec_f32);
         if (!k) {
@@ -253,29 +257,36 @@ bool agx_gemm_dispatch(agx_backend_context * ctx,
         return agx_cdm_dispatch(stream, k, gx, gy, batch_z, &pc, sizeof(pc), desc.post_barrier);
     }
 
-    // Predicated B=1..5 vec-mat path
-    // For arbitrary M > 5 with force_vecmat, loop in chunks of 5
-    const uint32_t m_spec = std::min(desc.M, 5u);
+    // Predicated B=1..8 vec-mat path (quantized specializations {1, 2, 4, 5, 8} to bound cache size)
+    // For arbitrary M > 8 with force_vecmat, loop in chunks of 8.
+    const uint32_t m_cap  = std::min(desc.M, 8u);
+    const uint32_t m_spec = (m_cap <= 1u) ? 1u
+                          : (m_cap <= 2u) ? 2u
+                          : (m_cap <= 4u) ? 4u
+                          : (m_cap == 5u) ? 5u
+                                          : 8u;
 
     if (desc.layout == AGX_WEIGHT_NVFP4_REPACKED || desc.layout == AGX_WEIGHT_NVFP4_RAW) {
         const bool repacked = (desc.layout == AGX_WEIGHT_NVFP4_REPACKED);
-        const uint32_t n_halves = (desc.N + 15u) / 16u;
-        const uint32_t k_sgs    = ((n_halves * batch_z) < 640u && desc.K >= 256u) ? 4u : 1u;
+        // K_SGS=4: M=1 uses 8 rows/WG (144 WGs on N=1152, 288 on N=2304);
+        //          M=2..8 repacked fuses s=0&s=1 -> 16 rows/WG (144 WGs on N=2304, 2x X reuse!).
+        // K_SGS=1: repacked fuses s=0&s=1 -> 128 rows/WG (512 WGs on N=65536!).
+        const uint32_t k_sgs = ((desc.N * batch_z) < 10240u && desc.K >= 256u) ? 4u : 1u;
 
         const agx_kernel * k = get_or_compile_nvfp4_vecmat(ctx, repacked, m_spec, k_sgs, desc.prec_f32);
         if (!k) {
             return false;
         }
         const bool fused_32row = repacked && (k_sgs == 1u) && (m_spec == 1u);
-        const uint32_t gx = fused_32row
-            ? ((desc.N + 127u) / 128u)
-            : ((k_sgs == 1u) ? ((n_halves + 3u) / 4u) : n_halves);
+        const uint32_t gx = (k_sgs == 4u)
+            ? ((desc.N + 7u) / 8u)
+            : (fused_32row ? ((desc.N + 127u) / 128u) : ((desc.N + 63u) / 64u));
 
-        if (desc.M <= 5u) {
+        if (desc.M <= 8u) {
             return agx_cdm_dispatch(stream, k, gx, 1u, batch_z, &pc, sizeof(pc), desc.post_barrier);
         }
-        for (uint32_t m0 = 0; m0 < desc.M; m0 += 5u) {
-            const uint32_t m_rem = std::min(5u, desc.M - m0);
+        for (uint32_t m0 = 0; m0 < desc.M; m0 += 8u) {
+            const uint32_t m_rem = std::min(8u, desc.M - m0);
             pc.x_va = desc.x_va + static_cast<uint64_t>(m0) * x_stride * sizeof(float);
             pc.y_va = desc.y_va + static_cast<uint64_t>(m0) * y_stride * sizeof(float);
             pc.M    = m_rem;
@@ -291,8 +302,14 @@ bool agx_gemm_dispatch(agx_backend_context * ctx,
     uint32_t quant_mode  = 6u;
     uint32_t rows_per_wg = 4u;
     bool     can_ksplit  = false;
+    uint32_t ksplit_min_k = 512u;
     switch (desc.layout) {
-        case AGX_WEIGHT_Q8_0_REPACKED:  quant_mode = 0u; rows_per_wg = 8u; can_ksplit = ((desc.K & 3u) == 0u && (x_stride & 3u) == 0u); break;
+        case AGX_WEIGHT_Q8_0_REPACKED:
+            quant_mode   = 0u;
+            rows_per_wg  = 8u;
+            can_ksplit   = ((desc.K & 3u) == 0u && (x_stride & 3u) == 0u);
+            ksplit_min_k = 1024u;
+            break;
         case AGX_WEIGHT_Q8_0_RAW:       quant_mode = 1u; rows_per_wg = 4u; break;
         case AGX_WEIGHT_MXFP8_REPACKED: quant_mode = 2u; rows_per_wg = 4u; break;
         case AGX_WEIGHT_F8_E4M3:        quant_mode = 3u; rows_per_wg = 4u; break;
@@ -302,19 +319,19 @@ bool agx_gemm_dispatch(agx_backend_context * ctx,
         default: return false;
     }
 
-    // Use K_SPLIT_ROW (all 4 sgs split K over 1 row -> 4x core occupancy!) on narrow-N, large-K
-    const bool k_split_row = can_ksplit && (desc.N * batch_z <= 256u) && (desc.K >= 512u);
+    // Use K_SPLIT_ROW (all 4 sgs split K over 1 row -> 4x-8x core occupancy!) on narrow-N, large-K
+    const bool k_split_row = can_ksplit && (desc.N * batch_z <= 256u) && (desc.K >= ksplit_min_k);
     const agx_kernel * k = get_or_compile_q8_mxfp8_vecmat(ctx, quant_mode, m_spec, k_split_row);
     if (!k) {
         return false;
     }
     const uint32_t gx = k_split_row ? desc.N : ((desc.N + rows_per_wg - 1u) / rows_per_wg);
 
-    if (desc.M <= 5u) {
+    if (desc.M <= 8u) {
         return agx_cdm_dispatch(stream, k, gx, 1u, batch_z, &pc, sizeof(pc), desc.post_barrier);
     }
-    for (uint32_t m0 = 0; m0 < desc.M; m0 += 5u) {
-        const uint32_t m_rem = std::min(5u, desc.M - m0);
+    for (uint32_t m0 = 0; m0 < desc.M; m0 += 8u) {
+        const uint32_t m_rem = std::min(8u, desc.M - m0);
         pc.x_va = desc.x_va + static_cast<uint64_t>(m0) * x_stride * sizeof(float);
         pc.y_va = desc.y_va + static_cast<uint64_t>(m0) * y_stride * sizeof(float);
         pc.M    = m_rem;

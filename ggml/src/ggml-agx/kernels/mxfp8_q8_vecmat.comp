@@ -84,10 +84,91 @@ void main() {
         acc[m] = 0.0;
     }
 
-#if QUANT_MODE == 0 && K_SPLIT_ROW == 0
+#if QUANT_MODE == 0 && K_SPLIT_ROW == 0 && BATCH_M > 1
+    // ------------------------------------------------------------------------
+    // AGX_Q8_0_8BLK M=2..8 (DSpark verify & LM head!): Lean 1-row/half-sg
+    // (8 rows/WG, <= 56 GPR32, 0:0 spills!) + overflow-proof q/128 magic-bias
+    // + 2x-rate AGX3B ffma16 (1x DRAM weight read, 0 f16->f32 casts in m-loop!)
+    // ------------------------------------------------------------------------
+    const uint row      = (gl_WorkGroupID.x * 4u + sg_id) * 2u + (lane >> 4);
+    const uint lane16   = lane & 15u;
+    const uint n_chunks = (pc.K + 255u) >> 8;
+
+    if (row < pc.N) {
+        AgxBufQ8_8Blk w_buf = AgxBufQ8_8Blk(w_base);
+        const uint row_chk_base = row * n_chunks;
+        const uint x_stride4    = pc.x_stride >> 2;
+        const bool x_aligned4   = ((pc.K & 3u) == 0u) && ((pc.x_stride & 3u) == 0u);
+
+        if (x_aligned4) {
+            for (uint c = 0u; c < n_chunks; ++c) {
+                const uint chk_idx = row_chk_base + c;
+                const uvec4 qv  = w_buf.blk[chk_idx].qs[lane16];
+                const float d128 = float(unpackFloat2x16(uint(w_buf.blk[chk_idx].d[lane16 >> 1])).x) * 128.0;
+                const uint k0   = c * 256u + lane16 * 16u;
+                if (k0 < pc.K) {
+                    const f16vec4 w0 = agx_q8_u32_magic_norm_to_f16vec4(qv.x);
+                    const f16vec4 w1 = agx_q8_u32_magic_norm_to_f16vec4(qv.y);
+                    const f16vec4 w2 = agx_q8_u32_magic_norm_to_f16vec4(qv.z);
+                    const f16vec4 w3 = agx_q8_u32_magic_norm_to_f16vec4(qv.w);
+                    const uint col4 = k0 >> 2;
+                    for (uint m = 0u; m < uint(BATCH_M); ++m) {
+                        if (m < pc.M) {
+                            const uint xo = m * x_stride4 + col4;
+                            float16_t dp = dot(w0, f16vec4(x_buf4.v[xo + 0u]))
+                                         + dot(w1, f16vec4(x_buf4.v[xo + 1u]))
+                                         + dot(w2, f16vec4(x_buf4.v[xo + 2u]))
+                                         + dot(w3, f16vec4(x_buf4.v[xo + 3u]));
+                            acc[m] = fma(float(dp), d128, acc[m]);
+                        }
+                    }
+                }
+            }
+        } else {
+            for (uint c = 0u; c < n_chunks; ++c) {
+                const uint chk_idx = row_chk_base + c;
+                const uvec4 qv   = w_buf.blk[chk_idx].qs[lane16];
+                const float d128 = float(unpackFloat2x16(uint(w_buf.blk[chk_idx].d[lane16 >> 1])).x) * 128.0;
+                const uint k0    = c * 256u + lane16 * 16u;
+                if (k0 < pc.K) {
+                    const f16vec4 w0 = agx_q8_u32_magic_norm_to_f16vec4(qv.x);
+                    const f16vec4 w1 = agx_q8_u32_magic_norm_to_f16vec4(qv.y);
+                    const f16vec4 w2 = agx_q8_u32_magic_norm_to_f16vec4(qv.z);
+                    const f16vec4 w3 = agx_q8_u32_magic_norm_to_f16vec4(qv.w);
+                    for (uint m = 0u; m < uint(BATCH_M); ++m) {
+                        if (m < pc.M) {
+                            const uint xo = m * pc.x_stride + k0;
+                            float16_t dp = dot(w0, f16vec4(x_buf.v[xo + 0u],  x_buf.v[xo + 1u],  x_buf.v[xo + 2u],  x_buf.v[xo + 3u]))
+                                         + dot(w1, f16vec4(x_buf.v[xo + 4u],  x_buf.v[xo + 5u],  x_buf.v[xo + 6u],  x_buf.v[xo + 7u]))
+                                         + dot(w2, f16vec4(x_buf.v[xo + 8u],  x_buf.v[xo + 9u],  x_buf.v[xo + 10u], x_buf.v[xo + 11u]))
+                                         + dot(w3, f16vec4(x_buf.v[xo + 12u], x_buf.v[xo + 13u], x_buf.v[xo + 14u], x_buf.v[xo + 15u]));
+                            acc[m] = fma(float(dp), d128, acc[m]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for (uint m = 0u; m < uint(BATCH_M); ++m) {
+        acc[m] += subgroupShuffleXor(acc[m], 1u);
+        acc[m] += subgroupShuffleXor(acc[m], 2u);
+        acc[m] += subgroupShuffleXor(acc[m], 4u);
+        acc[m] += subgroupShuffleXor(acc[m], 8u);
+    }
+
+    if (lane16 == 0u && row < pc.N) {
+        for (uint m = 0u; m < uint(BATCH_M); ++m) {
+            if (m < pc.M) {
+                y_buf.v[m * pc.y_stride + row] = acc[m];
+            }
+        }
+    }
+
+#elif QUANT_MODE == 0 && K_SPLIT_ROW == 0
     // ------------------------------------------------------------------------
     // AGX_Q8_0_8BLK (272B planar): 2 rows per simdgroup (16 lanes/row)
-    // Measured 515.94 GB/s (94.5% of wire peak) on M4 Max 2304 x 201024 LM head!
+    // Measured 517.68 GB/s (95% of wire peak) on M4 Max 2304 x 201024 LM head!
     // ------------------------------------------------------------------------
     const uint row      = (gl_WorkGroupID.x * 4u + sg_id) * 2u + (lane >> 4);
     const uint lane16   = lane & 15u;

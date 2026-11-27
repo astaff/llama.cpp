@@ -78,7 +78,7 @@ bool agx_gemm_precompile_all(agx_backend_context * ctx);
 // Infer weight layout from a ggml_tensor (honors agx_tensor_is_repacked(w))
 bool agx_gemm_infer_weight_layout(const struct ggml_tensor * w, agx_weight_layout * out_layout);
 
-// Raw-VA CDM-stream dispatch (selects predicated vec-mat for M<=5, 8x8 MMA GEMM for M>=6)
+// Raw-VA CDM-stream dispatch (selects predicated vec-mat for M<=8, 8x8 MMA GEMM for M>=9)
 bool agx_gemm_dispatch(agx_backend_context * ctx,
                        agx_cdm_stream *      stream,
                        const agx_gemm_desc & desc);

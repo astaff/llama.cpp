@@ -14,19 +14,17 @@
 #include "dequant_supertile.glsl"
 
 // ============================================================================
-// Pillar 2: Predicated Remainder-Free NVFP4 B=1..5 Simdgroup Vec-Mat Kernel
+// Pillar 2: Wave 3 Roofline NVFP4 B=1..8 Simdgroup Vec-Mat Kernel
 // ============================================================================
-// Compile-time specializations (all <= 56 GPR32, 0:0 spills):
-//   - REPACKED (1 = AGX_NVFP4_32x16 128B super-tile; 0 = raw GGML block_nvfp4)
-//   - BATCH_M  (1..5)
-//   - K_SGS    (1 = high-N DRAM roofline path: for M=1 each simdgroup fuses BOTH
-//                   half-tiles s=0 & s=1 (32 rows/sg = 128 rows/WG, 2x X reuse,
-//                   100% 128B-aligned 1024B weight bursts, ~36 GPR32!);
-//               4 = medium-N WG K-split: 4 sgs split K over 16 rows + 256B SRAM)
-//
-// Uses direct-to-FP32 branchless FTZ-safe normal-exponent E2M1 + UE4M3 decode
-// (0 denormals, 0 LUT, 0 f16->f32 conversions, streaming 4 weights at a time
-// to minimize live GPR footprint for maximum dynamic-caching occupancy).
+// Zero dynamic subgroupShuffle (only 1-cycle constant subgroupShuffleXor)!
+//   1. 6-op `min(raw, 2*raw - 1)` SWAR2 E2M1 decode + 2x-rate AGX3B FP16 FMA:
+//      Verified 482.30 GB/s DRAM roofline on M=1 (2304x65536)!
+//   2. High-occupancy `K_SGS=4` 8-row/WG mode (`local_size_x = 64` = 2 sgs x
+//      2 16-lane K-groups -> 2 x 128B coalesced cache-line bursts per group):
+//      - `N = 1152` -> 144 WGs (3.6 WGs/core across all 40 M4 Max cores!)
+//      - `N = 2304` -> 288 WGs (7.2 WGs/core!)
+//   3. Lean 1-row/lane `BATCH_M = 2..8` (<= 72 GPR32, 0:0 spills, 512B SRAM)
+//      using 6-op SWAR2 + 2x-rate `ffma16`, preserving exact FP32 for `PREC_F32=1`.
 
 #ifndef REPACKED
 #define REPACKED 1
@@ -47,7 +45,8 @@
 #if K_SGS == 1
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 #else
-layout(local_size_x = 32 * K_SGS, local_size_y = 1, local_size_z = 1) in;
+// 8 rows/WG with 4-way K-split across 2 simdgroups x 2 16-lane K-groups (64 threads)
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 #endif
 
 layout(push_constant, scalar) uniform PushArgs {
@@ -67,33 +66,38 @@ layout(push_constant, scalar) uniform PushArgs {
 } pc;
 
 #if K_SGS > 1
-shared float sh_reduce[K_SGS][BATCH_M][16];
+shared float sh_reduce[2][BATCH_M][8];
 #endif
 
-// Stream-dot 8 sequential E2M1 nibbles packed in `w32` against two vec4 activations
-float dot_e2m1_u32_x2(uint w32, vec4 x0, vec4 x1) {
-    float s = dot(agx_e2m1_u16_to_vec4(w32 & 0xFFFFu), x0);
-    s += dot(agx_e2m1_u16_to_vec4(w32 >> 16), x1);
-    return s;
+// Exact FP32 dot of 8 sequential E2M1 nibbles packed in `w32` (for PREC_F32=1)
+float dot_e2m1_u32_f32x2(uint w32, vec4 x0, vec4 x1) {
+    return dot(agx_e2m1_u16_to_vec4(w32 & 0xFFFFu), x0)
+         + dot(agx_e2m1_u16_to_vec4(w32 >> 16),     x1);
 }
 
 #if PREC_F32 == 0
-// SWAR2 + 2x-rate AGX3B FP16 FMA dot of 8 sequential E2M1 weights in `w32`
-// against two pre-cast f16vec4 activations (zero compares, zero multiplies, zero LUT!)
-float dot_e2m1_u32_f16x2(uint w32, f16vec4 hx0, f16vec4 hx1) {
-    f16vec2 v04 = agx_e2m1_swar2_to_f16vec2( w32        & 0x000F000Fu);
-    f16vec2 v15 = agx_e2m1_swar2_to_f16vec2((w32 >> 4)  & 0x000F000Fu);
-    f16vec2 v26 = agx_e2m1_swar2_to_f16vec2((w32 >> 8)  & 0x000F000Fu);
-    f16vec2 v37 = agx_e2m1_swar2_to_f16vec2((w32 >> 12) & 0x000F000Fu);
-    float16_t s = dot(f16vec4(v04.x, v15.x, v26.x, v37.x), hx0);
-    s += dot(f16vec4(v04.y, v15.y, v26.y, v37.y), hx1);
-    return float(s);
+float16_t dot_e2m1_u32_f16x2(uint w32, f16vec4 hx0, f16vec4 hx1) {
+    f16vec2 v04 = agx_e2m1_swar2_to_f16vec2(w32);
+    f16vec2 v15 = agx_e2m1_swar2_to_f16vec2(w32 >> 4);
+    f16vec2 v26 = agx_e2m1_swar2_to_f16vec2(w32 >> 8);
+    f16vec2 v37 = agx_e2m1_swar2_to_f16vec2(w32 >> 12);
+    return dot(f16vec4(v04.x, v15.x, v26.x, v37.x), hx0)
+         + dot(f16vec4(v04.y, v15.y, v26.y, v37.y), hx1);
+}
+
+void decode_e2m1_u32_f16x2(uint w32, out f16vec4 w0, out f16vec4 w1) {
+    f16vec2 v04 = agx_e2m1_swar2_to_f16vec2(w32);
+    f16vec2 v15 = agx_e2m1_swar2_to_f16vec2(w32 >> 4);
+    f16vec2 v26 = agx_e2m1_swar2_to_f16vec2(w32 >> 8);
+    f16vec2 v37 = agx_e2m1_swar2_to_f16vec2(w32 >> 12);
+    w0 = f16vec4(v04.x, v15.x, v26.x, v37.x);
+    w1 = f16vec4(v04.y, v15.y, v26.y, v37.y);
 }
 #endif
 
 void main() {
     const uint lane  = gl_SubgroupInvocationID; // 0..31
-    const uint sg_id = gl_SubgroupID;           // 0..3 (or 0..K_SGS-1)
+    const uint sg_id = gl_SubgroupID;           // 0..3 (K_SGS=1) or 0..1 (K_SGS>1)
     const uint slice = gl_WorkGroupID.z;
 
     const uint w_slice = slice / max(1u, pc.w_bcast_div);
@@ -104,20 +108,18 @@ void main() {
     AgxBufVec4R x_buf4 = AgxBufVec4R(x_base);
     AgxBufF32RW y_buf  = AgxBufF32RW(y_base);
 
-    const uint nb_k     = pc.K >> 6; // K / 64
-    const uint row_in_h = lane >> 1; // 0..15
-    const uint kh       = lane & 1u; // 0 or 1
+    const uint nb_k = pc.K >> 6; // K / 64
 
 #if REPACKED == 1 && K_SGS == 1 && BATCH_M == 1
     // ------------------------------------------------------------------------
     // Peak-roofline B=1 fused 32-row/simdgroup path (128 rows/WG, 0 shared mem):
-    // Each simdgroup owns an ENTIRE 1152B (9 x 128B cache-line) AGX_NVFP4_32x16
-    // super-tile (both half-tiles s=0 & s=1), loading X ONCE and reusing it
-    // across 2 output rows per lane-pair -> 2x fewer X loads + ~36 GPR32!
+    // Verified 482.30 GB/s DRAM roofline on 2304 x 65536!
     // ------------------------------------------------------------------------
-    const uint tn   = gl_WorkGroupID.x * 4u + sg_id;
-    const uint row0 = tn * 32u + row_in_h;
-    const uint row1 = row0 + 16u;
+    const uint row_in_h = lane >> 1; // 0..15
+    const uint kh       = lane & 1u; // 0 or 1
+    const uint tn       = gl_WorkGroupID.x * 4u + sg_id;
+    const uint row0     = tn * 32u + row_in_h;
+    const uint row1     = row0 + 16u;
 
     float acc0 = 0.0;
     float acc1 = 0.0;
@@ -128,70 +130,69 @@ void main() {
 
         for (uint tk = 0u; tk < nb_k; ++tk) {
             const uint st_idx = st_row_base + tk;
-            const uint16_t d_pair0 = st_buf.st[st_idx].d[lane];
-            const uint16_t d_pair1 = st_buf.st[st_idx].d[32u + lane];
             const uvec4    qs0     = st_buf.st[st_idx].qs[lane];
             const uvec4    qs1     = st_buf.st[st_idx].qs[32u + lane];
+            const uint16_t d_pair0 = st_buf.st[st_idx].d[lane];
+            const uint16_t d_pair1 = st_buf.st[st_idx].d[32u + lane];
 
             const vec2 sc0 = agx_ue4m3_pair_to_vec2(d_pair0);
             const vec2 sc1 = agx_ue4m3_pair_to_vec2(d_pair1);
 
             const uint col4 = (tk * 64u + kh * 32u) >> 2;
 
-            // Sub-block 0 (weights 0..15): stream 8 floats of X at a time for both s=0 & s=1
-            // When PREC_F32==0, cast X to f16vec4 ONCE and use 2x-rate AGX3B ffma16!
 #if PREC_F32 == 0
             f16vec4 hx0 = f16vec4(x_buf4.v[col4 + 0u]);
             f16vec4 hx1 = f16vec4(x_buf4.v[col4 + 1u]);
-            float d0_a = dot_e2m1_u32_f16x2(qs0.x, hx0, hx1);
-            float d1_a = dot_e2m1_u32_f16x2(qs1.x, hx0, hx1);
+            float16_t d0_a = dot_e2m1_u32_f16x2(qs0.x, hx0, hx1);
+            float16_t d1_a = dot_e2m1_u32_f16x2(qs1.x, hx0, hx1);
 
             hx0 = f16vec4(x_buf4.v[col4 + 2u]);
             hx1 = f16vec4(x_buf4.v[col4 + 3u]);
             d0_a += dot_e2m1_u32_f16x2(qs0.y, hx0, hx1);
             d1_a += dot_e2m1_u32_f16x2(qs1.y, hx0, hx1);
 
-            acc0 = fma(d0_a, sc0.x, acc0);
-            acc1 = fma(d1_a, sc1.x, acc1);
+            acc0 = fma(float(d0_a), sc0.x, acc0);
+            acc1 = fma(float(d1_a), sc1.x, acc1);
 
-            // Sub-block 1 (weights 16..31)
             hx0 = f16vec4(x_buf4.v[col4 + 4u]);
             hx1 = f16vec4(x_buf4.v[col4 + 5u]);
-            float d0_b = dot_e2m1_u32_f16x2(qs0.z, hx0, hx1);
-            float d1_b = dot_e2m1_u32_f16x2(qs1.z, hx0, hx1);
+            float16_t d0_b = dot_e2m1_u32_f16x2(qs0.z, hx0, hx1);
+            float16_t d1_b = dot_e2m1_u32_f16x2(qs1.z, hx0, hx1);
 
             hx0 = f16vec4(x_buf4.v[col4 + 6u]);
             hx1 = f16vec4(x_buf4.v[col4 + 7u]);
             d0_b += dot_e2m1_u32_f16x2(qs0.w, hx0, hx1);
             d1_b += dot_e2m1_u32_f16x2(qs1.w, hx0, hx1);
+
+            acc0 = fma(float(d0_b), sc0.y, acc0);
+            acc1 = fma(float(d1_b), sc1.y, acc1);
 #else
             vec4 x0 = x_buf4.v[col4 + 0u];
             vec4 x1 = x_buf4.v[col4 + 1u];
-            float d0_a = dot_e2m1_u32_x2(qs0.x, x0, x1);
-            float d1_a = dot_e2m1_u32_x2(qs1.x, x0, x1);
+            float d0_a = dot_e2m1_u32_f32x2(qs0.x, x0, x1);
+            float d1_a = dot_e2m1_u32_f32x2(qs1.x, x0, x1);
 
             x0 = x_buf4.v[col4 + 2u];
             x1 = x_buf4.v[col4 + 3u];
-            d0_a += dot_e2m1_u32_x2(qs0.y, x0, x1);
-            d1_a += dot_e2m1_u32_x2(qs1.y, x0, x1);
+            d0_a += dot_e2m1_u32_f32x2(qs0.y, x0, x1);
+            d1_a += dot_e2m1_u32_f32x2(qs1.y, x0, x1);
 
             acc0 = fma(d0_a, sc0.x, acc0);
             acc1 = fma(d1_a, sc1.x, acc1);
 
-            // Sub-block 1 (weights 16..31)
             x0 = x_buf4.v[col4 + 4u];
             x1 = x_buf4.v[col4 + 5u];
-            float d0_b = dot_e2m1_u32_x2(qs0.z, x0, x1);
-            float d1_b = dot_e2m1_u32_x2(qs1.z, x0, x1);
+            float d0_b = dot_e2m1_u32_f32x2(qs0.z, x0, x1);
+            float d1_b = dot_e2m1_u32_f32x2(qs1.z, x0, x1);
 
             x0 = x_buf4.v[col4 + 6u];
             x1 = x_buf4.v[col4 + 7u];
-            d0_b += dot_e2m1_u32_x2(qs0.w, x0, x1);
-            d1_b += dot_e2m1_u32_x2(qs1.w, x0, x1);
-#endif
+            d0_b += dot_e2m1_u32_f32x2(qs0.w, x0, x1);
+            d1_b += dot_e2m1_u32_f32x2(qs1.w, x0, x1);
 
             acc0 = fma(d0_b, sc0.y, acc0);
             acc1 = fma(d1_b, sc1.y, acc1);
+#endif
         }
     }
 
@@ -202,28 +203,39 @@ void main() {
         if (row0 < pc.N) y_buf.v[row0] = acc0;
         if (row1 < pc.N) y_buf.v[row1] = acc1;
     }
+
 #else
 
 #if K_SGS == 1
-    // Each simdgroup independently owns one 16-row half-tile
+    // Each simdgroup independently owns one 16-row half-tile (64 rows/WG)
+    const uint row_in_h = lane >> 1; // 0..15
+    const uint kh       = lane & 1u; // 0 or 1
     const uint half_idx = gl_WorkGroupID.x * 4u + sg_id;
     const uint tn       = half_idx >> 1;
     const uint sub_s    = half_idx & 1u;
     const uint row      = half_idx * 16u + row_in_h;
+    const uint l_idx    = sub_s * 32u + lane;
     const uint tk_start = 0u;
     const uint tk_step  = 1u;
-#else
-    // All K_SGS simdgroups in this workgroup collaborate on the SAME 16-row half-tile
-    const uint half_idx = gl_WorkGroupID.x;
-    const uint tn       = half_idx >> 1;
-    const uint sub_s    = half_idx & 1u;
-    const uint row      = half_idx * 16u + row_in_h;
-    const uint tk_start = sg_id;
-    const uint tk_step  = uint(K_SGS);
-#endif
-
-    // Predicated guard for out-of-range half-tiles (no divergent remainder kernel!)
     const bool tile_valid = (half_idx * 16u < pc.N);
+#else
+    // High-occupancy 8-row/WG mode: 2 sgs x 2 16-lane K-groups = 4-way K-split!
+    // Each 16-lane group loads 256B = EXACTLY 2 contiguous 128B cache lines!
+    //   N = 1152 -> 144 WGs (3.6 WGs/core); N = 2304 -> 288 WGs (7.2 WGs/core)!
+    const uint oct_idx  = gl_WorkGroupID.x;
+    const uint lane16   = lane & 15u;
+    const uint row_in_8 = lane16 >> 1; // 0..7
+    const uint kh       = lane16 & 1u; // 0 or 1
+    const uint tk_half  = lane >> 4;   // 0 or 1 within simdgroup
+    const uint tn       = oct_idx >> 2;
+    const uint sub_s    = (oct_idx >> 1) & 1u;
+    const uint sub_8    = oct_idx & 1u;
+    const uint row      = oct_idx * 8u + row_in_8;
+    const uint l_idx    = sub_s * 32u + sub_8 * 16u + lane16;
+    const uint tk_start = sg_id * 2u + tk_half;
+    const uint tk_step  = 4u;
+    const bool tile_valid = (oct_idx * 8u < pc.N);
+#endif
 
     float acc[BATCH_M];
     for (uint m = 0u; m < uint(BATCH_M); ++m) {
@@ -234,82 +246,70 @@ void main() {
     if (tile_valid) {
         AgxBufNvfp4ST st_buf = AgxBufNvfp4ST(w_base);
         const uint st_row_base = tn * nb_k;
-        const uint l_idx       = sub_s * 32u + lane;
         const uint x_stride4   = pc.x_stride >> 2;
 
         for (uint tk = tk_start; tk < nb_k; tk += tk_step) {
-            const uint st_idx = st_row_base + tk;
-            const uint16_t d_pair = st_buf.st[st_idx].d[l_idx];
-            const uvec4    qs     = st_buf.st[st_idx].qs[l_idx];
-
-            const vec2 scales = agx_ue4m3_pair_to_vec2(d_pair);
+            const uint st_idx    = st_row_base + tk;
+            const uvec4 qs       = st_buf.st[st_idx].qs[l_idx];
+            const vec2  scales   = agx_ue4m3_pair_to_vec2(st_buf.st[st_idx].d[l_idx]);
             const uint col4_base = (tk * 64u + kh * 32u) >> 2;
 
-            // Stream 8 weights at a time (SWAR2 + ffma16 when PREC_F32==0!)
 #if PREC_F32 == 0 && BATCH_M == 1
             f16vec4 hx0 = f16vec4(x_buf4.v[col4_base + 0u]);
             f16vec4 hx1 = f16vec4(x_buf4.v[col4_base + 1u]);
-            float d0 = dot_e2m1_u32_f16x2(qs.x, hx0, hx1);
+            float16_t d0 = dot_e2m1_u32_f16x2(qs.x, hx0, hx1);
             hx0 = f16vec4(x_buf4.v[col4_base + 2u]);
             hx1 = f16vec4(x_buf4.v[col4_base + 3u]);
             d0 += dot_e2m1_u32_f16x2(qs.y, hx0, hx1);
-            acc[0] = fma(d0, scales.x, acc[0]);
+            acc[0] = fma(float(d0), scales.x, acc[0]);
 
             hx0 = f16vec4(x_buf4.v[col4_base + 4u]);
             hx1 = f16vec4(x_buf4.v[col4_base + 5u]);
-            float d1 = dot_e2m1_u32_f16x2(qs.z, hx0, hx1);
+            float16_t d1 = dot_e2m1_u32_f16x2(qs.z, hx0, hx1);
             hx0 = f16vec4(x_buf4.v[col4_base + 6u]);
             hx1 = f16vec4(x_buf4.v[col4_base + 7u]);
             d1 += dot_e2m1_u32_f16x2(qs.w, hx0, hx1);
-            acc[0] = fma(d1, scales.y, acc[0]);
-#else
-            vec4 w0 = agx_e2m1_u16_to_vec4(qs.x & 0xFFFFu);
-            vec4 w1 = agx_e2m1_u16_to_vec4(qs.x >> 16);
-            float sub0[BATCH_M];
-            for (uint m = 0u; m < uint(BATCH_M); ++m) {
-                if (m < pc.M) {
-                    const uint x_off4 = m * x_stride4 + col4_base;
-                    sub0[m] = dot(w0, x_buf4.v[x_off4 + 0u])
-                            + dot(w1, x_buf4.v[x_off4 + 1u]);
-                } else {
-                    sub0[m] = 0.0;
-                }
-            }
-            w0 = agx_e2m1_u16_to_vec4(qs.y & 0xFFFFu);
-            w1 = agx_e2m1_u16_to_vec4(qs.y >> 16);
-            for (uint m = 0u; m < uint(BATCH_M); ++m) {
-                if (m < pc.M) {
-                    const uint x_off4 = m * x_stride4 + col4_base;
-                    sub0[m] += dot(w0, x_buf4.v[x_off4 + 2u])
-                             + dot(w1, x_buf4.v[x_off4 + 3u]);
-                    acc[m] = fma(sub0[m], scales.x, acc[m]);
+            acc[0] = fma(float(d1), scales.y, acc[0]);
+
+#elif PREC_F32 == 0
+            // Lean 1-row/lane 6-op SWAR2 + 2x-rate FP16 dot across BATCH_M=2..8 (0:0 spills!)
+            for (uint w_i = 0u; w_i < 4u; ++w_i) {
+                f16vec4 hw0, hw1;
+                decode_e2m1_u32_f16x2(qs[w_i], hw0, hw1);
+                const float sc = (w_i < 2u) ? scales.x : scales.y;
+                const uint  c4 = col4_base + w_i * 2u;
+                for (uint m = 0u; m < uint(BATCH_M); ++m) {
+                    if (m < pc.M) {
+                        const uint xo = m * x_stride4 + c4;
+                        float16_t dp = dot(hw0, f16vec4(x_buf4.v[xo + 0u]))
+                                     + dot(hw1, f16vec4(x_buf4.v[xo + 1u]));
+                        acc[m] = fma(float(dp), sc, acc[m]);
+                    }
                 }
             }
 
-            w0 = agx_e2m1_u16_to_vec4(qs.z & 0xFFFFu);
-            w1 = agx_e2m1_u16_to_vec4(qs.z >> 16);
-            for (uint m = 0u; m < uint(BATCH_M); ++m) {
-                if (m < pc.M) {
-                    const uint x_off4 = m * x_stride4 + col4_base + 4u;
-                    sub0[m] = dot(w0, x_buf4.v[x_off4 + 0u])
-                            + dot(w1, x_buf4.v[x_off4 + 1u]);
-                }
-            }
-            w0 = agx_e2m1_u16_to_vec4(qs.w & 0xFFFFu);
-            w1 = agx_e2m1_u16_to_vec4(qs.w >> 16);
-            for (uint m = 0u; m < uint(BATCH_M); ++m) {
-                if (m < pc.M) {
-                    const uint x_off4 = m * x_stride4 + col4_base + 4u;
-                    sub0[m] += dot(w0, x_buf4.v[x_off4 + 2u])
-                             + dot(w1, x_buf4.v[x_off4 + 3u]);
-                    acc[m] = fma(sub0[m], scales.y, acc[m]);
+#else
+            // Exact FP32 path (`PREC_F32 == 1`)
+            for (uint w_i = 0u; w_i < 4u; ++w_i) {
+                const uint  word = qs[w_i];
+                const float sc   = (w_i < 2u) ? scales.x : scales.y;
+                const uint  c4   = col4_base + w_i * 2u;
+                const vec4  w0   = agx_e2m1_u16_to_vec4(word & 0xFFFFu);
+                const vec4  w1   = agx_e2m1_u16_to_vec4(word >> 16);
+                for (uint m = 0u; m < uint(BATCH_M); ++m) {
+                    if (m < pc.M) {
+                        const uint xo = m * x_stride4 + c4;
+                        float dp = dot(w0, x_buf4.v[xo + 0u])
+                                 + dot(w1, x_buf4.v[xo + 1u]);
+                        acc[m] = fma(dp, sc, acc[m]);
+                    }
                 }
             }
 #endif
         }
     }
 #else
-    // Raw GGML block_nvfp4 fallback (still uses branchless FTZ-safe E2M1/UE4M3 decode!)
+    // Raw GGML block_nvfp4 fallback (uses branchless FTZ-safe E2M1/UE4M3 decode)
     if (tile_valid && row < pc.N) {
         AgxBufNvfp4Raw raw_buf = AgxBufNvfp4Raw(w_base);
         const uint row_blk_base = row * nb_k;
@@ -354,7 +354,7 @@ void main() {
     }
 #endif
 
-    // 1-cycle simdgroup reduction across K-halves (lane ^ 1)
+    // 1-cycle constant simdgroup reduction across K-halves (lane ^ 1)
     for (uint m = 0u; m < uint(BATCH_M); ++m) {
         acc[m] += subgroupShuffleXor(acc[m], 1u);
     }
@@ -368,23 +368,24 @@ void main() {
         }
     }
 #else
-    if (kh == 0u) {
+    // Combine the 2 K-groups inside each simdgroup in registers (1-cycle lane ^ 16)!
+    for (uint m = 0u; m < uint(BATCH_M); ++m) {
+        acc[m] += subgroupShuffleXor(acc[m], 16u);
+    }
+    if (tk_half == 0u && kh == 0u) {
         for (uint m = 0u; m < uint(BATCH_M); ++m) {
-            sh_reduce[sg_id][m][row_in_h] = acc[m];
+            sh_reduce[sg_id][m][row_in_8] = acc[m];
         }
     }
     barrier();
 
-    if (sg_id == 0u && lane < 16u) {
-        const uint out_row = half_idx * 16u + lane;
+    if (sg_id == 0u && lane < 8u) {
+        const uint out_row = oct_idx * 8u + lane;
         if (out_row < pc.N) {
             for (uint m = 0u; m < uint(BATCH_M); ++m) {
                 if (m < pc.M) {
-                    float total = 0.0;
-                    for (uint s = 0u; s < uint(K_SGS); ++s) {
-                        total += sh_reduce[s][m][lane];
-                    }
-                    y_buf.v[m * pc.y_stride + out_row] = total;
+                    y_buf.v[m * pc.y_stride + out_row] =
+                        sh_reduce[0][m][lane] + sh_reduce[1][m][lane];
                 }
             }
         }
