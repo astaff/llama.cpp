@@ -2799,9 +2799,10 @@ struct sconv_prep_store_push {
 };
 static_assert(sizeof(sconv_prep_store_push) <= AGX_MAX_PUSH_BYTES, "sconv_prep_store_push > 256B");
 
-// Wave 8 Pre-Scan of Exact Active [kv_beg, kv_end) Tile Bounds per 32-Query Tile (`PASS_MODE=3`!)
+// Wave 10 Pre-Scan of Exact Active [kv_beg, kv_end) Tile Bounds per q_br (16 or 32) Query Tile
 // Runs ONCE per unique 1-head mask in Wave 0 (2 dispatches total = 0.04 ms for all 48 Inkling 2 layers),
-// skipping 67-75% of SWA KV tiles & 49% of Full causal KV tiles (-9.2 GB DRAM kq_b reads, -9.0M WG barriers)!
+// with unlimited-n_kv span_no_holes detection (2048-KV chunk reduction -> works up to 1M+ ctx, eliminating
+// 2 barriers/tile + 100% redundant mask reads at 32k/250K+)!
 static const char * k_glsl_fa_mask_bounds = R"GLSL(
 #version 450
 #extension GL_EXT_buffer_reference : require
@@ -2826,66 +2827,82 @@ layout(push_constant) uniform PushArgs {
     uint     n_tokens;
     uint     mask_nb1;
     uint     is_f16;
+    uint     q_br;
+    uint     _pad0;
 } pc;
 
 shared uint s_min[4];
 shared uint s_max[4];
-shared uint s_bits[4][8];
+shared uint s_bits[4];
 
 void main() {
+    const uint q_br   = (pc.q_br > 16u) ? 32u : 16u;
     const uint q_tile = gl_WorkGroupID.x;
-    const uint q0     = q_tile * 16u;
+    const uint q0     = q_tile * q_br;
     const uint tid    = gl_LocalInvocationID.x;
-    const uint ql     = tid >> 3u;       // 0..15 (matches Wave 9 PASS_MODE=3 PF_BR=16!)
+    const uint sg     = tid >> 5u;
+    const uint ql0    = tid >> 3u;       // 0..15
     const uint kl4    = (tid & 7u) * 4u; // 0, 4, 8, 12, 16, 20, 24, 28 (32 KV/iter)
 
-    uint my_min = 0xFFFFFFFFu;
-    uint my_max = 0u;
-    uint my_bits[8] = uint[8](0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u);
+    uint my_min          = 0xFFFFFFFFu;
+    uint my_max          = 0u;
+    uint total_valid_t64 = 0u;
 
-    if (q0 + ql < pc.n_tokens) {
-        const uint64_t rva  = pc.mask_va + uint64_t(q0 + ql) * uint64_t(pc.mask_nb1);
-        const bool vec_f16  = (pc.is_f16 != 0u) && ((pc.mask_va & 7ul) == 0ul) && ((pc.mask_nb1 & 7u) == 0u);
-        const bool vec_f32  = (pc.is_f16 == 0u) && ((pc.mask_va & 15ul) == 0ul) && ((pc.mask_nb1 & 15u) == 0u);
-        for (uint kv0 = 0u; kv0 < pc.n_kv; kv0 += 32u) {
-            const uint rem = pc.n_kv - kv0;
-            bool ok = false;
-            if (rem >= 32u && vec_f16) {
-                uvec2 p = ConstBufUvec2(rva + uint64_t(kv0 + kl4) * 2ul).v[0];
-                vec4 mv = vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y));
-                ok = (mv.x > -1.0e30) || (mv.y > -1.0e30) || (mv.z > -1.0e30) || (mv.w > -1.0e30);
-            } else if (rem >= 32u && vec_f32) {
-                vec4 mv = ConstBufVec4(rva + uint64_t(kv0 + kl4) * 4ul).v[0];
-                ok = (mv.x > -1.0e30) || (mv.y > -1.0e30) || (mv.z > -1.0e30) || (mv.w > -1.0e30);
-            } else {
-                for (uint c = 0u; c < 4u; ++c) {
-                    if (kl4 + c < rem) {
-                        float v = (pc.is_f16 != 0u) ? float(ConstBufF16(rva).v[kv0 + kl4 + c])
-                                                    : ConstBufF32(rva).v[kv0 + kl4 + c];
-                        if (v > -1.0e30) ok = true;
+    const bool vec_f16  = (pc.is_f16 != 0u) && ((pc.mask_va & 7ul) == 0ul) && ((pc.mask_nb1 & 7u) == 0u);
+    const bool vec_f32  = (pc.is_f16 == 0u) && ((pc.mask_va & 15ul) == 0ul) && ((pc.mask_nb1 & 15u) == 0u);
+    const uint r_passes = (q_br > 16u) ? 2u : 1u;
+
+    // 2048-KV chunks (32 x 64-KV tiles per chunk -> 1 uint32 bitmask, exact span_no_holes up to 1M+ ctx!)
+    for (uint chunk0 = 0u; chunk0 < pc.n_kv; chunk0 += 2048u) {
+        const uint chunk_end = min(chunk0 + 2048u, pc.n_kv);
+        uint my_bits = 0u;
+        for (uint rp = 0u; rp < r_passes; ++rp) {
+            const uint q_row = q0 + ql0 + rp * 16u;
+            if (q_row < pc.n_tokens) {
+                const uint64_t rva = pc.mask_va + uint64_t(q_row) * uint64_t(pc.mask_nb1);
+                for (uint kv0 = chunk0; kv0 < chunk_end; kv0 += 32u) {
+                    const uint rem = pc.n_kv - kv0;
+                    bool ok = false;
+                    if (rem >= 32u && vec_f16) {
+                        uvec2 p = ConstBufUvec2(rva + uint64_t(kv0 + kl4) * 2ul).v[0];
+                        vec4 mv = vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y));
+                        ok = (mv.x > -1.0e30) || (mv.y > -1.0e30) || (mv.z > -1.0e30) || (mv.w > -1.0e30);
+                    } else if (rem >= 32u && vec_f32) {
+                        vec4 mv = ConstBufVec4(rva + uint64_t(kv0 + kl4) * 4ul).v[0];
+                        ok = (mv.x > -1.0e30) || (mv.y > -1.0e30) || (mv.z > -1.0e30) || (mv.w > -1.0e30);
+                    } else {
+                        for (uint c = 0u; c < 4u; ++c) {
+                            if (kl4 + c < rem) {
+                                float v = (pc.is_f16 != 0u) ? float(ConstBufF16(rva).v[kv0 + kl4 + c])
+                                                            : ConstBufF32(rva).v[kv0 + kl4 + c];
+                                if (v > -1.0e30) ok = true;
+                            }
+                        }
+                    }
+                    if (ok) {
+                        my_min = min(my_min, kv0);
+                        my_max = max(my_max, min(kv0 + 32u, pc.n_kv));
+                        my_bits |= (1u << ((kv0 - chunk0) >> 6u));
                     }
                 }
             }
-            if (ok) {
-                my_min = min(my_min, kv0);
-                my_max = max(my_max, min(kv0 + 32u, pc.n_kv));
-                const uint t64 = kv0 >> 6u;
-                if (t64 < 256u) {
-                    my_bits[t64 >> 5u] |= (1u << (t64 & 31u));
-                }
-            }
+        }
+        uint b_or = subgroupOr(my_bits);
+        if ((tid & 31u) == 0u) {
+            s_bits[sg] = b_or;
+        }
+        barrier();
+        if (tid == 0u) {
+            uint u = s_bits[0] | s_bits[1] | s_bits[2] | s_bits[3];
+            total_valid_t64 += uint(bitCount(u));
+        }
+        if (chunk_end < pc.n_kv) {
+            barrier();
         }
     }
 
-    const uint sg = tid >> 5u;
     uint sg_min = subgroupMin(my_min);
     uint sg_max = subgroupMax(my_max);
-    for (uint w = 0u; w < 8u; ++w) {
-        uint b_or = subgroupOr(my_bits[w]);
-        if ((tid & 31u) == 0u) {
-            s_bits[sg][w] = b_or;
-        }
-    }
     if ((tid & 31u) == 0u) {
         s_min[sg] = sg_min;
         s_max[sg] = sg_max;
@@ -2898,14 +2915,9 @@ void main() {
         if (gmin >= gmax) {
             gmin = pc.n_kv;
             gmax = 0u;
-        } else if (pc.n_kv <= 16384u) {
-            uint valid_cnt = 0u;
-            for (uint w = 0u; w < 8u; ++w) {
-                uint u = s_bits[0][w] | s_bits[1][w] | s_bits[2][w] | s_bits[3][w];
-                valid_cnt += uint(bitCount(u));
-            }
+        } else {
             const uint span_tiles = ((gmax + 63u) >> 6u) - (gmin >> 6u);
-            if (valid_cnt == span_tiles) {
+            if (total_valid_t64 == span_tiles) {
                 gmax |= 0x80000000u; // contiguous active 64-KV span (zero -INF hole tiles!)
             }
         }
@@ -2916,7 +2928,7 @@ void main() {
 
 struct fa_mask_bounds_push {
     uint64_t mask_va, bounds_va;
-    uint32_t n_kv, n_tokens, mask_nb1, is_f16;
+    uint32_t n_kv, n_tokens, mask_nb1, is_f16, q_br, _pad0;
 };
 static_assert(sizeof(fa_mask_bounds_push) <= AGX_MAX_PUSH_BYTES, "fa_mask_bounds_push > 256B");
 
@@ -3514,6 +3526,7 @@ struct agx_graph_exec_state {
     size_t                      ctrl_pipe_cap_B = 0;
     agx_graph_exec_stats        stats          = {};
     bool                        initialized    = false;
+    bool                        precompiled_llm = false;
 };
 
 static agx_graph_exec_state * get_exec_state(agx_backend_context * ctx) {
@@ -3548,7 +3561,7 @@ static agx_graph_exec_state * get_exec_state(agx_backend_context * ctx) {
         st->k_sconv_prep_store     = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_sconv_prep_store",     k_glsl_sconv_prep_store,     opts);
         st->k_router_topk_norm     = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_router_topk_norm",     k_glsl_router_topk_norm,     opts);
         st->k_rel_bias_gather      = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_rel_bias_gather_w9",   k_glsl_rel_bias_gather,      opts);
-        st->k_fa_mask_bounds       = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_fa_mask_bounds_w9",    k_glsl_fa_mask_bounds,       opts);
+        st->k_fa_mask_bounds       = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_fa_mask_bounds_w10",   k_glsl_fa_mask_bounds,       opts);
         st->initialized            = (st->k_bin_op && st->k_unary_op && st->k_cpy_cast && st->k_row_reduce &&
                                       st->k_softmax && st->k_get_rows && st->k_set_rows && st->k_concat_pad &&
                                       st->k_ssm_conv && st->k_rope && st->k_topk_argsort && st->k_glu &&
@@ -3818,9 +3831,178 @@ bool agx_supports_op(const agx_drm_device * dev, const struct ggml_tensor * op) 
 void agx_graph_optimize(agx_backend_context *                       ctx,
                         struct ggml_cgraph *                        cgraph,
                         struct ggml_backend_graph_optimize_params * params) {
-    (void) ctx;
-    (void) cgraph;
     (void) params;
+    if (!ctx || !ctx->drm || !ctx->compiler || !cgraph || cgraph->n_nodes < 256) {
+        return;
+    }
+    const char * no_pre = std::getenv("GGML_AGX_NO_PRECOMPILE");
+    if (no_pre && std::atoi(no_pre) != 0) {
+        return;
+    }
+
+    auto * st = get_exec_state(ctx);
+    if (!st) {
+        return;
+    }
+
+    // 1. Pre-compile ALL hot prefill/decode shaders ONCE during llama_context::graph_reserve()
+    //    so the first timed prompt (e.g. Code 1k after a 32-token warmup) pays ZERO cold compile tax!
+    if (!st->precompiled_llm) {
+        st->precompiled_llm = true;
+        agx_gemm_precompile_all(ctx);
+
+        bool has_moe = false;
+        struct fa_dt_key {
+            uint32_t     head_dim;
+            agx_kv_dtype k_dt;
+            agx_kv_dtype v_dt;
+        };
+        fa_dt_key fa_keys[4] = {};
+        int       n_fa_keys  = 0;
+
+        auto map_kv_dt = [](enum ggml_type t, agx_kv_dtype * out) -> bool {
+            switch (t) {
+                case GGML_TYPE_F8_E4M3: *out = AGX_KV_F8_E4M3;   return true;
+                case GGML_TYPE_F16:     *out = AGX_KV_F16;       return true;
+                case GGML_TYPE_F32:     *out = AGX_KV_F32;       return true;
+                case GGML_TYPE_Q8_0:    *out = AGX_KV_Q8_0_GGML; return true;
+                default:                return false;
+            }
+        };
+
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const struct ggml_tensor * nd = cgraph->nodes[i];
+            if (!nd) continue;
+            if (nd->op == GGML_OP_MUL_MAT_ID) {
+                has_moe = true;
+            } else if (nd->op == GGML_OP_FLASH_ATTN_EXT && nd->src[0] && nd->src[1] && nd->src[2]) {
+                const uint32_t d = static_cast<uint32_t>(nd->src[0]->ne[0]);
+                agx_kv_dtype k_dt, v_dt;
+                if ((d == 64u || d == 128u) &&
+                    map_kv_dt(nd->src[1]->type, &k_dt) &&
+                    map_kv_dt(nd->src[2]->type, &v_dt)) {
+                    bool seen = false;
+                    for (int k = 0; k < n_fa_keys; ++k) {
+                        if (fa_keys[k].head_dim == d && fa_keys[k].k_dt == k_dt && fa_keys[k].v_dt == v_dt) {
+                            seen = true;
+                            break;
+                        }
+                    }
+                    if (!seen && n_fa_keys < 4) {
+                        fa_keys[n_fa_keys++] = { d, k_dt, v_dt };
+                    }
+                }
+            }
+        }
+
+        if (has_moe) {
+            if (!ctx->moe_state) {
+                ctx->moe_state = agx_moe_create(ctx->drm, ctx->compiler);
+            }
+            if (ctx->moe_state) {
+                agx_moe_precompile_inkling2(static_cast<agx_moe_runner *>(ctx->moe_state));
+            }
+        }
+
+        if (n_fa_keys > 0) {
+            if (!ctx->kv_hybrid_state) {
+                agx_kv_hybrid_config kcfg;
+                kcfg.n_slots = 48;
+                kcfg.max_full_tokens = 4096;
+                ctx->kv_hybrid_state = agx_kv_hybrid_create(ctx->drm, ctx->compiler, kcfg);
+            }
+            if (ctx->kv_hybrid_state) {
+                auto * pool = static_cast<agx_kv_hybrid_pool *>(ctx->kv_hybrid_state);
+                for (int k = 0; k < n_fa_keys; ++k) {
+                    agx_kv_hybrid_precompile_ext_dtype(pool, fa_keys[k].head_dim, fa_keys[k].k_dt, fa_keys[k].v_dt);
+                }
+            }
+        }
+    }
+
+    // 2. Pre-size scratch BOs (fa_bounds_bo, redirect_tmp_bo, ctrl_pipe_bo) to the reserved
+    //    n_ubatch peak graph so Code 1k..32k pay ZERO BO free/alloc/VM-bind stalls!
+    constexpr size_t k_fa_bounds_pool_B = 131072u;
+    if (!st->fa_bounds_bo || st->fa_bounds_cap_B < k_fa_bounds_pool_B) {
+        if (st->fa_bounds_bo) agx_bo_free(ctx->drm, st->fa_bounds_bo);
+        st->fa_bounds_bo = agx_bo_alloc(ctx->drm, k_fa_bounds_pool_B,
+                                        AGX_BO_SLC_PIN | AGX_BO_WRITEBACK, "ge-fa-bounds");
+        st->fa_bounds_cap_B = st->fa_bounds_bo ? k_fa_bounds_pool_B : 0u;
+    }
+
+    const bool no_fusion    = (std::getenv("GGML_AGX_NO_FUSION")    != nullptr && std::atoi(std::getenv("GGML_AGX_NO_FUSION"))    != 0);
+    const bool no_redirect  = (std::getenv("GGML_AGX_NO_REDIRECT")  != nullptr && std::atoi(std::getenv("GGML_AGX_NO_REDIRECT"))  != 0);
+    const bool no_ctrl_pipe = (std::getenv("GGML_AGX_NO_CTRL_PIPE") != nullptr && std::atoi(std::getenv("GGML_AGX_NO_CTRL_PIPE")) != 0);
+    const bool ctrl_sram    = (std::getenv("GGML_AGX_CTRL_SRAM")    != nullptr && std::atoi(std::getenv("GGML_AGX_CTRL_SRAM"))    != 0);
+
+    if (!no_fusion && !no_redirect) {
+        size_t max_redir_elem_B = 0u;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const struct ggml_tensor * nd = cgraph->nodes[i];
+            if (nd && nd->type == GGML_TYPE_F32 && nd->ne[0] > 0 && nd->ne[0] <= 8192 &&
+                (nd->op == GGML_OP_MUL_MAT || nd->op == GGML_OP_MUL_MAT_ID ||
+                 nd->op == GGML_OP_ADD || nd->op == GGML_OP_MUL)) {
+                const size_t nb = ggml_nbytes(nd);
+                if (nb <= 32u * 1024u * 1024u && nb > max_redir_elem_B) {
+                    max_redir_elem_B = nb;
+                }
+            }
+        }
+        if (max_redir_elem_B > 0u) {
+            const size_t cand_slot_B  = agx_align_up(max_redir_elem_B, AGX_PAGE_SIZE);
+            const size_t total_need_B = cand_slot_B * 4u;
+            if (!st->redirect_tmp_bo || st->redirect_tmp_cap_B < total_need_B) {
+                if (st->redirect_tmp_bo) agx_bo_free(ctx->drm, st->redirect_tmp_bo);
+                const uint32_t rflags = (total_need_B <= 32u * 1024u * 1024u)
+                    ? (AGX_BO_SLC_PIN | AGX_BO_WRITEBACK)
+                    : (AGX_BO_SLC_STREAM | AGX_BO_WRITEBACK);
+                st->redirect_tmp_bo    = agx_bo_alloc(ctx->drm, total_need_B, rflags, "ge-redir-tmp");
+                st->redirect_tmp_cap_B = st->redirect_tmp_bo ? total_need_B : 0u;
+            }
+        }
+    }
+
+    if (!no_fusion && !no_ctrl_pipe && !ctrl_sram) {
+        std::vector<const struct ggml_tensor *> exec_nd;
+        exec_nd.reserve((size_t) cgraph->n_nodes);
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const struct ggml_tensor * nd = cgraph->nodes[i];
+            if (nd && !is_view_only_op(nd->op)) {
+                exec_nd.push_back(nd);
+            }
+        }
+        size_t n_ctrl_cand = 0u;
+        size_t m1 = 0u, m2 = 0u, m3 = 0u, m7 = 0u;
+        for (size_t e = 0; e + 10u < exec_nd.size(); ++e) {
+            const struct ggml_tensor * nd = exec_nd[e];
+            if (nd->op != GGML_OP_CONCAT || nd->ne[1] != 2 || nd->ne[3] != 1) continue;
+            const struct ggml_tensor * c1 = exec_nd[e + 1u];
+            const struct ggml_tensor * c2 = exec_nd[e + 2u];
+            const struct ggml_tensor * c3 = exec_nd[e + 3u];
+            const struct ggml_tensor * c7 = exec_nd[e + 7u];
+            if (c1->op == GGML_OP_RMS_NORM && c2->op == GGML_OP_MUL_MAT &&
+                c3->op == GGML_OP_MUL_MAT && c7->op == GGML_OP_MUL_MAT) {
+                n_ctrl_cand++;
+                m1 = std::max(m1, ggml_nbytes(c1));
+                m2 = std::max(m2, ggml_nbytes(c2));
+                m3 = std::max(m3, ggml_nbytes(c3));
+                m7 = std::max(m7, ggml_nbytes(c7));
+            }
+        }
+        if (n_ctrl_cand >= 2u && m1 > 0u && m2 > 0u && m3 > 0u && m7 > 0u) {
+            const size_t bank_B  = agx_align_up(m1, AGX_PAGE_SIZE) + agx_align_up(m2, AGX_PAGE_SIZE)
+                                 + agx_align_up(m3, AGX_PAGE_SIZE) + agx_align_up(m7, AGX_PAGE_SIZE);
+            const size_t total_B = bank_B * 3u;
+            if (total_B <= 384u * 1024u * 1024u && (!st->ctrl_pipe_bo || st->ctrl_pipe_cap_B < total_B)) {
+                if (st->ctrl_pipe_bo) agx_bo_free(ctx->drm, st->ctrl_pipe_bo);
+                const uint32_t cflags = (total_B <= 32u * 1024u * 1024u)
+                    ? (AGX_BO_SLC_PIN | AGX_BO_WRITEBACK)
+                    : (AGX_BO_SLC_STREAM | AGX_BO_WRITEBACK);
+                st->ctrl_pipe_bo    = agx_bo_alloc(ctx->drm, total_B, cflags, "ge-ctrl-pipe");
+                st->ctrl_pipe_cap_B = st->ctrl_pipe_bo ? total_B : 0u;
+            }
+        }
+    }
 }
 
 void agx_graph_exec_cleanup(agx_backend_context * ctx) {
@@ -4540,17 +4722,19 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
         uint32_t n_tokens;
         uint32_t mask_nb1;
         uint32_t is_f16;
+        uint32_t q_br;
         uint64_t bounds_va;
         agx_va_range bounds_range;
     };
     std::vector<fa_bounds_slot> fa_bounds_slots;
     fa_bounds_slots.reserve(8u);
     size_t fa_bounds_used_B = 0u;
-    const size_t k_fa_bounds_pool_B = 131072u; // 128 KiB fixed VA pool (covers >= 16 unique masks at Br=16 up to M=16384)
+    const size_t k_fa_bounds_pool_B = 131072u; // 128 KiB fixed VA pool (covers >= 16 unique masks at Br=16/32 up to M=16384)
 
     auto get_or_alloc_fa_bounds = [&](const struct ggml_tensor * bm,
                                       uint32_t n_kv_u,
                                       uint32_t n_tok_u,
+                                      uint32_t q_br_u,
                                       uint64_t * out_va,
                                       agx_va_range * out_r) -> bool {
         *out_va = 0ull;
@@ -4561,16 +4745,17 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
         const uint64_t bm_va   = agx_tensor_gpu_va(bm);
         const uint32_t m_nb1_u = (uint32_t) bm->nb[1];
         const uint32_t is_f16  = (bm->type == GGML_TYPE_F16) ? 1u : 0u;
+        const uint32_t br_u    = (q_br_u > 16u) ? 32u : 16u;
         if (bm_va == 0ull) return false;
         for (const auto & sl : fa_bounds_slots) {
             if (sl.mask_va == bm_va && sl.n_kv == n_kv_u && sl.n_tokens == n_tok_u &&
-                sl.mask_nb1 == m_nb1_u && sl.is_f16 == is_f16) {
+                sl.mask_nb1 == m_nb1_u && sl.is_f16 == is_f16 && sl.q_br == br_u) {
                 *out_va = sl.bounds_va;
                 *out_r  = sl.bounds_range;
                 return true;
             }
         }
-        const uint32_t n_qt = (n_tok_u + 15u) / 16u;
+        const uint32_t n_qt = (n_tok_u + br_u - 1u) / br_u;
         const size_t need_B = agx_align_up((size_t) n_qt * 8u, 256u);
         if (fa_bounds_used_B + need_B > k_fa_bounds_pool_B) return false;
         if (!st->fa_bounds_bo || st->fa_bounds_cap_B < k_fa_bounds_pool_B) {
@@ -4582,7 +4767,7 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
         const uint64_t bva = st->fa_bounds_bo->gpu_va + fa_bounds_used_B;
         const agx_va_range br = { bva, bva + need_B };
         fa_bounds_used_B += need_B;
-        fa_bounds_slots.push_back({ bm_va, n_kv_u, n_tok_u, m_nb1_u, is_f16, bva, br });
+        fa_bounds_slots.push_back({ bm_va, n_kv_u, n_tok_u, m_nb1_u, is_f16, br_u, bva, br });
 
         fa_mask_bounds_push bpc{};
         bpc.mask_va   = bm_va;
@@ -4591,6 +4776,8 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
         bpc.n_tokens  = n_tok_u;
         bpc.mask_nb1  = m_nb1_u;
         bpc.is_f16    = is_f16;
+        bpc.q_br      = br_u;
+        bpc._pad0     = 0u;
 
         agx_exec_item bit{};
         bit.kind          = ITEM_FA_MASK_BOUNDS;
@@ -7780,7 +7967,7 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                                                         fk->ne[1] == n_kv && fk->ne[1] >= 128 && fq->ne[3] == 1 &&
                                                         fk->type != GGML_TYPE_F32 && fv->type != GGML_TYPE_F32) {
                                                         get_or_alloc_fa_bounds(mask_t, (uint32_t) n_kv, (uint32_t) n_tokens,
-                                                                               &rel_bounds_va, &rel_bounds_r);
+                                                                               16u, &rel_bounds_va, &rel_bounds_r);
                                                     }
                                                 }
                                             }
@@ -7880,22 +8067,23 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
             // Check if PASS_MODE=3 prefill fastpath can use 1-head base mask [kv_beg, kv_end) bounds!
             agx_va_range bounds_r  = { 0, 0 };
             uint64_t     bounds_va = 0ull;
-            if (!no_fa_bounds && D == 128 && N >= 64 && k->ne[1] >= 128 && B == 1 &&
+            if (!no_fa_bounds && D == 128 && N >= 32 && k->ne[1] >= 128 && B == 1 &&
                 k->type != GGML_TYPE_F32 && v->type != GGML_TYPE_F32 && mask != nullptr) {
+                const uint32_t fa_q_br = agx_kv_hybrid_prefill_br_for_tokens((uint32_t) N);
                 for (const auto & rm : rel_mask_map) {
                     if (rm.kq_b_out == mask) {
-                        if (rm.bounds_va != 0ull) {
+                        if (rm.bounds_va != 0ull && fa_q_br == 16u) {
                             bounds_va = rm.bounds_va;
                             bounds_r  = rm.bounds_range;
                         } else {
                             get_or_alloc_fa_bounds(rm.base_mask, (uint32_t) k->ne[1], (uint32_t) N,
-                                                   &bounds_va, &bounds_r);
+                                                   fa_q_br, &bounds_va, &bounds_r);
                         }
                         break;
                     }
                 }
                 if (bounds_va == 0ull && mask->ne[2] == 1 && mask->ne[3] == 1) {
-                    get_or_alloc_fa_bounds(mask, (uint32_t) k->ne[1], (uint32_t) N, &bounds_va, &bounds_r);
+                    get_or_alloc_fa_bounds(mask, (uint32_t) k->ne[1], (uint32_t) N, fa_q_br, &bounds_va, &bounds_r);
                 }
             }
 

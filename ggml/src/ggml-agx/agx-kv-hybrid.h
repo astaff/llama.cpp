@@ -208,6 +208,11 @@ struct agx_ggml_flash_attn_epi {
 };
 
 // Generic ggml `GGML_OP_FLASH_ATTN_EXT` support check & dispatcher for `agx-graph-exec.cpp`.
+uint32_t agx_kv_hybrid_prefill_br_for_tokens(uint32_t n_tokens);
+bool     agx_kv_hybrid_precompile_ext_dtype(agx_kv_hybrid_pool * pool,
+                                            uint32_t             head_dim,
+                                            agx_kv_dtype         k_dt,
+                                            agx_kv_dtype         v_dt);
 bool agx_kv_hybrid_supports_ggml_flash_attn(const struct ggml_tensor * dst);
 bool agx_kv_hybrid_ggml_flash_attn_uses_scratch(const struct ggml_tensor * dst);
 bool agx_kv_hybrid_dispatch_ggml_flash_attn_ext(agx_kv_hybrid_pool *            pool,

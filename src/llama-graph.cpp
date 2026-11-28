@@ -1433,7 +1433,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
     return res;
 }
 
-static bool should_use_rel_pack(const llama_cparams & cparams, const llama_ubatch & ubatch) {
+static bool should_use_rel_pack(const llama_cparams & cparams, const llama_ubatch & ubatch, uint32_t n_kv_base) {
     if (!cparams.flash_attn) {
         return false;
     }
@@ -1445,10 +1445,10 @@ static bool should_use_rel_pack(const llama_cparams & cparams, const llama_ubatc
     if (all_env && std::atoi(all_env) != 0) {
         return true;
     }
-    // Keep M<=8 single-seq on legacy kq_b shape so agx-inkling2.cpp M<=8 megakernel
-    // matches unchanged; prefill, multi-stream batches, and graph_reserve (n_ubatch)
-    // use O(n_kv) banded rel_pos_pack (eliminates 17.83+ GiB kq_b OOM up to 250K+ ctx!).
-    return ubatch.n_tokens > 8 || ubatch.n_seqs > 1;
+    // Wave 10: Keep M<=8 single-seq at n_kv_base <= 1024 on legacy kq_b; switch to O(n_kv)
+    // banded rel_pos_pack whenever n_tokens > 8, n_seqs > 1, or n_kv_base > 1024
+    // (eliminates 200+ MB/step kq_b streaming at 4k..32k TG and 17.83+ GiB OOM at 250K+!).
+    return ubatch.n_tokens > 8 || ubatch.n_seqs > 1 || n_kv_base > 1024u;
 }
 
 static int64_t compute_rel_eff_rows(const llama_ubatch & ubatch, uint32_t extent) {
@@ -1534,7 +1534,7 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
     const auto * attn_ctx = mctx->get_attn();
 
     // the masks are always dense, see build_inp_mem_hybrid_iswa_rel()
-    const bool want_rel_pack = should_use_rel_pack(params.cparams, params.ubatch);
+    const bool want_rel_pack = should_use_rel_pack(params.cparams, params.ubatch, attn_ctx->get_base()->get_n_kv());
     res &= (self_rel_pos_pack != nullptr) == want_rel_pack;
 
     // base tensors may not be allocated if there are no non-SWA attention layers
@@ -4511,7 +4511,7 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa_rel>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur, extent, extent_swa);
 
-    if (should_use_rel_pack(cparams, ubatch)) {
+    if (should_use_rel_pack(cparams, ubatch, attn_ctx->get_base()->get_n_kv())) {
         const uint32_t n_kv_b   = attn_ctx->get_base()->get_n_kv();
         const uint32_t n_strm_b = (uint32_t) inp->inp_attn->self_attn_mask.raw->ne[3];
         inp->n_stream_rel       = n_strm_b;

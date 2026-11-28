@@ -174,10 +174,18 @@ struct agx_push_full_attn {
     uint32_t rel_cp_off;
     uint32_t rel_qp_off;
     uint32_t rel_tm_off;
-    uint32_t _pad0;
-    uint32_t _pad1;
+    uint32_t n_batches;
+    uint32_t batch_q_nb3;
+    uint32_t batch_k_nb3;
+    uint32_t batch_v_nb3;
+    uint32_t batch_mask_nb3;
+    uint32_t batch_out_nb3;
+    uint32_t batch_qgate_nb3;
+    uint32_t batch_rk3;
+    uint32_t batch_rv3;
+    uint32_t batch_mask_ne3;
 };
-static_assert(sizeof(agx_push_full_attn) == 224, "agx_push_full_attn must match GLSL PushAttn (224B)");
+static_assert(sizeof(agx_push_full_attn) == 256, "agx_push_full_attn must match GLSL PushAttn (256B)");
 
 struct agx_push_kv_append {
     uint64_t k_src_va;
@@ -253,12 +261,14 @@ struct agx_kv_hybrid_pool {
     size_t   split_partial_cap_bytes = 0;
 
     // Compiled kernels (head_slot: 0 = D128, 1 = D64; k_dt/v_dt: 0..4)
-    const agx_kernel * k_swa_attn[3]          = {}; // F8_E4M3, Q8_0_PLANAR, F16
-    const agx_kernel * k_full_phase1[2][5][5] = {}; // [head_slot][k_dt][v_dt]
-    const agx_kernel * k_full_phase2[2]       = {}; // [head_slot]
-    const agx_kernel * k_full_prefill[5][5]   = {}; // D128 BQ=32 coopmat prefill [k_dt][v_dt]
-    const agx_kernel * k_full_prefill_m8[5][5]= {}; // D128 BQ=8 split-K coopmat (M=2..15 DSpark!) [k_dt][v_dt]
-    const agx_kernel * k_kv_append[3]         = {}; // F8_E4M3, Q8_0_PLANAR, F16
+    const agx_kernel * k_swa_attn[3]             = {}; // F8_E4M3, Q8_0_PLANAR, F16
+    const agx_kernel * k_full_phase1[2][5][5]    = {}; // [head_slot][k_dt][v_dt]
+    const agx_kernel * k_full_phase1_gqa3[5][5]  = {}; // D128 GQA=3 grouped decode [k_dt][v_dt] (3.0x KV DRAM win!)
+    const agx_kernel * k_full_phase2[2]          = {}; // [head_slot]
+    const agx_kernel * k_full_prefill[5][5]      = {}; // D128 Br=16 Bc=64 coopmat prefill [k_dt][v_dt]
+    const agx_kernel * k_full_prefill_br32[5][5] = {}; // D128 Br=32 Bc=64 coopmat prefill [k_dt][v_dt] (Wave 10 32k PP!)
+    const agx_kernel * k_full_prefill_m8[5][5]   = {}; // D128 GQA-grouped 8-SG Zero-K/V-SRAM split-K verify [k_dt][v_dt]
+    const agx_kernel * k_kv_append[3]            = {}; // F8_E4M3, Q8_0_PLANAR, F16
 };
 
 static const agx_kernel * get_swa_kernel(agx_kv_hybrid_pool * pool, agx_kv_dtype dt) {
@@ -298,12 +308,38 @@ static const agx_kernel * get_full_phase1_kernel(agx_kv_hybrid_pool * pool,
         opts.defines.push_back("N_SG=4");
         opts.is_hot_kernel     = true;
         opts.strict_zero_spill = true;
-        const std::string name = "fused_full_flash_decode_p1w9_d" + std::to_string(head_dim)
+        const std::string name = "fused_full_flash_decode_p1w10c_d" + std::to_string(head_dim)
                                + "_k" + std::to_string(ik) + "_v" + std::to_string(iv);
         pool->k_full_phase1[hs][ik][iv] = agx_compiler_compile_file(
             pool->compiler, name.c_str(), "fused_full_flash_decode.comp", opts);
     }
     return pool->k_full_phase1[hs][ik][iv];
+}
+
+static const agx_kernel * get_full_phase1_gqa3_kernel(agx_kv_hybrid_pool * pool,
+                                                      agx_kv_dtype         k_dt,
+                                                      agx_kv_dtype         v_dt) {
+    const uint32_t ik = static_cast<uint32_t>(k_dt);
+    const uint32_t iv = static_cast<uint32_t>(v_dt);
+    if (ik >= 5u || iv >= 5u) {
+        return nullptr;
+    }
+    if (!pool->k_full_phase1_gqa3[ik][iv] && pool->compiler) {
+        agx_compile_opts opts;
+        opts.defines.push_back("PASS_MODE=0");
+        opts.defines.push_back("GQA_GRP=3");
+        opts.defines.push_back("HEAD_DIM=128");
+        opts.defines.push_back("KV_DTYPE_K=" + std::to_string(ik));
+        opts.defines.push_back("KV_DTYPE_V=" + std::to_string(iv));
+        opts.defines.push_back("N_SG=4");
+        opts.is_hot_kernel     = true;
+        opts.strict_zero_spill = true;
+        const std::string name = "fused_full_flash_decode_p1w10g3_d128_k" + std::to_string(ik)
+                               + "_v" + std::to_string(iv);
+        pool->k_full_phase1_gqa3[ik][iv] = agx_compiler_compile_file(
+            pool->compiler, name.c_str(), "fused_full_flash_decode.comp", opts);
+    }
+    return pool->k_full_phase1_gqa3[ik][iv];
 }
 
 static const agx_kernel * get_full_phase2_kernel(agx_kv_hybrid_pool * pool, uint32_t head_dim) {
@@ -317,7 +353,7 @@ static const agx_kernel * get_full_phase2_kernel(agx_kv_hybrid_pool * pool, uint
         opts.defines.push_back("HEAD_DIM=" + std::to_string(head_dim));
         opts.is_hot_kernel     = true;
         opts.strict_zero_spill = true;
-        const std::string name = "fused_full_flash_decode_p2w9_d" + std::to_string(head_dim);
+        const std::string name = "fused_full_flash_decode_p2w10b_d" + std::to_string(head_dim);
         pool->k_full_phase2[hs] = agx_compiler_compile_file(
             pool->compiler, name.c_str(), "fused_full_flash_decode.comp", opts);
     }
@@ -326,27 +362,32 @@ static const agx_kernel * get_full_phase2_kernel(agx_kv_hybrid_pool * pool, uint
 
 static const agx_kernel * get_full_prefill_kernel(agx_kv_hybrid_pool * pool,
                                                   agx_kv_dtype         k_dt,
-                                                  agx_kv_dtype         v_dt) {
+                                                  agx_kv_dtype         v_dt,
+                                                  uint32_t             pf_br) {
     const uint32_t ik = static_cast<uint32_t>(k_dt);
     const uint32_t iv = static_cast<uint32_t>(v_dt);
-    if (ik >= 5u || iv >= 5u) {
+    if (ik >= 5u || iv >= 5u || (pf_br != 16u && pf_br != 32u)) {
         return nullptr;
     }
-    if (!pool->k_full_prefill[ik][iv] && pool->compiler) {
+    const agx_kernel *& slot = (pf_br == 32u)
+        ? pool->k_full_prefill_br32[ik][iv]
+        : pool->k_full_prefill[ik][iv];
+    if (!slot && pool->compiler) {
         agx_compile_opts opts;
         opts.defines.push_back("PASS_MODE=3");
+        opts.defines.push_back("PF_BR=" + std::to_string(pf_br));
         opts.defines.push_back("HEAD_DIM=128");
         opts.defines.push_back("KV_DTYPE_K=" + std::to_string(ik));
         opts.defines.push_back("KV_DTYPE_V=" + std::to_string(iv));
         opts.defines.push_back("N_SG=8");
         opts.is_hot_kernel     = true;
         opts.strict_zero_spill = true;
-        const std::string name = "fused_full_flash_prefill_w9_d128_k" + std::to_string(ik)
-                               + "_v" + std::to_string(iv);
-        pool->k_full_prefill[ik][iv] = agx_compiler_compile_file(
+        const std::string name = "fused_full_flash_prefill_w10_br" + std::to_string(pf_br)
+                               + "_d128_k" + std::to_string(ik) + "_v" + std::to_string(iv);
+        slot = agx_compiler_compile_file(
             pool->compiler, name.c_str(), "fused_full_flash_decode.comp", opts);
     }
-    return pool->k_full_prefill[ik][iv];
+    return slot;
 }
 
 static const agx_kernel * get_full_prefill_m8_kernel(agx_kv_hybrid_pool * pool,
@@ -365,12 +406,52 @@ static const agx_kernel * get_full_prefill_m8_kernel(agx_kv_hybrid_pool * pool,
         opts.defines.push_back("KV_DTYPE_V=" + std::to_string(iv));
         opts.is_hot_kernel     = true;
         opts.strict_zero_spill = true;
-        const std::string name = "fused_full_flash_m8w9_d128_k" + std::to_string(ik)
+        const std::string name = "fused_full_flash_m8w10g_d128_k" + std::to_string(ik)
                                + "_v" + std::to_string(iv);
         pool->k_full_prefill_m8[ik][iv] = agx_compiler_compile_file(
             pool->compiler, name.c_str(), "fused_full_flash_decode.comp", opts);
     }
     return pool->k_full_prefill_m8[ik][iv];
+}
+
+uint32_t agx_kv_hybrid_prefill_br_for_tokens(uint32_t n_tokens) {
+    static const int forced_br = []() {
+        const char * e = std::getenv("GGML_AGX_FA_BR");
+        return (e && *e) ? std::atoi(e) : 0;
+    }();
+    static const uint32_t br32_min_m = []() {
+        const char * e = std::getenv("GGML_AGX_FA_BR32_MIN_M");
+        if (e && *e) {
+            int v = std::atoi(e);
+            if (v > 0) return static_cast<uint32_t>(v);
+        }
+        return 256u;
+    }();
+    if (forced_br == 16) return 16u;
+    if (forced_br == 32) return 32u;
+    return (n_tokens >= br32_min_m) ? 32u : 16u;
+}
+
+bool agx_kv_hybrid_precompile_ext_dtype(agx_kv_hybrid_pool * pool,
+                                        uint32_t             head_dim,
+                                        agx_kv_dtype         k_dt,
+                                        agx_kv_dtype         v_dt) {
+    if (!pool || !pool->compiler || (head_dim != 64u && head_dim != 128u)) {
+        return false;
+    }
+    bool ok = true;
+    ok &= (get_full_phase1_kernel(pool, head_dim, k_dt, v_dt) != nullptr);
+    ok &= (get_full_phase2_kernel(pool, head_dim) != nullptr);
+    if (head_dim == 128u) {
+        ok &= (get_full_phase1_gqa3_kernel(pool, k_dt, v_dt) != nullptr);
+        if (k_dt != AGX_KV_F32 && v_dt != AGX_KV_F32 &&
+            k_dt != AGX_KV_Q8_0_PLANAR && v_dt != AGX_KV_Q8_0_PLANAR) {
+            ok &= (get_full_prefill_kernel(pool, k_dt, v_dt, 16u) != nullptr);
+            ok &= (get_full_prefill_kernel(pool, k_dt, v_dt, 32u) != nullptr);
+            ok &= (get_full_prefill_m8_kernel(pool, k_dt, v_dt) != nullptr);
+        }
+    }
+    return ok;
 }
 
 static const agx_kernel * get_kv_append_kernel(agx_kv_hybrid_pool * pool, agx_kv_dtype dt) {
@@ -743,18 +824,109 @@ bool agx_kv_hybrid_dispatch_swa_attn(agx_kv_hybrid_pool *        pool,
                             &pc, sizeof(pc), post_barrier);
 }
 
-static uint32_t choose_flash_decode_splits(uint32_t n_kv, uint32_t n_head_q, uint32_t n_tokens) {
+static uint32_t choose_flash_decode_splits(uint32_t n_kv, uint32_t n_head_q, uint32_t total_tokens) {
     if (n_kv <= 256u) {
         return 1u;
     }
-    // Saturate all 40 M4 Max cores (target >= 160 WGs when n_kv is large, >= 128 keys/split)
-    const uint32_t max_by_kv   = std::max<uint32_t>(1u, (n_kv + 127u) / 128u);
-    const uint32_t base_wgs    = std::max<uint32_t>(1u, n_head_q * n_tokens);
+    // Saturate all 40 M4 Max cores with 64-key aligned splits:
+    // - When total WGs already >= 160 (e.g. Batch 8x @ 1k..8k -> 192 WGs), stay single-pass
+    //   n_splits=1 (zero Phase-2 reduce, zero split_partial_bo, 16x fewer dispatches & barriers!).
+    // - For Batch 4x (96 WGs), 2 splits -> 192 WGs avoids the 16-WG tail wave on 40 cores!
+    // - For B=1, cap at 16 splits for <=32k (384 WGs @ Hq=24, 1024..2048 keys/split).
+    const uint32_t max_by_kv = std::max<uint32_t>(1u, (n_kv + 63u) / 64u);
+    const uint32_t base_wgs  = std::max<uint32_t>(1u, n_head_q * total_tokens);
+    if (base_wgs >= 160u && n_kv <= 8192u) {
+        return 1u;
+    }
     const uint32_t want_splits = (base_wgs >= 160u) ? 1u : ((160u + base_wgs - 1u) / base_wgs);
-    uint32_t splits = std::max<uint32_t>(want_splits, (n_kv + 511u) / 512u);
+    uint32_t splits;
+    if (n_kv <= 8192u) {
+        splits = (base_wgs >= 160u)
+            ? 1u
+            : std::min<uint32_t>(8u, std::max<uint32_t>(want_splits, (n_kv + 1023u) / 1024u));
+    } else if (n_kv <= 32768u) {
+        splits = (base_wgs >= 160u)
+            ? std::min<uint32_t>(4u, (n_kv + 4095u) / 4096u)
+            : std::min<uint32_t>(16u, std::max<uint32_t>(want_splits, (n_kv + 2047u) / 2048u));
+    } else {
+        splits = std::max<uint32_t>(16u, (n_kv + 2047u) / 2048u);
+    }
     splits = std::min<uint32_t>(splits, max_by_kv);
     splits = std::min<uint32_t>(splits, AGX_KV_MAX_SPLITS);
     return std::max<uint32_t>(1u, splits);
+}
+
+static uint32_t compute_pf4_splits(uint32_t n_kv_v, uint32_t n_hq_v, uint32_t n_hkv_v, uint32_t n_tok_v) {
+    static const uint32_t pf4_split_min_kv = []() {
+        const char * e = std::getenv("GGML_AGX_PF4_SPLIT_MIN_KV");
+        if (e && *e) {
+            int v = std::atoi(e);
+            if (v > 0) return static_cast<uint32_t>(v);
+        }
+        return 128u;
+    }();
+    static const uint32_t pf4_max_splits_env = []() {
+        const char * e = std::getenv("GGML_AGX_PF4_MAX_SPLITS");
+        if (e && *e) {
+            int v = std::atoi(e);
+            if (v > 0) return std::min<uint32_t>(static_cast<uint32_t>(v), AGX_KV_MAX_SPLITS);
+        }
+        return 0u;
+    }();
+    if (n_kv_v < pf4_split_min_kv) {
+        return 1u;
+    }
+    const uint32_t gqa       = (n_hkv_v > 0u) ? std::max<uint32_t>(1u, n_hq_v / n_hkv_v) : 1u;
+    const uint32_t m_wg      = std::max<uint32_t>(1u, 16u / gqa);
+    const uint32_t gy        = (n_tok_v + m_wg - 1u) / m_wg;
+    const uint32_t base_wgs  = std::max<uint32_t>(1u, n_hkv_v * gy);
+    const uint32_t max_by_kv = std::max<uint32_t>(1u, (n_kv_v + 63u) / 64u);
+    // Wave 10 GQA-grouped 8-SG PASS_MODE=4 (3 WGs/core = 120 concurrent WGs on 40 cores):
+    // Target exact multiples of 40 cores -> ZERO tail wave!
+    uint32_t target_wgs = 40u;
+    if (n_kv_v <= 512u) {
+        target_wgs = 40u;
+    } else if (n_kv_v <= 2048u) {
+        target_wgs = 80u;
+    } else if (n_kv_v <= 8192u) {
+        target_wgs = 120u; // 1.0 full wave (15 splits @ Hkv=8)
+    } else if (n_kv_v <= 32768u) {
+        target_wgs = 240u; // 2.0 full waves (30 splits @ Hkv=8, 546..1092 keys/split!)
+    } else {
+        target_wgs = 360u; // 3.0 full waves (45 splits @ Hkv=8)
+    }
+    uint32_t sp = (base_wgs >= target_wgs) ? 1u : ((target_wgs + base_wgs - 1u) / base_wgs);
+    if (pf4_max_splits_env > 0u) {
+        sp = std::min<uint32_t>(sp, pf4_max_splits_env);
+    }
+    sp = std::min<uint32_t>(sp, max_by_kv);
+    sp = std::min<uint32_t>(sp, AGX_KV_MAX_SPLITS);
+    return std::max<uint32_t>(1u, sp);
+}
+
+static uint32_t choose_gqa3_decode_splits(uint32_t n_kv, uint32_t n_head_kv, uint32_t total_tokens) {
+    if (n_kv <= 256u) {
+        return 1u;
+    }
+    const uint32_t max_by_kv = std::max<uint32_t>(1u, (n_kv + 63u) / 64u);
+    const uint32_t base_wgs  = std::max<uint32_t>(1u, n_head_kv * total_tokens);
+    // 4-SG GQA=3 kernel (2,080 B SRAM -> 6-8 WGs/core): launch exact wave multiples of 40 cores!
+    uint32_t target_wgs = 40u;
+    if (n_kv <= 1024u) {
+        target_wgs = 80u;  // 10 splits @ Hkv=8 -> 80 WGs
+    } else if (n_kv <= 4096u) {
+        target_wgs = 120u; // 15 splits @ Hkv=8 -> 120 WGs
+    } else if (n_kv <= 16384u) {
+        target_wgs = 160u; // 20 splits @ Hkv=8 -> 160 WGs (4 WGs/core exact!)
+    } else if (n_kv <= 32768u) {
+        target_wgs = 240u; // 30 splits @ Hkv=8 -> 240 WGs (6 WGs/core exact, 1092 keys/split!)
+    } else {
+        target_wgs = 360u; // 45 splits @ Hkv=8 -> 360 WGs
+    }
+    uint32_t sp = (base_wgs >= target_wgs) ? 1u : ((target_wgs + base_wgs - 1u) / base_wgs);
+    sp = std::min<uint32_t>(sp, max_by_kv);
+    sp = std::min<uint32_t>(sp, AGX_KV_MAX_SPLITS);
+    return std::max<uint32_t>(1u, sp);
 }
 
 bool agx_kv_hybrid_dispatch_full_attn(agx_kv_hybrid_pool *        pool,
@@ -773,17 +945,6 @@ bool agx_kv_hybrid_dispatch_full_attn(agx_kv_hybrid_pool *        pool,
 
     const agx_kv_dtype k_dt = is_paged ? pool->cfg.full_dtype : args.ext_k_dtype;
     const agx_kv_dtype v_dt = is_paged ? pool->cfg.full_dtype : args.ext_v_dtype;
-    const agx_kernel * k_p1 = get_full_phase1_kernel(pool, args.head_dim, k_dt, v_dt);
-    if (!k_p1) {
-        return false;
-    }
-
-    const uint32_t n_splits = choose_flash_decode_splits(args.n_kv, args.n_head_q, args.n_tokens);
-    if (n_splits > 1u) {
-        if (!ensure_split_partial_bo(pool, args.n_tokens, args.n_head_q, n_splits)) {
-            return false;
-        }
-    }
 
     uint32_t n_head_log2 = 1u;
     while ((n_head_log2 << 1) <= args.n_head_q) {
@@ -799,11 +960,11 @@ bool agx_kv_hybrid_dispatch_full_attn(agx_kv_hybrid_pool *        pool,
     pc.q_gate_va        = args.q_gate_va;
     pc.pos_q_va         = args.pos_q_va;
     pc.kq_mask_va       = args.kq_mask_va;
-    pc.partial_va       = (n_splits > 1u) ? pool->split_partial_bo->gpu_va : 0;
+    pc.partial_va       = 0;
     pc.out_va           = args.out_va;
     pc.n_tokens         = args.n_tokens;
     pc.n_kv             = args.n_kv;
-    pc.n_splits         = n_splits;
+    pc.n_splits         = 1u;
     pc.n_head_q         = args.n_head_q;
     pc.n_head_kv        = args.n_head_kv;
     pc.head_dim         = args.head_dim;
@@ -846,64 +1007,44 @@ bool agx_kv_hybrid_dispatch_full_attn(agx_kv_hybrid_pool *        pool,
         const char * e = std::getenv("GGML_AGX_FA_P3_DISABLE");
         return e && std::atoi(e) != 0;
     }();
-    static const uint32_t pf4_split_min_kv = []() {
-        const char * e = std::getenv("GGML_AGX_PF4_SPLIT_MIN_KV");
-        if (e && *e) {
-            int v = std::atoi(e);
-            if (v > 0) return static_cast<uint32_t>(v);
-        }
-        return 128u;
-    }();
-    auto compute_pf4_splits = [&](uint32_t n_kv_v, uint32_t n_hq_v, uint32_t n_tok_v) -> uint32_t {
-        if (n_kv_v < pf4_split_min_kv) {
-            return 1u;
-        }
-        const uint32_t gy       = (n_tok_v + 7u) / 8u;
-        const uint32_t base_wgs = std::max<uint32_t>(1u, n_hq_v * gy);
-        const uint32_t max_by_kv = std::max<uint32_t>(1u, (n_kv_v + 63u) / 64u);
-        uint32_t sp = 1u;
-        if (n_kv_v <= 512u) {
-            sp = (base_wgs >= 40u) ? 1u : 2u;
-        } else if (n_kv_v <= 2048u) {
-            sp = (base_wgs >= 80u) ? 2u : 4u;
-        } else {
-            const uint32_t want = (base_wgs >= 160u) ? 1u : ((160u + base_wgs - 1u) / base_wgs);
-            sp = std::max<uint32_t>(want, (n_kv_v + 255u) / 256u);
-        }
-        sp = std::min<uint32_t>(sp, max_by_kv);
-        sp = std::min<uint32_t>(sp, AGX_KV_MAX_SPLITS);
-        return std::max<uint32_t>(1u, sp);
-    };
 
-    // Wave 9 Lean 8-SG Br=16 Bc=64 Zero-K/V-SRAM Coopmat Prefill fastpath
-    // (10.5 KB SRAM -> 3 WGs/core = 24 SGs/core, <= 64 GPR32, 2 barriers/64 KV, native O(n_kv) banded rel-bias!)
+    // Wave 10 Lean 8-SG Zero-K/V-SRAM Coopmat Prefill fastpath:
+    //   - M >= 256 (default): PF_BR=32, Bc=64 (16.00 KiB SRAM = 2 WGs/core, 2.0x fewer KV reads!)
+    //   - 16 <= M < 256:      PF_BR=16, Bc=64 (10.50 KiB SRAM = 3 WGs/core = 24 SGs/core!)
+    //   - Zero split_partial_bo allocation!
     if (!disable_p3 && !is_paged && args.head_dim == 128u && args.n_tokens >= 16u && args.n_kv >= 32u &&
         k_dt != AGX_KV_F32 && v_dt != AGX_KV_F32 &&
         k_dt != AGX_KV_Q8_0_PLANAR && v_dt != AGX_KV_Q8_0_PLANAR &&
         (args.flags & (AGX_ATTN_FLAG_CAUSAL | AGX_ATTN_FLAG_HAS_REL_TABLE)) == 0u) {
-        const agx_kernel * k_pf = get_full_prefill_kernel(pool, k_dt, v_dt);
+        const uint32_t pf_br = agx_kv_hybrid_prefill_br_for_tokens(args.n_tokens);
+        const agx_kernel * k_pf = get_full_prefill_kernel(pool, k_dt, v_dt, pf_br);
         if (k_pf) {
             pc.n_splits   = 1u;
             pc.partial_va = ((args.flags & AGX_ATTN_FLAG_KV_BOUNDS) != 0u) ? args.kv_bounds_va : 0ull;
-            const uint32_t grid_y = (args.n_tokens + 15u) / 16u;
+            const uint32_t grid_y = (args.n_tokens + pf_br - 1u) / pf_br;
             return agx_cdm_dispatch(stream, k_pf, args.n_head_q, grid_y, 1u,
                                     &pc, sizeof(pc), post_barrier);
         }
     }
 
-    // DSpark M=2..15 Split-K 8x8 FP16 Coopmat fastpath (2 SGs = 8 Q/WG, 8x KV reuse, banded rel-bias!)
+    // Wave 10 GQA-Grouped Zero-K/V-SRAM 8-SG Split-K Coopmat fastpath (M=2..15 DSpark Verify!):
+    // Packs all gqa Q-heads into ONE WG per h_kv -> 3.0x KV DRAM reduction, 24 ActSGs/core, 8x fewer barriers!
+    const uint32_t gqa_ratio = (args.n_head_kv > 0u) ? (args.n_head_q / args.n_head_kv) : 1u;
     if (!is_paged && args.head_dim == 128u && args.n_tokens >= 2u && args.n_tokens < 16u &&
-        args.n_kv >= 32u && k_dt != AGX_KV_F32 && v_dt != AGX_KV_F32 &&
+        args.n_kv >= 32u && gqa_ratio >= 1u && gqa_ratio <= 16u &&
+        args.n_head_kv > 0u && (args.n_head_q % args.n_head_kv) == 0u &&
+        k_dt != AGX_KV_F32 && v_dt != AGX_KV_F32 &&
         k_dt != AGX_KV_Q8_0_PLANAR && v_dt != AGX_KV_Q8_0_PLANAR &&
         (args.flags & (AGX_ATTN_FLAG_CAUSAL | AGX_ATTN_FLAG_HAS_REL_TABLE)) == 0u) {
         const agx_kernel * k_pf4 = get_full_prefill_m8_kernel(pool, k_dt, v_dt);
         if (k_pf4) {
-            const uint32_t grid_y     = (args.n_tokens + 7u) / 8u;
-            const uint32_t pf4_splits = compute_pf4_splits(args.n_kv, args.n_head_q, args.n_tokens);
+            const uint32_t m_wg       = std::max<uint32_t>(1u, 16u / gqa_ratio);
+            const uint32_t grid_y     = (args.n_tokens + m_wg - 1u) / m_wg;
+            const uint32_t pf4_splits = compute_pf4_splits(args.n_kv, args.n_head_q, args.n_head_kv, args.n_tokens);
             if (pf4_splits == 1u) {
                 pc.n_splits   = 1u;
                 pc.partial_va = 0;
-                return agx_cdm_dispatch(stream, k_pf4, args.n_head_q, grid_y, 1u,
+                return agx_cdm_dispatch(stream, k_pf4, args.n_head_kv, grid_y, 1u,
                                         &pc, sizeof(pc), post_barrier);
             }
             if (!ensure_split_partial_bo(pool, args.n_tokens, args.n_head_q, pf4_splits)) {
@@ -918,7 +1059,7 @@ bool agx_kv_hybrid_dispatch_full_attn(agx_kv_hybrid_pool *        pool,
             if (!agx_cdm_is_empty(stream)) {
                 agx_cdm_barrier_usc(stream);
             }
-            if (!agx_cdm_dispatch(stream, k_pf4, args.n_head_q, grid_y, pf4_splits,
+            if (!agx_cdm_dispatch(stream, k_pf4, args.n_head_kv, grid_y, pf4_splits,
                                   &pc, sizeof(pc), AGX_BARRIER_STRONG_USC)) {
                 return false;
             }
@@ -930,10 +1071,63 @@ bool agx_kv_hybrid_dispatch_full_attn(agx_kv_hybrid_pool *        pool,
         }
     }
 
+    // Wave 10 GQA=3 Grouped Split-K Flash-Decode fastpath (M=1 long-ctx: 3.0x KV DRAM reduction!)
+    static const bool disable_gqa_decode = []() {
+        const char * e = std::getenv("GGML_AGX_NO_GQA_DECODE");
+        return e && std::atoi(e) != 0;
+    }();
+    if (!disable_gqa_decode && !is_paged && args.head_dim == 128u &&
+        args.n_head_kv > 0u && args.n_head_q == args.n_head_kv * 3u &&
+        args.n_kv >= 512u && pc.ext_mask_ne2 <= 1u &&
+        (pc.flags & (AGX_ATTN_FLAG_ALIBI | AGX_ATTN_FLAG_HAS_REL_TABLE)) == 0u) {
+        const agx_kernel * k_g3 = get_full_phase1_gqa3_kernel(pool, k_dt, v_dt);
+        if (k_g3) {
+            const uint32_t g3_splits = choose_gqa3_decode_splits(args.n_kv, args.n_head_kv, args.n_tokens);
+            pc.n_splits = g3_splits;
+            if (g3_splits == 1u) {
+                pc.partial_va = 0;
+                return agx_cdm_dispatch(stream, k_g3, args.n_head_kv, args.n_tokens, 1u,
+                                        &pc, sizeof(pc), post_barrier);
+            }
+            if (!ensure_split_partial_bo(pool, args.n_tokens, args.n_head_q, g3_splits)) {
+                return false;
+            }
+            const agx_kernel * k_p2_g3 = get_full_phase2_kernel(pool, args.head_dim);
+            if (!k_p2_g3) {
+                return false;
+            }
+            pc.partial_va = pool->split_partial_bo->gpu_va;
+            if (!agx_cdm_is_empty(stream)) {
+                agx_cdm_barrier_usc(stream);
+            }
+            if (!agx_cdm_dispatch(stream, k_g3, args.n_head_kv, args.n_tokens, g3_splits,
+                                  &pc, sizeof(pc), AGX_BARRIER_STRONG_USC)) {
+                return false;
+            }
+            const agx_barrier_mode p2_bar = (post_barrier == AGX_BARRIER_NONE)
+                ? AGX_BARRIER_STRONG_USC
+                : post_barrier;
+            return agx_cdm_dispatch(stream, k_p2_g3, args.n_head_q, args.n_tokens, 1u,
+                                    &pc, sizeof(pc), p2_bar);
+        }
+    }
+
+    const agx_kernel * k_p1 = get_full_phase1_kernel(pool, args.head_dim, k_dt, v_dt);
+    if (!k_p1) {
+        return false;
+    }
+
+    const uint32_t n_splits = choose_flash_decode_splits(args.n_kv, args.n_head_q, args.n_tokens);
+    pc.n_splits = n_splits;
     if (n_splits == 1u) {
         return agx_cdm_dispatch(stream, k_p1, args.n_head_q, args.n_tokens, 1u,
                                 &pc, sizeof(pc), post_barrier);
     }
+
+    if (!ensure_split_partial_bo(pool, args.n_tokens, args.n_head_q, n_splits)) {
+        return false;
+    }
+    pc.partial_va = pool->split_partial_bo->gpu_va;
 
     const agx_kernel * k_p2 = get_full_phase2_kernel(pool, args.head_dim);
     if (!k_p2) {
@@ -1090,40 +1284,42 @@ bool agx_kv_hybrid_ggml_flash_attn_uses_scratch(const struct ggml_tensor * dst) 
     agx_kv_dtype v_dt = AGX_KV_F32;
     ggml_type_to_ext_kv(k->type, &k_dt);
     ggml_type_to_ext_kv(v->type, &v_dt);
-    const uint32_t head_dim = static_cast<uint32_t>(q->ne[0]);
-    const uint32_t n_tokens = static_cast<uint32_t>(q->ne[1]);
-    const uint32_t n_kv     = static_cast<uint32_t>(k->ne[1]);
-    const uint32_t n_head_q = static_cast<uint32_t>(q->ne[2]);
+    const uint32_t head_dim  = static_cast<uint32_t>(q->ne[0]);
+    const uint32_t n_tokens  = static_cast<uint32_t>(q->ne[1]);
+    const uint32_t n_kv      = static_cast<uint32_t>(k->ne[1]);
+    const uint32_t n_head_q  = static_cast<uint32_t>(q->ne[2]);
+    const uint32_t n_head_kv = static_cast<uint32_t>(k->ne[2]);
+    const uint32_t n_batch   = static_cast<uint32_t>(q->ne[3]);
     static const bool disable_p3 = []() {
         const char * e = std::getenv("GGML_AGX_FA_P3_DISABLE");
         return e && std::atoi(e) != 0;
     }();
-    static const uint32_t pf4_split_min_kv = []() {
-        const char * e = std::getenv("GGML_AGX_PF4_SPLIT_MIN_KV");
-        if (e && *e) {
-            int v = std::atoi(e);
-            if (v > 0) return static_cast<uint32_t>(v);
-        }
-        return 128u;
+    static const bool disable_batched_b = []() {
+        const char * e = std::getenv("GGML_AGX_NO_BATCHED_FA");
+        return e && std::atoi(e) != 0;
+    }();
+    static const bool disable_gqa_decode = []() {
+        const char * e = std::getenv("GGML_AGX_NO_GQA_DECODE");
+        return e && std::atoi(e) != 0;
     }();
     if (!disable_p3 && head_dim == 128u && n_tokens >= 16u && n_kv >= 32u &&
         k_dt != AGX_KV_F32 && v_dt != AGX_KV_F32 &&
         k_dt != AGX_KV_Q8_0_PLANAR && v_dt != AGX_KV_Q8_0_PLANAR) {
         return false; // PASS_MODE=3 single-pass coopmat prefill never uses split_partial_bo
     }
+    const uint32_t gqa_ratio = (n_head_kv > 0u) ? (n_head_q / n_head_kv) : 1u;
     if (head_dim == 128u && n_tokens >= 2u && n_tokens < 16u && n_kv >= 32u &&
+        gqa_ratio >= 1u && gqa_ratio <= 16u &&
         k_dt != AGX_KV_F32 && v_dt != AGX_KV_F32 &&
         k_dt != AGX_KV_Q8_0_PLANAR && v_dt != AGX_KV_Q8_0_PLANAR) {
-        if (n_kv < pf4_split_min_kv) {
-            return false; // PASS_MODE=4 pf4_splits == 1
-        }
-        const uint32_t gy = (n_tokens + 7u) / 8u;
-        if (n_kv <= 512u && n_head_q * gy >= 40u) {
-            return false;
-        }
-        return true; // PASS_MODE=4 split-K uses split_partial_bo
+        return compute_pf4_splits(n_kv, n_head_q, n_head_kv, n_tokens) > 1u;
     }
-    return choose_flash_decode_splits(n_kv, n_head_q, n_tokens) > 1u;
+    if (!disable_gqa_decode && n_batch == 1u && head_dim == 128u &&
+        n_head_kv > 0u && n_head_q == n_head_kv * 3u && n_kv >= 512u) {
+        return choose_gqa3_decode_splits(n_kv, n_head_kv, n_tokens) > 1u;
+    }
+    const uint32_t total_tok = (!disable_batched_b && n_batch > 1u) ? (n_tokens * n_batch) : n_tokens;
+    return choose_flash_decode_splits(n_kv, n_head_q, total_tok) > 1u;
 }
 
 bool agx_kv_hybrid_dispatch_ggml_flash_attn_ext(agx_kv_hybrid_pool *            pool,
@@ -1174,6 +1370,126 @@ bool agx_kv_hybrid_dispatch_ggml_flash_attn_ext(agx_kv_hybrid_pool *            
     const uint32_t n_tiles64  = static_cast<uint32_t>((k->ne[1] + 63) / 64);
     const uint32_t rel_extent = has_banded ? static_cast<uint32_t>(dst->op_params[6]) : 0u;
     const uint32_t rel_t_len  = rtab ? static_cast<uint32_t>(rtab->ne[0]) : 0u;
+
+    // Wave 10 Native Batched B > 1 PASS_MODE=0/1 Fastpath (Batch 8x @ 1k..8k: 192 WGs in ONE pass,
+    // 48 dispatches & 48 barriers instead of 768 — 16x reduction, 0 Phase-2, 0 split_partial_bo!)
+    static const bool disable_batched_b = []() {
+        const char * e = std::getenv("GGML_AGX_NO_BATCHED_FA");
+        return e && std::atoi(e) != 0;
+    }();
+    const bool p0_shape = (q->ne[1] == 1 || q->ne[0] == 64 ||
+                           k_dt == AGX_KV_F32 || v_dt == AGX_KV_F32 || k->ne[1] < 32);
+    const bool strides_u32 =
+        q->nb[3] <= 0xFFFFFFFFull && k->nb[3] <= 0xFFFFFFFFull && v->nb[3] <= 0xFFFFFFFFull &&
+        out_nb3  <= 0xFFFFFFFFull && (!mask || mask->nb[3] <= 0xFFFFFFFFull) &&
+        (!epi || !epi->q_gate_va || epi->q_gate_nb3 <= 0xFFFFFFFFull);
+    if (B > 1 && !disable_batched_b && p0_shape && strides_u32) {
+        const uint32_t n_tok_b  = static_cast<uint32_t>(q->ne[1]);
+        const uint32_t n_kv_u   = static_cast<uint32_t>(k->ne[1]);
+        const uint32_t n_hq_u   = static_cast<uint32_t>(q->ne[2]);
+        const uint32_t n_hkv_u  = static_cast<uint32_t>(k->ne[2]);
+        const uint32_t hdim_u   = static_cast<uint32_t>(q->ne[0]);
+        const uint32_t n_bat_u  = static_cast<uint32_t>(B);
+        const uint32_t tot_tok  = n_tok_b * n_bat_u;
+
+        const agx_kernel * k_p1 = get_full_phase1_kernel(pool, hdim_u, k_dt, v_dt);
+        if (!k_p1) {
+            return false;
+        }
+        const uint32_t n_splits = choose_flash_decode_splits(n_kv_u, n_hq_u, tot_tok);
+
+        uint32_t n_head_log2 = 1u;
+        while ((n_head_log2 << 1) <= n_hq_u) {
+            n_head_log2 <<= 1;
+        }
+        const float m0 = (max_bias > 0.0f) ? std::pow(2.0f, -(max_bias       ) / float(n_head_log2)) : 1.0f;
+        const float m1 = (max_bias > 0.0f) ? std::pow(2.0f, -(max_bias * 0.5f) / float(n_head_log2)) : 1.0f;
+
+        uint32_t flags = (logit_softcap != 0.0f ? AGX_ATTN_FLAG_SOFTCAP : 0u)
+                       | (max_bias > 0.0f ? AGX_ATTN_FLAG_ALIBI : 0u)
+                       | (q->type == GGML_TYPE_F16 ? AGX_ATTN_FLAG_Q_F16 : 0u)
+                       | (dst->type == GGML_TYPE_F16 ? AGX_ATTN_FLAG_OUT_F16 : 0u)
+                       | (epi ? (epi->extra_flags & ~AGX_ATTN_FLAG_KV_BOUNDS) : 0u);
+
+        agx_push_full_attn pc = {};
+        pc.q_va             = base_q_va;
+        pc.k_or_pt_va       = base_k_va;
+        pc.v_va             = base_v_va;
+        pc.q_gate_va        = (epi && epi->q_gate_va) ? epi->q_gate_va : 0ull;
+        pc.out_va           = base_out_va;
+        pc.n_tokens         = n_tok_b;
+        pc.n_kv             = n_kv_u;
+        pc.n_splits         = n_splits;
+        pc.n_head_q         = n_hq_u;
+        pc.n_head_kv        = n_hkv_u;
+        pc.head_dim         = hdim_u;
+        pc.ext_k_nb1        = static_cast<uint32_t>(k->nb[1]);
+        pc.ext_k_nb2        = static_cast<uint32_t>(k->nb[2]);
+        pc.ext_v_nb1        = static_cast<uint32_t>(v->nb[1]);
+        pc.ext_v_nb2        = static_cast<uint32_t>(v->nb[2]);
+        pc.q_nb1            = static_cast<uint32_t>(q->nb[1]);
+        pc.q_nb2            = static_cast<uint32_t>(q->nb[2]);
+        pc.mask_n_head_log2 = n_head_log2;
+        pc.kq_scale         = (logit_softcap != 0.0f) ? (scale / logit_softcap) : scale;
+        pc.logit_softcap    = logit_softcap;
+        pc.m0               = m0;
+        pc.m1               = m1;
+        pc.n_batches        = n_bat_u;
+        pc.batch_q_nb3      = static_cast<uint32_t>(q->nb[3]);
+        pc.batch_k_nb3      = static_cast<uint32_t>(k->nb[3]);
+        pc.batch_v_nb3      = static_cast<uint32_t>(v->nb[3]);
+        pc.batch_out_nb3    = static_cast<uint32_t>(out_nb3);
+        pc.batch_qgate_nb3  = (epi && epi->q_gate_va) ? static_cast<uint32_t>(epi->q_gate_nb3) : 0u;
+        pc.batch_rk3        = static_cast<uint32_t>(rk3);
+        pc.batch_rv3        = static_cast<uint32_t>(rv3);
+        pc.batch_mask_ne3   = mask ? static_cast<uint32_t>(mask->ne[3]) : 1u;
+
+        if (mask) {
+            pc.kq_mask_va     = base_mask_va;
+            pc.ext_mask_nb1   = static_cast<uint32_t>(mask->nb[1]);
+            pc.ext_mask_nb2   = (mask->ne[2] > 1) ? static_cast<uint32_t>(mask->nb[2]) : 0u;
+            pc.ext_mask_ne2   = static_cast<uint32_t>(mask->ne[2]);
+            pc.batch_mask_nb3 = static_cast<uint32_t>(mask->nb[3]);
+            flags |= (mask->type == GGML_TYPE_F16) ? AGX_ATTN_FLAG_HAS_MASK_F16 : AGX_ATTN_FLAG_HAS_MASK_F32;
+        }
+        if (sinks) {
+            pc.sinks_va = sinks_va;
+            flags |= (sinks->ne[1] > 1) ? AGX_ATTN_FLAG_SINK_PER_TOK_HEAD : AGX_ATTN_FLAG_SINK_PER_HEAD;
+        }
+        if (has_banded) {
+            flags |= AGX_ATTN_FLAG_BANDED_REL_BIAS;
+            pc.n_rel_extent    = rel_extent;
+            pc.rel_table_len   = rel_t_len;
+            pc.rel_table_va    = base_rtab_va;
+            pc.rel_pos_pack_va = base_rpos_va;
+            pc.rel_cp_off      = 0u;
+            pc.rel_qp_off      = static_cast<uint32_t>(B * k->ne[1]);
+            pc.rel_tm_off      = static_cast<uint32_t>(B * k->ne[1] + B * q->ne[1]);
+        }
+        pc.flags = flags;
+
+        if (n_splits == 1u) {
+            return agx_cdm_dispatch(stream, k_p1, n_hq_u, tot_tok, 1u, &pc, sizeof(pc), post_barrier);
+        }
+        if (!ensure_split_partial_bo(pool, tot_tok, n_hq_u, n_splits)) {
+            return false;
+        }
+        const agx_kernel * k_p2 = get_full_phase2_kernel(pool, hdim_u);
+        if (!k_p2) {
+            return false;
+        }
+        pc.partial_va = pool->split_partial_bo->gpu_va;
+        if (!agx_cdm_is_empty(stream)) {
+            agx_cdm_barrier_usc(stream);
+        }
+        if (!agx_cdm_dispatch(stream, k_p1, n_hq_u, tot_tok, n_splits, &pc, sizeof(pc), AGX_BARRIER_STRONG_USC)) {
+            return false;
+        }
+        const agx_barrier_mode p2_bar = (post_barrier == AGX_BARRIER_NONE)
+            ? AGX_BARRIER_STRONG_USC
+            : post_barrier;
+        return agx_cdm_dispatch(stream, k_p2, n_hq_u, tot_tok, 1u, &pc, sizeof(pc), p2_bar);
+    }
 
     for (int64_t b = 0; b < B; ++b) {
         agx_attn_stage_args args = {};
