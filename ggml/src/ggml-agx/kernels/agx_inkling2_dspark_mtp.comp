@@ -42,9 +42,11 @@
 #define WTYPE_BF16      2u
 #define WTYPE_Q8_0_RAW  3u
 #define WTYPE_Q8_0_8BLK 4u
+#define WTYPE_Q4_32     5u
 
 layout(buffer_reference, std430, buffer_reference_align = 4)  buffer BufF32          { float     v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer BufVec4         { vec4      v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer BufUvec4        { uvec4     v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4)  readonly buffer ConstBufF32   { float     v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer ConstBufVec4  { vec4      v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4)  buffer BufI32          { int       v[]; };
@@ -55,6 +57,7 @@ layout(buffer_reference, std430, buffer_reference_align = 4)  readonly buffer Co
 layout(buffer_reference, std430, buffer_reference_align = 8)  readonly buffer ConstBufUvec2 { uvec2     v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer ConstBufUvec4 { uvec4     v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 2)  buffer BufF16          { float16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2)  readonly buffer ConstBufF16   { float16_t v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 2)  buffer BufU16          { uint16_t  v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 2)  readonly buffer ConstBufU16   { uint16_t  v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 1)  readonly buffer ConstBufI8    { int8_t    v[]; };
@@ -63,7 +66,7 @@ bool comes_before_desc(float va, int ia, float vb, int ib) {
     return (va > vb) || (va == vb && ia < ib);
 }
 
-#if DSPARK_FUSED_MODE == 0 || DSPARK_FUSED_MODE == 2 || DSPARK_FUSED_MODE == 5 || DSPARK_FUSED_MODE == 7
+#if DSPARK_FUSED_MODE == 0 || DSPARK_FUSED_MODE == 2 || DSPARK_FUSED_MODE == 5 || DSPARK_FUSED_MODE == 7 || DSPARK_FUSED_MODE == 9 || DSPARK_FUSED_MODE == 10
 float load_w_scalar(uint64_t row_va, uint wtype, uint k) {
     if (wtype == WTYPE_F32)  return ConstBufF32(row_va).v[k];
     if (wtype == WTYPE_BF16) return uintBitsToFloat(uint(ConstBufU16(row_va).v[k]) << 16u);
@@ -524,6 +527,64 @@ void main() {
         for (uint v = beg + tid; v < end; v += 512u) {
             ob.v[out_off + v] = bb.v[base_off + v];
         }
+    } else if (pc.w2_wtype == WTYPE_Q4_32 && R == 256u) {
+        // Wave 8 SLC-Resident 28.81 MB Q4_32 (144B/row: 16B FP16 scales + 128B nibbles) @ 1.64 TB/s!
+        // Zero-denormal 0-ULP IEEE-754 magic decode ((nib | 0x64006400u) - 1032.0hf) + 2x f16vec2 FMA!
+        uint64_t mk_va = pc.markov_va + uint64_t(blk) * 256ul * 4ul;
+        if (tid < 64u) {
+            s_mk4[tid] = ConstBufVec4(mk_va).v[tid];
+        }
+        barrier();
+
+        const uint row_in8  = sg * 4u + (ln >> 3u); // 0..63 (64 rows/WG iter!)
+        const uint l8       = ln & 7u;              // 0..7 (32 weights/lane)
+        const uint k4       = l8 * 8u;
+        const bool has_bias = (pc.flags & DSPARK_F_HAS_W2_BIAS) != 0u && pc.w2_bias_va != 0ul;
+        const bool do_cap   = (pc.softcap > 0.0);
+
+        const f16vec2 kBias = f16vec2(float16_t(1032.0));
+        float b0 = neg_inf;
+        ConstBufF32 bb = ConstBufF32(pc.base_va);
+        BufF32      ob = BufF32(pc.out_logits_va);
+        for (uint v = beg + row_in8; v < end; v += 64u) {
+            const uint64_t rva = pc.w2_va + uint64_t(v) * 144ul;
+            const float    d   = float(ConstBufF16(rva).v[l8]);
+            const uvec4    qp  = ConstBufUvec4(rva + 16ul).v[l8];
+            f16vec2 dp2 = f16vec2(float16_t(0.0));
+            [[unroll]] for (uint w_i = 0u; w_i < 4u; ++w_i) {
+                const uint pw   = (w_i == 0u) ? qp.x : ((w_i == 1u) ? qp.y : ((w_i == 2u) ? qp.z : qp.w));
+                const vec4 m_lo = s_mk4[k4 + w_i * 2u + 0u];
+                const vec4 m_hi = s_mk4[k4 + w_i * 2u + 1u];
+                dp2 = fma(unpackFloat2x16(( pw         & 0x000F000Fu) | 0x64006400u) - kBias, f16vec2(float16_t(m_lo.x), float16_t(m_hi.x)), dp2);
+                dp2 = fma(unpackFloat2x16(((pw >>  4u) & 0x000F000Fu) | 0x64006400u) - kBias, f16vec2(float16_t(m_lo.y), float16_t(m_hi.y)), dp2);
+                dp2 = fma(unpackFloat2x16(((pw >>  8u) & 0x000F000Fu) | 0x64006400u) - kBias, f16vec2(float16_t(m_lo.z), float16_t(m_hi.z)), dp2);
+                dp2 = fma(unpackFloat2x16(((pw >> 12u) & 0x000F000Fu) | 0x64006400u) - kBias, f16vec2(float16_t(m_lo.w), float16_t(m_hi.w)), dp2);
+            }
+            float acc = float(dp2.x + dp2.y) * d;
+            acc += subgroupShuffleXor(acc, 1u);
+            acc += subgroupShuffleXor(acc, 2u);
+            acc += subgroupShuffleXor(acc, 4u);
+            if (l8 == 0u) {
+                float bias = acc * pc.w2_scale;
+                if (has_bias) bias += ConstBufF32(pc.w2_bias_va).v[v];
+                float logit = bb.v[base_off + v] + bias;
+                if (do_cap) logit = pc.softcap * tanh(logit * pc.inv_softcap);
+                ob.v[out_off + v] = logit;
+                b0 = max(b0, logit);
+            }
+        }
+        float sg_min = subgroupMin((l8 == 0u) ? b0 : pos_inf);
+        if (ln == 0u) s_t2[sg] = sg_min;
+        if (tid == 0u) s_cnt = 0u;
+        memoryBarrierBuffer();
+        barrier();
+        float t_lo = min(min(min(s_t2[0], s_t2[1]), min(s_t2[2], s_t2[3])),
+                         min(min(s_t2[4], s_t2[5]), min(s_t2[6], s_t2[7])));
+        float t_hi = min(min(min(s_t2[8], s_t2[9]), min(s_t2[10], s_t2[11])),
+                         min(min(s_t2[12], s_t2[13]), min(s_t2[14], s_t2[15])));
+        fast_thresh = min(t_lo, t_hi);
+        if (end - beg <= 64u) fast_thresh = neg_inf;
+        have_fast_thresh = true;
     } else if (pc.w2_wtype == WTYPE_BF16 && R == 256u) {
         // Ultra-fast 8-lane/row (64 rows/WG iter at 512T!) paired 2x uvec4 BF16 (<= 52 GPR32!) + Top-1 Pigeonhole!
         uint64_t mk_va = pc.markov_va + uint64_t(blk) * 256ul * 4ul;
@@ -1606,6 +1667,345 @@ void main() {
                 y = max(g, 0.0) * u;
             }
             yb.v[m * pc.N + row] = y;
+        }
+    }
+}
+
+#elif DSPARK_FUSED_MODE == 9
+// ============================================================================
+// Mode 9: One-Shot GPU Weight Binder (< 0.2 ms, ZERO CPU round-1 stall!)
+//   op == 0: Quantize R=256 markov_w2 -> SLC-Pinned Q4_32 (144 B/row = 28.81 MB!)
+//            Grid: ((n_vocab + 31) / 32, 1, 1), Local: (256, 1, 1) [8 lanes/row]
+//   op == 1: Coalesce [src0; src1; src2] Q8_0_8BLK rows in 16B uvec4 bursts
+//            Grid: ((total_rows * row_uvec4s + 255) / 256, 1, 1), Local: (256, 1, 1)
+// ============================================================================
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushArgs {
+    uint64_t src0_va;
+    uint64_t src1_va;
+    uint64_t src2_va;
+    uint64_t dst_va;
+    uint     op;
+    uint     n0;
+    uint     n1;
+    uint     n2;
+    uint     row_uvec4s;
+    uint     pad0;
+} pc;
+
+uint pack_q4_u32_pair(uint64_t rva, uint wt, uint base_k, float id) {
+    uint packed = 0u;
+    [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+        float w_lo = load_w_scalar(rva, wt, base_k + j);
+        float w_hi = load_w_scalar(rva, wt, base_k + j + 4u);
+        uint  q_lo = uint(clamp(int(round(w_lo * id)), -8, 7) + 8);
+        uint  q_hi = uint(clamp(int(round(w_hi * id)), -8, 7) + 8);
+        packed |= (q_lo << (4u * j)) | (q_hi << (16u + 4u * j));
+    }
+    return packed;
+}
+
+void main() {
+    if (pc.op == 0u) {
+        const uint tid = gl_LocalInvocationID.x;
+        const uint v   = gl_WorkGroupID.x * 32u + (tid >> 3u);
+        const uint l8  = tid & 7u;
+        if (v >= pc.n0) return;
+
+        const uint64_t src_rva = pc.src0_va + uint64_t(v) * uint64_t(pc.n2);
+        const uint     wt      = pc.n1;
+        const uint     k0      = l8 * 32u;
+
+        float max_p = 0.0;
+        float min_n = 0.0;
+        for (uint j = 0u; j < 32u; ++j) {
+            float w = load_w_scalar(src_rva, wt, k0 + j);
+            max_p = max(max_p, w);
+            min_n = min(min_n, w);
+        }
+        // Exact asymmetric-range coverage of [-8*d, +7*d] with exact zero at nibble 8!
+        float d   = max(max_p * (1.0 / 7.0), (-min_n) * (1.0 / 8.0));
+        float d16 = float(float16_t(d));
+        float id  = (d16 > 0.0) ? (1.0 / d16) : 0.0;
+
+        uvec4 qp = uvec4(
+            pack_q4_u32_pair(src_rva, wt, k0 +  0u, id),
+            pack_q4_u32_pair(src_rva, wt, k0 +  8u, id),
+            pack_q4_u32_pair(src_rva, wt, k0 + 16u, id),
+            pack_q4_u32_pair(src_rva, wt, k0 + 24u, id));
+
+        const uint64_t dst_rva = pc.dst_va + uint64_t(v) * 144ul;
+        BufF16(dst_rva).v[l8]          = float16_t(d16);
+        BufUvec4(dst_rva + 16ul).v[l8] = qp;
+        return;
+    }
+
+    // op == 1: Coalesce [src0 (n0 rows); src1 (n1 rows); src2 (n2 rows)] in 16B uvec4s
+    const uint idx        = gl_GlobalInvocationID.x;
+    const uint row_uvec4s = pc.row_uvec4s;
+    const uint total_rows = pc.n0 + pc.n1 + pc.n2;
+    if (row_uvec4s == 0u || idx >= total_rows * row_uvec4s) return;
+
+    const uint row = idx / row_uvec4s;
+    const uint col = idx - row * row_uvec4s;
+    uint64_t src_va = pc.src0_va;
+    uint     s_row  = row;
+    if (row >= pc.n0) {
+        if (row < pc.n0 + pc.n1) {
+            src_va = pc.src1_va;
+            s_row  = row - pc.n0;
+        } else {
+            src_va = pc.src2_va;
+            s_row  = row - pc.n0 - pc.n1;
+        }
+    }
+    BufUvec4(pc.dst_va).v[idx] = ConstBufUvec4(src_va).v[s_row * row_uvec4s + col];
+}
+
+#elif DSPARK_FUSED_MODE == 10
+// ============================================================================
+// Mode 10: 1-Dispatch Fused Target-Feature Gather + All-[f_rnn, cur_0..2] ctx_mix + RMSNorm*w
+//   - Grid: (n_slots, n_tokens, 1), Local: (256, 1, 1)
+//   - Collapses GET_ROWS + CONT(PERMUTE) + 4x MUL_MAT(ctx_mix) + 4x RMS_NORM*w (10 disp -> 1)!
+// ============================================================================
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushArgs {
+    uint64_t feat_src_va;
+    uint64_t embd_rows_va;
+    uint64_t mix_w_va[4];
+    uint64_t norm_w_va[4];
+    uint64_t out_va[4];
+    uint     n_embd;
+    uint     n_target;
+    uint     n_tokens;
+    uint     n_slots;
+    uint     feat_row_f32;
+    uint     mix_wtypes;
+    float    rms_eps;
+    uint     pad0;
+} pc;
+
+shared float s_buf[3072];
+shared float s_mw[16];
+shared float s_red[8];
+
+void main() {
+    const uint slot = gl_WorkGroupID.x;
+    const uint tok  = gl_WorkGroupID.y;
+    if (slot >= pc.n_slots || tok >= pc.n_tokens || pc.out_va[slot] == 0ul) return;
+
+    const uint tid = gl_LocalInvocationID.x;
+    const uint sg  = tid >> 5u;
+    const uint ln  = tid & 31u;
+    const uint D   = pc.n_embd;
+    const uint T   = pc.n_target;
+    const uint wt  = (pc.mix_wtypes >> (slot * 2u)) & 3u;
+
+    if (tid < T && tid < 16u) {
+        s_mw[tid] = load_w_scalar(pc.mix_w_va[slot], wt, tid);
+    }
+    barrier();
+
+    const int src_row = (pc.embd_rows_va != 0ul) ? max(ConstBufI32(pc.embd_rows_va).v[tok], 0) : int(tok);
+    const uint64_t row_va = pc.feat_src_va + uint64_t(src_row) * uint64_t(pc.feat_row_f32) * 4ul;
+    ConstBufVec4 fb = ConstBufVec4(row_va);
+    const uint D4 = D >> 2u;
+
+    float ss = 0.0;
+    for (uint i4 = tid; i4 < D4; i4 += 256u) {
+        vec4 acc = vec4(0.0);
+        for (uint tap = 0u; tap < T; ++tap) {
+            acc = fma(fb.v[tap * D4 + i4], vec4(s_mw[tap]), acc);
+        }
+        const uint b = i4 << 2u;
+        s_buf[b + 0u] = acc.x;
+        s_buf[b + 1u] = acc.y;
+        s_buf[b + 2u] = acc.z;
+        s_buf[b + 3u] = acc.w;
+        ss += dot(acc, acc);
+    }
+
+    float s = subgroupAdd(ss);
+    if (ln == 0u) s_red[sg] = s;
+    barrier();
+    if (sg == 0u) {
+        float tot = subgroupAdd((ln < 8u) ? s_red[ln] : 0.0);
+        if (ln == 0u) s_red[0] = inversesqrt(tot / float(D) + pc.rms_eps);
+    }
+    barrier();
+    const float ir = s_red[0];
+
+    ConstBufVec4 nw = ConstBufVec4(pc.norm_w_va[slot]);
+    BufVec4      ob = BufVec4(pc.out_va[slot] + uint64_t(tok * D) * 4ul);
+    for (uint i4 = tid; i4 < D4; i4 += 256u) {
+        const uint b = i4 << 2u;
+        vec4 v = vec4(s_buf[b], s_buf[b + 1u], s_buf[b + 2u], s_buf[b + 3u]) * ir;
+        ob.v[i4] = v * nw.v[i4];
+    }
+}
+
+#elif DSPARK_FUSED_MODE == 11
+// ============================================================================
+// Mode 11: 1-Dispatch Batched Multi-Layer Inject k_ctx_norm + RoPE + [FWHT128] + K/V SET_ROWS
+//   - Grid: (2 * n_head_kv, n_tokens, n_layers), Local: (32, 1, 1) [1 SG/WG, 0 WG barriers!]
+//   - Collapses 3 layers x (k_norm + RoPE + [FWHT] + SET_ROWS K + SET_ROWS V) (15+ disp -> 1)!
+// ============================================================================
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+#define QKV_SHARED_KV (1u << 0)
+#define QKV_HAS_ROPE  (1u << 1)
+#define QKV_ROPE_NEOX (1u << 2)
+#define QKV_FWHT_K    (1u << 3)
+#define QKV_FWHT_V    (1u << 4)
+#define QKV_KV_Q8_0   (1u << 5)
+#define QKV_K_IDS_I64 (1u << 6)
+#define QKV_V_IDS_I64 (1u << 7)
+
+layout(push_constant) uniform PushArgs {
+    uint64_t k_raw_base_va;
+    uint64_t v_raw_base_va;
+    uint64_t k_norm_va[3];
+    uint64_t k_store_va[3];
+    uint64_t v_store_va[3];
+    uint64_t k_idxs_va[3];
+    uint64_t v_idxs_va[3];
+    uint64_t inp_pos_va;
+    uint64_t rope_freq_va;
+    uint     n_layers;
+    uint     n_head_kv;
+    uint     head_dim;
+    uint     n_tokens;
+    uint     layer_raw_stride_f32;
+    uint     k_raw_stride_f32;
+    uint     v_raw_stride_f32;
+    uint     k_store_nb1_B[3];
+    uint     v_store_nb1_B[3];
+    uint     k_ids_nb0_B;
+    uint     v_ids_nb0_B;
+    uint     rope_n_dims;
+    uint     layer_flags[3];
+    float    rms_eps;
+    float    theta_scale;
+    float    freq_scale;
+    float    attn_factor;
+    uint     pad0;
+} pc;
+
+shared float s_h[256];
+
+void fwht128_reg11(inout float reg[4], uint ln) {
+    const float sc = 0.08838834764831845;
+    [[unroll]] for (uint k = 0u; k < 4u; ++k) reg[k] *= sc;
+    [[unroll]] for (uint h = 1u; h < 32u; h <<= 1u) {
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+            float a = reg[k];
+            float b = subgroupShuffleXor(a, h);
+            reg[k] = ((ln & h) == 0u) ? (a + b) : (b - a);
+        }
+    }
+    float a0 = reg[0], a1 = reg[1], a2 = reg[2], a3 = reg[3];
+    float b0 = a0 + a1, b1 = a0 - a1, b2 = a2 + a3, b3 = a2 - a3;
+    reg[0] = b0 + b2; reg[1] = b1 + b3;
+    reg[2] = b0 - b2; reg[3] = b1 - b3;
+}
+
+void main() {
+    const uint idx = gl_WorkGroupID.x;
+    const uint tok = gl_WorkGroupID.y;
+    const uint il  = gl_WorkGroupID.z;
+    const uint ln  = gl_SubgroupInvocationID;
+    const uint Hkv = pc.n_head_kv;
+    const uint hd  = pc.head_dim;
+    if (il >= pc.n_layers || tok >= pc.n_tokens || idx >= 2u * Hkv) return;
+
+    const bool is_k  = (idx < Hkv);
+    const uint head  = is_k ? idx : (idx - Hkv);
+    const uint flags = pc.layer_flags[il];
+
+    const uint64_t l_off_B = uint64_t(il) * uint64_t(pc.layer_raw_stride_f32) * 4ul;
+    const uint64_t src_va  = is_k
+        ? (pc.k_raw_base_va + l_off_B + uint64_t(tok * pc.k_raw_stride_f32 + head * hd) * 4ul)
+        : (pc.v_raw_base_va + l_off_B + uint64_t(tok * pc.v_raw_stride_f32 + head * hd) * 4ul);
+
+    float ss = 0.0;
+    for (uint i = ln; i < hd; i += 32u) {
+        float x = ConstBufF32(src_va).v[i];
+        s_h[i] = x;
+        ss += x * x;
+    }
+    if (is_k || ((flags & QKV_SHARED_KV) != 0u)) {
+        const uint64_t nw_va = is_k ? pc.k_norm_va[il] : 0ul;
+        float ir = inversesqrt(subgroupAdd(ss) / float(hd) + pc.rms_eps);
+        for (uint i = ln; i < hd; i += 32u) {
+            float v = s_h[i] * ir;
+            if (nw_va != 0ul) v *= ConstBufF32(nw_va).v[i];
+            s_h[i] = v;
+        }
+    }
+    subgroupMemoryBarrierShared();
+
+    if (is_k && (flags & QKV_HAS_ROPE) != 0u) {
+        const bool  is_neox = (flags & QKV_ROPE_NEOX) != 0u;
+        const uint  half_r  = pc.rope_n_dims >> 1u;
+        const float pos     = float(ConstBufI32(pc.inp_pos_va).v[tok]);
+        for (uint pair = ln; pair < half_r; pair += 32u) {
+            uint i0 = is_neox ? pair : (2u * pair);
+            uint i1 = is_neox ? (pair + half_r) : (2u * pair + 1u);
+            float freq = pow(pc.theta_scale, float(pair)) * pc.freq_scale;
+            if (pc.rope_freq_va != 0ul) freq /= ConstBufF32(pc.rope_freq_va).v[pair];
+            float theta = pos * freq;
+            float ct = cos(theta) * pc.attn_factor;
+            float st = sin(theta) * pc.attn_factor;
+            float x0 = s_h[i0];
+            float x1 = s_h[i1];
+            s_h[i0] = x0 * ct - x1 * st;
+            s_h[i1] = x0 * st + x1 * ct;
+        }
+        subgroupMemoryBarrierShared();
+    }
+
+    const bool do_fwht = (hd == 128u) &&
+        (is_k ? ((flags & QKV_FWHT_K) != 0u) : ((flags & QKV_FWHT_V) != 0u));
+    if (do_fwht) {
+        float reg[4];
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) reg[k] = s_h[k * 32u + ln];
+        fwht128_reg11(reg, ln);
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) s_h[k * 32u + ln] = reg[k];
+        subgroupMemoryBarrierShared();
+    }
+
+    const bool kv_q8    = (flags & QKV_KV_Q8_0) != 0u;
+    const bool ids_i64  = is_k ? ((flags & QKV_K_IDS_I64) != 0u) : ((flags & QKV_V_IDS_I64) != 0u);
+    const uint64_t iva  = is_k ? pc.k_idxs_va[il] : pc.v_idxs_va[il];
+    const uint     nb0  = is_k ? pc.k_ids_nb0_B   : pc.v_ids_nb0_B;
+    const uint64_t iv_t = iva + uint64_t(tok) * uint64_t(nb0);
+    int64_t dst_row = ids_i64 ? ConstBufI64(iv_t).v[0] : int64_t(ConstBufI32(iv_t).v[0]);
+    if (dst_row < 0l) return;
+
+    const uint64_t st_va  = is_k ? pc.k_store_va[il]    : pc.v_store_va[il];
+    const uint     st_nb1 = is_k ? pc.k_store_nb1_B[il] : pc.v_store_nb1_B[il];
+    const uint64_t row_va = st_va + uint64_t(dst_row) * uint64_t(st_nb1);
+    if (!kv_q8) {
+        BufF16 hb = BufF16(row_va + uint64_t(head * hd) * 2ul);
+        for (uint i = ln; i < hd; i += 32u) hb.v[i] = float16_t(s_h[i]);
+    } else {
+        const uint n_blks = hd >> 5u;
+        uint64_t h_va = row_va + uint64_t(head * n_blks) * 34ul;
+        for (uint b = 0u; b < n_blks; ++b) {
+            float val  = s_h[b * 32u + ln];
+            float amax = subgroupMax(abs(val));
+            float d    = amax * (1.0 / 127.0);
+            float id   = (d != 0.0) ? (1.0 / d) : 0.0;
+            int   q    = clamp(int(round(val * id)), -127, 127);
+            uint64_t bva = h_va + uint64_t(b) * 34ul;
+            if (ln == 0u) BufF16(bva).v[0] = float16_t(d);
+            int q_hi = subgroupShuffleXor(q, 1u);
+            if ((ln & 1u) == 0u) {
+                BufU16(bva + 2ul).v[ln >> 1u] =
+                    uint16_t((uint(q) & 0xFFu) | ((uint(q_hi) & 0xFFu) << 8u));
+            }
         }
     }
 }

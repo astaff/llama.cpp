@@ -440,6 +440,75 @@ struct agx_w7_dspark_gate_up_glu_push {
 };
 static_assert(sizeof(agx_w7_dspark_gate_up_glu_push) <= 256, "agx_w7_dspark_gate_up_glu_push > 256B");
 
+// Wave 8 DSpark MTP Silicon-Ceiling Accelerators (agx_inkling2_dspark_mtp.comp DSPARK_FUSED_MODE=9..11)
+#define AGX_W8_WTYPE_Q4_32          5u
+#define AGX_W8_Q4_32_R256_ROW_BYTES 144u // 8x FP16 scales (16B) + 8x uvec4 nibbles (128B) -> 28.81 MB < 48 MiB SLC!
+
+// DSPARK_FUSED_MODE == 9: One-shot GPU weight binder (op=0: w2 -> Q4_32 SLC_PIN, op=1: Q8_0_8BLK row coalescer)
+struct agx_w8_dspark_prep_push {
+    uint64_t src0_va;
+    uint64_t src1_va;
+    uint64_t src2_va;
+    uint64_t dst_va;
+    uint32_t op;          // 0 = quantize R=256 w2 -> Q4_32 (144B/row), 1 = coalesce [src0; src1; src2] uvec4 rows
+    uint32_t n0;          // op0: n_vocab      | op1: rows0
+    uint32_t n1;          // op0: src_wtype    | op1: rows1
+    uint32_t n2;          // op0: src_row_B    | op1: rows2
+    uint32_t row_uvec4s;  // op1: 16B uvec4 count per row ((K+255)/256 * 17)
+    uint32_t pad0;
+};
+static_assert(sizeof(agx_w8_dspark_prep_push) <= 256, "agx_w8_dspark_prep_push > 256B");
+
+// DSPARK_FUSED_MODE == 10: 1-Dispatch Fused Target-Feature Gather + All-[f_rnn, cur_0..2] ctx_mix + RMSNorm*w
+struct agx_w8_dspark_inject_mix_push {
+    uint64_t feat_src_va;   // layer_inp_src (when embd_rows_va != 0) or inp_embd
+    uint64_t embd_rows_va;  // I32 [n_tokens] or 0
+    uint64_t mix_w_va[4];   // [0]=f_rnn_mix (optional), [1..3]=layer[0..2].dflash_ctx_mix
+    uint64_t norm_w_va[4];  // [0]=f_rnn_norm (optional), [1..3]=layer[0..2].dflash_ctx_norm
+    uint64_t out_va[4];     // [0]=final_h_nextn_va (optional), [1..3]=cur[0..2]
+    uint32_t n_embd;
+    uint32_t n_target;
+    uint32_t n_tokens;
+    uint32_t n_slots;       // <= 4
+    uint32_t feat_row_f32;  // stride between rows in feat_src_va (in floats)
+    uint32_t mix_wtypes;    // 2 bits per slot (0=F32, 1=F16, 2=BF16)
+    float    rms_eps;
+    uint32_t pad0;
+};
+static_assert(sizeof(agx_w8_dspark_inject_mix_push) <= 256, "agx_w8_dspark_inject_mix_push > 256B");
+
+// DSPARK_FUSED_MODE == 11: 1-Dispatch Batched Multi-Layer Inject k_ctx_norm + RoPE + [FWHT128] + K/V SET_ROWS
+struct agx_w8_dspark_inject_kv_push {
+    uint64_t k_raw_base_va;
+    uint64_t v_raw_base_va;
+    uint64_t k_norm_va[3];
+    uint64_t k_store_va[3];
+    uint64_t v_store_va[3];
+    uint64_t k_idxs_va[3];
+    uint64_t v_idxs_va[3];
+    uint64_t inp_pos_va;
+    uint64_t rope_freq_va;
+    uint32_t n_layers;
+    uint32_t n_head_kv;
+    uint32_t head_dim;
+    uint32_t n_tokens;
+    uint32_t layer_raw_stride_f32;
+    uint32_t k_raw_stride_f32;
+    uint32_t v_raw_stride_f32;
+    uint32_t k_store_nb1_B[3];
+    uint32_t v_store_nb1_B[3];
+    uint32_t k_ids_nb0_B;
+    uint32_t v_ids_nb0_B;
+    uint32_t rope_n_dims;
+    uint32_t layer_flags[3];
+    float    rms_eps;
+    float    theta_scale;
+    float    freq_scale;
+    float    attn_factor;
+    uint32_t pad0;
+};
+static_assert(sizeof(agx_w8_dspark_inject_kv_push) <= 256, "agx_w8_dspark_inject_kv_push > 256B");
+
 // ============================================================================
 // Wave 5 Pillar 3: Persistent 40-WG SENSE_BARRIER B=1 Megakernel Descriptors
 // Matches kernels/agx_inkling2_persist_b1.comp (PERSIST_MODE=0,1,2)
