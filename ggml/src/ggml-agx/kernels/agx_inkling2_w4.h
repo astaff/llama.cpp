@@ -227,6 +227,14 @@ static_assert(sizeof(agx_w4_batch_rmsnorm_push) <= 256, "agx_w4_batch_rmsnorm_pu
 #define AGX_W4_DSPARK_F_ZERO_STATE   (1u << 1)
 #define AGX_W4_DSPARK_F_HAS_W2_BIAS  (1u << 2)
 #define AGX_W4_DSPARK_F_EMIT_TOP64   (1u << 3)
+#define AGX_W4_DSPARK_F_BASE_ONLY    (1u << 4)
+
+struct agx_w7_dspark_topk_entry {
+    uint64_t ids_va;
+    uint64_t vals_va;
+    uint64_t k_u64;
+};
+static_assert(sizeof(agx_w7_dspark_topk_entry) == 24, "agx_w7_dspark_topk_entry must be 24B");
 
 struct agx_w4_dspark_pack_push {
     uint64_t prev_tok_va;
@@ -278,6 +286,8 @@ struct agx_w4_dspark_w2_push {
     float    w2_scale;
     float    softcap;
     float    inv_softcap;
+    uint32_t base_stride_f32; // 0 -> n_vocab (non-zero reads padded LM head directly!)
+    uint32_t pad0;
 };
 static_assert(sizeof(agx_w4_dspark_w2_push) <= 256, "agx_w4_dspark_w2_push > 256B");
 
@@ -287,6 +297,13 @@ struct agx_w4_dspark_merge_push {
     uint64_t rnn_state_va;
     uint64_t prev_tok_va;
     uint64_t out_pack_va;
+    // Optional inline next-step JOINT_PACK (active when next_w1_va != 0)
+    uint64_t next_w1_va;
+    uint64_t next_hidden_va;
+    uint64_t next_f_rnn_va;
+    uint64_t next_state_va;
+    uint64_t next_joint_in_va;
+    uint64_t out_topk_table_va; // optional [n_tokens] table of agx_w7_dspark_topk_entry
     uint32_t n_embd;
     uint32_t n_blocks;
     uint32_t block_drafts;
@@ -294,8 +311,134 @@ struct agx_w4_dspark_merge_push {
     uint32_t n_splits;
     uint32_t n_cand;
     uint32_t has_rnn_state;
+    uint32_t next_rank;
+    uint32_t next_w1_wtype;
+    uint32_t next_w1_row_bytes;
+    uint32_t next_flags;
+    uint32_t pad0;
 };
 static_assert(sizeof(agx_w4_dspark_merge_push) <= 256, "agx_w4_dspark_merge_push > 256B");
+
+// Wave 7 DSpark Fused Accelerator push structs (agx_inkling2_dspark_mtp.comp DSPARK_FUSED_MODE=4..7)
+struct agx_w7_dspark_joint_gru_push {
+    uint64_t joint_in_va;
+    uint64_t joint_w_va;
+    uint64_t joint_b_va;
+    uint64_t state_va;
+    uint64_t markov_out_va;
+    uint32_t n_joint;
+    uint32_t rank;
+    uint32_t n_blocks;
+    uint32_t w_wtype;
+    uint32_t w_row_bytes;
+    uint32_t zero_state;
+};
+static_assert(sizeof(agx_w7_dspark_joint_gru_push) <= 256, "agx_w7_dspark_joint_gru_push > 256B");
+
+struct agx_w7_dspark_inp_block_push {
+    uint64_t tok_embd_va;
+    uint64_t tok_ids_va;
+    uint64_t tok_norm_va;
+    uint64_t mask_embd_va;
+    uint64_t attn_norm0_va;
+    uint64_t out_cur_va;
+    uint64_t out_norm_va;
+    uint32_t n_embd;
+    uint32_t n_tokens;
+    uint32_t block_drafts;
+    uint32_t embd_wtype;
+    uint32_t embd_row_bytes;
+    uint32_t mask_wtype;
+    uint32_t mask_row_bytes;
+    float    embd_scale;
+    float    rms_eps;
+    uint32_t pad0;
+};
+static_assert(sizeof(agx_w7_dspark_inp_block_push) <= 256, "agx_w7_dspark_inp_block_push > 256B");
+
+#define AGX_W7_DSPARK_QKV_SHARED_KV   (1u << 0)
+#define AGX_W7_DSPARK_QKV_HAS_ROPE    (1u << 1)
+#define AGX_W7_DSPARK_QKV_ROPE_NEOX   (1u << 2)
+#define AGX_W7_DSPARK_QKV_FWHT_K      (1u << 3)
+#define AGX_W7_DSPARK_QKV_FWHT_V      (1u << 4)
+#define AGX_W7_DSPARK_QKV_KV_Q8_0     (1u << 5)
+#define AGX_W7_DSPARK_QKV_K_IDS_I64   (1u << 6)
+#define AGX_W7_DSPARK_QKV_V_IDS_I64   (1u << 7)
+
+struct agx_w7_dspark_qkv_rope_push {
+    uint64_t q_raw_va;
+    uint64_t k_raw_va;
+    uint64_t v_raw_va;
+    uint64_t q_norm_va;
+    uint64_t k_norm_va;
+    uint64_t inp_pos_va;
+    uint64_t rope_freq_va;
+    uint64_t q_out_va;
+    uint64_t k_store_va;
+    uint64_t v_store_va;
+    uint64_t k_idxs_va;
+    uint64_t v_idxs_va;
+    uint32_t q_raw_stride_f32;
+    uint32_t k_raw_stride_f32;
+    uint32_t v_raw_stride_f32;
+    uint32_t n_head_q;
+    uint32_t n_head_kv;
+    uint32_t head_dim;
+    uint32_t n_tokens;
+    uint32_t rope_n_dims;
+    uint32_t k_store_nb1_B;
+    uint32_t v_store_nb1_B;
+    uint32_t k_ids_nb0_B;
+    uint32_t v_ids_nb0_B;
+    uint32_t flags;
+    float    rms_eps;
+    float    theta_scale;
+    float    freq_scale;
+    float    attn_factor;
+    uint32_t pad0;
+};
+static_assert(sizeof(agx_w7_dspark_qkv_rope_push) <= 256, "agx_w7_dspark_qkv_rope_push > 256B");
+
+// DSPARK_FUSED_MODE == 7: op=0 RES_NORM, op=1 GLU, op=2 MARKOV_INIT
+struct agx_w7_dspark_post_op_push {
+    uint64_t va0; // op0: cur_in   | op1: gate_in  | op2: anchor_toks
+    uint64_t va1; // op0: res_in   | op1: up_in    | op2: base_logits
+    uint64_t va2; // op0: post_nw  | op1: out_va   | op2: out_logits
+    uint64_t va3; // op0: out_sc   | op1: 0        | op2: out_h_nextn
+    uint64_t va4; // op0: next_nw  | op1: 0        | op2: prev_tok_va
+    uint64_t va5; // op0: out_cur  | op1: 0        | op2: w1_va
+    uint64_t va6; // op0: out_norm | op1: 0        | op2: hidden_va
+    uint64_t va7; // op0: export_n | op1: 0        | op2: f_rnn_va
+    uint64_t va8; // op0: 0        | op1: 0        | op2: joint_in_va
+    uint32_t op;  // 0=RES_NORM, 1=GLU, 2=MARKOV_INIT
+    uint32_t p0;  // op0: n_embd   | op1: n_ff     | op2: n_vocab
+    uint32_t p1;  // op0: n_tokens | op1: n_tokens | op2: base_stride_f32
+    uint32_t p2;  // op0: flags    | op1: g_stride | op2: n_blocks
+    uint32_t p3;  // op0: 0        | op1: u_stride | op2: block_drafts
+    uint32_t p4;  // op0: 0        | op1: glu_op   | op2: n_embd
+    uint32_t p5;  // op0: 0        | op1: 0        | op2: rank
+    uint32_t p6;  // op0: 0        | op1: 0        | op2: w1_wtype
+    uint32_t p7;  // op0: 0        | op1: 0        | op2: w1_row_bytes
+    uint32_t p8;  // op0: 0        | op1: 0        | op2: flags (sample_from_anchor, has_frnn, i_beg)
+    float    f0;  // op0: rms_eps  | op1: alpha    | op2: 0
+    float    f1;  // op0: 0        | op1: limit    | op2: 0
+};
+static_assert(sizeof(agx_w7_dspark_post_op_push) <= 256, "agx_w7_dspark_post_op_push > 256B");
+
+// DSPARK_FUSED_MODE == 8: Fused Q8_0_8BLK M=1..4 Gate + Up + GLU (1x sh_x read, 0 va_gu_out traffic!)
+struct agx_w7_dspark_gate_up_glu_push {
+    uint64_t wg_va;
+    uint64_t wu_va;
+    uint64_t x_va;
+    uint64_t y_va;
+    uint32_t M;       // 1..4
+    uint32_t N;       // n_ff (e.g. 9216)
+    uint32_t K;       // n_embd (e.g. 2304, multiple of 4)
+    uint32_t glu_op;  // 0=REGLU, 1=GEGLU, 2=SWIGLU, 3=SWIGLU_OAI, 5=GEGLU_QUICK
+    float    glu_alpha;
+    float    glu_limit;
+};
+static_assert(sizeof(agx_w7_dspark_gate_up_glu_push) <= 256, "agx_w7_dspark_gate_up_glu_push > 256B");
 
 // ============================================================================
 // Wave 5 Pillar 3: Persistent 40-WG SENSE_BARRIER B=1 Megakernel Descriptors
@@ -316,6 +459,10 @@ static_assert(sizeof(agx_w4_dspark_merge_push) <= 256, "agx_w4_dspark_merge_push
 #define AGX_W5_PFLAG_POST_FFN_DO_MIX   (1u << 10)
 #define AGX_W5_PFLAG_POST_FFN_DO_NORM  (1u << 11)
 #define AGX_W5_PFLAG_NEXT_IS_SWA       (1u << 12)
+#define AGX_W5_PFLAG_FUSE_ATTN_IN      (1u << 13)
+#define AGX_W5_PFLAG_FUSE_WO           (1u << 14)
+#define AGX_W5_PFLAG_FUSE_SINK_PROJ    (1u << 15)
+#define AGX_W5_PFLAG_FUSE_DYN_CONV     (1u << 16)
 
 struct alignas(16) agx_w5_pass_desc {
     // 1. SLC Arena / Activation VAs (30 x u64)

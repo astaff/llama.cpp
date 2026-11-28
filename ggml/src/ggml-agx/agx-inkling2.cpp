@@ -478,6 +478,9 @@ struct agx_w4_bound_model {
     agx_w4_layer_coalesced layers[AGX_INKLING2_MAX_PHYS_LAYERS];
 };
 
+// Wave 7: DSpark Draft Megakernel max supported layers
+#define AGX_W7_DSPARK_MAX_LAYERS 8u
+
 // ============================================================================
 // Engine Struct & SLC Scratch Layout
 // ============================================================================
@@ -520,6 +523,11 @@ struct agx_inkling2_engine {
     const agx_kernel * k_w4_dspark_gru      = nullptr;
     const agx_kernel * k_w4_dspark_w2       = nullptr;
     const agx_kernel * k_w4_dspark_merge    = nullptr;
+    const agx_kernel * k_w7_dspark_joint_gru = nullptr;
+    const agx_kernel * k_w7_dspark_inp_block = nullptr;
+    const agx_kernel * k_w7_dspark_qkv_rope  = nullptr;
+    const agx_kernel * k_w7_dspark_post_op   = nullptr;
+    const agx_kernel * k_w7_dspark_gate_up_glu = nullptr;
     const agx_kernel * k_w4_router_topk     = nullptr;
     const agx_kernel * k_w4_gather_f32      = nullptr;
     const agx_kernel * k_w4_fill_f32        = nullptr;
@@ -549,7 +557,8 @@ struct agx_inkling2_engine {
     bool               w5_hybrid_m_tried             = false;
     bool               w5_hybrid_m_ok                = false;
 
-    agx_w4_bound_model w4_model;
+    agx_w4_bound_model        w4_model;
+    agx_bo *                  dspark_scratch_bo = nullptr;
 
     // Dedicated SLC-pinned activation & recurrent-state arena (AGX_BO_SLC_PIN)
     agx_bo * slc_bo   = nullptr;
@@ -874,6 +883,7 @@ void agx_inkling2_engine_destroy(agx_inkling2_engine * eng) {
                 eng->w4_model.layers[i].valid = false;
             }
         }
+        if (eng->dspark_scratch_bo) agx_bo_free(eng->ctx->drm, eng->dspark_scratch_bo);
         if (eng->conv_bo) agx_bo_free(eng->ctx->drm, eng->conv_bo);
         if (eng->slc_bo)  agx_bo_free(eng->ctx->drm, eng->slc_bo);
     }
@@ -2010,13 +2020,18 @@ bool agx_inkling2_precompile_w4(agx_inkling2_engine * eng) {
     eng->k_w4_ctrl_mix_norm   = compile_file("agx_w4_ctrl_mix_norm",   "agx_inkling2_stage_prep.comp",     "STAGE_MODE=5");
     eng->k_w4_ctrl_up_mix     = compile_file("agx_w4_ctrl_up_mix",     "agx_inkling2_stage_prep.comp",     "STAGE_MODE=6");
     eng->k_w4_batch_rmsnorm   = compile_file("agx_w4_batch_rmsnorm",   "agx_inkling2_stage_prep.comp",     "STAGE_MODE=7");
-    eng->k_w4_dspark_pack     = compile_file("agx_w4_dspark_pack",     "agx_inkling2_dspark_mtp.comp",     "DSPARK_FUSED_MODE=0");
-    eng->k_w4_dspark_gru      = compile_file("agx_w4_dspark_gru",      "agx_inkling2_dspark_mtp.comp",     "DSPARK_FUSED_MODE=3");
-    eng->k_w4_dspark_w2       = compile_file("agx_w4_dspark_w2",       "agx_inkling2_dspark_mtp.comp",     "DSPARK_FUSED_MODE=1");
-    eng->k_w4_dspark_merge    = compile_file("agx_w4_dspark_merge",    "agx_inkling2_dspark_mtp.comp",     "DSPARK_FUSED_MODE=2");
-    eng->k_w4_router_topk     = compile_inline("agx_w4_router_topk",   k_glsl_w4_router_topk_norm);
-    eng->k_w4_gather_f32      = compile_inline("agx_w4_gather_f32",    k_glsl_w4_gather_f32);
-    eng->k_w4_fill_f32        = compile_inline("agx_w4_fill_f32",      k_glsl_w4_fill_f32);
+    eng->k_w4_dspark_pack      = compile_file("agx_w4_dspark_pack",      "agx_inkling2_dspark_mtp.comp",     "DSPARK_FUSED_MODE=0");
+    eng->k_w4_dspark_gru       = compile_file("agx_w4_dspark_gru",       "agx_inkling2_dspark_mtp.comp",     "DSPARK_FUSED_MODE=3");
+    eng->k_w4_dspark_w2        = compile_file("agx_w4_dspark_w2",        "agx_inkling2_dspark_mtp.comp",     "DSPARK_FUSED_MODE=1");
+    eng->k_w4_dspark_merge     = compile_file("agx_w4_dspark_merge",     "agx_inkling2_dspark_mtp.comp",     "DSPARK_FUSED_MODE=2");
+    eng->k_w7_dspark_joint_gru = compile_file("agx_w7_dspark_joint_gru", "agx_inkling2_dspark_mtp.comp",     "DSPARK_FUSED_MODE=4");
+    eng->k_w7_dspark_inp_block = compile_file("agx_w7_dspark_inp_block", "agx_inkling2_dspark_mtp.comp",     "DSPARK_FUSED_MODE=5");
+    eng->k_w7_dspark_qkv_rope  = compile_file("agx_w7_dspark_qkv_rope",  "agx_inkling2_dspark_mtp.comp",     "DSPARK_FUSED_MODE=6");
+    eng->k_w7_dspark_post_op   = compile_file("agx_w7_dspark_post_op",   "agx_inkling2_dspark_mtp.comp",     "DSPARK_FUSED_MODE=7");
+    eng->k_w7_dspark_gate_up_glu = compile_file("agx_w7_dspark_gate_up_glu", "agx_inkling2_dspark_mtp.comp", "DSPARK_FUSED_MODE=8");
+    eng->k_w4_router_topk      = compile_inline("agx_w4_router_topk",   k_glsl_w4_router_topk_norm);
+    eng->k_w4_gather_f32       = compile_inline("agx_w4_gather_f32",    k_glsl_w4_gather_f32);
+    eng->k_w4_fill_f32         = compile_inline("agx_w4_fill_f32",      k_glsl_w4_fill_f32);
     eng->k_w4_scatter_rows_f32 = compile_inline("agx_w4_scatter_rows_f32", k_glsl_w4_scatter_rows_f32);
 
     eng->w4_compiled = eng->k_w4_qkv_prep_store && eng->k_w4_stage_post_attn &&
@@ -2025,7 +2040,10 @@ bool agx_inkling2_precompile_w4(agx_inkling2_engine * eng) {
                        eng->k_w4_ctrl_mix_norm && eng->k_w4_ctrl_up_mix &&
                        eng->k_w4_batch_rmsnorm && eng->k_w4_dspark_pack &&
                        eng->k_w4_dspark_gru && eng->k_w4_dspark_w2 &&
-                       eng->k_w4_dspark_merge && eng->k_w4_router_topk &&
+                       eng->k_w4_dspark_merge && eng->k_w7_dspark_joint_gru &&
+                       eng->k_w7_dspark_inp_block && eng->k_w7_dspark_qkv_rope &&
+                       eng->k_w7_dspark_post_op && eng->k_w7_dspark_gate_up_glu &&
+                       eng->k_w4_router_topk &&
                        eng->k_w4_gather_f32 && eng->k_w4_fill_f32 &&
                        eng->k_w4_scatter_rows_f32;
     return eng->w4_compiled;
@@ -2297,6 +2315,285 @@ static constexpr bool agx_w5_verify_w4_sublayout() {
 static_assert(agx_w5_verify_w4_sublayout(),
               "Wave 5 Theorem W5.1: agx_w4_slc_layout sub-slices must be 128B-aligned, disjoint, and moe_out != x_v");
 
+static bool agx_dspark_dispatch_markov_head_w7(agx_inkling2_engine *             eng,
+                                               agx_cdm_stream *                  stream,
+                                               const agx_dspark_mtp_tensors &    w,
+                                               uint64_t                          anchor_toks_va,
+                                               uint64_t                          base_logits_va,
+                                               uint32_t                          base_stride_f32,
+                                               uint64_t                          hidden_va,
+                                               uint64_t                          f_rnn_va,
+                                               uint64_t                          rnn_state_va,
+                                               uint64_t                          out_logits_va,
+                                               uint64_t                          out_h_nextn_va,
+                                               uint32_t                          n_blocks,
+                                               uint32_t                          block_drafts,
+                                               agx_barrier_mode                  post_barrier,
+                                               const agx_w7_dspark_topk_entry *  topk_table = nullptr,
+                                               uint32_t                          n_topk_rows = 0u) {
+    if (!eng || !stream || !w.markov_w1 || !w.markov_w2 || n_blocks == 0 || n_blocks > 4 || block_drafts == 0) {
+        return false;
+    }
+    if (!agx_inkling2_precompile_w4(eng)) {
+        return false;
+    }
+    agx_slc_arena * slc = agx_backend_get_slc_arena(eng->ctx);
+    if (!slc) return false;
+    const agx_w4_slc_layout L = agx_w4_partition_slc(slc);
+
+    const uint32_t i_beg      = w.sample_from_anchor ? 0u : 1u;
+    const uint32_t base_str   = (base_stride_f32 > 0u) ? base_stride_f32 : w.n_vocab;
+    const bool     has_frnn   = (w.has_f_rnn && f_rnn_va != 0ull);
+
+    uint64_t topk_table_va = 0ull;
+    const bool has_topk_tbl = (topk_table != nullptr && n_topk_rows == n_blocks * block_drafts);
+    if (has_topk_tbl) {
+        void * tbl_cpu = nullptr;
+        topk_table_va = agx_cdm_alloc_args(stream, (size_t) n_topk_rows * sizeof(agx_w7_dspark_topk_entry),
+                                           16u, &tbl_cpu);
+        if (!topk_table_va || !tbl_cpu) return false;
+        std::memcpy(tbl_cpu, topk_table, (size_t) n_topk_rows * sizeof(agx_w7_dspark_topk_entry));
+    }
+    auto step_has_topk = [&](uint32_t step) -> bool {
+        if (!has_topk_tbl) return false;
+        for (uint32_t b = 0u; b < n_blocks; ++b) {
+            if (topk_table[b * block_drafts + step].ids_va != 0ull) return true;
+        }
+        return false;
+    };
+    const bool need_slot0_topk = (!w.sample_from_anchor && step_has_topk(0u));
+
+    uint32_t w1_rb = 0, w2_rb = 0;
+    const uint32_t w1_wt = agx_inkling2_tensor_wtype(w.markov_w1, &w1_rb);
+    const uint32_t w2_wt = agx_inkling2_tensor_wtype(w.markov_w2, &w2_rb);
+    if (!agx_gemm_init(eng->ctx)) {
+        return false;
+    }
+
+    const uint32_t n_splits = 40u;  // 1 WG/core x 512T = 16 SGs/core (Top-1 Pigeonhole + 2x smaller merge!)
+    const uint32_t n_cand   = std::min<uint32_t>(64u, w.n_vocab);
+
+    // 1-Dispatch Fused MARKOV_INIT: anchor_toks -> prev_tok + [slot-0 logit copy] + h_nextn[0] zero + step i_beg joint_in pack!
+    const bool can_pack_init = (w.joint_proj != nullptr && i_beg < block_drafts);
+    {
+        agx_w7_dspark_post_op_push ipc{};
+        ipc.va0 = anchor_toks_va;
+        ipc.va1 = base_logits_va;
+        ipc.va2 = out_logits_va;
+        ipc.va3 = (rnn_state_va != 0ull) ? out_h_nextn_va : 0ull;
+        ipc.va4 = L.dspark_prev;
+        ipc.va5 = agx_tensor_gpu_va(w.markov_w1);
+        ipc.va6 = hidden_va;
+        ipc.va7 = f_rnn_va;
+        ipc.va8 = L.dspark_in;
+        ipc.op  = 2u; // MARKOV_INIT
+        ipc.p0  = w.n_vocab;
+        ipc.p1  = base_str;
+        ipc.p2  = n_blocks;
+        ipc.p3  = block_drafts;
+        ipc.p4  = w.n_embd;
+        ipc.p5  = w.rank;
+        ipc.p6  = w1_wt;
+        ipc.p7  = w1_rb;
+        ipc.p8  = (w.sample_from_anchor ? 1u : 0u) |
+                  (has_frnn ? 2u : 0u) |
+                  (can_pack_init ? 4u : 0u) |
+                  (need_slot0_topk ? 8u : 0u);
+        const uint32_t init_wgs = need_slot0_topk ? 1u : 160u;
+        const agx_barrier_mode init_bar = need_slot0_topk
+            ? AGX_BARRIER_NONE
+            : ((i_beg < block_drafts) ? AGX_BARRIER_STRONG_USC : post_barrier);
+        if (!agx_cdm_dispatch(stream, eng->k_w7_dspark_post_op, init_wgs, n_blocks, 1u,
+                              &ipc, sizeof(ipc), init_bar)) {
+            return false;
+        }
+    }
+
+    if (need_slot0_topk) {
+        // Concurrent with 1-WG MARKOV_INIT: 160-WG copy slot 0 + emit top-64, then 1-WG merge -> top_k[0]!
+        agx_w4_dspark_w2_push w0{};
+        w0.base_va         = base_logits_va;
+        w0.out_logits_va   = out_logits_va;
+        w0.cand_val_va     = L.dspark_cand_val;
+        w0.cand_idx_va     = L.dspark_cand_idx;
+        w0.rank            = w.rank;
+        w0.n_vocab         = w.n_vocab;
+        w0.n_blocks        = n_blocks;
+        w0.block_drafts    = block_drafts;
+        w0.draft_pos       = 0u;
+        w0.n_splits        = n_splits;
+        w0.flags           = AGX_W4_DSPARK_F_BASE_ONLY | AGX_W4_DSPARK_F_EMIT_TOP64;
+        w0.base_stride_f32 = base_str;
+        if (!agx_cdm_dispatch(stream, eng->k_w4_dspark_w2, n_splits, n_blocks, 1u,
+                              &w0, sizeof(w0), AGX_BARRIER_STRONG_USC)) {
+            return false;
+        }
+        agx_w4_dspark_merge_push m0{};
+        m0.cand_val_va       = L.dspark_cand_val;
+        m0.cand_idx_va       = L.dspark_cand_idx;
+        m0.out_topk_table_va = topk_table_va;
+        m0.n_embd            = w.n_embd;
+        m0.n_blocks          = n_blocks;
+        m0.block_drafts      = block_drafts;
+        m0.draft_pos         = 0u;
+        m0.n_splits          = n_splits;
+        m0.n_cand            = n_cand;
+        if (!agx_cdm_dispatch(stream, eng->k_w4_dspark_merge, n_blocks, 1u, 1u,
+                              &m0, sizeof(m0),
+                              (i_beg < block_drafts) ? AGX_BARRIER_STRONG_USC : post_barrier)) {
+            return false;
+        }
+    }
+
+    float w2_scale = 1.0f;
+    if (w.markov_w2_s && w.markov_w2_s->data && w.markov_w2_s->type == GGML_TYPE_F32) {
+        w2_scale = *static_cast<const float *>(w.markov_w2_s->data);
+    }
+
+    uint32_t jp_rb = 0;
+    const uint32_t jp_wt = w.joint_proj ? agx_inkling2_tensor_wtype(w.joint_proj, &jp_rb) : 0u;
+    const bool use_fused_joint_gru =
+        w.joint_proj != nullptr &&
+        (w.joint_proj->type == GGML_TYPE_F32 || w.joint_proj->type == GGML_TYPE_F16 ||
+         w.joint_proj->type == GGML_TYPE_BF16 || w.joint_proj->type == GGML_TYPE_Q8_0) &&
+        (w.joint_proj->ne[0] % 8 == 0);
+    const uint32_t n_joint = 2u * w.rank + (has_frnn ? 2u * w.n_embd : w.n_embd);
+
+    bool joint_in_packed = can_pack_init;
+
+    for (uint32_t i = i_beg; i < block_drafts; ++i) {
+        const bool is_last   = (i + 1u == block_drafts);
+        const bool cur_topk  = step_has_topk(i);
+        const bool need_draw = (rnn_state_va != 0ull || !is_last || cur_topk);
+
+        if (w.joint_proj) {
+            if (!joint_in_packed) {
+                agx_w4_dspark_pack_push ppc{};
+                ppc.prev_tok_va  = L.dspark_prev;
+                ppc.w1_va        = agx_tensor_gpu_va(w.markov_w1);
+                ppc.hidden_va    = hidden_va;
+                ppc.f_rnn_va     = f_rnn_va;
+                ppc.state_va     = L.dspark_state;
+                ppc.joint_in_va  = L.dspark_in;
+                ppc.n_embd       = w.n_embd;
+                ppc.rank         = w.rank;
+                ppc.n_blocks     = n_blocks;
+                ppc.block_drafts = block_drafts;
+                ppc.draft_pos    = i;
+                ppc.w1_wtype     = w1_wt;
+                ppc.w1_row_bytes = w1_rb;
+                ppc.flags        = (has_frnn ? AGX_W4_DSPARK_F_HAS_FRNN : 0u) |
+                                   (i == i_beg ? AGX_W4_DSPARK_F_ZERO_STATE : 0u);
+                if (!agx_cdm_dispatch(stream, eng->k_w4_dspark_pack, n_blocks, 1u, 1u,
+                                      &ppc, sizeof(ppc), AGX_BARRIER_STRONG_USC)) {
+                    return false;
+                }
+            }
+            joint_in_packed = false;
+
+            if (use_fused_joint_gru && eng->k_w7_dspark_joint_gru) {
+                // 1 SINGLE 40-core dispatch reading joint_in ONCE across 3 rows + joint_b + GRU!
+                agx_w7_dspark_joint_gru_push jpc{};
+                jpc.joint_in_va   = L.dspark_in;
+                jpc.joint_w_va    = agx_tensor_gpu_va(w.joint_proj);
+                jpc.joint_b_va    = w.joint_proj_b ? agx_tensor_gpu_va(w.joint_proj_b) : 0ull;
+                jpc.state_va      = L.dspark_state;
+                jpc.markov_out_va = L.dspark_markov;
+                jpc.n_joint       = n_joint;
+                jpc.rank          = w.rank;
+                jpc.n_blocks      = n_blocks;
+                jpc.w_wtype       = jp_wt;
+                jpc.w_row_bytes   = jp_rb;
+                jpc.zero_state    = (i == i_beg) ? 1u : 0u;
+                if (!agx_cdm_dispatch(stream, eng->k_w7_dspark_joint_gru, w.rank, n_blocks, 1u,
+                                      &jpc, sizeof(jpc), AGX_BARRIER_STRONG_USC)) {
+                    return false;
+                }
+            } else {
+                if (!dispatch_dense_mm(eng->ctx, stream, w.joint_proj, L.dspark_in, L.dspark_joint_out,
+                                       n_blocks, AGX_BARRIER_STRONG_USC)) {
+                    return false;
+                }
+                agx_w4_dspark_gru_push gpc{};
+                gpc.joint_out_va  = L.dspark_joint_out;
+                gpc.joint_b_va    = w.joint_proj_b ? agx_tensor_gpu_va(w.joint_proj_b) : 0ull;
+                gpc.state_va      = L.dspark_state;
+                gpc.markov_out_va = L.dspark_markov;
+                gpc.rank          = w.rank;
+                gpc.n_blocks      = n_blocks;
+                gpc.zero_state    = (i == i_beg) ? 1u : 0u;
+                if (!agx_cdm_dispatch(stream, eng->k_w4_dspark_gru, n_blocks, 1u, 1u,
+                                      &gpc, sizeof(gpc), AGX_BARRIER_STRONG_USC)) {
+                    return false;
+                }
+            }
+        }
+
+        agx_w4_dspark_w2_push wpc{};
+        wpc.markov_va       = L.dspark_markov;
+        wpc.w2_va           = agx_tensor_gpu_va(w.markov_w2);
+        wpc.w2_bias_va      = w.markov_w2_b ? agx_tensor_gpu_va(w.markov_w2_b) : 0ull;
+        wpc.base_va         = base_logits_va;
+        wpc.out_logits_va   = out_logits_va;
+        wpc.cand_val_va     = L.dspark_cand_val;
+        wpc.cand_idx_va     = L.dspark_cand_idx;
+        wpc.rank            = w.rank;
+        wpc.n_vocab         = w.n_vocab;
+        wpc.n_blocks        = n_blocks;
+        wpc.block_drafts    = block_drafts;
+        wpc.draft_pos       = i;
+        wpc.n_splits        = n_splits;
+        wpc.w2_wtype        = w2_wt;
+        wpc.w2_row_bytes    = w2_rb;
+        wpc.flags           = (w.markov_w2_b ? AGX_W4_DSPARK_F_HAS_W2_BIAS : 0u) |
+                              (need_draw ? AGX_W4_DSPARK_F_EMIT_TOP64 : 0u);
+        wpc.w2_scale        = w2_scale;
+        wpc.softcap         = w.softcap;
+        wpc.inv_softcap     = (w.softcap > 0.0f) ? (1.0f / w.softcap) : 0.0f;
+        wpc.base_stride_f32 = base_str;
+
+        if (!agx_cdm_dispatch(stream, eng->k_w4_dspark_w2, n_splits, n_blocks, 1u,
+                              &wpc, sizeof(wpc),
+                              need_draw ? AGX_BARRIER_STRONG_USC : (is_last ? post_barrier : AGX_BARRIER_STRONG_USC))) {
+            return false;
+        }
+
+        if (need_draw) {
+            const bool fuse_next_pack = (!is_last && w.joint_proj != nullptr);
+            agx_w4_dspark_merge_push mpc{};
+            mpc.cand_val_va       = L.dspark_cand_val;
+            mpc.cand_idx_va       = L.dspark_cand_idx;
+            mpc.rnn_state_va      = rnn_state_va;
+            mpc.prev_tok_va       = L.dspark_prev;
+            mpc.out_pack_va       = out_h_nextn_va;
+            mpc.next_w1_va        = fuse_next_pack ? agx_tensor_gpu_va(w.markov_w1) : 0ull;
+            mpc.next_hidden_va    = fuse_next_pack ? hidden_va : 0ull;
+            mpc.next_f_rnn_va     = fuse_next_pack ? f_rnn_va : 0ull;
+            mpc.next_state_va     = fuse_next_pack ? L.dspark_state : 0ull;
+            mpc.next_joint_in_va  = fuse_next_pack ? L.dspark_in : 0ull;
+            mpc.out_topk_table_va = cur_topk ? topk_table_va : 0ull;
+            mpc.n_embd            = w.n_embd;
+            mpc.n_blocks          = n_blocks;
+            mpc.block_drafts      = block_drafts;
+            mpc.draft_pos         = i;
+            mpc.n_splits          = n_splits;
+            mpc.n_cand            = n_cand;
+            mpc.has_rnn_state     = (rnn_state_va != 0ull) ? 1u : 0u;
+            mpc.next_rank         = w.rank;
+            mpc.next_w1_wtype     = w1_wt;
+            mpc.next_w1_row_bytes = w1_rb;
+            mpc.next_flags        = has_frnn ? AGX_W4_DSPARK_F_HAS_FRNN : 0u;
+            if (!agx_cdm_dispatch(stream, eng->k_w4_dspark_merge, n_blocks, 1u, 1u,
+                                  &mpc, sizeof(mpc),
+                                  is_last ? post_barrier : AGX_BARRIER_STRONG_USC)) {
+                return false;
+            }
+            joint_in_packed = fuse_next_pack;
+        }
+    }
+    return true;
+}
+
 bool agx_dspark_dispatch_markov_head_w4(agx_inkling2_engine *          eng,
                                         agx_cdm_stream *               stream,
                                         const agx_dspark_mtp_tensors & w,
@@ -2310,171 +2607,10 @@ bool agx_dspark_dispatch_markov_head_w4(agx_inkling2_engine *          eng,
                                         uint32_t                       n_blocks,
                                         uint32_t                       block_drafts,
                                         agx_barrier_mode               post_barrier) {
-    if (!eng || !stream || !w.markov_w1 || !w.markov_w2 || n_blocks == 0 || n_blocks > 4 || block_drafts == 0) {
-        return false;
-    }
-    if (!agx_inkling2_precompile_w4(eng)) {
-        return false;
-    }
-    agx_slc_arena * slc = agx_backend_get_slc_arena(eng->ctx);
-    if (!slc) return false;
-    const agx_w4_slc_layout L = agx_w4_partition_slc(slc);
-
-    const uint32_t i_beg = w.sample_from_anchor ? 0u : 1u;
-
-    // Seed prev_tok from anchor token(s) (1-element copy per block when n_blocks == 1)
-    if (n_blocks == 1u) {
-        copy_f32_push cp{ anchor_toks_va, L.dspark_prev, 1u, 0u };
-        if (!agx_cdm_dispatch(stream, eng->k_copy_f32, 1u, 1u, 1u, &cp, sizeof(cp), AGX_BARRIER_NONE)) {
-            return false;
-        }
-    } else {
-        for (uint32_t b = 0; b < n_blocks; ++b) {
-            copy_f32_push cp{
-                anchor_toks_va + (uint64_t) (b * block_drafts) * sizeof(int32_t),
-                L.dspark_prev + (uint64_t) b * sizeof(int32_t),
-                1u, 0u
-            };
-            if (!agx_cdm_dispatch(stream, eng->k_copy_f32, 1u, 1u, 1u, &cp, sizeof(cp), AGX_BARRIER_NONE)) {
-                return false;
-            }
-        }
-    }
-
-    // Slot 0 pass-through (unbiased anchor logits + zero h_nextn slot 0)
-    if (!w.sample_from_anchor) {
-        if (out_logits_va != base_logits_va) {
-            for (uint32_t b = 0; b < n_blocks; ++b) {
-                const uint64_t off = (uint64_t) b * block_drafts * w.n_vocab * sizeof(float);
-                copy_f32_push cp{ base_logits_va + off, out_logits_va + off, w.n_vocab, 0u };
-                if (!agx_cdm_dispatch(stream, eng->k_copy_f32, (w.n_vocab + 255u) / 256u, 1u, 1u,
-                                      &cp, sizeof(cp), AGX_BARRIER_NONE)) {
-                    return false;
-                }
-            }
-        }
-        if (out_h_nextn_va != 0ull && rnn_state_va != 0ull) {
-            for (uint32_t b = 0; b < n_blocks; ++b) {
-                const uint64_t off = (uint64_t) b * block_drafts * w.n_embd * sizeof(float);
-                w4_fill_f32_push fp{ out_h_nextn_va + off, w.n_embd, 0.0f };
-                if (!agx_cdm_dispatch(stream, eng->k_w4_fill_f32, (w.n_embd + 255u) / 256u, 1u, 1u,
-                                      &fp, sizeof(fp), AGX_BARRIER_NONE)) {
-                    return false;
-                }
-            }
-        }
-    }
-    agx_cdm_barrier_usc(stream);
-
-    uint32_t w1_rb = 0, w2_rb = 0;
-    const uint32_t w1_wt = agx_inkling2_tensor_wtype(w.markov_w1, &w1_rb);
-    const uint32_t w2_wt = agx_inkling2_tensor_wtype(w.markov_w2, &w2_rb);
-    if (!agx_gemm_init(eng->ctx)) {
-        return false;
-    }
-
-    float w2_scale = 1.0f;
-    if (w.markov_w2_s && w.markov_w2_s->data && w.markov_w2_s->type == GGML_TYPE_F32) {
-        w2_scale = *static_cast<const float *>(w.markov_w2_s->data);
-    }
-
-    const uint32_t n_splits = 160u; // 4 WGs/core on M4 Max -> full 517 GB/s DRAM saturation!
-    const uint32_t n_cand   = std::min<uint32_t>(64u, w.n_vocab);
-
-    for (uint32_t i = i_beg; i < block_drafts; ++i) {
-        const bool is_last   = (i + 1u == block_drafts);
-        const bool need_draw = (rnn_state_va != 0ull || !is_last);
-
-        if (w.joint_proj) {
-            agx_w4_dspark_pack_push ppc{};
-            ppc.prev_tok_va  = L.dspark_prev;
-            ppc.w1_va        = agx_tensor_gpu_va(w.markov_w1);
-            ppc.hidden_va    = hidden_va;
-            ppc.f_rnn_va     = f_rnn_va;
-            ppc.state_va     = L.dspark_state;
-            ppc.joint_in_va  = L.dspark_in;
-            ppc.n_embd       = w.n_embd;
-            ppc.rank         = w.rank;
-            ppc.n_blocks     = n_blocks;
-            ppc.block_drafts = block_drafts;
-            ppc.draft_pos    = i;
-            ppc.w1_wtype     = w1_wt;
-            ppc.w1_row_bytes = w1_rb;
-            ppc.flags        = (w.has_f_rnn && f_rnn_va ? AGX_W4_DSPARK_F_HAS_FRNN : 0u) |
-                               (i == i_beg ? AGX_W4_DSPARK_F_ZERO_STATE : 0u);
-            if (!agx_cdm_dispatch(stream, eng->k_w4_dspark_pack, n_blocks, 1u, 1u,
-                                  &ppc, sizeof(ppc), AGX_BARRIER_STRONG_USC)) {
-                return false;
-            }
-            // All 40 cores at ~500 GB/s for joint_proj (replaces 1-WG bottleneck!)
-            if (!dispatch_dense_mm(eng->ctx, stream, w.joint_proj, L.dspark_in, L.dspark_joint_out,
-                                   n_blocks, AGX_BARRIER_STRONG_USC)) {
-                return false;
-            }
-            agx_w4_dspark_gru_push gpc{};
-            gpc.joint_out_va  = L.dspark_joint_out;
-            gpc.joint_b_va    = w.joint_proj_b ? agx_tensor_gpu_va(w.joint_proj_b) : 0ull;
-            gpc.state_va      = L.dspark_state;
-            gpc.markov_out_va = L.dspark_markov;
-            gpc.rank          = w.rank;
-            gpc.n_blocks      = n_blocks;
-            gpc.zero_state    = (i == i_beg) ? 1u : 0u;
-            if (!agx_cdm_dispatch(stream, eng->k_w4_dspark_gru, n_blocks, 1u, 1u,
-                                  &gpc, sizeof(gpc), AGX_BARRIER_STRONG_USC)) {
-                return false;
-            }
-        }
-
-        agx_w4_dspark_w2_push wpc{};
-        wpc.markov_va     = L.dspark_markov;
-        wpc.w2_va         = agx_tensor_gpu_va(w.markov_w2);
-        wpc.w2_bias_va    = w.markov_w2_b ? agx_tensor_gpu_va(w.markov_w2_b) : 0ull;
-        wpc.base_va       = base_logits_va;
-        wpc.out_logits_va = out_logits_va;
-        wpc.cand_val_va   = L.dspark_cand_val;
-        wpc.cand_idx_va   = L.dspark_cand_idx;
-        wpc.rank          = w.rank;
-        wpc.n_vocab       = w.n_vocab;
-        wpc.n_blocks      = n_blocks;
-        wpc.block_drafts  = block_drafts;
-        wpc.draft_pos     = i;
-        wpc.n_splits      = n_splits;
-        wpc.w2_wtype      = w2_wt;
-        wpc.w2_row_bytes  = w2_rb;
-        wpc.flags         = (w.markov_w2_b ? AGX_W4_DSPARK_F_HAS_W2_BIAS : 0u) |
-                            (need_draw ? AGX_W4_DSPARK_F_EMIT_TOP64 : 0u);
-        wpc.w2_scale      = w2_scale;
-        wpc.softcap       = w.softcap;
-        wpc.inv_softcap   = (w.softcap > 0.0f) ? (1.0f / w.softcap) : 0.0f;
-
-        if (!agx_cdm_dispatch(stream, eng->k_w4_dspark_w2, n_splits, n_blocks, 1u,
-                              &wpc, sizeof(wpc),
-                              need_draw ? AGX_BARRIER_STRONG_USC : (is_last ? post_barrier : AGX_BARRIER_STRONG_USC))) {
-            return false;
-        }
-
-        if (need_draw) {
-            agx_w4_dspark_merge_push mpc{};
-            mpc.cand_val_va   = L.dspark_cand_val;
-            mpc.cand_idx_va   = L.dspark_cand_idx;
-            mpc.rnn_state_va  = rnn_state_va;
-            mpc.prev_tok_va   = L.dspark_prev;
-            mpc.out_pack_va   = out_h_nextn_va;
-            mpc.n_embd        = w.n_embd;
-            mpc.n_blocks      = n_blocks;
-            mpc.block_drafts  = block_drafts;
-            mpc.draft_pos     = i;
-            mpc.n_splits      = n_splits;
-            mpc.n_cand        = n_cand;
-            mpc.has_rnn_state = (rnn_state_va != 0ull) ? 1u : 0u;
-            if (!agx_cdm_dispatch(stream, eng->k_w4_dspark_merge, n_blocks, 1u, 1u,
-                                  &mpc, sizeof(mpc),
-                                  is_last ? post_barrier : AGX_BARRIER_STRONG_USC)) {
-                return false;
-            }
-        }
-    }
-    return true;
+    return agx_dspark_dispatch_markov_head_w7(eng, stream, w, anchor_toks_va, base_logits_va,
+                                              w.n_vocab, hidden_va, f_rnn_va, rnn_state_va,
+                                              out_logits_va, out_h_nextn_va, n_blocks, block_drafts,
+                                              post_barrier);
 }
 
 // ============================================================================
@@ -3361,6 +3497,963 @@ static bool ensure_w4_bound_model(agx_inkling2_engine * eng, const agx_inkling2_
     return true;
 }
 
+// ============================================================================
+// Wave 7: Fused DSpark Draft Megakernel (3-Layer Q8_0 Body + LM Head + 4-Step Markov Head)
+// Collapses ~230 generic dispatches (4.76 ms) -> ~42 fused wire-speed dispatches (~2.2 ms)!
+// ============================================================================
+
+struct w7_dspark_layer_desc {
+    const struct ggml_tensor * attn_norm      = nullptr;
+    const struct ggml_tensor * wq             = nullptr;
+    const struct ggml_tensor * wk             = nullptr;
+    const struct ggml_tensor * wv             = nullptr; // nullptr -> shared_kv
+    const struct ggml_tensor * wo             = nullptr;
+    const struct ggml_tensor * attn_q_norm    = nullptr;
+    const struct ggml_tensor * attn_k_norm    = nullptr;
+    const struct ggml_tensor * attn_post_norm = nullptr;
+    const struct ggml_tensor * ffn_post_norm  = nullptr;
+    const struct ggml_tensor * out_scale      = nullptr;
+    const struct ggml_tensor * attn_sinks     = nullptr;
+    const struct ggml_tensor * ffn_norm       = nullptr;
+    const struct ggml_tensor * ffn_gate       = nullptr;
+    const struct ggml_tensor * ffn_up         = nullptr;
+    const struct ggml_tensor * ffn_down       = nullptr;
+
+    // Attention & KV cache
+    uint64_t k_va          = 0;
+    uint64_t v_va          = 0;
+    uint32_t k_nb1         = 0;
+    uint32_t k_nb2         = 0;
+    uint32_t v_nb1         = 0;
+    uint32_t v_nb2         = 0;
+    uint32_t n_kv          = 0;
+    bool     kv_is_q8      = false;
+    bool     has_k_rot     = false;
+    bool     has_v_rot     = false;
+
+    uint64_t k_store_va    = 0;
+    uint64_t v_store_va    = 0;
+    uint32_t k_store_nb1   = 0;
+    uint32_t v_store_nb1   = 0;
+    uint64_t k_idxs_va     = 0;
+    uint64_t v_idxs_va     = 0;
+    uint32_t k_ids_nb0     = 0;
+    uint32_t v_ids_nb0     = 0;
+    bool     k_ids_is_i64  = true;
+    bool     v_ids_is_i64  = true;
+
+    uint64_t kq_mask_va    = 0;
+    uint32_t kq_mask_nb1   = 0;
+    uint32_t kq_mask_nb2   = 0;
+    uint32_t kq_mask_ne2   = 1;
+    bool     kq_mask_f16   = true;
+    uint64_t sinks_va      = 0;
+    float    kq_scale      = 0.0f;
+    float    max_bias      = 0.0f;
+    float    logit_softcap = 0.0f;
+
+    // RoPE
+    bool     has_rope      = false;
+    uint32_t rope_n_dims   = 0;
+    uint32_t rope_mode     = 0;
+    float    theta_scale   = 1.0f;
+    float    freq_scale    = 1.0f;
+    float    attn_factor   = 1.0f;
+    uint64_t rope_freq_va  = 0;
+
+    // GLU
+    uint32_t glu_op        = 2u; // SWIGLU
+    float    glu_alpha     = 1.702f;
+    float    glu_limit     = 7.0f;
+};
+
+struct w7_dspark_draft_graph {
+    uint32_t n_layers       = 0;
+    uint32_t n_tokens       = 0;
+    uint32_t n_blocks       = 1;
+    uint32_t block_drafts   = 0;
+    uint32_t n_embd         = 0;
+    uint32_t n_head_q       = 0;
+    uint32_t n_head_kv      = 0;
+    uint32_t head_dim       = 0;
+    uint32_t n_ff           = 0;
+    uint32_t n_vocab        = 0;
+    uint32_t n_vocab_padded = 0;
+    float    rms_eps        = 1e-6f;
+    float    embd_scale     = 0.0f;
+
+    const struct ggml_tensor * tok_embd    = nullptr;
+    const struct ggml_tensor * tok_norm    = nullptr;
+    const struct ggml_tensor * mask_embd   = nullptr;
+    const struct ggml_tensor * output_norm = nullptr;
+    const struct ggml_tensor * output      = nullptr;
+
+    uint64_t inp_tokens_va    = 0;
+    uint64_t inp_pos_va       = 0;
+    uint64_t rnn_state_va     = 0;
+    uint64_t result_norm_va   = 0;
+    uint64_t lm_head_pad_va   = 0;
+    uint64_t final_out_va     = 0;
+    uint64_t final_h_nextn_va = 0;
+    bool     lm_pad_aliases_out = false;
+    bool     lm_head_prec_f32   = false;
+
+    w7_dspark_layer_desc                  layers[AGX_W7_DSPARK_MAX_LAYERS];
+    agx_dspark_mtp_tensors                markov;
+    std::vector<agx_w7_dspark_topk_entry> topk_rows;
+    bool                                  has_any_topk = false;
+};
+
+static bool discover_dspark_draft_cgraph(const struct ggml_cgraph * cgraph, w7_dspark_draft_graph & out) {
+    if (!cgraph || cgraph->n_nodes < 64) return false;
+
+    const char * dbg_env = std::getenv("GGML_AGX_MK_DEBUG");
+    const bool   mk_dbg  = (dbg_env && dbg_env[0] && dbg_env[0] != '0');
+    static int   dsp_fail_prints = 0;
+#define W7_DSP_FAIL(...) do { \
+        if (mk_dbg && dsp_fail_prints < 8) { \
+            ++dsp_fail_prints; \
+            std::fprintf(stderr, "[ggml-agx DSPARK MK DISCOVER FAIL] " __VA_ARGS__); \
+            std::fprintf(stderr, "\n"); \
+        } \
+        return false; \
+    } while (0)
+
+    // Quick presence check: must have markov_w1.weight, markov_w2.weight, joint_proj.weight
+    const struct ggml_tensor * fa_nodes[AGX_W7_DSPARK_MAX_LAYERS] = {};
+    int                        fa_idx[AGX_W7_DSPARK_MAX_LAYERS]   = {};
+    uint32_t                   n_fa = 0u;
+
+    const struct ggml_tensor * inp_tokens       = nullptr;
+    const struct ggml_tensor * inp_pos          = nullptr;
+    const struct ggml_tensor * base_t           = nullptr;
+    const struct ggml_tensor * hid_t            = nullptr;
+    const struct ggml_tensor * lm_head_node     = nullptr;
+    const struct ggml_tensor * rnn_state        = nullptr;
+    const struct ggml_tensor * final_out        = nullptr;
+    const struct ggml_tensor * final_h_nextn    = nullptr;
+    int                        base_idx         = -1;
+    int                        first_w1_idx     = -1;
+
+    auto reg_tensor = [&](const struct ggml_tensor * t) -> bool {
+        if (!t || !t->name[0]) return true;
+        const char * nm = t->name;
+        if      (std::strcmp(nm, "markov_w1.weight")  == 0) out.markov.markov_w1   = t;
+        else if (std::strcmp(nm, "markov_w2.weight")  == 0) out.markov.markov_w2   = t;
+        else if (std::strcmp(nm, "markov_w2.scale")   == 0) out.markov.markov_w2_s = t;
+        else if (std::strcmp(nm, "markov_w2.bias")    == 0) out.markov.markov_w2_b = t;
+        else if (std::strcmp(nm, "joint_proj.weight") == 0) out.markov.joint_proj  = t;
+        else if (std::strcmp(nm, "joint_proj.bias")   == 0) out.markov.joint_proj_b = t;
+        else if (std::strcmp(nm, "token_embd.weight") == 0) out.tok_embd    = t;
+        else if (std::strcmp(nm, "token_embd_norm.weight") == 0 ||
+                 std::strcmp(nm, "blk.0.token_embd_norm.weight") == 0) out.tok_norm = t;
+        else if (std::strcmp(nm, "mask_embd.weight")  == 0) out.mask_embd   = t;
+        else if (std::strcmp(nm, "output_norm.weight")== 0) out.output_norm = t;
+        else if (std::strcmp(nm, "output.weight")     == 0) out.output      = t;
+        else if (std::strcmp(nm, "d2t") == 0 ||
+                 std::strcmp(nm, "conf_proj.weight") == 0 ||
+                 std::strstr(nm, "hc_attn_fn") != nullptr ||
+                 std::strstr(nm, "attn_kv_a_mqa") != nullptr ||
+                 std::strstr(nm, "attn_conv_proj") != nullptr ||
+                 std::strstr(nm, "ffn_conv_proj") != nullptr) {
+            return false; // unsupported DSpark variant -> clean fallback
+        } else {
+            int blk = -1;
+            const char * sfx = nullptr;
+            if (w4_parse_blk_name(nm, &blk, &sfx) && blk >= 0 && blk < (int) AGX_W7_DSPARK_MAX_LAYERS) {
+                auto & L = out.layers[blk];
+                if      (std::strcmp(sfx, "attn_norm.weight")           == 0) L.attn_norm      = t;
+                else if (std::strcmp(sfx, "attn_q.weight")              == 0) L.wq             = t;
+                else if (std::strcmp(sfx, "attn_k.weight")              == 0) L.wk             = t;
+                else if (std::strcmp(sfx, "attn_v.weight")              == 0) L.wv             = t;
+                else if (std::strcmp(sfx, "attn_output.weight")         == 0) L.wo             = t;
+                else if (std::strcmp(sfx, "attn_q_norm.weight")         == 0) L.attn_q_norm    = t;
+                else if (std::strcmp(sfx, "attn_k_norm.weight")         == 0) L.attn_k_norm    = t;
+                else if (std::strcmp(sfx, "post_attention_norm.weight") == 0) L.attn_post_norm = t;
+                else if (std::strcmp(sfx, "post_ffw_norm.weight")       == 0) L.ffn_post_norm  = t;
+                else if (std::strcmp(sfx, "layer_output_scale.weight")  == 0) L.out_scale      = t;
+                else if (std::strcmp(sfx, "attn_sinks.weight")          == 0) L.attn_sinks     = t;
+                else if (std::strcmp(sfx, "ffn_norm.weight")            == 0) L.ffn_norm       = t;
+                else if (std::strcmp(sfx, "ffn_gate.weight")            == 0) L.ffn_gate       = t;
+                else if (std::strcmp(sfx, "ffn_up.weight")              == 0) L.ffn_up         = t;
+                else if (std::strcmp(sfx, "ffn_down.weight")            == 0) L.ffn_down       = t;
+            }
+        }
+        return true;
+    };
+
+    for (int i = 0; i < cgraph->n_leafs; ++i) {
+        if (!reg_tensor(cgraph->leafs[i])) return false;
+    }
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const struct ggml_tensor * n = cgraph->nodes[i];
+        if (!n) continue;
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (n->src[s]) {
+                if (!reg_tensor(n->src[s])) return false;
+                if (first_w1_idx < 0 && n->src[s]->name[0] &&
+                    std::strcmp(n->src[s]->name, "markov_w1.weight") == 0) {
+                    first_w1_idx = i;
+                }
+            }
+        }
+        if (n->op == GGML_OP_FLASH_ATTN_EXT) {
+            if (n_fa >= AGX_W7_DSPARK_MAX_LAYERS) return false;
+            fa_nodes[n_fa] = n;
+            fa_idx[n_fa]   = i;
+            ++n_fa;
+        }
+        if (n->op == GGML_OP_MUL_MAT && n->src[0] && std::strcmp(n->src[0]->name, "output.weight") == 0) {
+            lm_head_node = n;
+        }
+        if (n->name[0]) {
+            if (std::strcmp(n->name, "result_output") == 0) { base_t = n; base_idx = i; }
+            else if (std::strcmp(n->name, "result_norm") == 0) hid_t = n;
+            else if (std::strcmp(n->name, "attn_out_scaled") == 0) return false; // attn_value_scale not supported
+        }
+        if (n->op == GGML_OP_RMS_NORM && out.rms_eps == 1e-6f) {
+            float eps = 0.0f;
+            std::memcpy(&eps, n->op_params, sizeof(float));
+            if (eps > 0.0f) out.rms_eps = eps;
+        }
+    }
+
+    if (!out.markov.markov_w1 || !out.markov.markov_w2 || !out.markov.joint_proj ||
+        n_fa == 0u || !base_t || !hid_t || !lm_head_node || !out.tok_embd || !out.output || !out.output_norm ||
+        base_idx < 0 || first_w1_idx <= base_idx) {
+        return false;
+    }
+
+    // Extract n_blocks, block_drafts, inp_tokens, rnn_state across the ENTIRE Markov tail [base_idx+1 .. n_nodes-1]
+    // (Note: ggml_build_forward_expand visits w1_prev BEFORE f_rnn, so f_rnn / rnn_state has node index > first_w1_idx!)
+    const struct ggml_tensor * prev_cont = nullptr;
+    for (int i = base_idx + 1; i < cgraph->n_nodes; ++i) {
+        const struct ggml_tensor * nd = cgraph->nodes[i];
+        if (!nd) continue;
+        if (!prev_cont && i < first_w1_idx && nd->op == GGML_OP_CONT && nd->type == GGML_TYPE_I32 &&
+            nd->src[0] && nd->src[0]->op == GGML_OP_VIEW && nd->src[0]->view_src &&
+            nd->src[0]->view_src->type == GGML_TYPE_I32) {
+            prev_cont  = nd;
+            inp_tokens = nd->src[0]->view_src;
+        }
+        if (!rnn_state && nd->op == GGML_OP_CONT && nd->src[0] && nd->src[0]->op == GGML_OP_VIEW &&
+            nd->src[0]->view_src && nd->src[0]->view_src->type == GGML_TYPE_F32 &&
+            nd->src[0]->view_src->ne[0] == hid_t->ne[0] &&
+            nd->src[0]->view_src->ne[1] == base_t->ne[1] &&
+            nd->src[0]->view_src != hid_t) {
+            rnn_state = nd->src[0]->view_src;
+        }
+    }
+    if (!inp_tokens || !prev_cont || prev_cont->ne[0] < 1 || prev_cont->ne[0] > 4) {
+        W7_DSP_FAIL("inp_tokens/prev_cont missing or n_blocks=%lld", prev_cont ? (long long) prev_cont->ne[0] : -1LL);
+    }
+
+    out.n_layers       = n_fa;
+    out.n_tokens       = (uint32_t) base_t->ne[1];
+    out.n_blocks       = (uint32_t) prev_cont->ne[0];
+    if (out.n_tokens == 0u || out.n_tokens > 16u || (out.n_tokens % out.n_blocks) != 0u ||
+        base_t->ne[1] != hid_t->ne[1] || base_t->ne[1] != inp_tokens->ne[0]) {
+        W7_DSP_FAIL("token/block shape mismatch M=%u blk=%u", out.n_tokens, out.n_blocks);
+    }
+    out.block_drafts   = out.n_tokens / out.n_blocks;
+    out.n_embd         = (uint32_t) hid_t->ne[0];
+    out.n_vocab        = (uint32_t) base_t->ne[0];
+    out.n_vocab_padded = (uint32_t) lm_head_node->ne[0];
+    if (out.block_drafts < 2u || out.n_embd > 3072u || (out.n_embd % 4u) != 0u) {
+        W7_DSP_FAIL("unsupported dims drafts=%u D=%u", out.block_drafts, out.n_embd);
+    }
+
+    // Check optional embedding scale on inp_noise_embd
+    for (int i = 0; i < fa_idx[0]; ++i) {
+        const struct ggml_tensor * nd = cgraph->nodes[i];
+        if (nd && nd->name[0] && std::strcmp(nd->name, "inp_noise_embd") == 0 && nd->op == GGML_OP_SCALE) {
+            float s = 0.0f, b = 0.0f;
+            w4_read_scale_params(nd, &s, &b);
+            if (b != 0.0f) W7_DSP_FAIL("inp_noise_embd bias != 0");
+            out.embd_scale = s;
+        }
+    }
+
+    // Detect sample_from_anchor, final_out, final_h_nextn, and softcap in [base_idx+1 .. n_nodes-1]
+    // NOTE: ggml_build_forward_expand expands res->t_h_nextn BEFORE res->t_logits, so scan ALL
+    //       tail nodes for CONT(PERMUTE(...)) rather than assuming n_exec - 2!
+    bool sample_from_anchor = true;
+    float softcap = 0.0f;
+    for (int i = base_idx + 1; i < cgraph->n_nodes; ++i) {
+        const struct ggml_tensor * nd = cgraph->nodes[i];
+        if (!nd) continue;
+        if (nd->op == GGML_OP_CONT && nd->src[0] && nd->src[0]->op == GGML_OP_VIEW &&
+            nd->src[0]->view_src == base_t && nd->src[0]->view_offs == 0) {
+            sample_from_anchor = false;
+        }
+        if (nd->op == GGML_OP_CONT && nd->type == GGML_TYPE_F32 &&
+            nd->src[0] && nd->src[0]->op == GGML_OP_PERMUTE) {
+            if (ggml_nelements(nd) == (int64_t) out.n_vocab * out.n_tokens) {
+                final_out = nd;
+            } else if (rnn_state && ggml_nelements(nd) == (int64_t) out.n_embd * out.n_tokens) {
+                final_h_nextn = nd;
+            }
+        }
+        if (softcap == 0.0f && i >= first_w1_idx && i + 2 < cgraph->n_nodes) {
+            const struct ggml_tensor * s0 = cgraph->nodes[i];
+            const struct ggml_tensor * u1 = cgraph->nodes[i + 1];
+            const struct ggml_tensor * s2 = cgraph->nodes[i + 2];
+            if (s0 && u1 && s2 &&
+                s0->op == GGML_OP_SCALE && s0->ne[0] == (int64_t) out.n_vocab &&
+                u1->op == GGML_OP_UNARY && ggml_get_unary_op(u1) == GGML_UNARY_OP_TANH &&
+                s2->op == GGML_OP_SCALE && u1->src[0] == s0 && s2->src[0] == u1) {
+                float cap = 0.0f, b = 0.0f;
+                w4_read_scale_params(s2, &cap, &b);
+                if (cap > 0.0f && b == 0.0f) softcap = cap;
+            }
+        }
+    }
+    if (!final_out || (rnn_state && !final_h_nextn)) {
+        W7_DSP_FAIL("missing final_out=%d final_h_nextn=%d (rnn=%d)", !!final_out, !!final_h_nextn, !!rnn_state);
+    }
+
+    // Per-layer discovery: weights, RoPE, K/V SET_ROWS, FLASH_ATTN_EXT, GLU
+    for (uint32_t il = 0u; il < n_fa; ++il) {
+        auto & L = out.layers[il];
+        if (!L.attn_norm || !L.wq || !L.wk || !L.wo || !L.attn_q_norm || !L.attn_k_norm ||
+            !L.ffn_norm || !L.ffn_gate || !L.ffn_up || !L.ffn_down) {
+            W7_DSP_FAIL("layer %u missing required weight", il);
+        }
+        if (L.attn_norm->type != GGML_TYPE_F32 || L.attn_q_norm->type != GGML_TYPE_F32 ||
+            L.attn_k_norm->type != GGML_TYPE_F32 || L.ffn_norm->type != GGML_TYPE_F32 ||
+            (L.attn_post_norm && L.attn_post_norm->type != GGML_TYPE_F32) ||
+            (L.ffn_post_norm  && L.ffn_post_norm->type  != GGML_TYPE_F32) ||
+            (L.out_scale      && L.out_scale->type      != GGML_TYPE_F32)) {
+            W7_DSP_FAIL("layer %u non-F32 norm/scale", il);
+        }
+
+        const struct ggml_tensor * fa   = fa_nodes[il];
+        const struct ggml_tensor * q_in = fa->src[0];
+        const struct ggml_tensor * k_l  = fa->src[1];
+        const struct ggml_tensor * v_l  = fa->src[2];
+        const struct ggml_tensor * m_in = fa->src[3];
+        const struct ggml_tensor * s_in = fa->src[4];
+        if (!q_in || !k_l || !v_l) W7_DSP_FAIL("layer %u fa missing src", il);
+        if ((k_l->type != GGML_TYPE_F16 && k_l->type != GGML_TYPE_Q8_0) || k_l->type != v_l->type) {
+            W7_DSP_FAIL("layer %u kv type k=%d v=%d", il, (int) k_l->type, (int) v_l->type);
+        }
+        if (il == 0u) {
+            out.head_dim  = (uint32_t) q_in->ne[0];
+            out.n_head_q  = (uint32_t) q_in->ne[2];
+            out.n_head_kv = (uint32_t) k_l->ne[2];
+            out.n_ff      = (uint32_t) L.ffn_gate->ne[1];
+            if (out.head_dim > 256u || (out.head_dim % 32u) != 0u || out.n_head_kv == 0u ||
+                (out.n_head_q % out.n_head_kv) != 0u) {
+                W7_DSP_FAIL("unsupported head dims hd=%u Hq=%u Hkv=%u", out.head_dim, out.n_head_q, out.n_head_kv);
+            }
+        } else if ((uint32_t) q_in->ne[0] != out.head_dim || (uint32_t) q_in->ne[2] != out.n_head_q ||
+                   (uint32_t) k_l->ne[2] != out.n_head_kv || (uint32_t) L.ffn_gate->ne[1] != out.n_ff) {
+            W7_DSP_FAIL("layer %u heterogeneous dims", il);
+        }
+
+        L.kv_is_q8 = (k_l->type == GGML_TYPE_Q8_0);
+        L.k_va     = agx_tensor_gpu_va(k_l);
+        L.v_va     = agx_tensor_gpu_va(v_l);
+        L.k_nb1    = (uint32_t) k_l->nb[1];
+        L.k_nb2    = (uint32_t) k_l->nb[2];
+        L.v_nb1    = (uint32_t) v_l->nb[1];
+        L.v_nb2    = (uint32_t) v_l->nb[2];
+        L.n_kv     = (uint32_t) k_l->ne[1];
+        if (!L.k_va || !L.v_va) W7_DSP_FAIL("layer %u missing kv VA", il);
+        if (m_in) {
+            if (m_in->type != GGML_TYPE_F16 && m_in->type != GGML_TYPE_F32) {
+                W7_DSP_FAIL("layer %u unsupported mask type=%d", il, (int) m_in->type);
+            }
+            L.kq_mask_va  = agx_tensor_gpu_va(m_in);
+            L.kq_mask_nb1 = (uint32_t) m_in->nb[1];
+            L.kq_mask_nb2 = (m_in->ne[2] > 1) ? (uint32_t) m_in->nb[2] : 0u;
+            L.kq_mask_ne2 = (uint32_t) std::max<int64_t>(1, m_in->ne[2]);
+            L.kq_mask_f16 = (m_in->type == GGML_TYPE_F16);
+            if (!L.kq_mask_va) W7_DSP_FAIL("layer %u missing mask VA", il);
+        }
+        if (s_in) {
+            L.sinks_va = agx_tensor_gpu_va(s_in);
+            if (!L.sinks_va) W7_DSP_FAIL("layer %u missing sinks VA", il);
+        }
+        std::memcpy(&L.kq_scale,      (const char *) fa->op_params + 0, sizeof(float));
+        std::memcpy(&L.max_bias,      (const char *) fa->op_params + 4, sizeof(float));
+        std::memcpy(&L.logit_softcap, (const char *) fa->op_params + 8, sizeof(float));
+
+        // Hadamard rotation checks
+        const struct ggml_tensor * q_root = w4_strip_views(q_in);
+        if (q_root && q_root->op == GGML_OP_MUL_MAT &&
+            ggml_get_op_params_i32(q_root, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+            L.has_k_rot = true;
+        }
+        for (int j = fa_idx[il] + 1; j < std::min(cgraph->n_nodes, fa_idx[il] + 6); ++j) {
+            const struct ggml_tensor * cand = cgraph->nodes[j];
+            if (cand && cand->op == GGML_OP_MUL_MAT &&
+                ggml_get_op_params_i32(cand, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+                w4_strip_views(cand->src[1]) == fa) {
+                L.has_v_rot = true;
+                break;
+            }
+        }
+        if (L.has_v_rot) W7_DSP_FAIL("layer %u v_rot on draft unsupported", il);
+
+        // Scan window [win_beg, win_end) for RoPE, K/V SET_ROWS, and GLU
+        const int win_beg = (il == 0u) ? 0 : fa_idx[il - 1u];
+        const int win_end = (il + 1u < n_fa) ? fa_idx[il + 1u] : base_idx;
+        const uint64_t k_size_B = (uint64_t) ggml_nbytes(k_l);
+        const uint64_t v_size_B = (uint64_t) ggml_nbytes(v_l);
+        const int64_t  kv_dim   = (int64_t) out.n_head_kv * out.head_dim;
+
+        bool found_glu = false;
+        for (int j = win_beg; j < win_end; ++j) {
+            const struct ggml_tensor * nd = cgraph->nodes[j];
+            if (!nd) continue;
+            if (j < fa_idx[il] && nd->op == GGML_OP_ROPE && !L.has_rope) {
+                const uint32_t mode = (uint32_t) ggml_get_op_params_i32(nd, 2);
+                if (mode & 8u) W7_DSP_FAIL("layer %u M-RoPE unsupported", il);
+                L.has_rope    = true;
+                L.rope_n_dims = (uint32_t) ggml_get_op_params_i32(nd, 1);
+                L.rope_mode   = mode;
+                float freq_base = 10000.0f, freq_scale = 1.0f, attn_factor = 1.0f;
+                std::memcpy(&freq_base,   (const char *) nd->op_params + 20, sizeof(float));
+                std::memcpy(&freq_scale,  (const char *) nd->op_params + 24, sizeof(float));
+                std::memcpy(&attn_factor, (const char *) nd->op_params + 32, sizeof(float));
+                L.theta_scale  = std::pow(freq_base, -2.0f / (float) L.rope_n_dims);
+                L.freq_scale   = freq_scale;
+                L.attn_factor  = attn_factor;
+                L.rope_freq_va = nd->src[2] ? agx_tensor_gpu_va(nd->src[2]) : 0ull;
+                if (nd->src[1]) inp_pos = nd->src[1];
+            }
+            if (j < fa_idx[il] && nd->op == GGML_OP_SET_ROWS && nd->src[0] && nd->src[1]) {
+                if (!L.k_store_va && w4_tensor_in_va_range(nd, L.k_va, k_size_B) && nd->ne[0] == kv_dim) {
+                    L.k_store_va   = agx_tensor_gpu_va(nd);
+                    L.k_store_nb1  = (uint32_t) nd->nb[1];
+                    L.k_idxs_va    = agx_tensor_gpu_va(nd->src[1]);
+                    L.k_ids_is_i64 = (nd->src[1]->type == GGML_TYPE_I64);
+                    L.k_ids_nb0    = (uint32_t) nd->src[1]->nb[0];
+                } else if (!L.v_store_va && w4_tensor_in_va_range(nd, L.v_va, v_size_B) && nd->ne[0] == kv_dim) {
+                    L.v_store_va   = agx_tensor_gpu_va(nd);
+                    L.v_store_nb1  = (uint32_t) nd->nb[1];
+                    L.v_idxs_va    = agx_tensor_gpu_va(nd->src[1]);
+                    L.v_ids_is_i64 = (nd->src[1]->type == GGML_TYPE_I64);
+                    L.v_ids_nb0    = (uint32_t) nd->src[1]->nb[0];
+                }
+            }
+            if (j > fa_idx[il] && !found_glu) {
+                if (nd->op == GGML_OP_GLU && nd->ne[0] == (int64_t) out.n_ff) {
+                    L.glu_op = (uint32_t) ggml_get_glu_op(nd);
+                    if (ggml_get_op_params_i32(nd, 1) != 0) W7_DSP_FAIL("layer %u swapped GLU", il);
+                    std::memcpy(&L.glu_alpha, (const char *) nd->op_params + 8,  sizeof(float));
+                    std::memcpy(&L.glu_limit, (const char *) nd->op_params + 12, sizeof(float));
+                    found_glu = true;
+                } else if (nd->op == GGML_OP_MUL && nd->ne[0] == (int64_t) out.n_ff &&
+                           nd->src[0] && nd->src[0]->op == GGML_OP_UNARY) {
+                    const enum ggml_unary_op uop = ggml_get_unary_op(nd->src[0]);
+                    if      (uop == GGML_UNARY_OP_SILU)       { L.glu_op = 2u; found_glu = true; }
+                    else if (uop == GGML_UNARY_OP_GELU)       { L.glu_op = 1u; found_glu = true; }
+                    else if (uop == GGML_UNARY_OP_GELU_QUICK) { L.glu_op = 5u; found_glu = true; }
+                }
+            }
+        }
+        if (!L.k_store_va || !L.v_store_va || !L.k_idxs_va || !L.v_idxs_va || !found_glu) {
+            W7_DSP_FAIL("layer %u missing kv store or glu (ks=%d vs=%d glu=%d)",
+                        il, !!L.k_store_va, !!L.v_store_va, (int) found_glu);
+        }
+    }
+
+    // Verify no unexpected SET_ROWS or OUTPUT tensors exist in the graph.
+    // Accept backend-sampling TOP_K + GET_ROWS (top_k_rows) OUTPUT pairs on rows of final_out (or PAD(final_out))!
+    auto trace_final_out_row = [&](const struct ggml_tensor * t, uint32_t * out_row) -> bool {
+        uint64_t total_offs = 0;
+        const struct ggml_tensor * cur = t;
+        while (cur && (cur->op == GGML_OP_RESHAPE || cur->op == GGML_OP_VIEW ||
+                       cur->op == GGML_OP_PERMUTE || cur->op == GGML_OP_TRANSPOSE)) {
+            if (cur->op == GGML_OP_VIEW) total_offs += (uint64_t) cur->view_offs;
+            cur = cur->src[0];
+        }
+        if (!cur) return false;
+        const bool is_final = (cur == final_out) ||
+                              (cur->op == GGML_OP_PAD && w4_strip_views(cur->src[0]) == final_out);
+        if (!is_final) return false;
+        const uint64_t row_bytes = (uint64_t) out.n_vocab * sizeof(float);
+        if (row_bytes == 0 || (total_offs % row_bytes) != 0) return false;
+        const uint64_t r = total_offs / row_bytes;
+        if (r >= (uint64_t) out.n_tokens) return false;
+        *out_row = (uint32_t) r;
+        return true;
+    };
+
+    out.topk_rows.assign(out.n_tokens, agx_w7_dspark_topk_entry{ 0ull, 0ull, 0ull });
+    out.has_any_topk = false;
+    std::vector<const struct ggml_tensor *> topk_nodes(out.n_tokens, nullptr);
+
+    uint32_t total_set_rows = 0u;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const struct ggml_tensor * nd = cgraph->nodes[i];
+        if (!nd) continue;
+        if (nd->op == GGML_OP_SET_ROWS) ++total_set_rows;
+        if ((nd->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
+            const struct ggml_tensor * root = w4_strip_views(nd);
+            if (root == final_out || root == final_h_nextn || root == hid_t || root == base_t) {
+                continue;
+            }
+            if (nd->op == GGML_OP_TOP_K && nd->type == GGML_TYPE_I32 &&
+                nd->ne[0] >= 1 && nd->ne[0] <= 64 && ggml_nelements(nd) == nd->ne[0]) {
+                uint32_t r = 0u;
+                const uint64_t va = agx_tensor_gpu_va(nd);
+                if (va != 0ull && trace_final_out_row(nd->src[0], &r) && topk_nodes[r] == nullptr) {
+                    topk_nodes[r]         = nd;
+                    out.topk_rows[r].ids_va = va;
+                    out.topk_rows[r].k_u64  = (uint64_t) nd->ne[0];
+                    out.has_any_topk      = true;
+                    continue;
+                }
+            }
+            if (nd->op == GGML_OP_GET_ROWS && nd->type == GGML_TYPE_F32 && nd->src[1]) {
+                uint32_t r = 0u;
+                const uint64_t va = agx_tensor_gpu_va(nd);
+                if (va != 0ull && trace_final_out_row(nd->src[0], &r) &&
+                    topk_nodes[r] != nullptr && w4_strip_views(nd->src[1]) == topk_nodes[r] &&
+                    ggml_nelements(nd) == (int64_t) out.topk_rows[r].k_u64 &&
+                    out.topk_rows[r].vals_va == 0ull) {
+                    out.topk_rows[r].vals_va = va;
+                    continue;
+                }
+            }
+            W7_DSP_FAIL("unexpected OUTPUT '%s' op=%d", nd->name, (int) nd->op);
+        }
+    }
+    if (total_set_rows != 2u * n_fa) {
+        W7_DSP_FAIL("unexpected SET_ROWS count=%u != %u", total_set_rows, 2u * n_fa);
+    }
+
+    out.inp_tokens_va    = agx_tensor_gpu_va(inp_tokens);
+    out.inp_pos_va       = inp_pos ? agx_tensor_gpu_va(inp_pos) : 0ull;
+    out.rnn_state_va     = rnn_state ? agx_tensor_gpu_va(rnn_state) : 0ull;
+    out.result_norm_va   = agx_tensor_gpu_va(hid_t);
+    out.lm_head_pad_va   = agx_tensor_gpu_va(lm_head_node);
+    out.final_out_va     = agx_tensor_gpu_va(final_out);
+    out.final_h_nextn_va = final_h_nextn ? agx_tensor_gpu_va(final_h_nextn) : 0ull;
+    if (!out.inp_tokens_va || !out.final_out_va || !out.lm_head_pad_va ||
+        (rnn_state && (!out.rnn_state_va || !out.final_h_nextn_va))) {
+        W7_DSP_FAIL("missing core GPU VA");
+    }
+
+    // Check if lm_head_pad_va overlaps final_out_va (gallocr reuse)
+    const uint64_t lm_sz = (uint64_t) ggml_nbytes(lm_head_node);
+    const uint64_t fo_sz = (uint64_t) ggml_nbytes(final_out);
+    out.lm_pad_aliases_out =
+        !(out.lm_head_pad_va + lm_sz <= out.final_out_va || out.final_out_va + fo_sz <= out.lm_head_pad_va) ||
+        ((base_t->flags & GGML_TENSOR_FLAG_OUTPUT) != 0);
+    out.lm_head_prec_f32 = (ggml_prec_get_acc(lm_head_node) == GGML_PREC_F32 ||
+                            ggml_prec_get_src(lm_head_node, 0) == GGML_PREC_F32 ||
+                            ggml_prec_get_src(lm_head_node, 1) == GGML_PREC_F32);
+
+    // Populate Markov head descriptor
+    out.markov.n_embd             = out.n_embd;
+    out.markov.rank               = (uint32_t) out.markov.markov_w1->ne[0];
+    out.markov.n_vocab            = out.n_vocab;
+    out.markov.block_size         = out.block_drafts;
+    out.markov.sample_from_anchor = sample_from_anchor;
+    out.markov.has_f_rnn          = (rnn_state != nullptr);
+    out.markov.softcap            = softcap;
+    out.markov.rms_eps            = out.rms_eps;
+    if (out.markov.rank == 0u || out.markov.rank > 512u) {
+        W7_DSP_FAIL("unsupported markov rank=%u", out.markov.rank);
+    }
+
+#undef W7_DSP_FAIL
+    return true;
+}
+
+static bool execute_dspark_draft_cgraph(agx_backend_context *         ctx,
+                                        const w7_dspark_draft_graph & G) {
+    agx_inkling2_engine * eng = agx_graph_exec_get_inkling2(ctx);
+    if (!eng || !agx_inkling2_precompile_w4(eng)) return false;
+    agx_slc_arena * slc = agx_backend_get_slc_arena(ctx);
+    if (!slc || !agx_gemm_init(ctx)) return false;
+    if (!ctx->kv_hybrid_state) {
+        agx_kv_hybrid_config kcfg;
+        kcfg.n_slots = 48;
+        kcfg.max_full_tokens = 4096;
+        ctx->kv_hybrid_state = agx_kv_hybrid_create(ctx->drm, ctx->compiler, kcfg);
+        if (!ctx->kv_hybrid_state) return false;
+    }
+
+    const uint32_t M   = G.n_tokens;
+    const uint32_t D   = G.n_embd;
+    const uint32_t Hq  = G.n_head_q;
+    const uint32_t Hkv = G.n_head_kv;
+    const uint32_t hd  = G.head_dim;
+    const uint32_t F   = G.n_ff;
+
+    // Partition dedicated scratch BO for DSpark draft activations (100% disjoint from gallocr!)
+    const size_t sz_embd    = agx_align_up((size_t) M * D * sizeof(float), AGX_CACHE_LINE_BYTES);
+    const size_t sz_q       = agx_align_up((size_t) M * Hq * hd * sizeof(float), AGX_CACHE_LINE_BYTES);
+    const size_t sz_kv      = agx_align_up((size_t) M * Hkv * hd * sizeof(float), AGX_CACHE_LINE_BYTES);
+    const size_t sz_qkv     = agx_align_up((size_t) M * (Hq + 2u * Hkv) * hd * sizeof(float), AGX_CACHE_LINE_BYTES);
+    const size_t sz_gu      = agx_align_up((size_t) M * 2u * F * sizeof(float), AGX_CACHE_LINE_BYTES);
+    const size_t sz_inter   = agx_align_up((size_t) M * F * sizeof(float), AGX_CACHE_LINE_BYTES);
+    const size_t sz_lm_pad  = G.lm_pad_aliases_out
+        ? agx_align_up((size_t) M * G.n_vocab_padded * sizeof(float), AGX_CACHE_LINE_BYTES) : 0u;
+
+    size_t cur_off = 0;
+    auto take_off = [&](size_t sz) -> size_t {
+        size_t o = cur_off;
+        cur_off += agx_align_up(sz, AGX_CACHE_LINE_BYTES);
+        return o;
+    };
+    const size_t o_cur_a    = take_off(sz_embd);
+    const size_t o_cur_b    = take_off(sz_embd);
+    const size_t o_norm     = take_off(sz_embd);
+    const size_t o_wo_out   = take_off(sz_embd);
+    const size_t o_qkv_raw  = take_off(sz_qkv);
+    const size_t o_k_raw_fb = take_off(sz_kv);
+    const size_t o_v_raw_fb = take_off(sz_kv);
+    const size_t o_q_out    = take_off(sz_q);
+    const size_t o_attn_out = take_off(sz_q);
+    const size_t o_gu_out   = take_off(sz_gu);
+    const size_t o_inter    = take_off(sz_inter);
+    const size_t o_lm_pad   = sz_lm_pad ? take_off(sz_lm_pad) : 0u;
+
+    if (!eng->dspark_scratch_bo || eng->dspark_scratch_bo->size < cur_off) {
+        if (eng->dspark_scratch_bo) {
+            agx_bo_free(ctx->drm, eng->dspark_scratch_bo);
+            eng->dspark_scratch_bo = nullptr;
+        }
+        eng->dspark_scratch_bo = agx_bo_alloc(ctx->drm, cur_off,
+                                              AGX_BO_SLC_PIN | AGX_BO_WRITEBACK,
+                                              "dspark-draft-scratch");
+        if (!eng->dspark_scratch_bo) return false;
+    }
+
+    const uint64_t sb = eng->dspark_scratch_bo->gpu_va;
+    const uint64_t va_cur_a    = sb + o_cur_a;
+    const uint64_t va_cur_b    = sb + o_cur_b;
+    const uint64_t va_norm     = sb + o_norm;
+    const uint64_t va_wo_out   = sb + o_wo_out;
+    const uint64_t va_qkv_raw  = sb + o_qkv_raw;
+    const uint64_t va_k_raw_fb = sb + o_k_raw_fb;
+    const uint64_t va_v_raw_fb = sb + o_v_raw_fb;
+    const uint64_t va_q_out    = sb + o_q_out;
+    const uint64_t va_attn_out = sb + o_attn_out;
+    const uint64_t va_gu_out   = sb + o_gu_out;
+    const uint64_t va_inter    = sb + o_inter;
+    const uint64_t va_lm_pad   = G.lm_pad_aliases_out ? (sb + o_lm_pad) : G.lm_head_pad_va;
+
+    auto * kv_pool = static_cast<agx_kv_hybrid_pool *>(ctx->kv_hybrid_state);
+    agx_cdm_stream * stream = ctx->stream;
+
+    const auto t_enc_beg = std::chrono::steady_clock::now();
+    agx_cdm_stream_reset(stream);
+    agx_cdm_stats cdm_before{};
+    agx_cdm_get_stats(stream, &cdm_before);
+
+    // Step 0: Fused Input Block (anchor embd + tok_norm + mask_embd + scale + blk.0.attn_norm) -> va_cur_a & va_norm
+    {
+        uint32_t emb_rb = 0, msk_rb = 0;
+        agx_w7_dspark_inp_block_push ipc{};
+        ipc.tok_embd_va    = agx_tensor_gpu_va(G.tok_embd);
+        ipc.tok_ids_va     = G.inp_tokens_va;
+        ipc.tok_norm_va    = G.tok_norm ? agx_tensor_gpu_va(G.tok_norm) : 0ull;
+        ipc.mask_embd_va   = G.mask_embd ? agx_tensor_gpu_va(G.mask_embd) : 0ull;
+        ipc.attn_norm0_va  = agx_tensor_gpu_va(G.layers[0].attn_norm);
+        ipc.out_cur_va     = va_cur_a;
+        ipc.out_norm_va    = va_norm;
+        ipc.n_embd         = D;
+        ipc.n_tokens       = M;
+        ipc.block_drafts   = G.block_drafts;
+        ipc.embd_wtype     = agx_inkling2_tensor_wtype(G.tok_embd, &emb_rb);
+        ipc.embd_row_bytes = emb_rb;
+        ipc.mask_wtype     = G.mask_embd ? agx_inkling2_tensor_wtype(G.mask_embd, &msk_rb) : 0u;
+        ipc.mask_row_bytes = msk_rb;
+        ipc.embd_scale     = G.embd_scale;
+        ipc.rms_eps        = G.rms_eps;
+        if (!agx_cdm_dispatch(stream, eng->k_w7_dspark_inp_block, M, 1u, 1u,
+                              &ipc, sizeof(ipc), AGX_BARRIER_STRONG_USC)) {
+            return false;
+        }
+    }
+
+    uint64_t inp_l_va = va_cur_a;
+    uint64_t alt_l_va = va_cur_b;
+
+    // Step 1: 3-Layer Fused DSpark Draft Body
+    for (uint32_t il = 0u; il < G.n_layers; ++il) {
+        const auto & L = G.layers[il];
+
+        // 1a. Concurrent Q + K + [V] GEMMs (0 extra barriers, 0 lazy coalescing stall!)
+        const uint64_t q_raw_va = va_qkv_raw;
+        const uint64_t k_raw_va = va_k_raw_fb;
+        const uint64_t v_raw_va = L.wv ? va_v_raw_fb : k_raw_va;
+        const uint32_t q_str = Hq * hd, k_str = Hkv * hd, v_str = Hkv * hd;
+        if (!dispatch_dense_mm(ctx, stream, L.wq, va_norm, q_raw_va, M, AGX_BARRIER_NONE)) return false;
+        if (!dispatch_dense_mm(ctx, stream, L.wk, va_norm, k_raw_va, M, L.wv ? AGX_BARRIER_NONE : AGX_BARRIER_STRONG_USC)) return false;
+        if (L.wv) {
+            if (!dispatch_dense_mm(ctx, stream, L.wv, va_norm, v_raw_va, M, AGX_BARRIER_STRONG_USC)) return false;
+        }
+
+        // 1b. Fused 1-SG/head Q/K RMSNorm + RoPE + [FWHT128] + KV-Store (F16/Q8_0)
+        {
+            agx_w7_dspark_qkv_rope_push qpc{};
+            qpc.q_raw_va         = q_raw_va;
+            qpc.k_raw_va         = k_raw_va;
+            qpc.v_raw_va         = v_raw_va;
+            qpc.q_norm_va        = agx_tensor_gpu_va(L.attn_q_norm);
+            qpc.k_norm_va        = agx_tensor_gpu_va(L.attn_k_norm);
+            qpc.inp_pos_va       = G.inp_pos_va;
+            qpc.rope_freq_va     = L.rope_freq_va;
+            qpc.q_out_va         = va_q_out;
+            qpc.k_store_va       = L.k_store_va;
+            qpc.v_store_va       = L.v_store_va;
+            qpc.k_idxs_va        = L.k_idxs_va;
+            qpc.v_idxs_va        = L.v_idxs_va;
+            qpc.q_raw_stride_f32 = q_str;
+            qpc.k_raw_stride_f32 = k_str;
+            qpc.v_raw_stride_f32 = v_str;
+            qpc.n_head_q         = Hq;
+            qpc.n_head_kv        = Hkv;
+            qpc.head_dim         = hd;
+            qpc.n_tokens         = M;
+            qpc.rope_n_dims      = L.rope_n_dims;
+            qpc.k_store_nb1_B    = L.k_store_nb1;
+            qpc.v_store_nb1_B    = L.v_store_nb1;
+            qpc.k_ids_nb0_B      = L.k_ids_nb0;
+            qpc.v_ids_nb0_B      = L.v_ids_nb0;
+            qpc.flags            = (!L.wv ? AGX_W7_DSPARK_QKV_SHARED_KV : 0u) |
+                                   (L.has_rope ? AGX_W7_DSPARK_QKV_HAS_ROPE : 0u) |
+                                   ((L.rope_mode & 2u) ? AGX_W7_DSPARK_QKV_ROPE_NEOX : 0u) |
+                                   (L.has_k_rot ? AGX_W7_DSPARK_QKV_FWHT_K : 0u) |
+                                   (L.has_v_rot ? AGX_W7_DSPARK_QKV_FWHT_V : 0u) |
+                                   (L.kv_is_q8 ? AGX_W7_DSPARK_QKV_KV_Q8_0 : 0u) |
+                                   (L.k_ids_is_i64 ? AGX_W7_DSPARK_QKV_K_IDS_I64 : 0u) |
+                                   (L.v_ids_is_i64 ? AGX_W7_DSPARK_QKV_V_IDS_I64 : 0u);
+            qpc.rms_eps          = G.rms_eps;
+            qpc.theta_scale      = L.theta_scale;
+            qpc.freq_scale       = L.freq_scale;
+            qpc.attn_factor      = L.attn_factor;
+            if (!agx_cdm_dispatch(stream, eng->k_w7_dspark_qkv_rope, Hq + 2u * Hkv, M, 1u,
+                                  &qpc, sizeof(qpc), AGX_BARRIER_STRONG_USC)) {
+                return false;
+            }
+        }
+
+        // 1c. FlashAttention
+        {
+            agx_attn_stage_args attn{};
+            attn.n_tokens      = M;
+            attn.n_kv          = L.n_kv;
+            attn.n_head_q      = Hq;
+            attn.n_head_kv     = Hkv;
+            attn.head_dim      = hd;
+            attn.kq_scale      = L.kq_scale;
+            attn.max_bias      = L.max_bias;
+            attn.logit_softcap = L.logit_softcap;
+            attn.flags         = (L.kq_mask_va ? (L.kq_mask_f16 ? AGX_ATTN_FLAG_HAS_MASK_F16 : AGX_ATTN_FLAG_HAS_MASK_F32) : 0u) |
+                                 (L.sinks_va ? AGX_ATTN_FLAG_SINK_PER_HEAD : 0u) |
+                                 (L.max_bias > 0.0f ? AGX_ATTN_FLAG_ALIBI : 0u) |
+                                 (L.logit_softcap > 0.0f ? AGX_ATTN_FLAG_SOFTCAP : 0u);
+            attn.q_va          = va_q_out;
+            attn.q_nb1         = Hq * hd * sizeof(float);
+            attn.q_nb2         = hd * sizeof(float);
+            attn.out_va        = va_attn_out;
+            attn.sinks_va      = L.sinks_va;
+            attn.kq_mask_va    = L.kq_mask_va;
+            attn.ext_mask_nb1  = L.kq_mask_nb1;
+            attn.ext_mask_nb2  = L.kq_mask_nb2;
+            attn.ext_mask_ne2  = L.kq_mask_ne2;
+            attn.ext_k_dtype   = L.kv_is_q8 ? AGX_KV_Q8_0_GGML : AGX_KV_F16;
+            attn.ext_v_dtype   = L.kv_is_q8 ? AGX_KV_Q8_0_GGML : AGX_KV_F16;
+            attn.ext_k_va      = L.k_va;
+            attn.ext_v_va      = L.v_va;
+            attn.ext_k_nb1     = L.k_nb1;
+            attn.ext_k_nb2     = L.k_nb2;
+            attn.ext_v_nb1     = L.v_nb1;
+            attn.ext_v_nb2     = L.v_nb2;
+            if (!agx_kv_hybrid_dispatch_full_attn(kv_pool, stream, attn, AGX_BARRIER_STRONG_USC)) {
+                return false;
+            }
+        }
+
+        // 1d. W_o GEMM -> va_wo_out
+        if (!dispatch_dense_mm(ctx, stream, L.wo, va_attn_out, va_wo_out, M, AGX_BARRIER_STRONG_USC)) {
+            return false;
+        }
+
+        // 1e. Fused [attn_post_norm] + ffn_inp = wo_out + inpL + RMSNorm(ffn_inp, ffn_norm) -> alt_l_va & va_norm
+        {
+            agx_w7_dspark_post_op_push rpc{};
+            rpc.va0 = va_wo_out;
+            rpc.va1 = inp_l_va;
+            rpc.va2 = L.attn_post_norm ? agx_tensor_gpu_va(L.attn_post_norm) : 0ull;
+            rpc.va4 = agx_tensor_gpu_va(L.ffn_norm);
+            rpc.va5 = alt_l_va; // ffn_inp
+            rpc.va6 = va_norm;  // ffn_norm_out
+            rpc.op  = 0u; // RES_NORM
+            rpc.p0  = D;
+            rpc.p1  = M;
+            rpc.f0  = G.rms_eps;
+            if (!agx_cdm_dispatch(stream, eng->k_w7_dspark_post_op, M, 1u, 1u,
+                                  &rpc, sizeof(rpc), AGX_BARRIER_STRONG_USC)) {
+                return false;
+            }
+        }
+
+        // 1f+1g. Fused Q8_0_8BLK Gate + Up + GLU (1x sh_x read, 0 gu_out traffic, -1 barrier/layer!) OR fallback
+        if (M <= 4u && (D & 3u) == 0u && eng->k_w7_dspark_gate_up_glu &&
+            L.ffn_gate->type == GGML_TYPE_Q8_0 && agx_tensor_is_repacked(L.ffn_gate) &&
+            L.ffn_up->type == GGML_TYPE_Q8_0 && agx_tensor_is_repacked(L.ffn_up)) {
+            agx_w7_dspark_gate_up_glu_push gupc{};
+            gupc.wg_va     = agx_tensor_gpu_va(L.ffn_gate);
+            gupc.wu_va     = agx_tensor_gpu_va(L.ffn_up);
+            gupc.x_va      = va_norm;
+            gupc.y_va      = va_inter;
+            gupc.M         = M;
+            gupc.N         = F;
+            gupc.K         = D;
+            gupc.glu_op    = L.glu_op;
+            gupc.glu_alpha = L.glu_alpha;
+            gupc.glu_limit = L.glu_limit;
+            if (!agx_cdm_dispatch(stream, eng->k_w7_dspark_gate_up_glu, (F + 15u) / 16u, 1u, 1u,
+                                  &gupc, sizeof(gupc), AGX_BARRIER_STRONG_USC)) {
+                return false;
+            }
+        } else {
+            const uint64_t g_va = va_gu_out;
+            const uint64_t u_va = va_gu_out + (uint64_t) M * F * sizeof(float);
+            const uint32_t g_str = F, u_str = F;
+            if (!dispatch_dense_mm(ctx, stream, L.ffn_gate, va_norm, g_va, M, AGX_BARRIER_NONE)) return false;
+            if (!dispatch_dense_mm(ctx, stream, L.ffn_up,   va_norm, u_va, M, AGX_BARRIER_STRONG_USC)) return false;
+
+            agx_w7_dspark_post_op_push gpc{};
+            gpc.va0 = g_va;
+            gpc.va1 = u_va;
+            gpc.va2 = va_inter;
+            gpc.op  = 1u; // GLU
+            gpc.p0  = F;
+            gpc.p1  = M;
+            gpc.p2  = g_str;
+            gpc.p3  = u_str;
+            gpc.p4  = L.glu_op;
+            gpc.f0  = L.glu_alpha;
+            gpc.f1  = L.glu_limit;
+            if (!agx_cdm_dispatch(stream, eng->k_w7_dspark_post_op, (F + 255u) / 256u, M, 1u,
+                                  &gpc, sizeof(gpc), AGX_BARRIER_STRONG_USC)) {
+                return false;
+            }
+        }
+
+        // 1h. FFN Down GEMM -> va_wo_out
+        if (!dispatch_dense_mm(ctx, stream, L.ffn_down, va_inter, va_wo_out, M, AGX_BARRIER_STRONG_USC)) {
+            return false;
+        }
+
+        // 1i. Fused [ffn_post_norm] + l_out = ffn_out + ffn_inp + [out_scale] + next attn_norm / output_norm!
+        const bool is_last_layer = (il + 1u == G.n_layers);
+        {
+            agx_w7_dspark_post_op_push rpc{};
+            rpc.va0 = va_wo_out;
+            rpc.va1 = alt_l_va; // ffn_inp
+            rpc.va2 = L.ffn_post_norm ? agx_tensor_gpu_va(L.ffn_post_norm) : 0ull;
+            rpc.va3 = L.out_scale     ? agx_tensor_gpu_va(L.out_scale)     : 0ull;
+            rpc.va4 = is_last_layer ? agx_tensor_gpu_va(G.output_norm)
+                                    : agx_tensor_gpu_va(G.layers[il + 1u].attn_norm);
+            rpc.va5 = inp_l_va; // l_out -> next layer's inpL
+            rpc.va6 = va_norm;  // next layer's noise_norm OR result_norm
+            rpc.va7 = is_last_layer ? G.result_norm_va : 0ull;
+            rpc.op  = 0u; // RES_NORM
+            rpc.p0  = D;
+            rpc.p1  = M;
+            rpc.f0  = G.rms_eps;
+            if (!agx_cdm_dispatch(stream, eng->k_w7_dspark_post_op, M, 1u, 1u,
+                                  &rpc, sizeof(rpc), AGX_BARRIER_STRONG_USC)) {
+                return false;
+            }
+        }
+    }
+
+    // Optional per-phase GPU profiler (GGML_AGX_DSPARK_PROFILE=1, 0 overhead when unset)
+    static int dsp_prof_round = 0;
+    const char * prof_env = std::getenv("GGML_AGX_DSPARK_PROFILE");
+    const bool   do_prof  = (prof_env && prof_env[0] && prof_env[0] != '0' && ++dsp_prof_round == 3);
+    uint64_t prof_body_ns = 0, prof_lm_ns = 0, prof_mk_ns = 0;
+    if (do_prof) {
+        if (agx_cdm_submit(stream, true, &prof_body_ns) != 0) return false;
+        agx_cdm_stream_reset(stream);
+    }
+
+    // Step 2: Shared LM Head (output @ result_norm -> va_lm_pad [n_vocab_padded, M], ZERO truncate copy!)
+    {
+        agx_weight_layout lm_layout = AGX_WEIGHT_F32;
+        if (!agx_gemm_infer_weight_layout(G.output, &lm_layout)) return false;
+        agx_gemm_desc d{};
+        d.w_va         = agx_tensor_gpu_va(G.output);
+        d.x_va         = va_norm;
+        d.y_va         = va_lm_pad;
+        d.M            = M;
+        d.N            = G.n_vocab_padded;
+        d.K            = D;
+        d.layout       = lm_layout;
+        d.prec_f32     = G.lm_head_prec_f32;
+        d.post_barrier = AGX_BARRIER_STRONG_USC;
+        if (!agx_gemm_dispatch(ctx, stream, d)) {
+            return false;
+        }
+    }
+    if (do_prof) {
+        if (agx_cdm_submit(stream, true, &prof_lm_ns) != 0) return false;
+        agx_cdm_stream_reset(stream);
+    }
+
+    // Step 3: Fused 4-Step DSpark Markov Head (+ inline backend top_k/top_k_rows, reading padded va_lm_pad directly!)
+    if (!agx_dspark_dispatch_markov_head_w7(eng, stream, G.markov,
+                                            G.inp_tokens_va, va_lm_pad, G.n_vocab_padded,
+                                            va_norm, G.rnn_state_va, G.rnn_state_va,
+                                            G.final_out_va, G.final_h_nextn_va,
+                                            G.n_blocks, G.block_drafts,
+                                            AGX_BARRIER_MEMORY_HOST,
+                                            G.has_any_topk ? G.topk_rows.data() : nullptr,
+                                            G.has_any_topk ? (uint32_t) G.topk_rows.size() : 0u)) {
+        return false;
+    }
+
+    const auto t_enc_end = std::chrono::steady_clock::now();
+    const uint64_t cpu_enc_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(t_enc_end - t_enc_beg).count();
+
+    uint64_t gpu_ns = 0;
+    if (agx_cdm_submit(stream, true, &gpu_ns) != 0) {
+        AGX_LOG_ERROR("execute_dspark_draft_cgraph: CDM submit failed");
+        return false;
+    }
+    if (do_prof) {
+        prof_mk_ns = gpu_ns;
+        uint32_t rb_tmp = 0;
+        const uint32_t w2_wt = agx_inkling2_tensor_wtype(G.markov.markov_w2, &rb_tmp);
+        const uint32_t jp_wt = G.markov.joint_proj ? agx_inkling2_tensor_wtype(G.markov.joint_proj, &rb_tmp) : 99u;
+        const uint32_t wq_wt = agx_inkling2_tensor_wtype(G.layers[0].wq, &rb_tmp);
+        std::fprintf(stderr,
+                     "[ggml-agx DSPARK PROFILE] M=%u D=%u F=%u R=%u V=%u(pad=%u) wq_wt=%u w2_wt=%u jp_wt=%u lm_f32=%d "
+                     "body=%.3fms lm=%.3fms markov=%.3fms sum=%.3fms\n",
+                     M, D, F, G.markov.rank, G.n_vocab, G.n_vocab_padded, wq_wt, w2_wt, jp_wt, (int) G.lm_head_prec_f32,
+                     (double) prof_body_ns * 1e-6, (double) prof_lm_ns * 1e-6, (double) prof_mk_ns * 1e-6,
+                     (double) (prof_body_ns + prof_lm_ns + prof_mk_ns) * 1e-6);
+    }
+
+    const char * stats_env = std::getenv("GGML_AGX_STATS");
+    if (stats_env && stats_env[0] && stats_env[0] != '0') {
+        agx_cdm_stats cdm_after{};
+        agx_cdm_get_stats(stream, &cdm_after);
+        std::fprintf(stderr,
+                     "[ggml-agx DSPARK MK STATS] layers=%u M=%u blk=%u drafts=%u kv=%s dispatches=%llu submits=%llu "
+                     "usc_bar=%llu cpu_enc=%.2fms gpu=%.2fms\n",
+                     G.n_layers, M, G.n_blocks, G.block_drafts, G.layers[0].kv_is_q8 ? "Q8_0" : "F16",
+                     (unsigned long long) (cdm_after.dispatches          - cdm_before.dispatches),
+                     (unsigned long long) (cdm_after.submits             - cdm_before.submits),
+                     (unsigned long long) (cdm_after.strong_usc_barriers - cdm_before.strong_usc_barriers),
+                     (double) cpu_enc_ns * 1e-6, (double) gpu_ns * 1e-6);
+    }
+    return true;
+}
+
 } // namespace
 
 extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_cgraph * cgraph) {
@@ -3372,9 +4465,16 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
         return false;
     }
 
-    // 1. Discover Inkling-2-Mini 48-pass decode graph (M=1..8) without touching ctx->stream on mismatch
+    // 1. Discover Inkling-2-Mini 48-pass decode graph (M=1..8) OR DSpark Draft graph
     w4_discovered_graph G;
     if (!discover_inkling2_cgraph(cgraph, G)) {
+        const char * no_dsp_mk = std::getenv("GGML_AGX_NO_DSPARK_MK");
+        if (!(no_dsp_mk && no_dsp_mk[0] && no_dsp_mk[0] != '0')) {
+            w7_dspark_draft_graph DG;
+            if (discover_dspark_draft_cgraph(cgraph, DG)) {
+                return execute_dspark_draft_cgraph(ctx, DG);
+            }
+        }
         return false;
     }
 
@@ -3902,8 +5002,11 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
         }
 
         if (w5_ok) {
-            // Default = Pass-3 Hybrid (full 515/475 GB/s weight ops + lean <=60 GPR32 persistent super-stages).
-            // Opt-in A/B modes: GGML_AGX_PERSIST_CHUNK=<N> (14 disp) | GGML_AGX_PERSIST_SPLIT=1 (101 disp).
+            // Default = Wave 7 512T Hybrid (16 SGs/core across all 3 super-stages + 517 GB/s attn_in_b1 & Wo).
+            // Instant A/B toggles:
+            //   GGML_AGX_W7_FUSE_WO=1         : fuse WG-striped branchless Wo into HYBRID_MODE=1 (-48 disp/USC)
+            //   GGML_AGX_PERSIST_CHUNK=<N>    : 14-dispatch chunked persistent mode
+            //   GGML_AGX_PERSIST_SPLIT=1      : 101-dispatch split persistent mode
             bool hybrid_router_ok = true;
             for (uint32_t v = 0; v < 48u; ++v) {
                 if (descs[v].router_wtype > 2u) { hybrid_router_ok = false; break; }
@@ -3928,17 +5031,15 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
                         const auto & C     = eng->w4_model.layers[P.ip];
                         const auto & d     = descs[v];
                         const uint32_t lp_i = P.has_loop ? 1u : 0u;
-                        const bool same_qkv_inp = (P.is_swa && !P.has_loop);
 
-                        // Op 1: Single-dispatch 517 GB/s fused W_attn_in (independent x_q/x_k/x_v!) +
-                        //       BF16/F16/F32 attn_sink_proj + full-attn k/v_dyn (168 -> 48 dispatches!)
-                        const bool can_fuse_sink = (!C.in_coal[3] && d.sink_proj_wtype <= 2u);
-                        const bool can_fuse_dyn  = (!P.is_swa && d.k_proj_wtype <= 2u && d.v_proj_wtype <= 2u);
-                        const bool need_extra_sink = (!C.in_coal[3] && !can_fuse_sink);
-                        const bool need_extra_dyn  = (!P.is_swa && !can_fuse_dyn);
-                        if (eng->k_w5_attn_in_b1 && D == 2304u) {
-                            const uint32_t tail_rows = (can_fuse_sink ? 24u : 0u) + (can_fuse_dyn ? 64u : 0u);
-                            const uint32_t tot_rows  = C.total_coal_rows + tail_rows;
+                        // Op 1: Dedicated 517 GB/s 0B-SRAM agx_w5_attn_in_b1 (keeps HYBRID_MODE=0 <= 56 GPR32!)
+                        {
+                            const bool can_fuse_sink   = (!C.in_coal[3] && d.sink_proj_wtype <= 2u);
+                            const bool can_fuse_dyn    = (!P.is_swa && d.k_proj_wtype <= 2u && d.v_proj_wtype <= 2u);
+                            const bool need_extra_sink = (!C.in_coal[3] && !can_fuse_sink);
+                            const bool need_extra_dyn  = (!P.is_swa && !can_fuse_dyn);
+                            const uint32_t tail_rows   = (can_fuse_sink ? 24u : 0u) + (can_fuse_dyn ? 64u : 0u);
+                            const uint32_t tot_rows    = C.total_coal_rows + tail_rows;
                             agx_w5_attn_in_push apc{};
                             apc.w_attn_in_va    = C.w_attn_in.gpu_va;
                             apc.x_q_va          = d.x_q_va;
@@ -3982,39 +5083,9 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
                             if (need_extra_sink || need_extra_dyn) {
                                 agx_cdm_barrier_usc(stream);
                             }
-                        } else {
-                            if (same_qkv_inp) {
-                                if (!agx_gemm_dispatch_raw_q8_0(ctx, stream, C.w_attn_in.gpu_va, d.x_q_va, slc->qkv_buf,
-                                                                1u, C.total_coal_rows, D, AGX_BARRIER_NONE, D, C.total_coal_rows)) {
-                                    return false;
-                                }
-                            } else {
-                                if (!agx_gemm_dispatch_raw_q8_0(ctx, stream, C.w_attn_in.gpu_va, d.x_q_va, slc->qkv_buf,
-                                                                1u, C.q_prefix_rows, D, AGX_BARRIER_NONE, D, C.q_prefix_rows)) {
-                                    return false;
-                                }
-                                if (!agx_gemm_dispatch_raw_q8_0(ctx, stream, C.w_attn_in.gpu_va + C.byte_off[4], d.x_k_va,
-                                                                d.k_raw_va, 1u, C.row_cnt[4], D, AGX_BARRIER_NONE, D, C.row_cnt[4])) {
-                                    return false;
-                                }
-                                if (!agx_gemm_dispatch_raw_q8_0(ctx, stream, C.w_attn_in.gpu_va + C.byte_off[5], d.x_v_va,
-                                                                d.v_raw_va, 1u, C.row_cnt[5], D, AGX_BARRIER_NONE, D, C.row_cnt[5])) {
-                                    return false;
-                                }
-                            }
-                            if (!C.in_coal[3]) {
-                                if (!dispatch_dense_mm(ctx, stream, layer.attn_sink_proj, d.x_q_va, d.sinks_va, 1u, AGX_BARRIER_NONE)) {
-                                    return false;
-                                }
-                            }
-                            if (!P.is_swa) {
-                                if (!dispatch_dense_mm(ctx, stream, layer.attn_k_conv_proj, d.x_k_va, L.k_dyn, 1u, AGX_BARRIER_NONE)) return false;
-                                if (!dispatch_dense_mm(ctx, stream, layer.attn_v_conv_proj, d.x_v_va, L.v_dyn, 1u, AGX_BARRIER_NONE)) return false;
-                            }
-                            agx_cdm_barrier_usc(stream);
                         }
 
-                        // Op 2: 40-WG Fused qkv_prep_store + RelBias + FlashAttn + FWHT128 + Qgate (<= 60 GPR32!)
+                        // Op 2: Lean <= 56 GPR32 40-WG x 512T Fused qkv_prep_store + uvec4 RelBias + 16-SG FlashAttn + Qgate
                         agx_w5_persist_push ppc{};
                         ppc.descs_va   = descs_gpu_va + (uint64_t) v * sizeof(agx_w5_pass_desc);
                         ppc.barrier_va = slc->sense_barrier_va;
@@ -4025,12 +5096,12 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
                             return false;
                         }
 
-                        // Op 3: Full-wire-speed 515 GB/s W_o -> L.x_k
+                        // Op 3: Full-wire-speed 515 GB/s W_o
                         if (!dispatch_dense_mm(ctx, stream, layer.wo, slc->attn_out, L.x_k, 1u, AGX_BARRIER_STRONG_USC)) {
                             return false;
                         }
 
-                        // Op 4: 40-WG x 512T Fused stage_post_attn + [FFN loop ctrl] + router GEMM + bitonic Top-8
+                        // Op 4: 40-WG x 512T (lean <= 52 GPR32!) Fused stage_post_attn + [FFN loop ctrl] + uvec4 router + Top-8
                         if (!agx_cdm_dispatch(stream, eng->k_w5_hybrid_post_attn_rtr[lp_i],
                                               40u, 1u, 1u, &ppc, sizeof(ppc), AGX_BARRIER_STRONG_USC)) {
                             return false;

@@ -57,8 +57,13 @@
 #define KV_Q8 0
 #endif
 
+#if HYBRID_MODE <= 2
+#define LOCAL_X 512u
+#define N_SG    16u
+#else
 #define LOCAL_X 256u
 #define N_SG    8u
+#endif
 
 layout(local_size_x = LOCAL_X, local_size_y = 1, local_size_z = 1) in;
 
@@ -69,6 +74,7 @@ layout(buffer_reference, std430, buffer_reference_align = 4)  readonly buffer Co
 layout(buffer_reference, std430, buffer_reference_align = 8)  readonly buffer ConstBufI64   { int64_t   v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4)  readonly buffer ConstBufU32   { uint      v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 8)  readonly buffer ConstBufUvec2 { uvec2     v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer ConstBufUvec4 { uvec4     v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 8)  readonly buffer ConstBufU64   { uint64_t  v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 2)  readonly buffer ConstBufF16   { float16_t v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 2)  readonly buffer ConstBufU16   { uint16_t  v[]; };
@@ -105,6 +111,10 @@ layout(buffer_reference, std430, buffer_reference_align = 4) coherent buffer Sen
 #define PFLAG_POST_FFN_DO_MIX   (1u << 10)
 #define PFLAG_POST_FFN_DO_NORM  (1u << 11)
 #define PFLAG_NEXT_IS_SWA       (1u << 12)
+#define PFLAG_FUSE_ATTN_IN      (1u << 13)
+#define PFLAG_FUSE_WO           (1u << 14)
+#define PFLAG_FUSE_SINK_PROJ    (1u << 15)
+#define PFLAG_FUSE_DYN_CONV     (1u << 16)
 
 struct W5PassDesc {
     uint64_t x_q_va;
@@ -292,17 +302,18 @@ void agx_sense_barrier(uint64_t bar_va, uint n_wg, inout uint local_sense) {
 }
 
 // ============================================================================
-// HYBRID_MODE == 0: 40-WG Fused qkv_prep_store + RelBias + FlashAttn + Qgate
-//   - Only 4.8 KB SRAM, <= 60 GPR32, Q kept in sh_q_head[128] (0 SLC roundtrip!)
+// HYBRID_MODE == 0: Lean <= 56 GPR32 40-WG x 512T (16 SGs/core!)
+//   Fused qkv_prep_store + 16B uvec4 RelBias + 16-SG/head FlashAttn + Qgate
+//   - ~11.0 KB SRAM, Q & mask pinned in TG SRAM!
 // ============================================================================
 #if HYBRID_MODE == 0
 
-shared float     sh_o[1024];     // 4,096 B: 8 sgs x 32 lanes x 4 floats
+shared float     sh_o[2048];     // 8,192 B: 16 sgs x 32 lanes x 4 floats
 shared float     sh_q_head[128]; //   512 B: Q head pinned in TG SRAM across sense_barrier!
 shared float16_t sh_mask[1024];  // 2,048 B: kq_mask_f16 pinned in TG SRAM for n_kv <= 1024 (0 SLC R/W!)
 shared float     sh_r[32];       //   128 B: R head for RelBias
-shared float     sh_m[8];        //    32 B
-shared float     sh_l[8];        //    32 B
+shared float     sh_m[16];       //    64 B
+shared float     sh_l[16];       //    64 B
 
 void fwht128_in_reg(inout float reg[4], uint lane) {
     const float sc = 0.08838834764831845;
@@ -349,26 +360,33 @@ void store_kv_head_coh(uint64_t row_va, uint head, float reg[4], uint lane) {
 float dot_rel_bias_row_sh(uint64_t b_va, uint wtype, uint n_rel) {
     float acc = 0.0;
     if (wtype == 2u) {
-        const uint n4 = n_rel >> 2u;
-        ConstBufUvec2 bb = ConstBufUvec2(b_va);
-        for (uint g = 0u; g < n4; ++g) {
-            uvec2 p = bb.v[g];
-            uint k = g << 2u;
-            vec4 w = vec4(
+        // 16-byte uvec4 BF16 loads (4 loads for n_rel=32!)
+        const uint n8 = n_rel >> 3u;
+        ConstBufUvec4 bb = ConstBufUvec4(b_va);
+        for (uint g = 0u; g < n8; ++g) {
+            uvec4 p = bb.v[g];
+            uint k = g << 3u;
+            vec4 w0 = vec4(
                 uintBitsToFloat((p.x & 0xFFFFu) << 16u),
                 uintBitsToFloat(p.x & 0xFFFF0000u),
                 uintBitsToFloat((p.y & 0xFFFFu) << 16u),
                 uintBitsToFloat(p.y & 0xFFFF0000u));
-            acc += dot(w, vec4(sh_r[k], sh_r[k + 1u], sh_r[k + 2u], sh_r[k + 3u]));
+            vec4 w1 = vec4(
+                uintBitsToFloat((p.z & 0xFFFFu) << 16u),
+                uintBitsToFloat(p.z & 0xFFFF0000u),
+                uintBitsToFloat((p.w & 0xFFFFu) << 16u),
+                uintBitsToFloat(p.w & 0xFFFF0000u));
+            acc += dot(w0, vec4(sh_r[k], sh_r[k + 1u], sh_r[k + 2u], sh_r[k + 3u]))
+                 + dot(w1, vec4(sh_r[k + 4u], sh_r[k + 5u], sh_r[k + 6u], sh_r[k + 7u]));
         }
     } else if (wtype == 1u) {
-        const uint n4 = n_rel >> 2u;
-        ConstBufUvec2 bb = ConstBufUvec2(b_va);
-        for (uint g = 0u; g < n4; ++g) {
-            uvec2 p = bb.v[g];
-            uint k = g << 2u;
-            vec4 w = vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y));
-            acc += dot(w, vec4(sh_r[k], sh_r[k + 1u], sh_r[k + 2u], sh_r[k + 3u]));
+        const uint n8 = n_rel >> 3u;
+        ConstBufUvec4 bb = ConstBufUvec4(b_va);
+        for (uint g = 0u; g < n8; ++g) {
+            uvec4 p = bb.v[g];
+            uint k = g << 3u;
+            acc += dot(vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y)), vec4(sh_r[k], sh_r[k + 1u], sh_r[k + 2u], sh_r[k + 3u]))
+                 + dot(vec4(unpackHalf2x16(p.z), unpackHalf2x16(p.w)), vec4(sh_r[k + 4u], sh_r[k + 5u], sh_r[k + 6u], sh_r[k + 7u]));
         }
     } else if (wtype == 0u) {
         const uint n4 = n_rel >> 2u;
@@ -489,7 +507,7 @@ void main() {
 
         const bool     use_sh_m   = (n_kv <= 1024u);
         CohBufF16 dst_m = CohBufF16(dst_row_va);
-        for (uint j = tid; j < n_kv; j += 256u) {
+        for (uint j = tid; j < n_kv; j += LOCAL_X) {
             float bm = bmask_f16 ? float(ConstBufF16(bmask_va).v[j]) : ConstBufF32(bmask_va).v[j];
             float16_t mv16 = float16_t(bm);
             if (bm > -1.0e20) {
@@ -581,7 +599,7 @@ void main() {
 
         const bool use_sh_m = (n_kv <= 1024u);
         CohBufF16 mb = CohBufF16(mask_row_va);
-        for (uint kv = sg; kv < n_kv; kv += 8u) {
+        for (uint kv = sg; kv < n_kv; kv += N_SG) {
             float mv = use_sh_m ? float(sh_mask[kv]) : float(mb.v[kv]);
             if (!(mv > -1.0e30)) continue;
             vec4 k_reg = load_ext_kv_coh(k_va, k_nb1, k_nb2, kv, h_kv, ln);
@@ -608,12 +626,12 @@ void main() {
 
         if (sg == 0u) {
             float m_wg = -3.402823466e+38 * 0.5;
-            for (uint s = 0u; s < 8u; ++s) {
+            for (uint s = 0u; s < N_SG; ++s) {
                 if (sh_l[s] > 0.0) m_wg = max(m_wg, sh_m[s]);
             }
             float l_wg = 0.0;
             vec4  o_wg = vec4(0.0);
-            for (uint s = 0u; s < 8u; ++s) {
+            for (uint s = 0u; s < N_SG; ++s) {
                 if (sh_l[s] > 0.0) {
                     float w = exp(sh_m[s] - m_wg);
                     l_wg += sh_l[s] * w;
@@ -659,7 +677,7 @@ void main() {
 #else // HYBRID_MODE == 1 || HYBRID_MODE == 2
 
 shared float    sh_cur[2304];    // 9,216 B: s_cur / sh_gate[64] / router s_sel+s_prob
-shared float    sh_red[5][8];    //   160 B: 8-sg reduction scratch
+shared float    sh_red[5][16];   //   320 B: 8-or-16-sg reduction scratch
 shared float    sh_inv_rms[16];  //    64 B
 shared float    sh_prob[4][16];  //   256 B
 shared uint64_t sh_bva[8];       //    64 B
@@ -672,7 +690,7 @@ float wg_sum1_256(float val, uint sg, uint ln) {
     if (ln == 0u) sh_red[0][sg] = s;
     barrier();
     if (sg == 0u) {
-        float t = subgroupAdd((ln < 8u) ? sh_red[0][ln] : 0.0);
+        float t = subgroupAdd((ln < N_SG) ? sh_red[0][ln] : 0.0);
         if (ln == 0u) sh_red[0][0] = t;
     }
     barrier();
@@ -691,7 +709,7 @@ vec4 wg_sum4_256(vec4 v, uint sg, uint ln) {
     }
     barrier();
     if (sg < 4u) {
-        float t = subgroupAdd((ln < 8u) ? sh_red[sg][ln] : 0.0);
+        float t = subgroupAdd((ln < N_SG) ? sh_red[sg][ln] : 0.0);
         if (ln == 0u) sh_red[sg][0] = t;
     }
     barrier();
@@ -705,15 +723,24 @@ void wg_rmsnorm_unweighted_256(uint64_t src_va, uint64_t dst_va, float eps, uint
     const uint D4 = 2304u >> 2u;
     CohBufVec4 sb = CohBufVec4(src_va);
     CohBufVec4 db = CohBufVec4(dst_va);
+#if HYBRID_MODE <= 2
+    vec4 v0 = sb.v[tid];
+    vec4 v1 = (tid + 512u < D4) ? sb.v[tid + 512u] : vec4(0.0);
+    float ss = dot(v0, v0) + dot(v1, v1);
+    float rms = inversesqrt(wg_sum1_256(ss, sg, ln) * (1.0 / 2304.0) + eps);
+    db.v[tid] = v0 * rms;
+    if (tid + 512u < D4) db.v[tid + 512u] = v1 * rms;
+#else
     float ss = 0.0;
-    for (uint i4 = tid; i4 < D4; i4 += 256u) {
+    for (uint i4 = tid; i4 < D4; i4 += LOCAL_X) {
         vec4 v = sb.v[i4];
         ss += dot(v, v);
     }
     float rms = inversesqrt(wg_sum1_256(ss, sg, ln) * (1.0 / 2304.0) + eps);
-    for (uint i4 = tid; i4 < D4; i4 += 256u) {
+    for (uint i4 = tid; i4 < D4; i4 += LOCAL_X) {
         db.v[i4] = sb.v[i4] * rms;
     }
+#endif
 }
 
 void wg_rmsnorm_weighted_256(uint64_t src_va, uint64_t norm_w_va, uint64_t dst_va, float eps, uint tid, uint sg, uint ln) {
@@ -721,18 +748,27 @@ void wg_rmsnorm_weighted_256(uint64_t src_va, uint64_t norm_w_va, uint64_t dst_v
     CohBufVec4   sb = CohBufVec4(src_va);
     ConstBufVec4 nw = ConstBufVec4(norm_w_va);
     CohBufVec4   db = CohBufVec4(dst_va);
+#if HYBRID_MODE <= 2
+    vec4 v0 = sb.v[tid];
+    vec4 v1 = (tid + 512u < D4) ? sb.v[tid + 512u] : vec4(0.0);
+    float ss = dot(v0, v0) + dot(v1, v1);
+    float rms = inversesqrt(wg_sum1_256(ss, sg, ln) * (1.0 / 2304.0) + eps);
+    db.v[tid] = (v0 * rms) * nw.v[tid];
+    if (tid + 512u < D4) db.v[tid + 512u] = (v1 * rms) * nw.v[tid + 512u];
+#else
     float ss = 0.0;
-    for (uint i4 = tid; i4 < D4; i4 += 256u) {
+    for (uint i4 = tid; i4 < D4; i4 += LOCAL_X) {
         vec4 v = sb.v[i4];
         ss += dot(v, v);
     }
     float rms = inversesqrt(wg_sum1_256(ss, sg, ln) * (1.0 / 2304.0) + eps);
-    for (uint i4 = tid; i4 < D4; i4 += 256u) {
+    for (uint i4 = tid; i4 < D4; i4 += LOCAL_X) {
         db.v[i4] = (sb.v[i4] * rms) * nw.v[i4];
     }
+#endif
 }
 
-// 8-SG/WG (256T) F32 K=64 ctrl_up_mix: 8 lanes/row x 2 vec4 loads = 64 floats -> 32 rows/WG (128B exact!)
+// 16-SG/WG (512T) F32 K=64 ctrl_up_mix: 8 lanes/row x 2 vec4 loads = 64 floats -> 64 rows/WG (36 tiles = 1 wave!)
 void phase_ctrl_up_mix_256(
         uint64_t cur_va, uint64_t msg_va, uint64_t gate_va,
         uint64_t gain_w_va, uint64_t forget_w_va, uint64_t out_va,
@@ -742,7 +778,7 @@ void phase_ctrl_up_mix_256(
     }
     barrier();
 
-    const uint r_sg = ln >> 3u; // 0..3 (4 rows/sg x 8 sgs = 32 rows/WG = exact 128B line!)
+    const uint r_sg = ln >> 3u; // 0..3 (4 rows/sg x 16 sgs = 64 rows/WG!)
     const uint l8   = ln & 7u;  // 0..7 (8 lanes x 8 floats = 64!)
     const uint k0   = l8 * 4u;
     const uint k1   = (l8 + 8u) * 4u;
@@ -753,8 +789,9 @@ void phase_ctrl_up_mix_256(
     CohBufF32 mb = CohBufF32(msg_va);
     CohBufF32 ob = CohBufF32(out_va);
 
-    for (uint tile = wg; tile < 72u; tile += 40u) {
-        const uint row = tile * 32u + sg * 4u + r_sg;
+    const uint n_tiles = 2304u / (N_SG * 4u); // 36 for 512T (1 wave!), 72 for 256T
+    for (uint tile = wg; tile < n_tiles; tile += 40u) {
+        const uint row = tile * (N_SG * 4u) + sg * 4u + r_sg;
         const uint64_t row_off = uint64_t(row) * 256ul;
         ConstBufVec4 gw = ConstBufVec4(gain_w_va   + row_off);
         ConstBufVec4 fw = ConstBufVec4(forget_w_va + row_off);
@@ -816,7 +853,7 @@ void main() {
         const float    res_sc       = D_FLD(desc_va, post_conv_res_scale);
 
         float ss_cur = 0.0;
-        for (uint ch = tid; ch < D; ch += 256u) {
+        for (uint ch = tid; ch < D; ch += LOCAL_X) {
             const uint64_t past_va = hist_cell_va + uint64_t((2048u + ch) * 3u) * 4ul;
             CohBufF32 pb = CohBufF32(past_va);
             float p0 = pb.v[0], p1 = pb.v[1], p2 = pb.v[2];
@@ -845,7 +882,7 @@ void main() {
             vec4 acc = vec4(0.0);
             CohBufVec4 xb = CohBufVec4(x_va);
             ConstBufVec4 qb = ConstBufVec4(q_va);
-            for (uint i4 = tid; i4 < D4; i4 += 256u) {
+            for (uint i4 = tid; i4 < D4; i4 += LOCAL_X) {
                 vec4 xv = xb.v[i4];
                 acc.x += dot(xv, xv);
                 acc.y += dot(xv, qb.v[i4]);
@@ -860,7 +897,7 @@ void main() {
         {
             vec4 acc = vec4(ss_cur, 0.0, 0.0, 0.0);
             ConstBufVec4 qb = ConstBufVec4(q_va);
-            for (uint i4 = tid; i4 < D4; i4 += 256u) {
+            for (uint i4 = tid; i4 < D4; i4 += LOCAL_X) {
                 uint b = i4 << 2u;
                 vec4 xv = vec4(sh_cur[b], sh_cur[b + 1u], sh_cur[b + 2u], sh_cur[b + 3u]);
                 acc.y += dot(xv, qb.v[i4]);
@@ -888,7 +925,7 @@ void main() {
         const float wb = sh_prob[0][B];
         CohBufVec4 db = CohBufVec4(dst_va);
         float ss_y = 0.0;
-        for (uint i4 = tid; i4 < D4; i4 += 256u) {
+        for (uint i4 = tid; i4 < D4; i4 += LOCAL_X) {
             uint b = i4 << 2u;
             vec4 yv = wb * vec4(sh_cur[b], sh_cur[b + 1u], sh_cur[b + 2u], sh_cur[b + 3u]);
             for (uint s = 0u; s < B; ++s) {
@@ -907,7 +944,7 @@ void main() {
         {
             float rms_c = inversesqrt(wg_sum1_256(ss_y, sg, ln) * inv_D + 1e-6);
             CohBufVec4 cb0 = CohBufVec4(D_FLD(desc_va, ctrl_cat_va)[0]);
-            for (uint i4 = tid; i4 < D4; i4 += 256u) {
+            for (uint i4 = tid; i4 < D4; i4 += LOCAL_X) {
                 cb0.v[i4] = db.v[i4] * rms_c;
             }
         }
@@ -915,7 +952,7 @@ void main() {
         if (do_norm) {
             float rms = inversesqrt(wg_sum1_256(ss_y, sg, ln) * inv_D + D_FLD(desc_va, rms_eps));
             ConstBufVec4 nw = ConstBufVec4(D_FLD(desc_va, ffn_norm_w_va));
-            for (uint i4 = tid; i4 < D4; i4 += 256u) {
+            for (uint i4 = tid; i4 < D4; i4 += LOCAL_X) {
                 db.v[i4] = (db.v[i4] * rms) * nw.v[i4];
             }
         }
@@ -931,32 +968,27 @@ void main() {
     agx_sense_barrier(pc.barrier_va, pc.n_wg, local_sense);
 
 #if HAS_LOOP == 1
-    // Phase 2a: 1-Wave 40-Core-Striped 4-SG/Row 3x-Unrolled F32 ctrl_down[3] (64 rows, K=4608, 1 WG barrier!)
+    // Phase 2a: 1-Wave 40-Core 8-SG/Row (512T -> ALL 16 SGs/core!) F32 ctrl_down[3] (64 rows, K=4608)
     {
-        const uint half_wg = sg >> 2u;          // 0..1 (2 quads/WG)
-        const uint sg4     = sg & 3u;           // 0..3
-        const uint tid128  = sg4 * 32u + ln;    // 0..127 (1152 = 9 * 128 exact!)
-        const uint row     = half_wg * 40u + wg; // Quad 0: 0..39 (all 40 cores!), Quad 1: 40..63
+        const uint half_wg = sg >> 3u;           // 0..1 (2 octs/WG)
+        const uint sg8     = sg & 7u;            // 0..7
+        const uint tid256  = sg8 * 32u + ln;     // 0..255
+        const uint row     = half_wg * 40u + wg; // Oct 0: 0..39, Oct 1: 40..63
         float acc = 0.0;
         if (row < 64u) {
             ConstBufVec4 wb = ConstBufVec4(D_FLD(desc_va, ctrl_down_w_va)[3] + uint64_t(row) * 4608ul * 4ul);
             CohBufVec4   xb = CohBufVec4(D_FLD(desc_va, ctrl_cat_va)[0]);
-            for (uint k0 = tid128; k0 < 1152u; k0 += 384u) {
-                vec4 w0 = wb.v[k0];
-                vec4 w1 = wb.v[k0 + 128u];
-                vec4 w2 = wb.v[k0 + 256u];
-                vec4 x0 = xb.v[k0];
-                vec4 x1 = xb.v[k0 + 128u];
-                vec4 x2 = xb.v[k0 + 256u];
-                acc += dot(w0, x0) + dot(w1, x1) + dot(w2, x2);
+            for (uint k0 = tid256; k0 < 1152u; k0 += 256u) {
+                acc += dot(wb.v[k0], xb.v[k0]);
             }
         }
         float s = subgroupAdd(acc);
-        if (ln == 0u) sh_red[half_wg][sg4] = s;
+        if (ln == 0u) sh_red[half_wg][sg8] = s;
         barrier();
-        if (row < 64u && sg4 == 0u && ln == 0u) {
+        if (row < 64u && sg8 == 0u && ln == 0u) {
             CohBufF32(D_FLD(desc_va, ctrl_gate_va)[0]).v[row] =
-                sh_red[half_wg][0] + sh_red[half_wg][1] + sh_red[half_wg][2] + sh_red[half_wg][3];
+                sh_red[half_wg][0] + sh_red[half_wg][1] + sh_red[half_wg][2] + sh_red[half_wg][3] +
+                sh_red[half_wg][4] + sh_red[half_wg][5] + sh_red[half_wg][6] + sh_red[half_wg][7];
         }
     }
     agx_sense_barrier(pc.barrier_va, pc.n_wg, local_sense);
@@ -974,7 +1006,7 @@ void main() {
     agx_sense_barrier(pc.barrier_va, pc.n_wg, local_sense);
 #endif
 
-    // Phase 3: 1-Wave 40-Core-Striped 2-SG/Row 3x-Unrolled Router GEMM (128 rows, K=2304, 1 WG barrier!)
+    // Phase 3: 1-Wave 40-Core 4-SG/Row (512T -> ALL 16 SGs/core!) Router GEMM (128 rows, K=2304)
     const uint n_exp = D_FLD(desc_va, n_expert);
     {
         const uint64_t rw_va = D_FLD(desc_va, router_w_va);
@@ -982,56 +1014,43 @@ void main() {
         const uint     rw_rb = D_FLD(desc_va, router_row_B);
         CohBufVec4     xb    = CohBufVec4(D_FLD(desc_va, x_q_va));
         CohBufF32      lb    = CohBufF32(D_FLD(desc_va, router_logits_va));
-        const uint     pair  = sg >> 1u;       // 0..3 (4 pairs/WG -> 160 rows/wave!)
-        const uint     sg2   = sg & 1u;        // 0..1
-        const uint     tid64 = sg2 * 32u + ln; // 0..63 (576 = 9 * 64 = 3 * 192 exact!)
+        const uint     quad  = sg >> 2u;        // 0..3 (4 quads/WG -> 160 rows/wave!)
+        const uint     sg4   = sg & 3u;         // 0..3
+        const uint     tid128 = sg4 * 32u + ln; // 0..127
         for (uint base = 0u; base < n_exp; base += 160u) {
-            const uint row = base + pair * 40u + wg;
+            const uint row = base + quad * 40u + wg;
             float acc = 0.0;
             if (row < n_exp) {
                 const uint64_t r_va = rw_va + uint64_t(row) * uint64_t(rw_rb);
                 if (rw_wt == 0u) {
                     ConstBufVec4 wb = ConstBufVec4(r_va);
-                    for (uint k0 = tid64; k0 < D4; k0 += 192u) {
-                        vec4 w0 = wb.v[k0];
-                        vec4 w1 = wb.v[k0 + 64u];
-                        vec4 w2 = wb.v[k0 + 128u];
-                        vec4 x0 = xb.v[k0];
-                        vec4 x1 = xb.v[k0 + 64u];
-                        vec4 x2 = xb.v[k0 + 128u];
-                        acc += dot(w0, x0) + dot(w1, x1) + dot(w2, x2);
+                    for (uint k0 = tid128; k0 < D4; k0 += 128u) {
+                        acc += dot(wb.v[k0], xb.v[k0]);
                     }
                 } else if (rw_wt == 2u) {
-                    ConstBufUvec2 wb = ConstBufUvec2(r_va);
-                    for (uint k0 = tid64; k0 < D4; k0 += 192u) {
-                        uvec2 p0 = wb.v[k0];
-                        uvec2 p1 = wb.v[k0 + 64u];
-                        uvec2 p2 = wb.v[k0 + 128u];
-                        vec4 w0 = vec4(uintBitsToFloat((p0.x & 0xFFFFu) << 16u), uintBitsToFloat(p0.x & 0xFFFF0000u),
-                                       uintBitsToFloat((p0.y & 0xFFFFu) << 16u), uintBitsToFloat(p0.y & 0xFFFF0000u));
-                        vec4 w1 = vec4(uintBitsToFloat((p1.x & 0xFFFFu) << 16u), uintBitsToFloat(p1.x & 0xFFFF0000u),
-                                       uintBitsToFloat((p1.y & 0xFFFFu) << 16u), uintBitsToFloat(p1.y & 0xFFFF0000u));
-                        vec4 w2 = vec4(uintBitsToFloat((p2.x & 0xFFFFu) << 16u), uintBitsToFloat(p2.x & 0xFFFF0000u),
-                                       uintBitsToFloat((p2.y & 0xFFFFu) << 16u), uintBitsToFloat(p2.y & 0xFFFF0000u));
-                        acc += dot(w0, xb.v[k0]) + dot(w1, xb.v[k0 + 64u]) + dot(w2, xb.v[k0 + 128u]);
+                    ConstBufUvec4 wb = ConstBufUvec4(r_va);
+                    for (uint k8 = tid128; k8 < (D >> 3u); k8 += 128u) {
+                        uvec4 p = wb.v[k8];
+                        vec4 w0 = vec4(uintBitsToFloat((p.x & 0xFFFFu) << 16u), uintBitsToFloat(p.x & 0xFFFF0000u),
+                                       uintBitsToFloat((p.y & 0xFFFFu) << 16u), uintBitsToFloat(p.y & 0xFFFF0000u));
+                        vec4 w1 = vec4(uintBitsToFloat((p.z & 0xFFFFu) << 16u), uintBitsToFloat(p.z & 0xFFFF0000u),
+                                       uintBitsToFloat((p.w & 0xFFFFu) << 16u), uintBitsToFloat(p.w & 0xFFFF0000u));
+                        acc += dot(w0, xb.v[k8 * 2u]) + dot(w1, xb.v[k8 * 2u + 1u]);
                     }
                 } else {
-                    ConstBufUvec2 wb = ConstBufUvec2(r_va);
-                    for (uint k0 = tid64; k0 < D4; k0 += 192u) {
-                        uvec2 p0 = wb.v[k0];
-                        uvec2 p1 = wb.v[k0 + 64u];
-                        uvec2 p2 = wb.v[k0 + 128u];
-                        acc += dot(vec4(unpackHalf2x16(p0.x), unpackHalf2x16(p0.y)), xb.v[k0])
-                             + dot(vec4(unpackHalf2x16(p1.x), unpackHalf2x16(p1.y)), xb.v[k0 + 64u])
-                             + dot(vec4(unpackHalf2x16(p2.x), unpackHalf2x16(p2.y)), xb.v[k0 + 128u]);
+                    ConstBufUvec4 wb = ConstBufUvec4(r_va);
+                    for (uint k8 = tid128; k8 < (D >> 3u); k8 += 128u) {
+                        uvec4 p = wb.v[k8];
+                        acc += dot(vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y)), xb.v[k8 * 2u])
+                             + dot(vec4(unpackHalf2x16(p.z), unpackHalf2x16(p.w)), xb.v[k8 * 2u + 1u]);
                     }
                 }
             }
             float s = subgroupAdd(acc);
-            if (ln == 0u) sh_red[pair][sg2] = s;
+            if (ln == 0u) sh_red[quad][sg4] = s;
             barrier();
-            if (row < n_exp && sg2 == 0u && ln == 0u) {
-                lb.v[row] = sh_red[pair][0] + sh_red[pair][1];
+            if (row < n_exp && sg4 == 0u && ln == 0u) {
+                lb.v[row] = sh_red[quad][0] + sh_red[quad][1] + sh_red[quad][2] + sh_red[quad][3];
             }
             if (base + 160u < n_exp) barrier();
         }
@@ -1139,7 +1158,7 @@ void main() {
         const float    res_sc       = D_FLD(d0_va, post_conv_res_scale);
 
         float ss_cur = 0.0;
-        for (uint ch = tid; ch < D; ch += 256u) {
+        for (uint ch = tid; ch < D; ch += LOCAL_X) {
             const uint64_t past_va = hist_cell_va + uint64_t((4352u + ch) * 3u) * 4ul;
             CohBufF32 pb = CohBufF32(past_va);
             float p0 = pb.v[0], p1 = pb.v[1], p2 = pb.v[2];
@@ -1171,7 +1190,7 @@ void main() {
                 vec4 acc = vec4(0.0);
                 CohBufVec4 xb = CohBufVec4(x_va);
                 ConstBufVec4 qb = ConstBufVec4(q_va);
-                for (uint i4 = tid; i4 < D4; i4 += 256u) {
+                for (uint i4 = tid; i4 < D4; i4 += LOCAL_X) {
                     vec4 xv = xb.v[i4];
                     acc.x += dot(xv, xv);
                     acc.y += dot(xv, qb.v[i4]);
@@ -1191,7 +1210,7 @@ void main() {
             {
                 vec4 acc = vec4(ss_cur, 0.0, 0.0, 0.0);
                 ConstBufVec4 qb = ConstBufVec4(q_va);
-                for (uint i4 = tid; i4 < D4; i4 += 256u) {
+                for (uint i4 = tid; i4 < D4; i4 += LOCAL_X) {
                     uint b = i4 << 2u;
                     vec4 xv = vec4(sh_cur[b], sh_cur[b + 1u], sh_cur[b + 2u], sh_cur[b + 3u]);
                     acc.y += dot(xv, qb.v[i4]);
@@ -1223,7 +1242,7 @@ void main() {
             for (uint q = 0u; q < Q; ++q) {
                 CohBufVec4 db = CohBufVec4(D_FLD(d0_va, next_mix_out_va)[q]);
                 const float wb = sh_prob[q][B];
-                for (uint i4 = tid; i4 < D4; i4 += 256u) {
+                for (uint i4 = tid; i4 < D4; i4 += LOCAL_X) {
                     uint b = i4 << 2u;
                     vec4 yv = wb * vec4(sh_cur[b], sh_cur[b + 1u], sh_cur[b + 2u], sh_cur[b + 3u]);
                     for (uint s = 0u; s < B; ++s) {
@@ -1249,7 +1268,7 @@ void main() {
             float ss = 0.0, d0 = 0.0, d1 = 0.0, d2 = 0.0, d3 = 0.0;
             CohBufVec4   xb = CohBufVec4(x_va);
             ConstBufVec4 qb = ConstBufVec4(q_va);
-            for (uint i4 = tid; i4 < D4; i4 += 256u) {
+            for (uint i4 = tid; i4 < D4; i4 += LOCAL_X) {
                 vec4 xv = xb.v[i4];
                 ss += dot(xv, xv);
                 d0 += dot(xv, qb.v[0u * D4 + i4]);
@@ -1265,7 +1284,7 @@ void main() {
             }
             barrier();
             if (sg < 5u) {
-                float t = subgroupAdd((ln < 8u) ? sh_red[sg][ln] : 0.0);
+                float t = subgroupAdd((ln < N_SG) ? sh_red[sg][ln] : 0.0);
                 if (ln == 0u) sh_red[sg][0] = t;
             }
             barrier();
@@ -1294,7 +1313,7 @@ void main() {
         CohBufVec4 x1b = CohBufVec4(D_FLD(d1_va, msg_state_va)[1]);
         const uint64_t h_msg_va = D_FLD(d1_va, h_msg_va);
         vec4 ss_m = vec4(0.0);
-        for (uint i4 = tid; i4 < D4; i4 += 256u) {
+        for (uint i4 = tid; i4 < D4; i4 += LOCAL_X) {
             vec4 xv0 = x0b.v[i4];
             vec4 xv1 = x1b.v[i4];
             vec4 y0 = sh_prob[0][0] * xv0 + sh_prob[0][1] * xv1;
@@ -1316,7 +1335,7 @@ void main() {
         CohBufVec4 c0 = CohBufVec4(D_FLD(d1_va, ctrl_cat_va)[0] + uint64_t(D) * 4ul);
         CohBufVec4 c1 = CohBufVec4(D_FLD(d1_va, ctrl_cat_va)[1] + uint64_t(D) * 4ul);
         CohBufVec4 c2 = CohBufVec4(D_FLD(d1_va, ctrl_cat_va)[2] + uint64_t(D) * 4ul);
-        for (uint i4 = tid; i4 < D4; i4 += 256u) {
+        for (uint i4 = tid; i4 < D4; i4 += LOCAL_X) {
             c0.v[i4] = CohBufVec4(h_msg_va + uint64_t(0u * D) * 4ul).v[i4] * rms0;
             c1.v[i4] = CohBufVec4(h_msg_va + uint64_t(1u * D) * 4ul).v[i4] * rms1;
             c2.v[i4] = CohBufVec4(h_msg_va + uint64_t(2u * D) * 4ul).v[i4] * rms2;
@@ -1333,7 +1352,7 @@ void main() {
             vec4 acc = vec4(0.0);
             CohBufVec4 xb = CohBufVec4(x_va);
             ConstBufVec4 qb = ConstBufVec4(q_va);
-            for (uint i4 = tid; i4 < D4; i4 += 256u) {
+            for (uint i4 = tid; i4 < D4; i4 += LOCAL_X) {
                 vec4 xv = xb.v[i4];
                 acc.x += dot(xv, xv);
                 acc.y += dot(xv, qb.v[i4]);
@@ -1349,7 +1368,7 @@ void main() {
             vec4 acc = vec4(0.0);
             CohBufVec4 cb = CohBufVec4(D_FLD(d1_va, qkv_mix_cur_va));
             ConstBufVec4 qb = ConstBufVec4(q_va);
-            for (uint i4 = tid; i4 < D4; i4 += 256u) {
+            for (uint i4 = tid; i4 < D4; i4 += LOCAL_X) {
                 vec4 xv = cb.v[i4];
                 acc.x += dot(xv, xv);
                 acc.y += dot(xv, qb.v[i4]);
@@ -1375,7 +1394,7 @@ void main() {
         CohBufVec4 cur_b = CohBufVec4(D_FLD(d1_va, qkv_mix_cur_va));
         CohBufVec4 out_b = CohBufVec4(D_FLD(d1_va, qkv_in_va)[0]);
         float ss_y = 0.0;
-        for (uint i4 = tid; i4 < D4; i4 += 256u) {
+        for (uint i4 = tid; i4 < D4; i4 += LOCAL_X) {
             vec4 yv = wb * cur_b.v[i4];
             for (uint s = 0u; s < B; ++s) {
                 uint64_t x_va = (s < 8u) ? sh_bva[s] : ConstBufU64(bptrs_va).v[s];
@@ -1388,7 +1407,7 @@ void main() {
         CohBufVec4 c0 = CohBufVec4(D_FLD(d1_va, ctrl_cat_va)[0]);
         CohBufVec4 c1 = CohBufVec4(D_FLD(d1_va, ctrl_cat_va)[1]);
         CohBufVec4 c2 = CohBufVec4(D_FLD(d1_va, ctrl_cat_va)[2]);
-        for (uint i4 = tid; i4 < D4; i4 += 256u) {
+        for (uint i4 = tid; i4 < D4; i4 += LOCAL_X) {
             vec4 nv = out_b.v[i4] * rms;
             c0.v[i4] = nv;
             c1.v[i4] = nv;
@@ -1401,33 +1420,40 @@ void main() {
     }
     agx_sense_barrier(pc.barrier_va, pc.n_wg, local_sense);
 
-    // Phase 2: 1-Wave 40-Core-Striped 1-SG/Row 4x-Unrolled 3x ctrl_down (192 rows, K=4608, ZERO WG barriers!)
+    // Phase 2: 1-Wave 40-Core 3-SG/Row (512T -> 14.4 SGs/core active, 96% util!) 3x ctrl_down (192 rows, K=4608)
     {
-        const uint r = sg * 40u + wg; // 4-5 active SGs on ALL 40 cores!
+        const uint tri   = sg / 3u;        // 0..4 for sg < 15 (5 triplets/WG -> 200 rows/wave!)
+        const uint sg3   = sg - tri * 3u;  // 0..2
+        const uint tid96 = sg3 * 32u + ln; // 0..95 (1152 = 12 * 96 = 4 * 288 exact!)
+        const uint r     = (sg < 15u) ? (tri * 40u + wg) : 255u;
+        float acc = 0.0;
         if (r < 192u) {
             const uint c   = r >> 6u;
             const uint row = r & 63u;
             ConstBufVec4 wb = ConstBufVec4(D_FLD(d1_va, ctrl_down_w_va)[c] + uint64_t(row) * 4608ul * 4ul);
             CohBufVec4   xb = CohBufVec4(D_FLD(d1_va, ctrl_cat_va)[c]);
-            float acc = 0.0;
-            for (uint k0 = ln; k0 < 1152u; k0 += 128u) {
+            for (uint k0 = tid96; k0 < 1152u; k0 += 288u) {
                 vec4 w0 = wb.v[k0];
-                vec4 w1 = wb.v[k0 + 32u];
-                vec4 w2 = wb.v[k0 + 64u];
-                vec4 w3 = wb.v[k0 + 96u];
+                vec4 w1 = wb.v[k0 + 96u];
+                vec4 w2 = wb.v[k0 + 192u];
                 vec4 x0 = xb.v[k0];
-                vec4 x1 = xb.v[k0 + 32u];
-                vec4 x2 = xb.v[k0 + 64u];
-                vec4 x3 = xb.v[k0 + 96u];
-                acc += dot(w0, x0) + dot(w1, x1) + dot(w2, x2) + dot(w3, x3);
+                vec4 x1 = xb.v[k0 + 96u];
+                vec4 x2 = xb.v[k0 + 192u];
+                acc += dot(w0, x0) + dot(w1, x1) + dot(w2, x2);
             }
-            float tot = subgroupAdd(acc);
-            if (ln == 0u) CohBufF32(D_FLD(d1_va, ctrl_gate_va)[c]).v[row] = tot;
+        }
+        float s = subgroupAdd(acc);
+        if (sg < 15u && ln == 0u) sh_red[tri][sg3] = s;
+        barrier();
+        if (r < 192u && sg3 == 0u && ln == 0u) {
+            const uint c   = r >> 6u;
+            const uint row = r & 63u;
+            CohBufF32(D_FLD(d1_va, ctrl_gate_va)[c]).v[row] = sh_red[tri][0] + sh_red[tri][1] + sh_red[tri][2];
         }
     }
     agx_sense_barrier(pc.barrier_va, pc.n_wg, local_sense);
 
-    // Phase 3: Flat 216-Tile Single-Barrier 4x-Prefetched 3x ctrl_up_mix (K=64, N=2304 x 3, 1 WG barrier!)
+    // Phase 3: Flat 108-Tile (512T -> 64 rows/tile, 16 SGs/core!) 3x ctrl_up_mix (K=64, N=2304 x 3)
     {
         if (tid < 192u) {
             sh_cur[tid] = CohBufF32(D_FLD(d1_va, ctrl_gate_va)[tid >> 6u]).v[tid & 63u];
@@ -1440,10 +1466,10 @@ void main() {
         const uint     k1       = (l8 + 8u) * 4u;
         const uint64_t h_msg_va = D_FLD(d1_va, h_msg_va);
 
-        for (uint t = wg; t < 216u; t += 40u) {
-            const uint     c       = (t < 72u) ? 0u : ((t < 144u) ? 1u : 2u);
-            const uint     tile    = t - c * 72u;
-            const uint     row     = tile * 32u + sg * 4u + r_sg;
+        for (uint t = wg; t < 108u; t += 40u) {
+            const uint     c       = (t < 36u) ? 0u : ((t < 72u) ? 1u : 2u);
+            const uint     tile    = t - c * 36u;
+            const uint     row     = tile * 64u + sg * 4u + r_sg;
             const uint     g_off   = c * 64u;
             const vec4     x0      = vec4(sh_cur[g_off + k0], sh_cur[g_off + k0 + 1u],
                                           sh_cur[g_off + k0 + 2u], sh_cur[g_off + k0 + 3u]);

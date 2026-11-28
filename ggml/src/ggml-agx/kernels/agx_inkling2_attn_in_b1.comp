@@ -120,11 +120,23 @@ void main() {
         const uint d_slot    = lane16 >> 1u;
 
         float acc = 0.0;
-        for (uint c = 0u; c < 9u; ++c) {
-            const uint  chk = row_chk0 + c;
-            const uvec4 qv  = w_buf.blk[chk].qs[lane16];
-            const float d   = float(unpackFloat2x16(uint(w_buf.blk[chk].d[d_slot])).x);
-            const uint  c4  = c * 64u + lane16 * 4u;
+        uvec4 qv = w_buf.blk[row_chk0].qs[lane16];
+        float d  = float(unpackFloat2x16(uint(w_buf.blk[row_chk0].d[d_slot])).x);
+        for (uint c = 0u; c < 8u; ++c) {
+            const uint  chk_n = row_chk0 + c + 1u;
+            const uvec4 qv_n  = w_buf.blk[chk_n].qs[lane16];
+            const float d_n   = float(unpackFloat2x16(uint(w_buf.blk[chk_n].d[d_slot])).x);
+            const uint  c4    = c * 64u + lane16 * 4u;
+            float dp = dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.x)), x_buf4.v[c4 + 0u])
+                     + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.y)), x_buf4.v[c4 + 1u])
+                     + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.z)), x_buf4.v[c4 + 2u])
+                     + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.w)), x_buf4.v[c4 + 3u]);
+            acc = fma(dp, d, acc);
+            qv = qv_n;
+            d  = d_n;
+        }
+        {
+            const uint c4 = 8u * 64u + lane16 * 4u;
             float dp = dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.x)), x_buf4.v[c4 + 0u])
                      + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.y)), x_buf4.v[c4 + 1u])
                      + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.z)), x_buf4.v[c4 + 2u])
