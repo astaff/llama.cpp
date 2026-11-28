@@ -45,6 +45,7 @@
 #define AGX_MOE_VECMAT_DSPARK_M  8u  // Wave 5: 8-way sh_x BATCH_CAP=8 for M=5..8 DSpark (1x W load, 0 GEMM dispatches!)
 #define AGX_MOE_GEMM_MIN_M       5u  // M >= 9 prefill: M_bucket >= 5 -> 128N x 32M/64M reshaped-SLM 8x8 MMA GEMM
 #define AGX_MOE_GEMM_TILE_M      32u
+#define AGX_MOE_GEMM_TILE_M_MID  48u
 #define AGX_MOE_GEMM_TILE_M_BIG  64u
 #define AGX_MOE_VECMAT_WG_PAIRS  32u // 32 (gate,up) pairs/WG for gate_up vec-mat (Q8_0_8BLK uses 4 pairs/WG)
 #define AGX_MOE_VECMAT_WG_OUT    64u // 64 output rows/WG for down vec-mat (Q8_0_8BLK uses 8 rows/WG)

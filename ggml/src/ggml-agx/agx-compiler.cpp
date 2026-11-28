@@ -416,6 +416,14 @@ static uint64_t fnv1a_64(const void * data, size_t n, uint64_t seed = 0xcbf29ce4
     return h;
 }
 
+static bool agx_want_robust_access() {
+    static const bool robust = []() {
+        const char * v = std::getenv("GGML_AGX_ROBUST_ACCESS");
+        return v && v[0] && v[0] != '0';
+    }();
+    return robust;
+}
+
 static std::string compute_cache_key(const uint32_t * spv, size_t word_count,
                                      const agx_compile_opts & opts,
                                      const agx_drm_device_info & info) {
@@ -424,11 +432,12 @@ static std::string compute_cache_key(const uint32_t * spv, size_t word_count,
     const char * ep = opts.entry_point ? opts.entry_point : "main";
     h1 = fnv1a_64(ep, std::strlen(ep), h1);
     h2 = fnv1a_64(&opts.push_constant_bytes, sizeof(opts.push_constant_bytes), h2);
+    const uint32_t flags_bits = (opts.allow_preamble ? 1u : 0u) | (agx_want_robust_access() ? 2u : 0u);
     uint32_t meta[4] = {
         info.chip_id,
         info.gpu_hal_generation,
-        opts.allow_preamble ? 1u : 0u,
-        0x41475831u, // cache schema v1
+        flags_bits,
+        0x41475832u, // cache schema v2 (Wave 9 norobust / checked_offsets=false)
     };
     h1 = fnv1a_64(meta, sizeof(meta), h1);
     h2 = fnv1a_64(meta, sizeof(meta), h2);
@@ -994,13 +1003,24 @@ static bool init_borealis_vk(agx_borealis_vk_ctx & vk) {
             }
         }
     }
-    // Enable VK_KHR_cooperative_matrix on Honeykrisp/Borealis (requires HK_PERFTEST=...,coopmat)
+    // Enable VK_KHR_cooperative_matrix + norobust on Honeykrisp/Borealis
+    // (norobust + robustBufferAccess=VK_FALSE sets checked_offsets=false, unlocking
+    //  agx_nir_merge_global_words, hoist_readonly_loop_loads, and ulea_agx shift fusion!)
+    const bool want_robust = agx_want_robust_access();
     const char * cur_perf = std::getenv("HK_PERFTEST");
     if (!cur_perf || !cur_perf[0]) {
-        ::setenv("HK_PERFTEST", "weakbarrier,coopmat", 0);
-    } else if (std::strstr(cur_perf, "coopmat") == nullptr) {
-        std::string merged = std::string(cur_perf) + ",coopmat";
-        ::setenv("HK_PERFTEST", merged.c_str(), 1);
+        ::setenv("HK_PERFTEST", want_robust ? "weakbarrier,coopmat" : "weakbarrier,coopmat,norobust", 0);
+    } else {
+        std::string merged(cur_perf);
+        if (merged.find("coopmat") == std::string::npos) {
+            merged += ",coopmat";
+        }
+        if (!want_robust && merged.find("norobust") == std::string::npos) {
+            merged += ",norobust";
+        }
+        if (merged != cur_perf) {
+            ::setenv("HK_PERFTEST", merged.c_str(), 1);
+        }
     }
 
     // Disable USC preambles by default so Borealis uses uniform DMA + root pointer cleanly
@@ -1155,6 +1175,13 @@ static bool init_borealis_vk(agx_borealis_vk_ctx & vk) {
     f2.pNext = &v11;
 
     pGetFeats2(vk.phys_dev, &f2);
+    if (!want_robust) {
+        // Clear robustBufferAccess (raw[0]), robustImageAccess, & cooperativeMatrixRobustBufferAccess
+        // so Honeykrisp sets backend_key.checked_offsets=false (matching ggml-vulkan S24!).
+        f2.features.raw[0]                       = AGX_VK_FALSE;
+        v13.robustImageAccess                    = AGX_VK_FALSE;
+        cm_feat.cooperativeMatrixRobustBufferAccess = AGX_VK_FALSE;
+    }
     vk.has_coopmat = has_ext("VK_KHR_cooperative_matrix") && (cm_feat.cooperativeMatrix == AGX_VK_TRUE);
 
     float prio = 1.0f;
@@ -1241,7 +1268,7 @@ struct agxbin_header {
 };
 
 constexpr uint32_t AGXBIN_MAGIC   = 0x33584741u; // "AGX3"
-constexpr uint32_t AGXBIN_VERSION = 3u;
+constexpr uint32_t AGXBIN_VERSION = 4u;
 
 static bool save_agxbin(const std::string & path,
                         const agx_kernel & k,

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <unordered_map>
 
@@ -10,8 +11,24 @@
 //           and 8x8 `simdgroup_matrix` `agx_mma_gemm`)
 // ============================================================================
 
+struct agx_push_cvt_f16 {
+    uint64_t src_va;
+    uint64_t dst_va;
+    uint32_t n_vec4;
+    uint32_t _pad;
+};
+static_assert(sizeof(agx_push_cvt_f16) == 24, "agx_push_cvt_f16 size check");
+
 struct agx_gemm_state {
     std::unordered_map<std::string, const agx_kernel *> cache;
+
+    // Wave 9 B_IS_F16 activation pre-conversion scratch (SLC-pinned <= 24 MiB, hazard-tracked!)
+    agx_bo *               x_f16_bo         = nullptr;
+    size_t                 x_f16_cap_bytes  = 0;
+    const agx_kernel *     k_cvt_f16        = nullptr;
+    const agx_cdm_stream * last_stream      = nullptr;
+    uint64_t               last_stream_gen  = 0;
+    uint64_t               last_strong_bars = UINT64_MAX;
 };
 
 static agx_gemm_state * get_gemm_state(agx_backend_context * ctx) {
@@ -32,8 +49,71 @@ void agx_gemm_cleanup(agx_backend_context * ctx) {
     if (!ctx || !ctx->gemm_state) {
         return;
     }
-    delete static_cast<agx_gemm_state *>(ctx->gemm_state);
+    auto * st = static_cast<agx_gemm_state *>(ctx->gemm_state);
+    if (st->x_f16_bo && ctx->drm) {
+        agx_bo_free(ctx->drm, st->x_f16_bo);
+        st->x_f16_bo = nullptr;
+        st->x_f16_cap_bytes = 0;
+    }
+    delete st;
     ctx->gemm_state = nullptr;
+}
+
+static bool gemm_ensure_x_f16_bo(agx_backend_context * ctx, agx_gemm_state * st, size_t req_bytes) {
+    if (!ctx || !ctx->drm || !st || req_bytes == 0 || req_bytes > 24u * 1024u * 1024u) {
+        return false;
+    }
+    if (st->x_f16_bo && req_bytes <= st->x_f16_cap_bytes) {
+        return true;
+    }
+    if (st->x_f16_bo) {
+        agx_bo_free(ctx->drm, st->x_f16_bo);
+        st->x_f16_bo = nullptr;
+        st->x_f16_cap_bytes = 0;
+    }
+    const size_t alloc_B = agx_align_up(std::max<size_t>(req_bytes, 256u * 1024u), AGX_PAGE_SIZE);
+    st->x_f16_bo = agx_bo_alloc(ctx->drm, alloc_B, AGX_BO_SLC_PIN | AGX_BO_WRITEBACK, "gemm-x-f16-slc");
+    if (!st->x_f16_bo) {
+        return false;
+    }
+    st->x_f16_cap_bytes = alloc_B;
+    return true;
+}
+
+static const agx_kernel * gemm_get_cvt_f16_kernel(agx_backend_context * ctx, agx_gemm_state * st) {
+    if (!ctx || !ctx->compiler || !st) {
+        return nullptr;
+    }
+    if (!st->k_cvt_f16) {
+        static const char * k_src = R"GLSL(
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly  buffer BufV4R { vec4    v[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 8)  writeonly buffer BufH4W { f16vec4 v[]; };
+layout(push_constant, scalar) uniform PushCvt {
+    uint64_t src_va;
+    uint64_t dst_va;
+    uint     n_vec4;
+    uint     _pad;
+} pc;
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i < pc.n_vec4) {
+        BufH4W(pc.dst_va).v[i] = f16vec4(BufV4R(pc.src_va).v[i]);
+    }
+}
+)GLSL";
+        agx_compile_opts opts;
+        opts.push_constant_bytes = sizeof(agx_push_cvt_f16);
+        opts.is_hot_kernel       = true;
+        opts.strict_zero_spill   = true;
+        st->k_cvt_f16 = agx_compiler_compile_glsl(ctx->compiler, "agx_gemm_cvt_f32_to_f16_v4", k_src, opts);
+    }
+    return st->k_cvt_f16;
 }
 
 static const agx_kernel * get_or_compile_nvfp4_vecmat(agx_backend_context * ctx,
@@ -111,17 +191,42 @@ static const agx_kernel * get_or_compile_mma_gemm(agx_backend_context * ctx,
                                                   agx_weight_layout     layout,
                                                   uint32_t              tile_mode,
                                                   bool                  prec_f32,
-                                                  bool                  x_aligned4 = false) {
+                                                  bool                  x_aligned4   = false,
+                                                  bool                  x_is_f16     = false,
+                                                  bool                  k_aligned128 = false) {
     auto * st = get_gemm_state(ctx);
     if (!st || !ctx->compiler) {
         return nullptr;
     }
     const bool pf_64x64 = (tile_mode == 0u || tile_mode == 5u) && !prec_f32 &&
                           (layout == AGX_WEIGHT_NVFP4_REPACKED || layout == AGX_WEIGHT_Q8_0_REPACKED);
-    const bool eff_a4   = x_aligned4 && pf_64x64;
-    char name[96];
-    std::snprintf(name, sizeof(name), "agx_mma_gemm_w%u_t%u_p%u_a%u",
-                  static_cast<uint32_t>(layout), tile_mode, prec_f32 ? 1u : 0u, eff_a4 ? 1u : 0u);
+    const bool eff_a4   = x_aligned4   && pf_64x64;
+    const bool eff_f16  = x_is_f16     && pf_64x64;
+    const bool eff_k128 = k_aligned128 && pf_64x64 && (layout == AGX_WEIGHT_NVFP4_REPACKED);
+
+    static const uint32_t pf_k_pairs = []() -> uint32_t {
+        const char * v = std::getenv("GGML_AGX_GEMM_NO_K128");
+        return (v && v[0] && v[0] != '0') ? 1u : 2u;
+    }();
+    static const uint32_t pf_shx_pad = []() -> uint32_t {
+        const char * v = std::getenv("GGML_AGX_GEMM_SHX_PAD");
+        if (v && v[0]) {
+            const int parsed = std::atoi(v);
+            return parsed > 0 ? static_cast<uint32_t>(parsed) : 0u;
+        }
+        return 2u;
+    }();
+
+    char name[112];
+    if (pf_64x64) {
+        std::snprintf(name, sizeof(name), "agx_mma_gemm_w%u_t%u_p0_a%u_kp%u_pad%u_f%u_k%u",
+                      static_cast<uint32_t>(layout), tile_mode,
+                      eff_a4 ? 1u : 0u, pf_k_pairs, pf_shx_pad,
+                      eff_f16 ? 1u : 0u, eff_k128 ? 1u : 0u);
+    } else {
+        std::snprintf(name, sizeof(name), "agx_mma_gemm_w%u_t%u_p%u_a0",
+                      static_cast<uint32_t>(layout), tile_mode, prec_f32 ? 1u : 0u);
+    }
     auto it = st->cache.find(name);
     if (it != st->cache.end()) {
         return it->second;
@@ -132,6 +237,12 @@ static const agx_kernel * get_or_compile_mma_gemm(agx_backend_context * ctx,
     opts.defines.push_back(std::string("TILE_MODE=") + std::to_string(tile_mode));
     opts.defines.push_back(std::string("PREC_F32=") + (prec_f32 ? "1" : "0"));
     opts.defines.push_back(std::string("X_ALIGNED4=") + (eff_a4 ? "1" : "0"));
+    if (pf_64x64) {
+        opts.defines.push_back(std::string("K_PAIRS=") + std::to_string(pf_k_pairs));
+        opts.defines.push_back(std::string("SH_X_PAD=") + std::to_string(pf_shx_pad));
+        opts.defines.push_back(std::string("X_IS_F16=") + (eff_f16 ? "1" : "0"));
+        opts.defines.push_back(std::string("K_ALIGNED128=") + (eff_k128 ? "1" : "0"));
+    }
     opts.push_constant_bytes = sizeof(agx_gemm_push_args);
     opts.is_hot_kernel       = true;
     opts.strict_zero_spill   = true;
@@ -181,12 +292,16 @@ bool agx_gemm_precompile_all(agx_backend_context * ctx) {
         ok &= (get_or_compile_mma_gemm(ctx, wl, 0u, false, is_pf64) != nullptr);
         ok &= (get_or_compile_mma_gemm(ctx, wl, 1u, false) != nullptr);
     }
-    // Wave 5/7 M=5..8 native 8x8 MMA tiles (TILE_MODE=3/4) + Wave 7 large 128Nx64M prefill (TILE_MODE=5)
+    // Wave 5/7 M=5..8 native 8x8 MMA tiles (TILE_MODE=3/4) + Wave 9 K_PAIRS=2 128Nx32M (TILE_MODE=5)
     for (agx_weight_layout wl : {AGX_WEIGHT_NVFP4_REPACKED, AGX_WEIGHT_Q8_0_REPACKED}) {
+        const bool is_nv = (wl == AGX_WEIGHT_NVFP4_REPACKED);
         ok &= (get_or_compile_mma_gemm(ctx, wl, 3u, false) != nullptr);
         ok &= (get_or_compile_mma_gemm(ctx, wl, 4u, false) != nullptr);
-        ok &= (get_or_compile_mma_gemm(ctx, wl, 5u, false, true) != nullptr);
+        ok &= (get_or_compile_mma_gemm(ctx, wl, 0u, false, true, false, is_nv) != nullptr);
+        ok &= (get_or_compile_mma_gemm(ctx, wl, 5u, false, true, false, is_nv) != nullptr);
+        ok &= (get_or_compile_mma_gemm(ctx, wl, 5u, false, true, true,  is_nv) != nullptr);
     }
+    ok &= (gemm_get_cvt_f16_kernel(ctx, get_gemm_state(ctx)) != nullptr);
     // FP32 full-range 8x8 MMA variants (incl. narrow-N TILE_MODE=2 for 4608x64 ctrl_down!)
     ok &= (get_or_compile_mma_gemm(ctx, AGX_WEIGHT_F32,  0u, true) != nullptr);
     ok &= (get_or_compile_mma_gemm(ctx, AGX_WEIGHT_F32,  2u, true) != nullptr);
@@ -258,7 +373,11 @@ bool agx_gemm_dispatch(agx_backend_context * ctx,
     //     (zero 50% MMA padding waste, 0 sh_w staging, 4x more WGs on Wk/Wv/Wo!).
     //   - TILE_MODE=3 (64N x 8M): large-N (e.g. Q8_0 LM head 201024 -> 3,141 WGs)
     //   - TILE_MODE=4 (32N/16N x 8M): medium-N (e.g. NVFP4 2304x2304 -> 144 WGs, W_attn_in 8984 -> 281 WGs!)
-    const bool use_m8_mma = !desc.force_vecmat && !desc.prec_f32 &&
+    static const bool no_m8_mma = []() {
+        const char * v = std::getenv("GGML_AGX_GEMM_NO_M8_MMA");
+        return v && v[0] && v[0] != '0';
+    }();
+    const bool use_m8_mma = !no_m8_mma && !desc.force_vecmat && !desc.prec_f32 &&
                             (desc.layout == AGX_WEIGHT_NVFP4_REPACKED || desc.layout == AGX_WEIGHT_Q8_0_REPACKED) &&
                             (desc.M >= 5u && desc.M <= 8u) &&
                             (desc.N > 256u) &&
@@ -282,13 +401,12 @@ bool agx_gemm_dispatch(agx_backend_context * ctx,
     const bool use_mma = desc.force_mma || (!desc.force_vecmat && desc.M >= 9u);
 
     if (use_mma) {
-        // Select tile geometry to saturate all 40 M4 Max cores (Vulkan S24 PF_NT=2, PF_RT=4 architecture):
+        // Select tile geometry to saturate all 40 M4 Max cores (Vulkan S24 K_PAIRS=2 USE_SH_B=12!):
         //   - TILE_MODE=2 (16x16, 2x2): narrow N <= 128 (e.g. 4608x64 ctrl_down -> 128 WGs!)
         //   - TILE_MODE=1 (32x16, 4x1): medium M <= 48 (72-216 WGs on N=2304)
-        //   - TILE_MODE=5 (128x32, 256T = 8 SGs, 4.0 KB SRAM, <=64 GPR32 -> 24 ActSGs/core, 0.25 LDS/MMA):
-        //     large prefill repacked NVFP4/Q8_0 when >= 512 WGs (pp2048 & W_attn_in/LM; halves X reads!)
-        //   - TILE_MODE=0 (64x32, 128T = 4 SGs, 4.0 KB SRAM, <=64 GPR32 -> 24-28 ActSGs/core, 0.25 LDS/MMA):
-        //     exact S24 ci=5 geometry (576 WGs on 2304x2304 M=512!); 64x32 for PREC_F32 / non-repacked.
+        //   - TILE_MODE=5 (128x32, 256T = 8 SGs, K_PAIRS=2, 8.7 KB SRAM -> 16 ActSGs/core, 2x X reuse!):
+        //     prefill repacked NVFP4/Q8_0 when >= t5_min_wgs (default 256 -> covers 2304x2304 M=512 & pp2048!)
+        //   - TILE_MODE=0 (64x32, 128T = 4 SGs, K_PAIRS=2): smaller prefill tiles; 64x32 for PREC_F32/non-repacked.
         uint32_t tile_mode       = (desc.N <= 128u && batch_z <= 2u) ? 2u
                                  : (desc.M <= 48u)                   ? 1u
                                                                      : 0u;
@@ -296,9 +414,17 @@ bool agx_gemm_dispatch(agx_backend_context * ctx,
                                    (desc.layout == AGX_WEIGHT_NVFP4_REPACKED ||
                                     desc.layout == AGX_WEIGHT_Q8_0_REPACKED);
         static const bool no_t5 = (std::getenv("GGML_AGX_GEMM_NO_T5") != nullptr);
+        static const uint32_t t5_min_wgs = []() -> uint32_t {
+            const char * v = std::getenv("GGML_AGX_GEMM_T5_MIN_WGS");
+            if (v && v[0]) {
+                const int parsed = std::atoi(v);
+                return parsed > 0 ? static_cast<uint32_t>(parsed) : 0xFFFFFFFFu;
+            }
+            return 256u;
+        }();
         if (tile_mode == 0u && is_repack_f16 && !no_t5) {
             const uint32_t wgs_128 = ((desc.N + 127u) / 128u) * ((desc.M + 31u) / 32u) * batch_z;
-            if (wgs_128 >= 512u) {
+            if (wgs_128 >= t5_min_wgs) {
                 tile_mode = 5u;
             }
         }
@@ -309,14 +435,63 @@ bool agx_gemm_dispatch(agx_backend_context * ctx,
                                                      : 64u;
         const uint32_t wg_m      = (tile_mode == 0u || tile_mode == 5u) ? 32u : 16u;
 
-        const bool mma_a4 = pf_64x64 && ((desc.K & 3u) == 0u) && ((x_stride & 3u) == 0u);
-        const agx_kernel * k = get_or_compile_mma_gemm(ctx, desc.layout, tile_mode, desc.prec_f32, mma_a4);
+        // Wave 9 B_IS_F16: pre-convert X F32->F16 into SLC-pinned scratch when wide-N re-reads X
+        // many times (e.g. W_attn_in 8984, LM head 201024 -> 2x less global X traffic & 0 f32->f16 ALU!)
+        static const uint32_t bf16_min_n = []() -> uint32_t {
+            const char * v = std::getenv("GGML_AGX_GEMM_BF16_MIN_N");
+            if (v && v[0]) {
+                const int parsed = std::atoi(v);
+                return parsed > 0 ? static_cast<uint32_t>(parsed) : 0xFFFFFFFFu;
+            }
+            return 4096u;
+        }();
+        const bool mma_a4   = pf_64x64 && ((desc.K & 3u) == 0u) && ((x_stride & 3u) == 0u);
+        const bool mma_k128 = pf_64x64 && ((desc.K & 127u) == 0u);
+        bool       use_f16  = false;
+        auto *     st       = get_gemm_state(ctx);
+        if (mma_a4 && batch_z == 1u && desc.M >= 64u && desc.N >= bf16_min_n && x_stride == desc.K) {
+            const size_t x_elems    = static_cast<size_t>(desc.M) * desc.K;
+            const size_t x_f16_B    = x_elems * sizeof(uint16_t);
+            const agx_kernel * kcvt = gemm_get_cvt_f16_kernel(ctx, st);
+            if (kcvt && gemm_ensure_x_f16_bo(ctx, st, x_f16_B)) {
+                if (!agx_cdm_is_empty(stream)) {
+                    agx_cdm_stats cst{};
+                    agx_cdm_get_stats(stream, &cst);
+                    const uint64_t gen  = agx_cdm_stream_record_gen(stream);
+                    const uint64_t bars = cst.strong_usc_barriers + cst.memory_host_barriers;
+                    if (st->last_stream == stream && st->last_stream_gen == gen && bars == st->last_strong_bars) {
+                        agx_cdm_barrier_usc(stream);
+                    }
+                }
+                agx_push_cvt_f16 pcvt{};
+                pcvt.src_va = desc.x_va;
+                pcvt.dst_va = st->x_f16_bo->gpu_va;
+                pcvt.n_vec4 = static_cast<uint32_t>(x_elems >> 2u);
+                const uint32_t cvt_gx = (pcvt.n_vec4 + 127u) / 128u;
+                if (agx_cdm_dispatch(stream, kcvt, cvt_gx, 1u, 1u,
+                                     &pcvt, sizeof(pcvt), AGX_BARRIER_STRONG_USC)) {
+                    pc.x_va = st->x_f16_bo->gpu_va;
+                    use_f16 = true;
+                }
+            }
+        }
+
+        const agx_kernel * k = get_or_compile_mma_gemm(
+            ctx, desc.layout, tile_mode, desc.prec_f32, mma_a4, use_f16, mma_k128);
         if (!k) {
             return false;
         }
         const uint32_t gx = (desc.N + wg_n - 1u) / wg_n;
         const uint32_t gy = (desc.M + wg_m - 1u) / wg_m;
-        return agx_cdm_dispatch(stream, k, gx, gy, batch_z, &pc, sizeof(pc), desc.post_barrier);
+        const bool ok = agx_cdm_dispatch(stream, k, gx, gy, batch_z, &pc, sizeof(pc), desc.post_barrier);
+        if (ok && use_f16) {
+            agx_cdm_stats cst{};
+            agx_cdm_get_stats(stream, &cst);
+            st->last_stream      = stream;
+            st->last_stream_gen  = agx_cdm_stream_record_gen(stream);
+            st->last_strong_bars = cst.strong_usc_barriers + cst.memory_host_barriers;
+        }
+        return ok;
     }
 
     // Predicated B=1..8 vec-mat path (quantized specializations {1, 2, 4, 5, 8} to bound cache size)
