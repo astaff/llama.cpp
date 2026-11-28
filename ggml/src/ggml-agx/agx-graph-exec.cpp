@@ -54,7 +54,7 @@ layout(push_constant) uniform PushArgs {
     uint     nb00, nb01, nb02, nb03; // in floats (bytes / 4)
     uint     nb10, nb11, nb12, nb13; // in floats
     uint     nb0,  nb1,  nb2,  nb3;  // in floats
-    uint     op_kind; // low 8 bits: 0=ADD,1=SUB,2=MUL,3=DIV,4=(a+b)*p0+p1,5=a*sigmoid(b); bit 8 (0x100)=flat vec4 fastpath
+    uint     op_kind; // low 8 bits: 0=ADD,1=SUB,2=MUL,3=DIV,4=(a+b)*p0+p1,5=a*sigmoid(b); 0x100=flat vec4; 0x200=3D bcast vec4
     uint     total;
     float    p0;
     float    p1;
@@ -62,10 +62,29 @@ layout(push_constant) uniform PushArgs {
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
-    if ((pc.op_kind & 0x100u) != 0u) {
-        if (idx >= (pc.total >> 2u)) return;
-        vec4 a = ConstBufVec4(pc.a_va).v[idx];
-        vec4 b = ConstBufVec4(pc.b_va).v[idx];
+    if ((pc.op_kind & 0x300u) != 0u) {
+        vec4 a, b;
+        uint out_off4;
+        if ((pc.op_kind & 0x100u) != 0u) {
+            if (idx >= (pc.total >> 2u)) return;
+            a = ConstBufVec4(pc.a_va).v[idx];
+            b = ConstBufVec4(pc.b_va).v[idx];
+            out_off4 = idx;
+        } else {
+            const uint ne0_4 = pc.ne0 >> 2u;
+            const uint i1    = gl_WorkGroupID.y;
+            const uint i2    = gl_WorkGroupID.z;
+            if (idx >= ne0_4 || i1 >= pc.ne1 || i2 >= pc.ne2) return;
+            out_off4 = (i2 * pc.ne1 + i1) * ne0_4 + idx;
+            a = ConstBufVec4(pc.a_va).v[out_off4];
+            const uint bi1 = (pc.ne11 > 1u) ? i1 : 0u;
+            const uint bi2 = (pc.ne12 > 1u) ? i2 : 0u;
+            if (pc.ne10 > 1u) {
+                b = ConstBufVec4(pc.b_va).v[(bi2 * pc.ne11 + bi1) * ne0_4 + idx];
+            } else {
+                b = vec4(ConstBufF32(pc.b_va).v[bi2 * pc.ne11 + bi1]);
+            }
+        }
         uint op = pc.op_kind & 0xFFu;
         vec4 r;
         if      (op == 0u) r = a + b;
@@ -74,7 +93,7 @@ void main() {
         else if (op == 3u) r = a / b;
         else if (op == 4u) r = (a + b) * pc.p0 + pc.p1;
         else               r = a / (vec4(1.0) + exp(-b));
-        BufVec4(pc.d_va).v[idx] = r;
+        BufVec4(pc.d_va).v[out_off4] = r;
         return;
     }
     if (idx >= pc.total) return;
@@ -255,6 +274,10 @@ layout(buffer_reference, std430, buffer_reference_align = 2) buffer BufU16 { uin
 layout(buffer_reference, std430, buffer_reference_align = 2) readonly buffer ConstBufU16 { uint16_t v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 2) buffer BufF16 { float16_t v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 2) readonly buffer ConstBufF16 { float16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer BufUvec2 { uvec2 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer ConstBufUvec2 { uvec2 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer BufVec4 { vec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer ConstBufVec4 { vec4 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer BufUvec4 { uvec4 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer ConstBufUvec4 { uvec4 v[]; };
 
@@ -268,14 +291,22 @@ layout(push_constant) uniform PushArgs {
     uint     src_type; // 0=F32, 1=F16, 2=BF16, 3=I32
     uint     dst_type; // 0=F32, 1=F16, 2=BF16, 3=I32
     uint     total;
-    uint     d_is_linear; // 1 = write linearly by idx; 2 = flat 16B uvec4 copy (0 divides!)
+    uint     d_is_linear; // 1=linear; 2=flat uvec4 copy; 3=flat F16->F32 vec4; 4=flat F32->F16 vec4
 } pc;
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
-    if (pc.d_is_linear == 2u) {
+    if (pc.d_is_linear >= 2u) {
         if (idx >= (pc.total >> 2u)) return;
-        BufUvec4(pc.dst_va).v[idx] = ConstBufUvec4(pc.src_va).v[idx];
+        if (pc.d_is_linear == 2u) {
+            BufUvec4(pc.dst_va).v[idx] = ConstBufUvec4(pc.src_va).v[idx];
+        } else if (pc.d_is_linear == 3u) {
+            uvec2 p = ConstBufUvec2(pc.src_va).v[idx];
+            BufVec4(pc.dst_va).v[idx] = vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y));
+        } else {
+            vec4 v = ConstBufVec4(pc.src_va).v[idx];
+            BufUvec2(pc.dst_va).v[idx] = uvec2(packHalf2x16(v.xy), packHalf2x16(v.zw));
+        }
         return;
     }
     if (idx >= pc.total) return;
@@ -348,6 +379,7 @@ static const char * k_glsl_row_reduce = R"GLSL(
 #version 450
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_control_flow_attributes : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
@@ -356,6 +388,8 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufF32 { float v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer BufVec4 { vec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer ConstBufVec4 { vec4 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufI32 { int v[]; };
 
 layout(push_constant) uniform PushArgs {
@@ -410,6 +444,56 @@ void main() {
     if (pc.op_kind == 0u) {
         // RMS_NORM (with optional fused 1D weight multiply & optional dim-0 stride for CONT(VIEW_3D) absorption)
         const uint s0 = (pc.nb00 > 1u) ? pc.nb00 : 1u;
+        const bool v4_ok = (s0 == 1u) && ((D & 3u) == 0u) && (((a_base | d_base) & 3u) == 0u) &&
+                           (((pc.a_va | pc.d_va | pc.w_va) & 15ul) == 0ul);
+        if (v4_ok) {
+            const uint D4 = D >> 2u;
+            const uint a4 = a_base >> 2u;
+            const uint d4 = d_base >> 2u;
+            ConstBufVec4 ab = ConstBufVec4(pc.a_va);
+            BufVec4      db = BufVec4(pc.d_va);
+            if (D4 <= 1024u) {
+                vec4 rx[4];
+                float ss = 0.0;
+                [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+                    uint i = tid + k * 256u;
+                    vec4 x = (i < D4) ? ab.v[a4 + i] : vec4(0.0);
+                    rx[k] = x;
+                    ss += dot(x, x);
+                }
+                float sc = inversesqrt(wg_sum(ss, sg_id, lane_id) / float(D) + pc.eps);
+                if (pc.w_va != 0ul) {
+                    ConstBufVec4 wb = ConstBufVec4(pc.w_va);
+                    [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+                        uint i = tid + k * 256u;
+                        if (i < D4) db.v[d4 + i] = (rx[k] * sc) * wb.v[i];
+                    }
+                } else {
+                    [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+                        uint i = tid + k * 256u;
+                        if (i < D4) db.v[d4 + i] = rx[k] * sc;
+                    }
+                }
+                return;
+            }
+            float ss = 0.0;
+            for (uint i = tid; i < D4; i += 256u) {
+                vec4 x = ab.v[a4 + i];
+                ss += dot(x, x);
+            }
+            float sc = inversesqrt(wg_sum(ss, sg_id, lane_id) / float(D) + pc.eps);
+            if (pc.w_va != 0ul) {
+                ConstBufVec4 wb = ConstBufVec4(pc.w_va);
+                for (uint i = tid; i < D4; i += 256u) {
+                    db.v[d4 + i] = (ab.v[a4 + i] * sc) * wb.v[i];
+                }
+            } else {
+                for (uint i = tid; i < D4; i += 256u) {
+                    db.v[d4 + i] = ab.v[a4 + i] * sc;
+                }
+            }
+            return;
+        }
         float ss = 0.0;
         if (s0 == 1u) {
             for (uint i = tid; i < D; i += 256u) {
@@ -1384,6 +1468,7 @@ static const char * k_glsl_ctrl_mix = R"GLSL(
 #version 450
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_control_flow_attributes : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
@@ -1391,6 +1476,8 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufF32 { float v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer BufVec4 { vec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer ConstBufVec4 { vec4 v[]; };
 
 layout(push_constant) uniform PushArgs {
     uint64_t cur_va;
@@ -1409,7 +1496,6 @@ layout(push_constant) uniform PushArgs {
     uint     msg_nb1; // floats
 } pc;
 
-shared float s_y[4096];
 shared float s_red[8];
 
 float wg_sum(float val, uint sg, uint ln) {
@@ -1443,7 +1529,26 @@ void main() {
     const uint c_base = tok * c_nb1;
     const uint m_base = tok * m_nb1;
 
+    const bool v4_c = (c_nb0 == 1u) && ((c_base & 3u) == 0u) && ((pc.cur_va & 15ul) == 0ul);
+    const bool v4_m = (m_nb0 == 1u) && ((m_base & 3u) == 0u) && ((pc.msg_va & 15ul) == 0ul);
+    const bool v4_base = ((D & 3u) == 0u) && ((base & 3u) == 0u) &&
+                         (((pc.out_va | pc.forget_va | pc.gain_va | pc.norm_w_va) & 15ul) == 0ul);
+
     if (pc.mode == 1u) {
+        if (v4_base && v4_c) {
+            const uint D4 = D >> 2u;
+            const uint b4 = base >> 2u;
+            const uint c4 = c_base >> 2u;
+            ConstBufVec4 cb = ConstBufVec4(pc.cur_va);
+            ConstBufVec4 fb = ConstBufVec4(pc.forget_va);
+            BufVec4      ob = BufVec4(pc.out_va);
+            for (uint i = tid; i < D4; i += 256u) {
+                vec4 c = cb.v[c4 + i];
+                vec4 f = tanh(fb.v[b4 + i]);
+                ob.v[b4 + i] = c - f * c;
+            }
+            return;
+        }
         for (uint i = tid; i < D; i += 256u) {
             float c = ConstBufF32(pc.cur_va).v[c_base + i * c_nb0];
             float f = tanh(ConstBufF32(pc.forget_va).v[base + i]);
@@ -1453,6 +1558,25 @@ void main() {
     }
 
     if (pc.norm_w_va == 0ul) {
+        if (v4_base && v4_c && v4_m) {
+            const uint D4 = D >> 2u;
+            const uint b4 = base >> 2u;
+            const uint c4 = c_base >> 2u;
+            const uint m4 = m_base >> 2u;
+            ConstBufVec4 cb = ConstBufVec4(pc.cur_va);
+            ConstBufVec4 mb = ConstBufVec4(pc.msg_va);
+            ConstBufVec4 gb = ConstBufVec4(pc.gain_va);
+            ConstBufVec4 fb = ConstBufVec4(pc.forget_va);
+            BufVec4      ob = BufVec4(pc.out_va);
+            for (uint i = tid; i < D4; i += 256u) {
+                vec4 c = cb.v[c4 + i];
+                vec4 m = mb.v[m4 + i];
+                vec4 g = tanh(gb.v[b4 + i]);
+                vec4 y = (pc.mode == 2u) ? (c + g * m) : ((c - tanh(fb.v[b4 + i]) * c) + g * m);
+                ob.v[b4 + i] = y;
+            }
+            return;
+        }
         for (uint i = tid; i < D; i += 256u) {
             float c = ConstBufF32(pc.cur_va).v[c_base + i * c_nb0];
             float m = ConstBufF32(pc.msg_va).v[m_base + i * m_nb0];
@@ -1465,20 +1589,95 @@ void main() {
         return;
     }
 
+    if (v4_base && v4_c && v4_m) {
+        const uint D4 = D >> 2u;
+        const uint b4 = base >> 2u;
+        const uint c4 = c_base >> 2u;
+        const uint m4 = m_base >> 2u;
+        ConstBufVec4 cb  = ConstBufVec4(pc.cur_va);
+        ConstBufVec4 mb  = ConstBufVec4(pc.msg_va);
+        ConstBufVec4 gb  = ConstBufVec4(pc.gain_va);
+        ConstBufVec4 fb  = ConstBufVec4(pc.forget_va);
+        ConstBufVec4 nwb = ConstBufVec4(pc.norm_w_va);
+        BufVec4      ob  = BufVec4(pc.out_va);
+        if (D4 <= 1024u) {
+            vec4 ry[4];
+            float ss = 0.0;
+            [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+                uint i = tid + k * 256u;
+                vec4 y = vec4(0.0);
+                if (i < D4) {
+                    vec4 c = cb.v[c4 + i];
+                    vec4 m = mb.v[m4 + i];
+                    vec4 g = tanh(gb.v[b4 + i]);
+                    y = (pc.mode == 2u) ? (c + g * m) : ((c - tanh(fb.v[b4 + i]) * c) + g * m);
+                }
+                ry[k] = y;
+                ss += dot(y, y);
+            }
+            float sc = inversesqrt(wg_sum(ss, sg, ln) / float(D) + pc.eps_norm);
+            [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+                uint i = tid + k * 256u;
+                if (i < D4) ob.v[b4 + i] = (ry[k] * sc) * nwb.v[i];
+            }
+            return;
+        }
+        float ss = 0.0;
+        for (uint i = tid; i < D4; i += 256u) {
+            vec4 c = cb.v[c4 + i];
+            vec4 m = mb.v[m4 + i];
+            vec4 g = tanh(gb.v[b4 + i]);
+            vec4 y = (pc.mode == 2u) ? (c + g * m) : ((c - tanh(fb.v[b4 + i]) * c) + g * m);
+            ob.v[b4 + i] = y;
+            ss += dot(y, y);
+        }
+        float sc = inversesqrt(wg_sum(ss, sg, ln) / float(D) + pc.eps_norm);
+        for (uint i = tid; i < D4; i += 256u) {
+            ob.v[b4 + i] = (ob.v[b4 + i] * sc) * nwb.v[i];
+        }
+        return;
+    }
+
+    ConstBufF32 cbf  = ConstBufF32(pc.cur_va);
+    ConstBufF32 mbf  = ConstBufF32(pc.msg_va);
+    ConstBufF32 gbf  = ConstBufF32(pc.gain_va);
+    ConstBufF32 fbf  = ConstBufF32(pc.forget_va);
+    ConstBufF32 nwbf = ConstBufF32(pc.norm_w_va);
+    BufF32      obf  = BufF32(pc.out_va);
+    if (D <= 2560u) {
+        float ry[10];
+        float ss = 0.0;
+        [[unroll]] for (uint k = 0u; k < 10u; ++k) {
+            uint i = tid + k * 256u;
+            float y = 0.0;
+            if (i < D) {
+                float c = cbf.v[c_base + i * c_nb0];
+                float m = mbf.v[m_base + i * m_nb0];
+                float g = tanh(gbf.v[base + i]);
+                y = (pc.mode == 2u) ? (c + g * m) : ((c - tanh(fbf.v[base + i]) * c) + g * m);
+            }
+            ry[k] = y;
+            ss += y * y;
+        }
+        float sc = inversesqrt(wg_sum(ss, sg, ln) / float(D) + pc.eps_norm);
+        [[unroll]] for (uint k = 0u; k < 10u; ++k) {
+            uint i = tid + k * 256u;
+            if (i < D) obf.v[base + i] = (ry[k] * sc) * nwbf.v[i];
+        }
+        return;
+    }
     float ss = 0.0;
     for (uint i = tid; i < D; i += 256u) {
-        float c = ConstBufF32(pc.cur_va).v[c_base + i * c_nb0];
-        float m = ConstBufF32(pc.msg_va).v[m_base + i * m_nb0];
-        float g = tanh(ConstBufF32(pc.gain_va).v[base + i]);
-        float y = (pc.mode == 2u)
-            ? (c + g * m)
-            : ((c - tanh(ConstBufF32(pc.forget_va).v[base + i]) * c) + g * m);
-        s_y[i] = y;
+        float c = cbf.v[c_base + i * c_nb0];
+        float m = mbf.v[m_base + i * m_nb0];
+        float g = tanh(gbf.v[base + i]);
+        float y = (pc.mode == 2u) ? (c + g * m) : ((c - tanh(fbf.v[base + i]) * c) + g * m);
+        obf.v[base + i] = y;
         ss += y * y;
     }
     float sc = inversesqrt(wg_sum(ss, sg, ln) / float(D) + pc.eps_norm);
     for (uint i = tid; i < D; i += 256u) {
-        BufF32(pc.out_va).v[base + i] = (s_y[i] * sc) * ConstBufF32(pc.norm_w_va).v[i];
+        obf.v[base + i] = (obf.v[base + i] * sc) * nwbf.v[i];
     }
 }
 )GLSL";
@@ -1492,13 +1691,14 @@ struct ctrl_mix_push {
 };
 static_assert(sizeof(ctrl_mix_push) <= AGX_MAX_PUSH_BYTES, "ctrl_mix_push > 256B");
 
-// Fused CONCAT(cur, msg, dim=1) + per-row RMS_NORM(eps) for B < 16 control() fastpath.
-// Supports strided CONT(VIEW_3D) absorption on cur and msg.
+// Fused CONCAT(cur, msg, dim=1) + per-row RMS_NORM(eps) for control() MMA pipeline.
+// Supports strided CONT(VIEW_3D) absorption on cur and msg + vec4 contiguous fastpath.
 // Grid: (2, n_tokens, 1), Local: (256, 1, 1).
 static const char * k_glsl_ctrl_norm_cat = R"GLSL(
 #version 450
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_control_flow_attributes : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
@@ -1506,6 +1706,8 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufF32 { float v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer BufVec4 { vec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer ConstBufVec4 { vec4 v[]; };
 
 layout(push_constant) uniform PushArgs {
     uint64_t cur_va;
@@ -1554,27 +1756,69 @@ void main() {
     const uint s_base  = tok * s_nb1;
     const uint d_base  = (tok * 2u + row_id) * D;
 
+    if (s_nb0 == 1u && ((D & 3u) == 0u) && (((s_base | d_base) & 3u) == 0u) &&
+        (((src_va | pc.dst_va) & 15ul) == 0ul)) {
+        const uint D4 = D >> 2u;
+        const uint s4 = s_base >> 2u;
+        const uint d4 = d_base >> 2u;
+        ConstBufVec4 sb = ConstBufVec4(src_va);
+        BufVec4      db = BufVec4(pc.dst_va);
+        if (D4 <= 1024u) {
+            vec4 rx[4];
+            float ss = 0.0;
+            [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+                uint i = tid + k * 256u;
+                vec4 x = (i < D4) ? sb.v[s4 + i] : vec4(0.0);
+                rx[k] = x;
+                ss += dot(x, x);
+            }
+            float sc = inversesqrt(wg_sum(ss, sg, ln) / float(D) + pc.eps);
+            [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+                uint i = tid + k * 256u;
+                if (i < D4) db.v[d4 + i] = rx[k] * sc;
+            }
+            return;
+        }
+        float ss = 0.0;
+        for (uint i = tid; i < D4; i += 256u) {
+            vec4 x = sb.v[s4 + i];
+            ss += dot(x, x);
+        }
+        float sc = inversesqrt(wg_sum(ss, sg, ln) / float(D) + pc.eps);
+        for (uint i = tid; i < D4; i += 256u) {
+            db.v[d4 + i] = sb.v[s4 + i] * sc;
+        }
+        return;
+    }
+
+    ConstBufF32 sbf = ConstBufF32(src_va);
+    BufF32      dbf = BufF32(pc.dst_va);
+    if (D <= 2560u) {
+        // Single-pass register-cached path: halves DRAM traffic on strided 72 MiB messages!
+        float rx[10];
+        float ss = 0.0;
+        [[unroll]] for (uint k = 0u; k < 10u; ++k) {
+            uint i = tid + k * 256u;
+            float x = (i < D) ? sbf.v[s_base + i * s_nb0] : 0.0;
+            rx[k] = x;
+            ss += x * x;
+        }
+        float sc = inversesqrt(wg_sum(ss, sg, ln) / float(D) + pc.eps);
+        [[unroll]] for (uint k = 0u; k < 10u; ++k) {
+            uint i = tid + k * 256u;
+            if (i < D) dbf.v[d_base + i] = rx[k] * sc;
+        }
+        return;
+    }
+
     float ss = 0.0;
-    if (s_nb0 == 1u) {
-        for (uint i = tid; i < D; i += 256u) {
-            float x = ConstBufF32(src_va).v[s_base + i];
-            ss += x * x;
-        }
-    } else {
-        for (uint i = tid; i < D; i += 256u) {
-            float x = ConstBufF32(src_va).v[s_base + i * s_nb0];
-            ss += x * x;
-        }
+    for (uint i = tid; i < D; i += 256u) {
+        float x = sbf.v[s_base + i * s_nb0];
+        ss += x * x;
     }
     float sc = inversesqrt(wg_sum(ss, sg, ln) / float(D) + pc.eps);
-    if (s_nb0 == 1u) {
-        for (uint i = tid; i < D; i += 256u) {
-            BufF32(pc.dst_va).v[d_base + i] = ConstBufF32(src_va).v[s_base + i] * sc;
-        }
-    } else {
-        for (uint i = tid; i < D; i += 256u) {
-            BufF32(pc.dst_va).v[d_base + i] = ConstBufF32(src_va).v[s_base + i * s_nb0] * sc;
-        }
+    for (uint i = tid; i < D; i += 256u) {
+        dbf.v[d_base + i] = sbf.v[s_base + i * s_nb0] * sc;
     }
 }
 )GLSL";
@@ -2124,28 +2368,29 @@ void main() {
     const uint seq = gl_WorkGroupID.z;
     if (ch >= pc.n_ch || t >= pc.n_t || seq >= pc.n_s) return;
 
-    const uint tok    = seq * pc.n_t + t;
-    const uint n_conv = pc.n_conv;
-    const uint n_hist = n_conv - 1u;
-    const uint p_base = seq * pc.past_nb2 + ch * pc.past_nb1;
-    const uint w_base = ch * pc.w_nb1;
-    const uint head   = (pc.dyn_va != 0ul) ? (ch / pc.head_dim) : 0u;
-    const uint d_base = (tok * pc.n_heads + head) * n_conv;
+    const uint tok     = seq * pc.n_t + t;
+    const uint n_conv  = pc.n_conv;
+    const uint n_hist  = n_conv - 1u;
+    const uint p_base  = seq * pc.past_nb2 + ch * pc.past_nb1;
+    const uint w_base  = ch * pc.w_nb1;
+    const bool has_dyn = (pc.dyn_va != 0ul);
+    uint d_base = 0u;
+    if (has_dyn) {
+        const uint head = ((pc.head_dim & (pc.head_dim - 1u)) == 0u)
+            ? (ch >> findLSB(pc.head_dim))
+            : (ch / pc.head_dim);
+        d_base = (tok * pc.n_heads + head) * n_conv;
+    }
 
     float x_cur = ConstBufF32(pc.cur_va).v[tok * pc.n_ch + ch];
     float sum   = 0.0;
-    for (uint k = 0u; k < n_conv; ++k) {
-        uint lag = n_conv - 1u - k;
-        float x_k = (t >= lag)
-            ? ConstBufF32(pc.cur_va).v[(tok - lag) * pc.n_ch + ch]
-            : ConstBufF32(pc.past_va).v[p_base + (n_hist - (lag - t))];
-        sum += x_k * ConstBufF32(pc.w_va).v[w_base + k];
-    }
-    if (pc.dyn_va != 0ul) {
-        for (uint lag = 0u; lag < n_conv; ++lag) {
-            float x_lag = (t >= lag)
+    for (uint lag = 0u; lag < n_conv; ++lag) {
+        float x_lag = (lag == 0u) ? x_cur : (
+            (t >= lag)
                 ? ConstBufF32(pc.cur_va).v[(tok - lag) * pc.n_ch + ch]
-                : ConstBufF32(pc.past_va).v[p_base + (n_hist - (lag - t))];
+                : ConstBufF32(pc.past_va).v[p_base + (n_hist - (lag - t))]);
+        sum += x_lag * ConstBufF32(pc.w_va).v[w_base + (n_hist - lag)];
+        if (has_dyn) {
             sum += x_lag * ConstBufF32(pc.dyn_va).v[d_base + lag];
         }
     }
@@ -2299,13 +2544,19 @@ static const char * k_glsl_rel_bias_gather = R"GLSL(
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
 
-layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer BufF16 { float16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer BufUvec2W { uvec2 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufF32 { float v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufI32 { int v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer ConstBufIvec4 { ivec4 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 2) readonly buffer ConstBufU16 { uint16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) readonly buffer ConstBufF16 { float16_t v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer ConstBufUvec2 { uvec2 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer ConstBufVec4 { vec4 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 1) readonly buffer ConstBufI8 { int8_t v[]; };
@@ -2315,6 +2566,7 @@ layout(push_constant) uniform PushArgs {
     uint64_t bias_va;
     uint64_t sinks_va;
     uint64_t rel_pos_va;
+    uint64_t mask_va;    // optional [n_kv, n_t, mask_ne2, mask_ne3] F16/F32
     uint64_t dst_va;
     uint     n_rel;
     uint     n_extent;
@@ -2326,105 +2578,171 @@ layout(push_constant) uniform PushArgs {
     uint     bias_nb1;   // bytes
     uint     rpos_nb0;   // bytes
     uint     rpos_nb1;   // bytes
+    uint     mask_ne2;   // 1 or n_head
+    uint     mask_ne3;   // 1 or n_stream
+    uint     flags;      // bit0=mask_is_f16, bit1=dst_is_f16, bit2=vec4_f16_fastpath
+    uint     pad0;
 } pc;
 
 shared float s_r[64];
+shared vec4  s_r4[16];
+shared float s_sink;
+
+float eval_rel_dot(int dist) {
+    if (dist < 0 || uint(dist) >= pc.n_extent) return 0.0;
+    uint64_t row_va = pc.bias_va + uint64_t(dist) * uint64_t(pc.bias_nb1);
+    const bool vec4_ok = ((pc.n_rel & 3u) == 0u) && ((row_va & 7ul) == 0ul);
+    float acc = 0.0;
+    if (pc.bias_wtype == 0u) {
+        if (vec4_ok && ((row_va & 15ul) == 0ul)) {
+            const uint n4 = pc.n_rel >> 2u;
+            ConstBufVec4 rb = ConstBufVec4(row_va);
+            for (uint g = 0u; g < n4; ++g) {
+                acc += dot(rb.v[g], s_r4[g]);
+            }
+        } else {
+            for (uint k = 0u; k < pc.n_rel; ++k) {
+                acc += ConstBufF32(row_va).v[k] * s_r[k];
+            }
+        }
+    } else if (pc.bias_wtype == 1u) {
+        if (vec4_ok) {
+            const uint n4 = pc.n_rel >> 2u;
+            ConstBufUvec2 rb = ConstBufUvec2(row_va);
+            for (uint g = 0u; g < n4; ++g) {
+                uvec2 p = rb.v[g];
+                acc += dot(vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y)), s_r4[g]);
+            }
+        } else {
+            for (uint k = 0u; k < pc.n_rel; ++k) {
+                acc += unpackHalf2x16(uint(ConstBufU16(row_va).v[k])).x * s_r[k];
+            }
+        }
+    } else if (pc.bias_wtype == 2u) {
+        if (vec4_ok) {
+            const uint n4 = pc.n_rel >> 2u;
+            ConstBufUvec2 rb = ConstBufUvec2(row_va);
+            for (uint g = 0u; g < n4; ++g) {
+                uvec2 p = rb.v[g];
+                vec4 w = vec4(
+                    uintBitsToFloat((p.x & 0xFFFFu) << 16u),
+                    uintBitsToFloat(p.x & 0xFFFF0000u),
+                    uintBitsToFloat((p.y & 0xFFFFu) << 16u),
+                    uintBitsToFloat(p.y & 0xFFFF0000u));
+                acc += dot(w, s_r4[g]);
+            }
+        } else {
+            for (uint k = 0u; k < pc.n_rel; ++k) {
+                acc += uintBitsToFloat(uint(ConstBufU16(row_va).v[k]) << 16u) * s_r[k];
+            }
+        }
+    } else {
+        uint n_blks = pc.n_rel >> 5u;
+        for (uint b = 0u; b < n_blks; ++b) {
+            uint64_t bva = row_va + uint64_t(b) * 34ul;
+            float d = unpackHalf2x16(uint(ConstBufU16(bva).v[0])).x;
+            float p = 0.0;
+            uint bk = b << 5u;
+            for (uint j = 0u; j < 32u; ++j) {
+                p += float(ConstBufI8(bva + 2ul).v[j]) * s_r[bk + j];
+            }
+            acc += d * p;
+        }
+    }
+    return acc;
+}
 
 void main() {
-    const uint tid = gl_LocalInvocationID.x;
-    const uint kv  = gl_GlobalInvocationID.x;
-    const uint h   = gl_WorkGroupID.y;
-    const uint tok = gl_WorkGroupID.z;
+    const uint tid   = gl_LocalInvocationID.x;
+    const uint kv    = gl_GlobalInvocationID.x;
+    const uint h     = gl_WorkGroupID.y;
+    const uint tok   = gl_WorkGroupID.z;
     const uint n_tok = pc.n_t * pc.n_stream;
     if (h >= pc.n_head || tok >= n_tok) return;
 
+    const uint r_base = (tok * pc.n_head + h) * pc.n_rel;
     if (tid < pc.n_rel) {
-        s_r[tid] = ConstBufF32(pc.rcur_va).v[(tok * pc.n_head + h) * pc.n_rel + tid];
+        s_r[tid] = ConstBufF32(pc.rcur_va).v[r_base + tid];
+    }
+    if (tid < (pc.n_rel >> 2u)) {
+        const uint rb = r_base + (tid << 2u);
+        ConstBufF32 rcf = ConstBufF32(pc.rcur_va);
+        s_r4[tid] = vec4(rcf.v[rb], rcf.v[rb + 1u], rcf.v[rb + 2u], rcf.v[rb + 3u]);
+    }
+    if (tid == 0u) {
+        s_sink = ConstBufF32(pc.sinks_va).v[tok * pc.n_head + h];
     }
     barrier();
 
+    const uint m = (pc.n_stream == 1u) ? tok : (tok % pc.n_t);
+    const uint s = (pc.n_stream == 1u) ? 0u  : (tok / pc.n_t);
+
+    if ((pc.flags & 4u) != 0u) {
+        const uint n_kv4 = pc.n_kv >> 2u;
+        if (kv >= n_kv4) return;
+        const uint out4 = (((s * pc.n_head + h) * pc.n_t + m) * n_kv4) + kv;
+        const uint hm = (pc.mask_ne2 > 1u) ? h : 0u;
+        const uint sm = (pc.mask_ne3 > 1u) ? s : 0u;
+        const uint m4 = (((sm * pc.mask_ne2 + hm) * pc.n_t + m) * n_kv4) + kv;
+        vec4 mv;
+        if ((pc.flags & 1u) != 0u) {
+            uvec2 mp = ConstBufUvec2(pc.mask_va).v[m4];
+            mv = vec4(unpackHalf2x16(mp.x), unpackHalf2x16(mp.y));
+        } else {
+            mv = ConstBufVec4(pc.mask_va).v[m4];
+        }
+        if (mv.x < -1.0e30 && mv.y < -1.0e30 && mv.z < -1.0e30 && mv.w < -1.0e30) {
+            BufUvec2W(pc.dst_va).v[out4] = uvec2(0xFC00FC00u, 0xFC00FC00u);
+            return;
+        }
+        ivec4 d4 = ConstBufIvec4(pc.rel_pos_va + uint64_t(tok) * pc.rpos_nb1).v[kv];
+        vec4 ov = mv;
+        for (uint j = 0u; j < 4u; ++j) {
+            float m_j = mv[j];
+            if (m_j >= -1.0e30) {
+                ov[j] = (eval_rel_dot(d4[j]) - s_sink) + m_j;
+            }
+        }
+        BufUvec2W(pc.dst_va).v[out4] = uvec2(packHalf2x16(ov.xy), packHalf2x16(ov.zw));
+        return;
+    }
+
     if (kv >= pc.n_kv) return;
 
-    int dist = ConstBufI32(pc.rel_pos_va + uint64_t(tok) * pc.rpos_nb1 + uint64_t(kv) * pc.rpos_nb0).v[0];
-    float sink = ConstBufF32(pc.sinks_va).v[tok * pc.n_head + h];
-    float acc  = 0.0;
+    const uint out_idx = ((s * pc.n_head + h) * pc.n_t + m) * pc.n_kv + kv;
+    const bool dst_f16 = (pc.flags & 2u) != 0u;
 
-    if (dist >= 0 && uint(dist) < pc.n_extent) {
-        uint64_t row_va = pc.bias_va + uint64_t(dist) * uint64_t(pc.bias_nb1);
-        const bool vec4_ok = ((pc.n_rel & 3u) == 0u) && ((row_va & 7ul) == 0ul);
-        if (pc.bias_wtype == 0u) {
-            if (vec4_ok && ((row_va & 15ul) == 0ul)) {
-                const uint n4 = pc.n_rel >> 2u;
-                ConstBufVec4 rb = ConstBufVec4(row_va);
-                for (uint g = 0u; g < n4; ++g) {
-                    uint k = g << 2u;
-                    acc += dot(rb.v[g], vec4(s_r[k], s_r[k + 1u], s_r[k + 2u], s_r[k + 3u]));
-                }
-            } else {
-                for (uint k = 0u; k < pc.n_rel; ++k) {
-                    acc += ConstBufF32(row_va).v[k] * s_r[k];
-                }
-            }
-        } else if (pc.bias_wtype == 1u) {
-            if (vec4_ok) {
-                const uint n4 = pc.n_rel >> 2u;
-                ConstBufUvec2 rb = ConstBufUvec2(row_va);
-                for (uint g = 0u; g < n4; ++g) {
-                    uvec2 p = rb.v[g];
-                    uint k = g << 2u;
-                    acc += dot(vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y)),
-                               vec4(s_r[k], s_r[k + 1u], s_r[k + 2u], s_r[k + 3u]));
-                }
-            } else {
-                for (uint k = 0u; k < pc.n_rel; ++k) {
-                    acc += unpackHalf2x16(uint(ConstBufU16(row_va).v[k])).x * s_r[k];
-                }
-            }
-        } else if (pc.bias_wtype == 2u) {
-            if (vec4_ok) {
-                const uint n4 = pc.n_rel >> 2u;
-                ConstBufUvec2 rb = ConstBufUvec2(row_va);
-                for (uint g = 0u; g < n4; ++g) {
-                    uvec2 p = rb.v[g];
-                    uint k = g << 2u;
-                    vec4 w = vec4(
-                        uintBitsToFloat((p.x & 0xFFFFu) << 16u),
-                        uintBitsToFloat(p.x & 0xFFFF0000u),
-                        uintBitsToFloat((p.y & 0xFFFFu) << 16u),
-                        uintBitsToFloat(p.y & 0xFFFF0000u));
-                    acc += dot(w, vec4(s_r[k], s_r[k + 1u], s_r[k + 2u], s_r[k + 3u]));
-                }
-            } else {
-                for (uint k = 0u; k < pc.n_rel; ++k) {
-                    acc += uintBitsToFloat(uint(ConstBufU16(row_va).v[k]) << 16u) * s_r[k];
-                }
-            }
-        } else {
-            // Q8_0_RAW: 34B per 32 elements
-            uint n_blks = pc.n_rel >> 5u;
-            for (uint b = 0u; b < n_blks; ++b) {
-                uint64_t bva = row_va + uint64_t(b) * 34ul;
-                float d = unpackHalf2x16(uint(ConstBufU16(bva).v[0])).x;
-                float p = 0.0;
-                uint bk = b << 5u;
-                for (uint j = 0u; j < 32u; ++j) {
-                    p += float(ConstBufI8(bva + 2ul).v[j]) * s_r[bk + j];
-                }
-                acc += d * p;
-            }
+    float mask_v = 0.0;
+    if (pc.mask_va != 0ul) {
+        const uint hm = (pc.mask_ne2 > 1u) ? h : 0u;
+        const uint sm = (pc.mask_ne3 > 1u) ? s : 0u;
+        const uint m_idx = ((sm * pc.mask_ne2 + hm) * pc.n_t + m) * pc.n_kv + kv;
+        mask_v = ((pc.flags & 1u) != 0u)
+            ? float(ConstBufF16(pc.mask_va).v[m_idx])
+            : ConstBufF32(pc.mask_va).v[m_idx];
+        // Exact -inf early exit: finite + (-inf) == -inf (skips 50%-62.5% of causal/SWA matrix!)
+        if (mask_v < -1.0e30) {
+            if (dst_f16) BufF16(pc.dst_va).v[out_idx] = float16_t(mask_v);
+            else         BufF32(pc.dst_va).v[out_idx] = mask_v;
+            return;
         }
     }
 
-    const uint m = tok % pc.n_t;
-    const uint s = tok / pc.n_t;
-    const uint out_idx = ((s * pc.n_head + h) * pc.n_t + m) * pc.n_kv + kv;
-    BufF32(pc.dst_va).v[out_idx] = acc - sink;
+    int dist = (pc.rpos_nb0 == 4u)
+        ? ConstBufI32(pc.rel_pos_va + uint64_t(tok) * pc.rpos_nb1).v[kv]
+        : ConstBufI32(pc.rel_pos_va + uint64_t(tok) * pc.rpos_nb1 + uint64_t(kv) * pc.rpos_nb0).v[0];
+    float acc = eval_rel_dot(dist);
+
+    float out_v = (acc - s_sink) + mask_v;
+    if (dst_f16) BufF16(pc.dst_va).v[out_idx] = float16_t(out_v);
+    else         BufF32(pc.dst_va).v[out_idx] = out_v;
 }
 )GLSL";
 
 struct rel_bias_gather_push {
-    uint64_t rcur_va, bias_va, sinks_va, rel_pos_va, dst_va;
+    uint64_t rcur_va, bias_va, sinks_va, rel_pos_va, mask_va, dst_va;
     uint32_t n_rel, n_extent, n_kv, n_head, n_t, n_stream, bias_wtype, bias_nb1, rpos_nb0, rpos_nb1;
+    uint32_t mask_ne2, mask_ne3, flags, pad0;
 };
 static_assert(sizeof(rel_bias_gather_push) <= AGX_MAX_PUSH_BYTES, "rel_bias_gather_push > 256B");
 
@@ -2584,6 +2902,7 @@ enum agx_exec_kind : uint8_t {
     ITEM_FULL_SHORTCONV,
     ITEM_ROUTER_TOPK,
     ITEM_REL_BIAS,
+    ITEM_REL_SAVE_TMP,
     ITEM_DSPARK_MARKOV_W4,
     ITEM_FUSED_MOE,
 };
@@ -2602,25 +2921,30 @@ struct agx_dspark_w4_item_args {
 };
 
 struct agx_exec_item {
-    agx_exec_kind        kind              = ITEM_GENERIC_NODE;
-    struct ggml_tensor * node              = nullptr;
+    agx_exec_kind        kind               = ITEM_GENERIC_NODE;
+    struct ggml_tensor * node               = nullptr;
     uint32_t             gx = 1, gy = 1, gz = 1;
-    uint32_t             nodes_covered     = 1;
-    agx_va_range         reads[8]          = {};
-    uint8_t              n_reads           = 0;
-    agx_va_range         writes[4]         = {};
-    uint8_t              n_writes          = 0;
-    bool                 uses_moe_scratch  = false;
-    bool                 uses_attn_scratch = false;
-    alignas(8) uint8_t   push[160]         = {};
-    uint32_t             push_bytes        = 0;
-    agx_ctrl_gate_desc   ctrl_desc         = {};
+    uint32_t             nodes_covered      = 1;
+    agx_va_range         reads[8]           = {};
+    uint8_t              n_reads            = 0;
+    agx_va_range         writes[4]          = {};
+    uint8_t              n_writes           = 0;
+    bool                 uses_moe_scratch   = false;
+    bool                 uses_attn_scratch  = false;
+    bool                 uses_alias_scratch = false;
+    alignas(8) uint8_t   push[160]          = {};
+    uint32_t             push_bytes         = 0;
+    agx_ctrl_gate_desc   ctrl_desc          = {};
     uint64_t             va0 = 0, va1 = 0;
     uint32_t             u0 = 0, u1 = 0, u2 = 0;
     float                f0 = 0.0f, f1 = 0.0f;
-    agx_dspark_w4_item_args dspark_w4 = {};
-    agx_moe_stage_args      moe_args  = {};
-    bool                    moe_alias_tmp = false;
+    agx_dspark_w4_item_args dspark_w4       = {};
+    agx_moe_stage_args      moe_args        = {};
+    size_t                  alias_tmp_need_B = 0;
+    uint32_t                alias_tmp_off_B  = 0; // byte offset in alias_tmp_bo (e.g. sinks slot)
+    uint32_t                alias_floats0    = 0; // element count for alias copy 0 (or dst copy)
+    uint32_t                alias_floats1    = 0; // element count for alias copy 1 (sinks)
+    uint8_t                 alias_flags      = 0; // item-specific alias trampoline bitmask
 
     void add_read(agx_va_range r) {
         if (r.beg < r.end && n_reads < 8u) reads[n_reads++] = r;
@@ -2665,11 +2989,11 @@ struct agx_graph_exec_state {
     std::vector<int>            exec_nodes;
     std::vector<agx_exec_item>  items;
     std::vector<agx_exec_item>  ordered_items;
-    agx_inkling2_engine *       inkling2    = nullptr;
-    agx_bo *                    moe_tmp_bo  = nullptr;
-    size_t                      moe_tmp_cap_B = 0;
-    agx_graph_exec_stats        stats       = {};
-    bool                        initialized = false;
+    agx_inkling2_engine *       inkling2       = nullptr;
+    agx_bo *                    alias_tmp_bo   = nullptr;
+    size_t                      alias_tmp_cap_B = 0;
+    agx_graph_exec_stats        stats          = {};
+    bool                        initialized    = false;
 };
 
 static agx_graph_exec_state * get_exec_state(agx_backend_context * ctx) {
@@ -2984,10 +3308,10 @@ void agx_graph_exec_cleanup(agx_backend_context * ctx) {
             agx_inkling2_engine_destroy(st->inkling2);
             st->inkling2 = nullptr;
         }
-        if (st->moe_tmp_bo) {
-            agx_bo_free(ctx->drm, st->moe_tmp_bo);
-            st->moe_tmp_bo = nullptr;
-            st->moe_tmp_cap_B = 0;
+        if (st->alias_tmp_bo) {
+            agx_bo_free(ctx->drm, st->alias_tmp_bo);
+            st->alias_tmp_bo = nullptr;
+            st->alias_tmp_cap_B = 0;
         }
         delete st;
         ctx->graph_exec_state = nullptr;
@@ -3093,10 +3417,12 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                                 std::getenv("GGML_AGX_FORCE_BARRIER")[0] == '1');
     const bool no_fusion     = (std::getenv("GGML_AGX_NO_FUSION") != nullptr &&
                                 std::getenv("GGML_AGX_NO_FUSION")[0] == '1');
-    const bool no_wave_sched = (std::getenv("GGML_AGX_NO_WAVE_SCHED") != nullptr &&
-                                std::getenv("GGML_AGX_NO_WAVE_SCHED")[0] == '1');
-    const bool print_stats   = (std::getenv("GGML_AGX_STATS") != nullptr &&
-                                std::getenv("GGML_AGX_STATS")[0] == '1');
+    const bool no_wave_sched  = (std::getenv("GGML_AGX_NO_WAVE_SCHED") != nullptr &&
+                                 std::getenv("GGML_AGX_NO_WAVE_SCHED")[0] == '1');
+    const bool ctrl_use_sram  = (std::getenv("GGML_AGX_CTRL_SRAM") != nullptr &&
+                                 std::getenv("GGML_AGX_CTRL_SRAM")[0] == '1');
+    const bool print_stats    = (std::getenv("GGML_AGX_STATS") != nullptr &&
+                                 std::getenv("GGML_AGX_STATS")[0] == '1');
     uint32_t fusion_mask     = no_fusion ? 0u : 0xFFFFFFFFu;
     if (!no_fusion) {
         if (const char * fm = std::getenv("GGML_AGX_FUSION_MASK")) {
@@ -3126,6 +3452,7 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
         if (!n) continue;
         bool view_counted = false;
         for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (n->op == GGML_OP_CPY && s == 1 && n->src[s] == n) continue; // ggml_cast self-ref
             if (n->src[s]) {
                 st->use_map.inc(n->src[s]);
                 st->first_use.set_if_empty(n->src[s], n);
@@ -3280,11 +3607,17 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
     // Exact VA non-interference check for placing fused op at e_min or e_max.
     // `all_ins_prod[r]` is the exec index that produces `all_ins[r]` (-1 if external/input/weight),
     // so placing at e_max allows `j == all_ins_prod[r]` (its legitimate producer in (e_min, e_max))
-    // while still rejecting any clobbering write at j > all_ins_prod[r]!
+    // while still rejecting any clobbering write at j > all_ins_prod[r].
+    // `outs_exec[w]` is the original exec index that produces `outs[w]`:
+    //   - Placing at e_min moves write earlier (outs_exec[w] -> e_min): check j in (e_min, outs_exec[w]).
+    //   - Placing at e_max moves write later (outs_exec[w] -> e_max): check j in (outs_exec[w], e_max).
+    //     When outs_exec[w] == e_max (every single-output fusion!), (e_max, e_max) is empty so dead
+    //     intermediates before e_max whose VA was reused by outs[w] never falsely block fusion!
     auto find_safe_anchor = [&](const int32_t * set_arr, int set_n,
                                 const agx_va_range * all_ins, const int32_t * all_ins_prod, int n_all_ins,
                                 const agx_va_range * extra_ins_for_first, int n_extra_first,
-                                const agx_va_range * outs, int n_outs) -> int32_t {
+                                const agx_va_range * outs, const int32_t * outs_exec, int n_outs,
+                                bool require_last = false) -> int32_t {
         if (set_n <= 0) return -1;
         size_t e_min = (size_t) set_arr[0];
         size_t e_max = (size_t) set_arr[0];
@@ -3297,20 +3630,23 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
         if (e_min == e_max) return (int32_t) e_min;
 
         // Try placing at e_min first (optimal for K/V SET_ROWS since src is guaranteed live at e_min!)
-        bool ok_first = true;
-        for (size_t j = e_min + 1u; j <= e_max && ok_first; ++j) {
-            if (in_idx_set(j, set_arr, set_n)) continue;
-            for (int r = 0; r < n_extra_first; ++r) {
-                if (va_range_overlap(raw_vas[j].w, extra_ins_for_first[r])) { ok_first = false; break; }
-            }
-            for (int w = 0; ok_first && w < n_outs; ++w) {
-                if (va_range_overlap(raw_vas[j].w, outs[w])) { ok_first = false; break; }
-                for (uint8_t jr = 0; jr < raw_vas[j].nr; ++jr) {
-                    if (va_range_overlap(raw_vas[j].r[jr], outs[w])) { ok_first = false; break; }
+        if (!require_last) {
+            bool ok_first = true;
+            for (size_t j = e_min + 1u; j <= e_max && ok_first; ++j) {
+                if (in_idx_set(j, set_arr, set_n)) continue;
+                for (int r = 0; r < n_extra_first; ++r) {
+                    if (va_range_overlap(raw_vas[j].w, extra_ins_for_first[r])) { ok_first = false; break; }
+                }
+                for (int w = 0; ok_first && w < n_outs; ++w) {
+                    if (outs_exec && outs_exec[w] >= 0 && (int32_t) j >= outs_exec[w]) continue;
+                    if (va_range_overlap(raw_vas[j].w, outs[w])) { ok_first = false; break; }
+                    for (uint8_t jr = 0; jr < raw_vas[j].nr; ++jr) {
+                        if (va_range_overlap(raw_vas[j].r[jr], outs[w])) { ok_first = false; break; }
+                    }
                 }
             }
+            if (ok_first) return (int32_t) e_min;
         }
-        if (ok_first) return (int32_t) e_min;
 
         // Fall back to placing at e_max (e.g. when an extra input like sinks/dyn is computed in (e_min, e_max))
         bool ok_last = true;
@@ -3324,6 +3660,7 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                 if (va_range_overlap(raw_vas[j].w, all_ins[r])) { ok_last = false; break; }
             }
             for (int w = 0; ok_last && w < n_outs; ++w) {
+                if (outs_exec && outs_exec[w] >= 0 && (int32_t) j <= outs_exec[w]) continue;
                 if (va_range_overlap(raw_vas[j].w, outs[w])) { ok_last = false; break; }
                 for (uint8_t jr = 0; jr < raw_vas[j].nr; ++jr) {
                     if (va_range_overlap(raw_vas[j].r[jr], outs[w])) { ok_last = false; break; }
@@ -3341,12 +3678,15 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
     };
 
     // Check if an already-emitted single-node generic op at e_prev < e_cur can be backward-absorbed
-    auto can_absorb_prev = [&](int32_t e_prev, size_t e_cur, const agx_va_range * new_ins, int n_new_ins) -> bool {
+    // (optionally ignoring writes from other to-be-absorbed nodes skip0..skip2).
+    auto can_absorb_prev = [&](int32_t e_prev, size_t e_cur, const agx_va_range * new_ins, int n_new_ins,
+                               int32_t skip0 = -1, int32_t skip1 = -1, int32_t skip2 = -1) -> bool {
         if (e_prev < 0 || (size_t) e_prev >= e_cur) return false;
         if (consumed[(size_t) e_prev]) return false;
         const auto & sl = anchors[(size_t) e_prev];
         if (sl.cnt != 1u || st->items[sl.beg].kind != ITEM_GENERIC_NODE) return false;
         for (size_t j = (size_t) e_prev + 1u; j < e_cur; ++j) {
+            if ((int32_t) j == skip0 || (int32_t) j == skip1 || (int32_t) j == skip2) continue;
             for (int r = 0; r < n_new_ins; ++r) {
                 if (va_range_overlap(raw_vas[j].w, new_ins[r])) return false;
             }
@@ -3386,6 +3726,7 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
     uint64_t g_l2_clip = 0, g_situ = 0, g_softcap = 0, g_ctrl = 0, g_rms_mul = 0, g_add_sc = 0, g_sig_mul = 0;
     uint64_t g_mix = 0, g_moe_wsum = 0, g_ssm_res = 0, g_moe_norm = 0;
     uint64_t g_prep_store = 0, g_full_sconv = 0, g_router = 0, g_rel_bias = 0, g_cont_abs = 0, g_fused_moe = 0;
+    std::vector<uint8_t> alias_scratch_locked(n_exec, 0u);
 
     // ------------------------------------------------------------------------
     // Wave 4 Fusion 12: DSpark Markov Head Tail Fusion (~320 ops -> 21 high-BW dispatches!)
@@ -3710,8 +4051,9 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                         if (tau_t) extra_ins[n_extra++] = tensor_va_range(tau_t);
                         if (ids_t) extra_ins[n_extra++] = tensor_va_range(ids_t);
 
-                        agx_va_range outs[1] = { tensor_va_range(final_dst) };
-                        const int32_t anc = find_safe_anchor(fset, fset_n, all_ins, all_prods, n_all, extra_ins, n_extra, outs, 1);
+                        agx_va_range outs[1]    = { tensor_va_range(final_dst) };
+                        int32_t      outs_ex[1] = { st->exec_idx_map.get(final_dst) };
+                        const int32_t anc = find_safe_anchor(fset, fset_n, all_ins, all_prods, n_all, extra_ins, n_extra, outs, outs_ex, 1);
                         if (anc >= 0) {
                             prep_norm_fwht_store_push pc{};
                             pc.src_va     = agx_tensor_gpu_va(raw_src);
@@ -3965,50 +4307,16 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                             }
                         }
 
-                        if (n_tokens >= 16 &&
-                            va_same_or_disjoint(final_dst, cur) && va_same_or_disjoint(final_dst, msg) &&
-                            is_ctrl_wtype_ok(w_down) && is_ctrl_wtype_ok(w_forget) && is_ctrl_wtype_ok(w_gain)) {
-                            int32_t fset[13];
-                            for (size_t k = 0; k <= advance; ++k) fset[k] = (int32_t) (e + k);
-                            agx_exec_item it{};
-                            it.kind          = ITEM_CTRL_SRAM;
-                            it.nodes_covered = (uint32_t) (advance + 1u);
-                            it.ctrl_desc.cur_va         = agx_tensor_gpu_va(cur);
-                            it.ctrl_desc.msg_va         = agx_tensor_gpu_va(msg);
-                            it.ctrl_desc.down_va        = agx_tensor_gpu_va(w_down);
-                            it.ctrl_desc.gain_va        = agx_tensor_gpu_va(w_gain);
-                            it.ctrl_desc.forget_va      = agx_tensor_gpu_va(w_forget);
-                            it.ctrl_desc.norm_w_va      = norm_w ? agx_tensor_gpu_va(norm_w) : 0ull;
-                            it.ctrl_desc.out_va         = agx_tensor_gpu_va(final_dst);
-                            it.ctrl_desc.down_wtype     = agx_inkling2_tensor_wtype(w_down,   &it.ctrl_desc.down_row_bytes);
-                            it.ctrl_desc.gain_wtype     = agx_inkling2_tensor_wtype(w_gain,   &it.ctrl_desc.gain_row_bytes);
-                            it.ctrl_desc.forget_wtype   = agx_inkling2_tensor_wtype(w_forget, &it.ctrl_desc.forget_row_bytes);
-                            it.ctrl_desc.cur_stride_f32 = (uint32_t) n_embd;
-                            it.ctrl_desc.msg_stride_f32 = (uint32_t) n_embd;
-                            it.ctrl_desc.msg_offset_f32 = 0u;
-                            it.ctrl_desc.out_stride_f32 = (uint32_t) n_embd;
-                            it.u0 = (uint32_t) n_embd;
-                            it.u1 = (uint32_t) rank;
-                            it.u2 = (uint32_t) n_tokens;
-                            it.f0 = eps_ctrl;
-                            it.f1 = eps_norm;
-                            it.add_read(tensor_va_range(cur));
-                            it.add_read(tensor_va_range(msg));
-                            it.add_read(tensor_va_range(w_down));
-                            it.add_read(tensor_va_range(w_forget));
-                            it.add_read(tensor_va_range(w_gain));
-                            if (norm_w) it.add_read(tensor_va_range(norm_w));
-                            it.add_write(tensor_va_range(final_dst));
-                            commit_single_item((int32_t) e, fset, (int) (advance + 1u), it);
-                            st->stats.fused_ctrl_gate_hits++;
-                            g_ctrl++;
-                            continue;
-                        } else if (n_tokens < 16 &&
-                                   agx_tensor_gpu_va(n1) != 0 && agx_tensor_gpu_va(n2) != 0 &&
-                                   agx_tensor_gpu_va(n3) != 0 && agx_tensor_gpu_va(n6) != 0 &&
-                                   agx_tensor_gpu_va(n7) != 0 &&
-                                   agx_gemm_supports_mul_mat(n2) && agx_gemm_supports_mul_mat(n3) &&
-                                   agx_gemm_supports_mul_mat(n7)) {
+                        // Wave 7: Prefer wave-schedulable 8x8 MMA + CONT(VIEW_3D)-absorbing pipeline for ALL M!
+                        // (At M=512..2048, scalar 1-WG/core ITEM_CTRL_SRAM burned 232 GFLOPs without MMA and left
+                        //  168 strided CONT(VIEW_3D) copies unfused; set GGML_AGX_CTRL_SRAM=1 to A/B legacy SRAM path.)
+                        bool ctrl_emitted = false;
+                        if (!(ctrl_use_sram && n_tokens >= 16) &&
+                            agx_tensor_gpu_va(n1) != 0 && agx_tensor_gpu_va(n2) != 0 &&
+                            agx_tensor_gpu_va(n3) != 0 && agx_tensor_gpu_va(n6) != 0 &&
+                            agx_tensor_gpu_va(n7) != 0 &&
+                            agx_gemm_supports_mul_mat(n2) && agx_gemm_supports_mul_mat(n3) &&
+                            agx_gemm_supports_mul_mat(n7)) {
                             const struct ggml_tensor * cur_act = cur;
                             const struct ggml_tensor * msg_act = msg;
                             uint32_t cur_nb0 = 1u, cur_nb1 = (uint32_t) n_embd;
@@ -4056,8 +4364,39 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                                 va_same_or_disjoint(final_dst, n7);
 
                             if (!va_safe_abs && (ec_cur >= 0 || ec_msg >= 0)) {
-                                cur_act = cur; cur_nb0 = 1u; cur_nb1 = (uint32_t) n_embd; ec_cur = -1;
-                                msg_act = msg; msg_nb0 = 1u; msg_nb1 = (uint32_t) n_embd; ec_msg = -1;
+                                // Try dropping only the conflicting CONT absorption(s) before giving up both
+                                if (ec_cur >= 0 && ec_msg >= 0) {
+                                    // Test keeping ec_msg only
+                                    const bool msg_only_ok =
+                                        va_disjoint(n1, cur) && va_disjoint(n1, msg_act) &&
+                                        va_disjoint(n2, cur) && va_disjoint(n2, msg_act) &&
+                                        va_disjoint(n3, cur) && va_disjoint(n3, msg_act) &&
+                                        va_same_or_disjoint(n6, cur) && va_disjoint(n6, msg_act) && va_same_or_disjoint(n6, n3) &&
+                                        va_disjoint(n7, n6) && va_disjoint(n7, msg_act) &&
+                                        va_same_or_disjoint(final_dst, n6) && dst_ok_with(final_dst, msg_act, msg_nb0) &&
+                                        va_same_or_disjoint(final_dst, n7);
+                                    if (msg_only_ok) {
+                                        cur_act = cur; cur_nb0 = 1u; cur_nb1 = (uint32_t) n_embd; ec_cur = -1;
+                                    } else {
+                                        const bool cur_only_ok =
+                                            va_disjoint(n1, cur_act) && va_disjoint(n1, msg) &&
+                                            va_disjoint(n2, cur_act) && va_disjoint(n2, msg) &&
+                                            va_disjoint(n3, cur_act) && va_disjoint(n3, msg) &&
+                                            dst_ok_with(n6, cur_act, cur_nb0) && va_disjoint(n6, msg) && va_same_or_disjoint(n6, n3) &&
+                                            va_disjoint(n7, n6) && va_disjoint(n7, msg) &&
+                                            va_same_or_disjoint(final_dst, n6) && va_same_or_disjoint(final_dst, msg) &&
+                                            va_same_or_disjoint(final_dst, n7);
+                                        if (cur_only_ok) {
+                                            msg_act = msg; msg_nb0 = 1u; msg_nb1 = (uint32_t) n_embd; ec_msg = -1;
+                                        } else {
+                                            cur_act = cur; cur_nb0 = 1u; cur_nb1 = (uint32_t) n_embd; ec_cur = -1;
+                                            msg_act = msg; msg_nb0 = 1u; msg_nb1 = (uint32_t) n_embd; ec_msg = -1;
+                                        }
+                                    }
+                                } else {
+                                    cur_act = cur; cur_nb0 = 1u; cur_nb1 = (uint32_t) n_embd; ec_cur = -1;
+                                    msg_act = msg; msg_nb0 = 1u; msg_nb1 = (uint32_t) n_embd; ec_msg = -1;
+                                }
                             }
 
                             const bool va_safe =
@@ -4238,8 +4577,48 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                                 for (size_t k = 0; k <= advance; ++k) consumed[e + k] = 1u;
                                 st->stats.fused_ctrl_gate_hits++;
                                 g_ctrl++;
-                                continue;
+                                ctrl_emitted = true;
                             }
+                        }
+                        if (ctrl_emitted) continue;
+
+                        if (va_same_or_disjoint(final_dst, cur) && va_same_or_disjoint(final_dst, msg) &&
+                            is_ctrl_wtype_ok(w_down) && is_ctrl_wtype_ok(w_forget) && is_ctrl_wtype_ok(w_gain)) {
+                            int32_t fset[13];
+                            for (size_t k = 0; k <= advance; ++k) fset[k] = (int32_t) (e + k);
+                            agx_exec_item it{};
+                            it.kind          = ITEM_CTRL_SRAM;
+                            it.nodes_covered = (uint32_t) (advance + 1u);
+                            it.ctrl_desc.cur_va         = agx_tensor_gpu_va(cur);
+                            it.ctrl_desc.msg_va         = agx_tensor_gpu_va(msg);
+                            it.ctrl_desc.down_va        = agx_tensor_gpu_va(w_down);
+                            it.ctrl_desc.gain_va        = agx_tensor_gpu_va(w_gain);
+                            it.ctrl_desc.forget_va      = agx_tensor_gpu_va(w_forget);
+                            it.ctrl_desc.norm_w_va      = norm_w ? agx_tensor_gpu_va(norm_w) : 0ull;
+                            it.ctrl_desc.out_va         = agx_tensor_gpu_va(final_dst);
+                            it.ctrl_desc.down_wtype     = agx_inkling2_tensor_wtype(w_down,   &it.ctrl_desc.down_row_bytes);
+                            it.ctrl_desc.gain_wtype     = agx_inkling2_tensor_wtype(w_gain,   &it.ctrl_desc.gain_row_bytes);
+                            it.ctrl_desc.forget_wtype   = agx_inkling2_tensor_wtype(w_forget, &it.ctrl_desc.forget_row_bytes);
+                            it.ctrl_desc.cur_stride_f32 = (uint32_t) n_embd;
+                            it.ctrl_desc.msg_stride_f32 = (uint32_t) n_embd;
+                            it.ctrl_desc.msg_offset_f32 = 0u;
+                            it.ctrl_desc.out_stride_f32 = (uint32_t) n_embd;
+                            it.u0 = (uint32_t) n_embd;
+                            it.u1 = (uint32_t) rank;
+                            it.u2 = (uint32_t) n_tokens;
+                            it.f0 = eps_ctrl;
+                            it.f1 = eps_norm;
+                            it.add_read(tensor_va_range(cur));
+                            it.add_read(tensor_va_range(msg));
+                            it.add_read(tensor_va_range(w_down));
+                            it.add_read(tensor_va_range(w_forget));
+                            it.add_read(tensor_va_range(w_gain));
+                            if (norm_w) it.add_read(tensor_va_range(norm_w));
+                            it.add_write(tensor_va_range(final_dst));
+                            commit_single_item((int32_t) e, fset, (int) (advance + 1u), it);
+                            st->stats.fused_ctrl_gate_hits++;
+                            g_ctrl++;
+                            continue;
                         }
                     }
                 }
@@ -4486,9 +4865,10 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                                 agx_va_range extra_ins[1];
                                 int n_extra = 0;
                                 if (bias_t) extra_ins[n_extra++] = tensor_va_range(bias_t);
-                                agx_va_range outs[2] = { tensor_va_range(argsort), tensor_va_range(final_w) };
+                                agx_va_range outs[2]    = { tensor_va_range(argsort), tensor_va_range(final_w) };
+                                int32_t      outs_ex[2] = { st->exec_idx_map.get(argsort), st->exec_idx_map.get(final_w) };
 
-                                const int32_t anc = find_safe_anchor(fset, fn, all_ins, all_prods, n_ins, extra_ins, n_extra, outs, 2);
+                                const int32_t anc = find_safe_anchor(fset, fn, all_ins, all_prods, n_ins, extra_ins, n_extra, outs, outs_ex, 2);
                                 if (anc >= 0) {
                                     router_topk_norm_push pc{};
                                     pc.logits_va  = agx_tensor_gpu_va(logits);
@@ -4580,10 +4960,11 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
         }
 
         // --------------------------------------------------------------------
-        // Fusion 8 (Wave 6 Upgraded): Inkling 2 `mix()` / `msg_mix()` Depth-Mix Attention
+        // Fusion 8 (Wave 7 Upgraded): Inkling 2 `mix()` / `msg_mix()` Depth-Mix Attention
         //   - Non-adjacent DAG matching (`mm1 -> sm -> mm2` + `cnt = CONT(TRANSPOSE(states))`)
-        //   - Backward absorption of `REPEAT(query)`, `CONCAT(blocks, norm_cur, dim=1)` & `RMS_NORM(cur, 1e-6)`
-        //   - Checks `va_disjoint(states, mm2)` ONLY when `states` is NOT absorbed (fixes M=512 gallocr aliasing!)
+        //   - Backward absorption of `REPEAT(query)`, `CONT(TRANSPOSE)`, `CONCAT`, & `RMS_NORM(cur, 1e-6)`
+        //   - Skips to-be-absorbed `e_rep`/`e_cnt`/`e_cat` in `can_absorb_prev` & supports `alias_tmp_bo`
+        //     trampoline when `mm2` aliases `base_states`/`extra_t` at block boundaries (`mix=120/120`!)
         // --------------------------------------------------------------------
         if ((fusion_mask & (1u << 7)) && node->op == GGML_OP_MUL_MAT) {
             struct ggml_tensor * mm1 = node;
@@ -4619,8 +5000,7 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                         orig_q->ne[0] == states->ne[0] && orig_q->ne[1] > 0 &&
                         (orig_q->ne[2] == 1 || orig_q->ne[2] == states->ne[2]) &&
                         mm2->ne[0] == orig_q->ne[1] && mm2->ne[1] == states->ne[0] && mm2->ne[2] == states->ne[2] &&
-                        agx_tensor_gpu_va(states) != 0 && agx_tensor_gpu_va(orig_q) != 0 && agx_tensor_gpu_va(mm2) != 0 &&
-                        va_disjoint(orig_q, mm2)) {
+                        agx_tensor_gpu_va(states) != 0 && agx_tensor_gpu_va(orig_q) != 0 && agx_tensor_gpu_va(mm2) != 0) {
 
                         const int32_t e_sm  = st->exec_idx_map.get(sm);
                         const int32_t e_cnt = st->exec_idx_map.get(cnt);
@@ -4633,6 +5013,22 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                         fset[n_fset++] = e_sm;
                         if (e_cnt > (int32_t) e) fset[n_fset++] = e_cnt;
                         fset[n_fset++] = e_mm2;
+
+                        // Pre-check backward-absorbable REPEAT(query) and pre-emitted CONT(TRANSPOSE)
+                        // so their dead writes do not falsely block absorbing CONCAT / RMS_NORM!
+                        agx_va_range orig_q_r = tensor_va_range(orig_q);
+                        int32_t e_abs_rep = -1;
+                        if (rep_n && e_rep >= 0 && e_rep < (int32_t) e &&
+                            st->use_map.get(rep_n) == 1u && (rep_n->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+                            can_absorb_prev(e_rep, e, &orig_q_r, 1)) {
+                            e_abs_rep = e_rep;
+                        }
+                        int32_t e_abs_cnt = -1;
+                        if (e_cnt >= 0 && e_cnt < (int32_t) e && !consumed[(size_t) e_cnt] &&
+                            anchors[(size_t) e_cnt].cnt == 1u &&
+                            st->items[anchors[(size_t) e_cnt].beg].kind == ITEM_GENERIC_NODE) {
+                            e_abs_cnt = e_cnt;
+                        }
 
                         const struct ggml_tensor * base_states = states;
                         const struct ggml_tensor * extra_t     = nullptr;
@@ -4651,11 +5047,10 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                                 bs->ne[0] == states->ne[0] && bs->ne[1] == states->ne[1] - 1 &&
                                 bs->ne[2] == states->ne[2] && bs->ne[3] == 1 &&
                                 ex->ne[0] == states->ne[0] && ex->ne[1] == 1 &&
-                                ex->ne[2] == states->ne[2] && ex->ne[3] == 1 &&
-                                va_disjoint(bs, mm2) && va_disjoint(ex, mm2)) {
+                                ex->ne[2] == states->ne[2] && ex->ne[3] == 1) {
                                 int32_t e_cat = st->exec_idx_map.get(states);
                                 agx_va_range cat_ins[2] = { tensor_va_range(bs), tensor_va_range(ex) };
-                                if (can_absorb_prev(e_cat, e, cat_ins, 2)) {
+                                if (can_absorb_prev(e_cat, e, cat_ins, 2, e_abs_rep, e_abs_cnt)) {
                                     e_abs_cat   = e_cat;
                                     base_states = bs;
                                     extra_t     = ex;
@@ -4665,11 +5060,10 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                                         st->use_map.get(ex_r) == 1u &&
                                         ex_r->src[0] && ex_r->src[0]->type == GGML_TYPE_F32 &&
                                         ggml_is_contiguous(ex_r->src[0]) &&
-                                        ggml_nelements(ex_r->src[0]) == ggml_nelements(ex) &&
-                                        va_disjoint(ex_r->src[0], mm2)) {
+                                        ggml_nelements(ex_r->src[0]) == ggml_nelements(ex)) {
                                         int32_t e_rms = st->exec_idx_map.get(ex_r);
                                         agx_va_range rms_in = tensor_va_range(ex_r->src[0]);
-                                        if (can_absorb_prev(e_rms, e, &rms_in, 1)) {
+                                        if (can_absorb_prev(e_rms, e, &rms_in, 1, e_abs_cat, e_abs_rep, e_abs_cnt)) {
                                             e_abs_rms    = e_rms;
                                             extra_t      = ex_r->src[0];
                                             extra_do_rms = 1u;
@@ -4682,11 +5076,10 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                                    (states->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
                                    st->use_map.get(states) == 2u &&
                                    states->src[0] && states->src[0]->type == GGML_TYPE_F32 &&
-                                   ggml_is_contiguous(states->src[0]) &&
-                                   va_disjoint(states->src[0], mm2)) {
+                                   ggml_is_contiguous(states->src[0])) {
                             int32_t e_rms = st->exec_idx_map.get(states);
                             agx_va_range rms_in = tensor_va_range(states->src[0]);
-                            if (can_absorb_prev(e_rms, e, &rms_in, 1)) {
+                            if (can_absorb_prev(e_rms, e, &rms_in, 1, e_abs_rep, e_abs_cnt)) {
                                 e_abs_rms    = e_rms;
                                 base_states  = nullptr;
                                 extra_t      = states->src[0];
@@ -4695,81 +5088,77 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                             }
                         }
 
-                        const bool states_va_ok = (e_abs_cat >= 0 || e_abs_rms >= 0) ? true : va_disjoint(states, mm2);
-                        if (states_va_ok) {
-                            agx_va_range all_ins[3];
-                            int32_t      all_prods[3];
-                            int          n_all_ins = 0;
-                            if (base_states) {
-                                all_ins[n_all_ins]   = tensor_va_range(base_states);
-                                all_prods[n_all_ins] = tensor_prod_idx(base_states);
-                                n_all_ins++;
-                            }
-                            if (extra_t) {
-                                all_ins[n_all_ins]   = tensor_va_range(extra_t);
-                                all_prods[n_all_ins] = tensor_prod_idx(extra_t);
-                                n_all_ins++;
-                            }
-                            all_ins[n_all_ins]   = tensor_va_range(orig_q);
-                            all_prods[n_all_ins] = tensor_prod_idx(orig_q);
+                        agx_va_range all_ins[3];
+                        int32_t      all_prods[3];
+                        int          n_all_ins = 0;
+                        if (base_states) {
+                            all_ins[n_all_ins]   = tensor_va_range(base_states);
+                            all_prods[n_all_ins] = tensor_prod_idx(base_states);
                             n_all_ins++;
-                            agx_va_range orig_q_r = tensor_va_range(orig_q);
-                            agx_va_range out_r    = tensor_va_range(mm2);
+                        }
+                        if (extra_t) {
+                            all_ins[n_all_ins]   = tensor_va_range(extra_t);
+                            all_prods[n_all_ins] = tensor_prod_idx(extra_t);
+                            n_all_ins++;
+                        }
+                        all_ins[n_all_ins]   = orig_q_r;
+                        all_prods[n_all_ins] = tensor_prod_idx(orig_q);
+                        n_all_ins++;
+                        agx_va_range out_r   = tensor_va_range(mm2);
+                        int32_t      out_ex  = e_mm2;
 
-                            const int32_t anc = find_safe_anchor(fset, n_fset, all_ins, all_prods, n_all_ins,
-                                                                 &orig_q_r, 1, &out_r, 1);
-                            if (anc >= 0) {
-                                // Backward-absorb optional REPEAT(query) and/or pre-emitted cnt if safe
-                                int32_t e_abs_rep = -1;
-                                if (rep_n && e_rep >= 0 && e_rep < (int32_t) e &&
-                                    st->use_map.get(rep_n) == 1u && (rep_n->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
-                                    can_absorb_prev(e_rep, e, &orig_q_r, 1)) {
-                                    e_abs_rep = e_rep;
-                                }
-                                int32_t e_abs_cnt = -1;
-                                if (e_cnt >= 0 && e_cnt < (int32_t) e && can_absorb_prev(e_cnt, e, all_ins, n_all_ins)) {
-                                    e_abs_cnt = e_cnt;
-                                }
+                        const int32_t anc = find_safe_anchor(fset, n_fset, all_ins, all_prods, n_all_ins,
+                                                             &orig_q_r, 1, &out_r, &out_ex, 1);
+                        const bool mix_alias =
+                            (base_states && !va_disjoint(base_states, mm2)) ||
+                            (extra_t     && !va_disjoint(extra_t, mm2)) ||
+                            !va_disjoint(orig_q, mm2);
+                        if (anc >= 0 && (!mix_alias || !alias_scratch_locked[(size_t) anc])) {
+                            if (e_abs_cat >= 0) { anchors[(size_t) e_abs_cat].cnt = 0u; consumed[(size_t) e_abs_cat] = 1u; }
+                            if (e_abs_rms >= 0) { anchors[(size_t) e_abs_rms].cnt = 0u; consumed[(size_t) e_abs_rms] = 1u; }
+                            if (e_abs_rep >= 0) { anchors[(size_t) e_abs_rep].cnt = 0u; consumed[(size_t) e_abs_rep] = 1u; }
+                            if (e_abs_cnt >= 0) { anchors[(size_t) e_abs_cnt].cnt = 0u; consumed[(size_t) e_abs_cnt] = 1u; }
 
-                                if (e_abs_cat >= 0) { anchors[(size_t) e_abs_cat].cnt = 0u; consumed[(size_t) e_abs_cat] = 1u; }
-                                if (e_abs_rms >= 0) { anchors[(size_t) e_abs_rms].cnt = 0u; consumed[(size_t) e_abs_rms] = 1u; }
-                                if (e_abs_rep >= 0) { anchors[(size_t) e_abs_rep].cnt = 0u; consumed[(size_t) e_abs_rep] = 1u; }
-                                if (e_abs_cnt >= 0) { anchors[(size_t) e_abs_cnt].cnt = 0u; consumed[(size_t) e_abs_cnt] = 1u; }
+                            mix_attn_push mpc{};
+                            mpc.states_va    = base_states ? agx_tensor_gpu_va(base_states) : 0ull;
+                            mpc.extra_va     = extra_t     ? agx_tensor_gpu_va(extra_t)     : 0ull;
+                            mpc.queries_va   = agx_tensor_gpu_va(orig_q);
+                            mpc.out_va       = agx_tensor_gpu_va(mm2);
+                            mpc.n_embd       = (uint32_t) states->ne[0];
+                            mpc.n_states     = (uint32_t) states->ne[1];
+                            mpc.n_queries    = (uint32_t) orig_q->ne[1];
+                            mpc.n_tokens     = (uint32_t) states->ne[2];
+                            mpc.q_ne2        = (uint32_t) orig_q->ne[2];
+                            mpc.extra_do_rms = extra_do_rms;
+                            mpc.scale        = sm_scale;
+                            mpc.extra_eps    = extra_eps;
 
-                                mix_attn_push mpc{};
-                                mpc.states_va    = base_states ? agx_tensor_gpu_va(base_states) : 0ull;
-                                mpc.extra_va     = extra_t     ? agx_tensor_gpu_va(extra_t)     : 0ull;
-                                mpc.queries_va   = agx_tensor_gpu_va(orig_q);
-                                mpc.out_va       = agx_tensor_gpu_va(mm2);
-                                mpc.n_embd       = (uint32_t) states->ne[0];
-                                mpc.n_states     = (uint32_t) states->ne[1];
-                                mpc.n_queries    = (uint32_t) orig_q->ne[1];
-                                mpc.n_tokens     = (uint32_t) states->ne[2];
-                                mpc.q_ne2        = (uint32_t) orig_q->ne[2];
-                                mpc.extra_do_rms = extra_do_rms;
-                                mpc.scale        = sm_scale;
-                                mpc.extra_eps    = extra_eps;
-
-                                agx_exec_item it{};
-                                it.kind          = ITEM_MIX_ATTN;
-                                const bool fused_q4 = (mpc.n_queries <= 4u) && ((mpc.n_embd & 3u) == 0u) &&
-                                                      (((mpc.states_va | mpc.extra_va | mpc.queries_va) & 15ull) == 0ull);
-                                it.gx            = fused_q4 ? 1u : mpc.n_queries;
-                                it.gy            = mpc.n_tokens;
-                                it.gz            = 1u;
-                                it.nodes_covered = (uint32_t) n_fset
-                                                 + (e_abs_cat >= 0 ? 1u : 0u) + (e_abs_rms >= 0 ? 1u : 0u)
-                                                 + (e_abs_rep >= 0 ? 1u : 0u) + (e_abs_cnt >= 0 ? 1u : 0u);
-                                if (base_states) it.add_read(tensor_va_range(base_states));
-                                if (extra_t)     it.add_read(tensor_va_range(extra_t));
-                                it.add_read(tensor_va_range(orig_q));
-                                it.add_write(tensor_va_range(mm2));
-                                it.set_push(mpc);
-                                commit_single_item(anc, fset, n_fset, it);
-                                st->stats.fused_mix_hits++;
-                                g_mix++;
-                                continue;
+                            agx_exec_item it{};
+                            it.kind          = ITEM_MIX_ATTN;
+                            const bool fused_q4 = (mpc.n_queries <= 4u) && ((mpc.n_embd & 3u) == 0u) &&
+                                                  (((mpc.states_va | mpc.extra_va | mpc.queries_va) & 15ull) == 0ull);
+                            it.gx            = fused_q4 ? 1u : mpc.n_queries;
+                            it.gy            = mpc.n_tokens;
+                            it.gz            = 1u;
+                            it.nodes_covered = (uint32_t) n_fset
+                                             + (e_abs_cat >= 0 ? 1u : 0u) + (e_abs_rms >= 0 ? 1u : 0u)
+                                             + (e_abs_rep >= 0 ? 1u : 0u) + (e_abs_cnt >= 0 ? 1u : 0u);
+                            if (mix_alias) {
+                                const uint32_t out_floats = mpc.n_queries * mpc.n_embd * mpc.n_tokens;
+                                it.uses_alias_scratch = true;
+                                it.alias_flags        = 1u;
+                                it.alias_floats0      = out_floats;
+                                it.alias_tmp_need_B   = agx_align_up((size_t) out_floats * sizeof(float), AGX_PAGE_SIZE);
                             }
+                            if (base_states) it.add_read(tensor_va_range(base_states));
+                            if (extra_t)     it.add_read(tensor_va_range(extra_t));
+                            it.add_read(orig_q_r);
+                            it.add_write(out_r);
+                            it.set_push(mpc);
+                            commit_single_item(anc, fset, n_fset, it);
+                            st->stats.fused_mix_hits++;
+                            g_mix++;
+                            continue;
                         }
                     }
                 }
@@ -5068,11 +5457,15 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                                     extra_ins[n_extra++] = tensor_va_range(weights);
                                     if (gu_m.w_s) extra_ins[n_extra++] = tensor_va_range(gu_m.w_s);
                                     if (dn_m.w_s) extra_ins[n_extra++] = tensor_va_range(dn_m.w_s);
-                                    agx_va_range out_r = tensor_va_range(prev_add);
+                                    agx_va_range out_r  = tensor_va_range(prev_add);
+                                    int32_t      out_ex = st->exec_idx_map.get(prev_add);
 
+                                    const bool moe_alias = !va_disjoint(x_in, prev_add) ||
+                                                           !va_disjoint(ids, prev_add) ||
+                                                           !va_disjoint(weights, prev_add);
                                     const int32_t anc = find_safe_anchor(fset, n_fset, all_ins, all_prods, n_ins,
-                                                                         extra_ins, n_extra, &out_r, 1);
-                                    if (anc >= 0) {
+                                                                         extra_ins, n_extra, &out_r, &out_ex, 1);
+                                    if (anc >= 0 && (!moe_alias || !alias_scratch_locked[(size_t) anc])) {
                                         uint32_t abs_cnt = 0u;
                                         for (int b = 0; b < n_bset; ++b) {
                                             if (can_absorb_prev(bset[b], e, all_ins, n_ins)) {
@@ -5115,9 +5508,13 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                                         it.nodes_covered    = (uint32_t) n_fset + abs_cnt;
                                         it.uses_moe_scratch = true;
                                         it.moe_args         = ma;
-                                        it.moe_alias_tmp    = !va_disjoint(x_in, prev_add) ||
-                                                              !va_disjoint(ids, prev_add) ||
-                                                              !va_disjoint(weights, prev_add);
+                                        if (moe_alias) {
+                                            const uint32_t out_floats = ma.n_tokens * ma.n_embd;
+                                            it.uses_alias_scratch = true;
+                                            it.alias_flags        = 1u;
+                                            it.alias_floats0      = out_floats;
+                                            it.alias_tmp_need_B   = agx_align_up((size_t) out_floats * sizeof(float), AGX_PAGE_SIZE);
+                                        }
                                         for (int r = 0; r < n_ins; ++r) it.add_read(all_ins[r]);
                                         it.add_write(out_r);
                                         commit_single_item(anc, fset, n_fset, it);
@@ -5373,11 +5770,11 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                             }
 
                             const struct ggml_tensor * w = ssm_n->src[1];
-                            const bool dst_va_ok =
-                                va_disjoint(past, final_dst) && va_disjoint(w, final_dst) &&
-                                va_disjoint(dyn_t, final_dst) && va_disjoint(cpy_n, final_dst) &&
-                                (n_t == 1 ? va_same_or_disjoint(cur, final_dst) : va_disjoint(cur, final_dst)) &&
-                                va_same_or_disjoint(post_add_t, final_dst);
+                            const bool sconv_alias_dst =
+                                !va_disjoint(past, final_dst) || !va_disjoint(dyn_t, final_dst) ||
+                                (n_t > 1 ? !va_disjoint(cur, final_dst) : !va_same_or_disjoint(cur, final_dst)) ||
+                                !va_same_or_disjoint(post_add_t, final_dst);
+                            const bool dst_va_ok = va_disjoint(w, final_dst) && va_disjoint(cpy_n, final_dst);
                             const bool cell_va_ok = (!cpy_n) || (
                                 va_disjoint(cur, cpy_n) && va_disjoint(w, cpy_n) &&
                                 va_disjoint(dyn_t, cpy_n) && va_disjoint(post_add_t, cpy_n) &&
@@ -5400,12 +5797,14 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                                 if (post_add_t) extra_ins[n_extra++] = tensor_va_range(post_add_t);
 
                                 agx_va_range outs[2];
+                                int32_t      outs_ex[2];
                                 int n_outs = 0;
-                                outs[n_outs++] = tensor_va_range(final_dst);
-                                if (cpy_n) outs[n_outs++] = tensor_va_range(cpy_n);
+                                outs[n_outs] = tensor_va_range(final_dst); outs_ex[n_outs++] = st->exec_idx_map.get(final_dst);
+                                if (cpy_n) { outs[n_outs] = tensor_va_range(cpy_n); outs_ex[n_outs++] = st->exec_idx_map.get(cpy_n); }
 
-                                const int32_t anc = find_safe_anchor(fset, fn, all_ins, all_prods, n_ins, extra_ins, n_extra, outs, n_outs);
-                                if (anc >= 0) {
+                                const int32_t anc = find_safe_anchor(fset, fn, all_ins, all_prods, n_ins,
+                                                                     extra_ins, n_extra, outs, outs_ex, n_outs);
+                                if (anc >= 0 && (!sconv_alias_dst || !alias_scratch_locked[(size_t) anc])) {
                                     full_shortconv_push pc{};
                                     pc.past_va     = agx_tensor_gpu_va(past);
                                     pc.cur_va      = agx_tensor_gpu_va(cur);
@@ -5432,6 +5831,13 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                                     it.gy            = pc.n_t;
                                     it.gz            = pc.n_s;
                                     it.nodes_covered = (uint32_t) fn;
+                                    if (sconv_alias_dst) {
+                                        const uint32_t out_floats = pc.n_ch * pc.n_t * pc.n_s;
+                                        it.uses_alias_scratch = true;
+                                        it.alias_flags        = 1u;
+                                        it.alias_floats0      = out_floats;
+                                        it.alias_tmp_need_B   = agx_align_up((size_t) out_floats * sizeof(float), AGX_PAGE_SIZE);
+                                    }
                                     for (int r = 0; r < n_ins; ++r)    it.add_read(all_ins[r]);
                                     for (int ow = 0; ow < n_outs; ++ow) it.add_write(outs[ow]);
                                     it.set_push(pc);
@@ -5570,8 +5976,11 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
         }
 
         // --------------------------------------------------------------------
-        // Fusion 12 (Wave 3 NEW): Direct Relative-Position Bias Gather
-        //   PAD(rel_bias, 0,1,0,0) -> MUL_MAT(Rcur) -> SUB(sinks) -> CONT(PERM 1,0,2,3) -> GET_ROWS(rel_pos) -> CONT(PERM 2,0,1,3)
+        // Fusion 12 (Wave 7 Upgraded): Direct Relative-Position Bias Gather
+        //   PAD(rel_bias, 0,1,0,0) -> MUL_MAT(Rcur) -> SUB(sinks) -> CONT(PERM 1,0,2,3) ->
+        //   GET_ROWS(rel_pos) -> CONT(PERM 2,0,1,3) [-> ADD([CAST(mask,F32)]) -> CAST(F16)]
+        //   Supports `alias_tmp_bo` trampoline (both inline and pre-saved at e_mm/e_sub) so
+        //   48/48 layers fuse even at `-ub 2048` where 192-384 MiB output reuses rcur/sinks!
         // --------------------------------------------------------------------
         if ((fusion_mask & (1u << 12)) && node->op == GGML_OP_PAD && node->src[0] &&
             ggml_get_op_params_i32(node, 0) == 0 && ggml_get_op_params_i32(node, 2) == 0 &&
@@ -5628,62 +6037,253 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                             ggml_nelements(sinks) == n_head * n_tokens &&
                             rel_pos->ne[1] == n_tokens && rel_pos->ne[2] == 1 && rel_pos->ne[3] == 1 &&
                             c2->ne[0] == n_kv && c2->ne[2] == n_head && n_t * n_stream == n_tokens &&
-                            ((n_kv + 63) / 64) <= 65535 && n_head <= 65535 && n_tokens <= 65535 &&
-                            (uint64_t) n_tokens * (uint64_t) n_head * (uint64_t) n_kv <= 0xFFFFFFFFull &&
-                            va_disjoint(orig_bias, c2) && va_disjoint(rcur, c2) &&
-                            va_disjoint(sinks, c2) && va_disjoint(rel_pos, c2)) {
-                            int32_t fset[6] = {
-                                (int32_t) e,
-                                st->exec_idx_map.get(mm),
-                                st->exec_idx_map.get(sub),
-                                st->exec_idx_map.get(c1),
-                                st->exec_idx_map.get(gr),
-                                st->exec_idx_map.get(c2),
-                            };
-                            agx_va_range all_ins[4] = {
-                                tensor_va_range(orig_bias), tensor_va_range(rcur),
-                                tensor_va_range(sinks),     tensor_va_range(rel_pos),
-                            };
-                            int32_t all_prods[4] = {
-                                tensor_prod_idx(orig_bias), tensor_prod_idx(rcur),
-                                tensor_prod_idx(sinks),     tensor_prod_idx(rel_pos),
-                            };
-                            agx_va_range extra_ins[3] = {
-                                tensor_va_range(rcur), tensor_va_range(sinks), tensor_va_range(rel_pos),
-                            };
-                            agx_va_range outs[1] = { tensor_va_range(c2) };
-                            const int32_t anc = find_safe_anchor(fset, 6, all_ins, all_prods, 4, extra_ins, 3, outs, 1);
-                            if (anc >= 0) {
-                                rel_bias_gather_push pc{};
-                                pc.rcur_va    = agx_tensor_gpu_va(rcur);
-                                pc.bias_va    = agx_tensor_gpu_va(orig_bias);
-                                pc.sinks_va   = agx_tensor_gpu_va(sinks);
-                                pc.rel_pos_va = agx_tensor_gpu_va(rel_pos);
-                                pc.dst_va     = agx_tensor_gpu_va(c2);
-                                pc.n_rel      = (uint32_t) n_rel;
-                                pc.n_extent   = (uint32_t) n_extent;
-                                pc.n_kv       = (uint32_t) n_kv;
-                                pc.n_head     = (uint32_t) n_head;
-                                pc.n_t        = (uint32_t) n_t;
-                                pc.n_stream   = (uint32_t) n_stream;
-                                pc.bias_wtype = bwtype;
-                                pc.bias_nb1   = (uint32_t) orig_bias->nb[1];
-                                pc.rpos_nb0   = (uint32_t) rel_pos->nb[0];
-                                pc.rpos_nb1   = (uint32_t) rel_pos->nb[1];
+                            ((n_kv + 127) / 128) <= 65535 && n_head <= 65535 && n_tokens <= 65535 &&
+                            (uint64_t) n_tokens * (uint64_t) n_head * (uint64_t) n_kv <= 0xFFFFFFFFull) {
 
-                                agx_exec_item it{};
-                                it.kind          = ITEM_REL_BIAS;
-                                it.gx            = (pc.n_kv + 63u) / 64u;
-                                it.gy            = pc.n_head;
-                                it.gz            = (uint32_t) n_tokens;
-                                it.nodes_covered = 6u;
-                                for (int r = 0; r < 4; ++r) it.add_read(all_ins[r]);
-                                it.add_write(outs[0]);
-                                it.set_push(pc);
-                                commit_single_item(anc, fset, 6, it);
-                                st->stats.fused_rel_bias_hits++;
-                                g_rel_bias++;
-                                continue;
+                            // Optionally absorb trailing `[CAST(mask_f16 -> F32)] -> ADD(c2, mask) -> [CAST(F16)]`
+                            // (eliminates 73.6 GB DRAM + 96.6B divides on -ub 2048 & enables exact -inf early-exit!)
+                            struct ggml_tensor *       final_dst    = c2;
+                            struct ggml_tensor *       add_m        = nullptr;
+                            struct ggml_tensor *       cast_m       = nullptr;
+                            struct ggml_tensor *       cast_out     = nullptr;
+                            const struct ggml_tensor * mask_t       = nullptr;
+                            bool                       mask_is_f16  = false;
+                            bool                       dst_is_f16   = false;
+                            int32_t                    e_abs_cast_m = -1;
+
+                            if (struct ggml_tensor * u_add = next_single_use_compute(c2, false)) {
+                                if (u_add->op == GGML_OP_ADD && u_add->type == GGML_TYPE_F32 &&
+                                    ggml_is_contiguous(u_add) && ggml_are_same_shape(u_add, c2) &&
+                                    u_add->src[0] && u_add->src[1]) {
+                                    struct ggml_tensor * other = (u_add->src[0] == c2) ? u_add->src[1]
+                                                               : ((u_add->src[1] == c2) ? u_add->src[0] : nullptr);
+                                    const struct ggml_tensor * cand_m = nullptr;
+                                    bool cand_f16 = false;
+                                    struct ggml_tensor * cand_cast_m = nullptr;
+                                    int32_t cand_abs_cm = -1;
+                                    if (other && other->op == GGML_OP_CPY && other->type == GGML_TYPE_F32 &&
+                                        other->src[0] && other->src[0]->type == GGML_TYPE_F16 &&
+                                        ggml_is_contiguous(other->src[0]) && ggml_are_same_shape(other, other->src[0]) &&
+                                        st->use_map.get(other) == 1u && (other->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
+                                        int32_t e_cm = st->exec_idx_map.get(other);
+                                        agx_va_range mr = tensor_va_range(other->src[0]);
+                                        if (e_cm > (int32_t) e) {
+                                            cand_m      = other->src[0];
+                                            cand_f16    = true;
+                                            cand_cast_m = other;
+                                        } else if (e_cm >= 0 && can_absorb_prev(e_cm, e, &mr, 1)) {
+                                            cand_m      = other->src[0];
+                                            cand_f16    = true;
+                                            cand_abs_cm = e_cm;
+                                        }
+                                    }
+                                    if (!cand_m && other && other->type == GGML_TYPE_F32 && ggml_is_contiguous(other)) {
+                                        cand_m   = other;
+                                        cand_f16 = false;
+                                    }
+                                    if (cand_m && agx_tensor_gpu_va(cand_m) != 0 &&
+                                        cand_m->ne[0] == n_kv && cand_m->ne[1] == n_t &&
+                                        (cand_m->ne[2] == 1 || cand_m->ne[2] == n_head) &&
+                                        (cand_m->ne[3] == 1 || cand_m->ne[3] == n_stream)) {
+                                        add_m        = u_add;
+                                        cast_m       = cand_cast_m;
+                                        e_abs_cast_m = cand_abs_cm;
+                                        mask_t       = cand_m;
+                                        mask_is_f16  = cand_f16;
+                                        final_dst    = u_add;
+                                        if (struct ggml_tensor * u_co = next_single_use_compute(u_add, false)) {
+                                            if (u_co->op == GGML_OP_CPY && u_co->src[0] == u_add &&
+                                                u_co->type == GGML_TYPE_F16 && ggml_is_contiguous(u_co) &&
+                                                ggml_are_same_shape(u_co, u_add) && agx_tensor_gpu_va(u_co) != 0) {
+                                                cast_out   = u_co;
+                                                final_dst  = u_co;
+                                                dst_is_f16 = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (va_disjoint(orig_bias, final_dst) && va_disjoint(rel_pos, final_dst) &&
+                                va_disjoint(mask_t, final_dst)) {
+                                const int32_t e_mm  = st->exec_idx_map.get(mm);
+                                const int32_t e_sub = st->exec_idx_map.get(sub);
+                                int32_t fset[9];
+                                int fn = 0;
+                                fset[fn++] = (int32_t) e;
+                                fset[fn++] = e_mm;
+                                fset[fn++] = e_sub;
+                                fset[fn++] = st->exec_idx_map.get(c1);
+                                fset[fn++] = st->exec_idx_map.get(gr);
+                                fset[fn++] = st->exec_idx_map.get(c2);
+                                if (cast_m)   fset[fn++] = st->exec_idx_map.get(cast_m);
+                                if (add_m)    fset[fn++] = st->exec_idx_map.get(add_m);
+                                if (cast_out) fset[fn++] = st->exec_idx_map.get(cast_out);
+
+                                size_t e_min_r = (size_t) fset[0], e_max_r = (size_t) fset[0];
+                                bool fset_valid = true;
+                                for (int k = 0; k < fn; ++k) {
+                                    if (fset[k] < 0 || (size_t) fset[k] >= n_exec || consumed[(size_t) fset[k]]) {
+                                        fset_valid = false; break;
+                                    }
+                                    if ((size_t) fset[k] < e_min_r) e_min_r = (size_t) fset[k];
+                                    if ((size_t) fset[k] > e_max_r) e_max_r = (size_t) fset[k];
+                                }
+
+                                if (fset_valid) {
+                                    const agx_va_range rcur_r  = tensor_va_range(rcur);
+                                    const agx_va_range sinks_r = tensor_va_range(sinks);
+                                    const int32_t p_rcur       = tensor_prod_idx(rcur);
+                                    const int32_t p_sinks      = tensor_prod_idx(sinks);
+
+                                    // Check if any non-fset node in (prod, e_max_r) clobbers rcur or sinks
+                                    bool rcur_clob  = false;
+                                    bool sinks_clob = false;
+                                    for (size_t j = e_min_r; j < e_max_r; ++j) {
+                                        if (in_idx_set(j, fset, fn)) continue;
+                                        if ((p_rcur  < 0 || (int32_t) j > p_rcur)  && va_range_overlap(raw_vas[j].w, rcur_r))  rcur_clob  = true;
+                                        if ((p_sinks < 0 || (int32_t) j > p_sinks) && va_range_overlap(raw_vas[j].w, sinks_r)) sinks_clob = true;
+                                    }
+
+                                    auto presave_window_ok = [&](int32_t e_save, agx_va_range r, int32_t prod) -> bool {
+                                        if (e_save <= (int32_t) e_min_r || e_save >= (int32_t) e_max_r) return false;
+                                        if (prod >= e_save) return false;
+                                        for (size_t j = e_min_r; j < (size_t) e_save; ++j) {
+                                            if (in_idx_set(j, fset, fn)) continue;
+                                            if ((prod < 0 || (int32_t) j > prod) && va_range_overlap(raw_vas[j].w, r)) return false;
+                                        }
+                                        for (size_t j = (size_t) e_save; j <= e_max_r; ++j) {
+                                            if (alias_scratch_locked[j]) return false;
+                                            if (j > (size_t) e_save && j < e_max_r && anchors[j].cnt > 0u) {
+                                                for (uint32_t k = 0; k < anchors[j].cnt; ++k) {
+                                                    if (st->items[anchors[j].beg + k].uses_alias_scratch) return false;
+                                                }
+                                            }
+                                        }
+                                        return true;
+                                    };
+
+                                    const bool rcur_presave  = rcur_clob  && presave_window_ok(e_mm,  rcur_r,  p_rcur);
+                                    const bool sinks_presave = sinks_clob && presave_window_ok(e_sub, sinks_r, p_sinks);
+                                    if ((!rcur_clob || rcur_presave) && (!sinks_clob || sinks_presave)) {
+                                        agx_va_range all_ins[5];
+                                        int32_t      all_prods[5];
+                                        int n_all = 0;
+                                        all_ins[n_all] = tensor_va_range(orig_bias); all_prods[n_all++] = tensor_prod_idx(orig_bias);
+                                        if (!rcur_presave)  { all_ins[n_all] = rcur_r;  all_prods[n_all++] = p_rcur; }
+                                        if (!sinks_presave) { all_ins[n_all] = sinks_r; all_prods[n_all++] = p_sinks; }
+                                        all_ins[n_all] = tensor_va_range(rel_pos);   all_prods[n_all++] = tensor_prod_idx(rel_pos);
+                                        if (mask_t) { all_ins[n_all] = tensor_va_range(mask_t); all_prods[n_all++] = tensor_prod_idx(mask_t); }
+
+                                        agx_va_range extra_ins[4];
+                                        int n_extra = 0;
+                                        if (!rcur_presave)  extra_ins[n_extra++] = rcur_r;
+                                        if (!sinks_presave) extra_ins[n_extra++] = sinks_r;
+                                        extra_ins[n_extra++] = tensor_va_range(rel_pos);
+                                        if (mask_t) extra_ins[n_extra++] = tensor_va_range(mask_t);
+
+                                        agx_va_range outs[1]    = { tensor_va_range(final_dst) };
+                                        int32_t      outs_ex[1] = { st->exec_idx_map.get(final_dst) };
+                                        const bool need_last    = rcur_presave || sinks_presave;
+                                        const int32_t anc = find_safe_anchor(fset, fn, all_ins, all_prods, n_all,
+                                                                             extra_ins, n_extra, outs, outs_ex, 1, need_last);
+                                        uint8_t rel_amask = 0u;
+                                        if (rcur_presave)                        rel_amask |= 4u;
+                                        else if (!va_disjoint(rcur, final_dst))  rel_amask |= 1u;
+                                        if (sinks_presave)                       rel_amask |= 8u;
+                                        else if (!va_disjoint(sinks, final_dst)) rel_amask |= 2u;
+
+                                        if (anc >= 0 && (rel_amask == 0u || !alias_scratch_locked[(size_t) anc])) {
+                                            if (e_abs_cast_m >= 0) {
+                                                anchors[(size_t) e_abs_cast_m].cnt = 0u;
+                                                consumed[(size_t) e_abs_cast_m]    = 1u;
+                                            }
+                                            const uint32_t n_rcur_f    = (uint32_t) (n_rel * n_head * n_tokens);
+                                            const uint32_t n_sinks_f   = (uint32_t) (n_head * n_tokens);
+                                            const uint32_t rcur_slot_B = (uint32_t) agx_align_up((size_t) n_rcur_f * sizeof(float), 256u);
+                                            const uint32_t tot_slot_B  = rcur_slot_B + (uint32_t) agx_align_up((size_t) n_sinks_f * sizeof(float), 256u);
+
+                                            rel_bias_gather_push pc{};
+                                            pc.rcur_va    = agx_tensor_gpu_va(rcur);
+                                            pc.bias_va    = agx_tensor_gpu_va(orig_bias);
+                                            pc.sinks_va   = agx_tensor_gpu_va(sinks);
+                                            pc.rel_pos_va = agx_tensor_gpu_va(rel_pos);
+                                            pc.mask_va    = mask_t ? agx_tensor_gpu_va(mask_t) : 0ull;
+                                            pc.dst_va     = agx_tensor_gpu_va(final_dst);
+                                            pc.n_rel      = (uint32_t) n_rel;
+                                            pc.n_extent   = (uint32_t) n_extent;
+                                            pc.n_kv       = (uint32_t) n_kv;
+                                            pc.n_head     = (uint32_t) n_head;
+                                            pc.n_t        = (uint32_t) n_t;
+                                            pc.n_stream   = (uint32_t) n_stream;
+                                            pc.bias_wtype = bwtype;
+                                            pc.bias_nb1   = (uint32_t) orig_bias->nb[1];
+                                            pc.rpos_nb0   = (uint32_t) rel_pos->nb[0];
+                                            pc.rpos_nb1   = (uint32_t) rel_pos->nb[1];
+                                            pc.mask_ne2   = mask_t ? (uint32_t) mask_t->ne[2] : 1u;
+                                            pc.mask_ne3   = mask_t ? (uint32_t) mask_t->ne[3] : 1u;
+                                            const bool vec4_f16 = dst_is_f16 && (mask_t != nullptr) && ((pc.n_kv & 3u) == 0u) &&
+                                                                  (pc.rpos_nb0 == 4u) && ((pc.rpos_nb1 & 15u) == 0u) &&
+                                                                  ((pc.dst_va & 7ull) == 0ull) && ((pc.rel_pos_va & 15ull) == 0ull) &&
+                                                                  ((pc.mask_va & (mask_is_f16 ? 7ull : 15ull)) == 0ull);
+                                            pc.flags      = (mask_is_f16 ? 1u : 0u) | (dst_is_f16 ? 2u : 0u) | (vec4_f16 ? 4u : 0u);
+
+                                            agx_exec_item it{};
+                                            it.kind          = ITEM_REL_BIAS;
+                                            it.gx            = vec4_f16 ? (((pc.n_kv >> 2u) + 127u) / 128u) : ((pc.n_kv + 127u) / 128u);
+                                            it.gy            = pc.n_head;
+                                            it.gz            = (uint32_t) n_tokens;
+                                            it.nodes_covered = (uint32_t) fn + (e_abs_cast_m >= 0 ? 1u : 0u);
+                                            if (rel_amask != 0u) {
+                                                it.uses_alias_scratch = true;
+                                                it.alias_flags        = rel_amask;
+                                                it.alias_tmp_off_B    = rcur_slot_B;
+                                                it.alias_floats0      = n_rcur_f;
+                                                it.alias_floats1      = n_sinks_f;
+                                                it.alias_tmp_need_B   = agx_align_up((size_t) tot_slot_B, AGX_PAGE_SIZE);
+                                            }
+                                            for (int r = 0; r < n_all; ++r) it.add_read(all_ins[r]);
+                                            it.add_write(outs[0]);
+                                            it.set_push(pc);
+                                            commit_single_item(anc, fset, fn, it);
+
+                                            if (rcur_presave) {
+                                                agx_exec_item sv{};
+                                                sv.kind               = ITEM_REL_SAVE_TMP;
+                                                sv.nodes_covered      = 0u;
+                                                sv.uses_alias_scratch = true;
+                                                sv.va0                = agx_tensor_gpu_va(rcur);
+                                                sv.alias_tmp_off_B    = 0u;
+                                                sv.alias_floats0      = n_rcur_f;
+                                                sv.alias_tmp_need_B   = agx_align_up((size_t) tot_slot_B, AGX_PAGE_SIZE);
+                                                sv.add_read(rcur_r);
+                                                const uint32_t sv_idx = (uint32_t) st->items.size();
+                                                st->items.push_back(sv);
+                                                anchors[(size_t) e_mm] = { sv_idx, 1u };
+                                                for (size_t j = (size_t) e_mm; j <= (size_t) anc; ++j) alias_scratch_locked[j] = 1u;
+                                            }
+                                            if (sinks_presave) {
+                                                agx_exec_item sv{};
+                                                sv.kind               = ITEM_REL_SAVE_TMP;
+                                                sv.nodes_covered      = 0u;
+                                                sv.uses_alias_scratch = true;
+                                                sv.va0                = agx_tensor_gpu_va(sinks);
+                                                sv.alias_tmp_off_B    = rcur_slot_B;
+                                                sv.alias_floats0      = n_sinks_f;
+                                                sv.alias_tmp_need_B   = agx_align_up((size_t) tot_slot_B, AGX_PAGE_SIZE);
+                                                sv.add_read(sinks_r);
+                                                const uint32_t sv_idx = (uint32_t) st->items.size();
+                                                st->items.push_back(sv);
+                                                anchors[(size_t) e_sub] = { sv_idx, 1u };
+                                                for (size_t j = (size_t) e_sub; j <= (size_t) anc; ++j) alias_scratch_locked[j] = 1u;
+                                            }
+
+                                            st->stats.fused_rel_bias_hits++;
+                                            g_rel_bias++;
+                                            continue;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -5769,15 +6369,17 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
         std::vector<agx_interval_lvl> active_reads;
         active_writes.reserve(128u);
         active_reads.reserve(128u);
-        int32_t last_moe_lvl  = -1;
-        int32_t last_attn_lvl = -1;
+        int32_t last_moe_lvl   = -1;
+        int32_t last_attn_lvl  = -1;
+        int32_t last_alias_lvl = -1;
         uint32_t max_lvl = 0u;
 
         for (size_t u = 0; u < n_items; ++u) {
             const auto & it = st->ordered_items[u];
             uint32_t lv = 0u;
-            if (it.uses_moe_scratch  && last_moe_lvl  >= 0) lv = std::max(lv, (uint32_t) last_moe_lvl  + 1u);
-            if (it.uses_attn_scratch && last_attn_lvl >= 0) lv = std::max(lv, (uint32_t) last_attn_lvl + 1u);
+            if (it.uses_moe_scratch   && last_moe_lvl   >= 0) lv = std::max(lv, (uint32_t) last_moe_lvl   + 1u);
+            if (it.uses_attn_scratch  && last_attn_lvl  >= 0) lv = std::max(lv, (uint32_t) last_attn_lvl  + 1u);
+            if (it.uses_alias_scratch && last_alias_lvl >= 0) lv = std::max(lv, (uint32_t) last_alias_lvl + 1u);
 
             // RAW: any dynamic read overlapping an active write
             for (uint8_t r = 0; r < it.n_reads; ++r) {
@@ -5798,8 +6400,9 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
             item_lvl[u] = lv;
             if (lv > max_lvl) max_lvl = lv;
 
-            if (it.uses_moe_scratch)  last_moe_lvl  = (int32_t) lv;
-            if (it.uses_attn_scratch) last_attn_lvl = (int32_t) lv;
+            if (it.uses_moe_scratch)   last_moe_lvl   = (int32_t) lv;
+            if (it.uses_attn_scratch)  last_attn_lvl  = (int32_t) lv;
+            if (it.uses_alias_scratch) last_alias_lvl = (int32_t) lv;
 
             for (uint8_t r = 0; r < it.n_reads; ++r) {
                 if (!overlaps_any_write(it.reads[r])) continue;
@@ -5825,19 +6428,54 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
     // ------------------------------------------------------------------------
     // Phase C: Single-CDM-Stream Dispatch Loop with Live Hazard Safety Net
     // ------------------------------------------------------------------------
+    // Pre-size shared alias-trampoline BO ONCE before encoding the CDM stream so
+    // its GPU VA never moves mid-submission!
+    size_t max_alias_tmp_B = 0u;
+    for (size_t u = 0; u < n_items; ++u) {
+        if (st->ordered_items[u].alias_tmp_need_B > max_alias_tmp_B) {
+            max_alias_tmp_B = st->ordered_items[u].alias_tmp_need_B;
+        }
+    }
+    if (max_alias_tmp_B > 0u && (!st->alias_tmp_bo || max_alias_tmp_B > st->alias_tmp_cap_B)) {
+        if (st->alias_tmp_bo) agx_bo_free(ctx->drm, st->alias_tmp_bo);
+        st->alias_tmp_bo = agx_bo_alloc(ctx->drm, max_alias_tmp_B, AGX_BO_SLC_STREAM, "ge-alias-tmp");
+        if (!st->alias_tmp_bo) { st->alias_tmp_cap_B = 0; return GGML_STATUS_FAILED; }
+        st->alias_tmp_cap_B = max_alias_tmp_B;
+    }
+
+    auto emit_f32_copy = [&](uint64_t src_va, uint64_t dst_va, uint32_t n_floats, agx_barrier_mode bm) -> bool {
+        cpy_cast_push cpc{};
+        cpc.src_va = src_va;
+        cpc.dst_va = dst_va;
+        cpc.ne0    = n_floats; cpc.ne1 = 1u; cpc.ne2 = 1u; cpc.ne3 = 1u;
+        cpc.d_ne0  = n_floats; cpc.d_ne1 = 1u; cpc.d_ne2 = 1u; cpc.d_ne3 = 1u;
+        cpc.s_nb0  = 4u; cpc.s_nb1 = n_floats * 4u; cpc.s_nb2 = cpc.s_nb1; cpc.s_nb3 = cpc.s_nb1;
+        cpc.d_nb0  = 4u; cpc.d_nb1 = n_floats * 4u; cpc.d_nb2 = cpc.d_nb1; cpc.d_nb3 = cpc.d_nb1;
+        cpc.src_type = 0u;
+        cpc.dst_type = 0u;
+        cpc.total    = n_floats;
+        const bool v4_cp = ((n_floats & 3u) == 0u) && (((src_va | dst_va) & 15ull) == 0ull);
+        cpc.d_is_linear  = v4_cp ? 2u : 1u;
+        return agx_cdm_dispatch(stream, st->k_cpy_cast,
+                                v4_cp ? (((n_floats >> 2u) + 255u) / 256u) : ((n_floats + 255u) / 256u),
+                                1u, 1u, &cpc, sizeof(cpc), bm);
+    };
+
     std::vector<agx_va_range> dirty_vas;
     std::vector<agx_va_range> read_vas;
     dirty_vas.reserve(64);
     read_vas.reserve(128);
-    bool has_dispatched    = false;
-    bool used_moe_scratch  = false;
-    bool used_attn_scratch = false;
+    bool has_dispatched     = false;
+    bool used_moe_scratch   = false;
+    bool used_attn_scratch  = false;
+    bool used_alias_scratch = false;
 
     auto ensure_item_ready = [&](const agx_exec_item & it) {
         bool hazard = force_barrier;
         if (!hazard && has_dispatched) {
-            if ((it.uses_moe_scratch && used_moe_scratch) ||
-                (it.uses_attn_scratch && used_attn_scratch)) {
+            if ((it.uses_moe_scratch   && used_moe_scratch) ||
+                (it.uses_attn_scratch  && used_attn_scratch) ||
+                (it.uses_alias_scratch && used_alias_scratch)) {
                 hazard = true;
             }
             for (uint8_t r = 0; !hazard && r < it.n_reads; ++r) {
@@ -5853,8 +6491,9 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
             agx_cdm_barrier_usc(stream);
             dirty_vas.clear();
             read_vas.clear();
-            used_moe_scratch  = false;
-            used_attn_scratch = false;
+            used_moe_scratch   = false;
+            used_attn_scratch  = false;
+            used_alias_scratch = false;
         } else if (has_dispatched) {
             st->stats.barriers_elided++;
         }
@@ -5864,8 +6503,9 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
         has_dispatched = true;
         for (uint8_t r = 0; r < it.n_reads; ++r)  read_vas.push_back(it.reads[r]);
         for (uint8_t w = 0; w < it.n_writes; ++w) dirty_vas.push_back(it.writes[w]);
-        if (it.uses_moe_scratch)  used_moe_scratch  = true;
-        if (it.uses_attn_scratch) used_attn_scratch = true;
+        if (it.uses_moe_scratch)   used_moe_scratch   = true;
+        if (it.uses_attn_scratch)  used_attn_scratch  = true;
+        if (it.uses_alias_scratch) used_alias_scratch = true;
     };
 
     for (size_t idx = 0; idx < n_items; ++idx) {
@@ -5917,8 +6557,20 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                 break;
 
             case ITEM_MIX_ATTN:
-                ok = agx_cdm_dispatch(stream, st->k_mix_attn, it.gx, it.gy, it.gz,
-                                      it.push, it.push_bytes, AGX_BARRIER_NONE);
+                if (it.alias_flags != 0u) {
+                    mix_attn_push mpc{};
+                    std::memcpy(&mpc, it.push, sizeof(mpc));
+                    const uint64_t final_out_va = mpc.out_va;
+                    mpc.out_va = st->alias_tmp_bo->gpu_va;
+                    ok = agx_cdm_dispatch(stream, st->k_mix_attn, it.gx, it.gy, it.gz,
+                                          &mpc, sizeof(mpc), AGX_BARRIER_STRONG_USC);
+                    if (ok) {
+                        ok = emit_f32_copy(st->alias_tmp_bo->gpu_va, final_out_va, it.alias_floats0, AGX_BARRIER_NONE);
+                    }
+                } else {
+                    ok = agx_cdm_dispatch(stream, st->k_mix_attn, it.gx, it.gy, it.gz,
+                                          it.push, it.push_bytes, AGX_BARRIER_NONE);
+                }
                 break;
 
             case ITEM_MOE_WSUM:
@@ -5932,8 +6584,20 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                 break;
 
             case ITEM_FULL_SHORTCONV:
-                ok = agx_cdm_dispatch(stream, st->k_full_shortconv, it.gx, it.gy, it.gz,
-                                      it.push, it.push_bytes, AGX_BARRIER_NONE);
+                if (it.alias_flags != 0u) {
+                    full_shortconv_push pc{};
+                    std::memcpy(&pc, it.push, sizeof(pc));
+                    const uint64_t final_dst_va = pc.dst_va;
+                    pc.dst_va = st->alias_tmp_bo->gpu_va;
+                    ok = agx_cdm_dispatch(stream, st->k_full_shortconv, it.gx, it.gy, it.gz,
+                                          &pc, sizeof(pc), AGX_BARRIER_STRONG_USC);
+                    if (ok) {
+                        ok = emit_f32_copy(st->alias_tmp_bo->gpu_va, final_dst_va, it.alias_floats0, AGX_BARRIER_NONE);
+                    }
+                } else {
+                    ok = agx_cdm_dispatch(stream, st->k_full_shortconv, it.gx, it.gy, it.gz,
+                                          it.push, it.push_bytes, AGX_BARRIER_NONE);
+                }
                 break;
 
             case ITEM_ROUTER_TOPK:
@@ -5941,9 +6605,43 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                                       it.push, it.push_bytes, AGX_BARRIER_NONE);
                 break;
 
+            case ITEM_REL_SAVE_TMP:
+                ok = emit_f32_copy(it.va0, st->alias_tmp_bo->gpu_va + it.alias_tmp_off_B,
+                                   it.alias_floats0, AGX_BARRIER_NONE);
+                break;
+
             case ITEM_REL_BIAS:
-                ok = agx_cdm_dispatch(stream, st->k_rel_bias_gather, it.gx, it.gy, it.gz,
-                                      it.push, it.push_bytes, AGX_BARRIER_NONE);
+                if (it.alias_flags != 0u) {
+                    rel_bias_gather_push pc{};
+                    std::memcpy(&pc, it.push, sizeof(pc));
+                    const uint64_t tmp_base = st->alias_tmp_bo->gpu_va;
+                    ok = true;
+                    bool did_copy = false;
+                    if (it.alias_flags & 1u) {
+                        ok = ok && emit_f32_copy(pc.rcur_va, tmp_base, it.alias_floats0, AGX_BARRIER_NONE);
+                        pc.rcur_va = tmp_base;
+                        did_copy = true;
+                    } else if (it.alias_flags & 4u) {
+                        pc.rcur_va = tmp_base;
+                    }
+                    if (it.alias_flags & 2u) {
+                        ok = ok && emit_f32_copy(pc.sinks_va, tmp_base + it.alias_tmp_off_B, it.alias_floats1, AGX_BARRIER_NONE);
+                        pc.sinks_va = tmp_base + it.alias_tmp_off_B;
+                        did_copy = true;
+                    } else if (it.alias_flags & 8u) {
+                        pc.sinks_va = tmp_base + it.alias_tmp_off_B;
+                    }
+                    if (ok && did_copy) {
+                        agx_cdm_barrier_usc(stream);
+                    }
+                    if (ok) {
+                        ok = agx_cdm_dispatch(stream, st->k_rel_bias_gather, it.gx, it.gy, it.gz,
+                                              &pc, sizeof(pc), AGX_BARRIER_NONE);
+                    }
+                } else {
+                    ok = agx_cdm_dispatch(stream, st->k_rel_bias_gather, it.gx, it.gy, it.gz,
+                                          it.push, it.push_bytes, AGX_BARRIER_NONE);
+                }
                 break;
 
             case ITEM_DSPARK_MARKOV_W4: {
@@ -5963,33 +6661,12 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                 }
                 auto * mr = static_cast<agx_moe_runner *>(ctx->moe_state);
                 agx_moe_stage_args ma = it.moe_args;
-                if (it.moe_alias_tmp) {
-                    const size_t need_B = agx_align_up((size_t) ma.n_tokens * ma.n_embd * sizeof(float), AGX_PAGE_SIZE);
-                    if (!st->moe_tmp_bo || need_B > st->moe_tmp_cap_B) {
-                        if (st->moe_tmp_bo) agx_bo_free(ctx->drm, st->moe_tmp_bo);
-                        st->moe_tmp_bo = agx_bo_alloc(ctx->drm, need_B, AGX_BO_SLC_STREAM, "ge-moe-tmp");
-                        if (!st->moe_tmp_bo) { st->moe_tmp_cap_B = 0; return GGML_STATUS_FAILED; }
-                        st->moe_tmp_cap_B = need_B;
-                    }
+                if (it.alias_flags != 0u) {
                     const uint64_t final_out_va = ma.moe_out_va;
-                    ma.moe_out_va = st->moe_tmp_bo->gpu_va;
+                    ma.moe_out_va = st->alias_tmp_bo->gpu_va;
                     ok = agx_moe_dispatch_fused_situ_down(mr, stream, ma, AGX_BARRIER_STRONG_USC);
                     if (ok) {
-                        cpy_cast_push cpc{};
-                        cpc.src_va = st->moe_tmp_bo->gpu_va;
-                        cpc.dst_va = final_out_va;
-                        cpc.ne0    = ma.n_embd; cpc.ne1 = ma.n_tokens; cpc.ne2 = 1u; cpc.ne3 = 1u;
-                        cpc.d_ne0  = ma.n_embd; cpc.d_ne1 = ma.n_tokens; cpc.d_ne2 = 1u; cpc.d_ne3 = 1u;
-                        cpc.s_nb0  = 4u; cpc.s_nb1 = ma.n_embd * 4u; cpc.s_nb2 = cpc.s_nb1 * ma.n_tokens; cpc.s_nb3 = cpc.s_nb2;
-                        cpc.d_nb0  = 4u; cpc.d_nb1 = ma.n_embd * 4u; cpc.d_nb2 = cpc.d_nb1 * ma.n_tokens; cpc.d_nb3 = cpc.d_nb2;
-                        cpy_type_code(GGML_TYPE_F32, &cpc.src_type);
-                        cpy_type_code(GGML_TYPE_F32, &cpc.dst_type);
-                        cpc.total       = ma.n_embd * ma.n_tokens;
-                        const bool v4_cp = ((cpc.total & 3u) == 0u) && (((cpc.src_va | cpc.dst_va) & 15ull) == 0ull);
-                        cpc.d_is_linear = v4_cp ? 2u : 1u;
-                        ok = agx_cdm_dispatch(stream, st->k_cpy_cast,
-                                              v4_cp ? (((cpc.total >> 2u) + 255u) / 256u) : ((cpc.total + 255u) / 256u),
-                                              1u, 1u, &cpc, sizeof(cpc), AGX_BARRIER_NONE);
+                        ok = emit_f32_copy(st->alias_tmp_bo->gpu_va, final_out_va, it.alias_floats0, AGX_BARRIER_NONE);
                     }
                 } else {
                     ok = agx_moe_dispatch_fused_situ_down(mr, stream, ma, AGX_BARRIER_NONE);
@@ -6028,10 +6705,27 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                         const bool vec4_ok = ggml_are_same_shape(a, b) && ggml_are_same_shape(a, node) &&
                                              ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(node) &&
                                              (pc.total & 3u) == 0u && ((pc.a_va | pc.b_va | pc.d_va) & 15ull) == 0ull;
-                        if (vec4_ok) pc.op_kind |= 0x100u;
-                        ok = agx_cdm_dispatch(stream, st->k_bin_op,
-                                              vec4_ok ? (((pc.total >> 2u) + 255u) / 256u) : ((pc.total + 255u) / 256u),
-                                              1, 1, &pc, sizeof(pc), AGX_BARRIER_NONE);
+                        const bool bcast3d_ok = !vec4_ok && ggml_are_same_shape(a, node) &&
+                                                ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(node) &&
+                                                node->ne[3] == 1 && b->ne[3] == 1 &&
+                                                (pc.ne0 & 3u) == 0u && pc.ne1 <= 65535u && pc.ne2 <= 65535u &&
+                                                (pc.ne10 == pc.ne0 || pc.ne10 == 1u) &&
+                                                (pc.ne11 == pc.ne1 || pc.ne11 == 1u) &&
+                                                (pc.ne12 == pc.ne2 || pc.ne12 == 1u) &&
+                                                ((pc.a_va | pc.d_va) & 15ull) == 0ull &&
+                                                (pc.ne10 == 1u || (pc.b_va & 15ull) == 0ull);
+                        if (vec4_ok) {
+                            pc.op_kind |= 0x100u;
+                            ok = agx_cdm_dispatch(stream, st->k_bin_op, ((pc.total >> 2u) + 255u) / 256u,
+                                                  1, 1, &pc, sizeof(pc), AGX_BARRIER_NONE);
+                        } else if (bcast3d_ok) {
+                            pc.op_kind |= 0x200u;
+                            ok = agx_cdm_dispatch(stream, st->k_bin_op, ((pc.ne0 >> 2u) + 255u) / 256u,
+                                                  pc.ne1, pc.ne2, &pc, sizeof(pc), AGX_BARRIER_NONE);
+                        } else {
+                            ok = agx_cdm_dispatch(stream, st->k_bin_op, (pc.total + 255u) / 256u,
+                                                  1, 1, &pc, sizeof(pc), AGX_BARRIER_NONE);
+                        }
                     } break;
 
                     case GGML_OP_SCALE:
@@ -6103,13 +6797,18 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                         cpy_type_code(s->type,    &pc.src_type);
                         cpy_type_code(node->type, &pc.dst_type);
                         pc.total = (uint32_t) ggml_nelements(s);
-                        const bool v4_cp = (s->type == node->type) &&
-                                           (pc.src_type == 0u || pc.src_type == 3u) &&
-                                           ggml_is_contiguous(s) && ggml_is_contiguous(node) &&
-                                           (pc.total & 3u) == 0u && (((pc.src_va | pc.dst_va) & 15ull) == 0ull);
-                        pc.d_is_linear = v4_cp ? 2u : (ggml_is_contiguous(node) ? 1u : 0u);
+                        const bool contig_v4 = ggml_is_contiguous(s) && ggml_is_contiguous(node) && ((pc.total & 3u) == 0u);
+                        const bool v4_cp     = contig_v4 && (s->type == node->type) &&
+                                               (pc.src_type == 0u || pc.src_type == 3u) &&
+                                               (((pc.src_va | pc.dst_va) & 15ull) == 0ull);
+                        const bool v4_f16_to_f32 = contig_v4 && (pc.src_type == 1u && pc.dst_type == 0u) &&
+                                                   ((pc.src_va & 7ull) == 0ull) && ((pc.dst_va & 15ull) == 0ull);
+                        const bool v4_f32_to_f16 = contig_v4 && (pc.src_type == 0u && pc.dst_type == 1u) &&
+                                                   ((pc.src_va & 15ull) == 0ull) && ((pc.dst_va & 7ull) == 0ull);
+                        const bool v4_any = v4_cp || v4_f16_to_f32 || v4_f32_to_f16;
+                        pc.d_is_linear = v4_cp ? 2u : (v4_f16_to_f32 ? 3u : (v4_f32_to_f16 ? 4u : (ggml_is_contiguous(node) ? 1u : 0u)));
                         ok = agx_cdm_dispatch(stream, st->k_cpy_cast,
-                                              v4_cp ? (((pc.total >> 2u) + 255u) / 256u) : ((pc.total + 255u) / 256u),
+                                              v4_any ? (((pc.total >> 2u) + 255u) / 256u) : ((pc.total + 255u) / 256u),
                                               1, 1, &pc, sizeof(pc), AGX_BARRIER_NONE);
                     } break;
 
