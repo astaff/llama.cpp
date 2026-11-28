@@ -1563,10 +1563,7 @@ void main() {
 
     const uint64_t desc_va    = pc.descs_va;
     const uint     flags      = D_FLD(desc_va, flags);
-    const uint     n_tok      = min(D_FLD(desc_va, n_tokens), 4u);
-    const uint     t1_idx     = min(1u, n_tok - 1u);
-    const uint     t2_idx     = min(2u, n_tok - 1u);
-    const uint     t3_idx     = min(3u, n_tok - 1u);
+    const uint     n_tok      = min(D_FLD(desc_va, n_tokens), 8u);
     const uint     D          = 2304u;
     const uint     D4         = D >> 2u;
     const float    inv_D      = 1.0 / 2304.0;
@@ -1702,44 +1699,51 @@ void main() {
     agx_sense_barrier(pc.barrier_va, pc.n_wg, local_sense);
 
 #if HAS_LOOP == 1
-    // Phase 2a: 1-Wave 40-Core 4-SG/Row F32 ctrl_down[3] (scalar a0..a3, zero dynamic array mux, <= 52 GPR32!)
+    // Phase 2a: 1-Wave 40-Core 4-SG/Row F32 ctrl_down[3] (M = 2..8 chunked by 4, <= 52 GPR32!)
     {
         const uint half_wg = sg >> 2u;
         const uint sg4     = sg & 3u;
         const uint tid128  = sg4 * 32u + ln;
         const uint row     = half_wg * 40u + wg;
-        float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
-        if (row < 64u) {
-            ConstBufVec4   wb     = ConstBufVec4(D_FLD(desc_va, ctrl_down_w_va)[3] + uint64_t(row) * 4608ul * 4ul);
-            const uint64_t cat_va = D_FLD(desc_va, ctrl_cat_va)[0];
-            CohBufVec4 x0b = CohBufVec4(cat_va);
-            CohBufVec4 x1b = CohBufVec4(cat_va + uint64_t(t1_idx * 4608u) * 4ul);
-            CohBufVec4 x2b = CohBufVec4(cat_va + uint64_t(t2_idx * 4608u) * 4ul);
-            CohBufVec4 x3b = CohBufVec4(cat_va + uint64_t(t3_idx * 4608u) * 4ul);
-            for (uint k0 = tid128; k0 < 1152u; k0 += 128u) {
-                vec4 wv = wb.v[k0];
-                a0 += dot(wv, x0b.v[k0]);
-                a1 += dot(wv, x1b.v[k0]);
-                a2 += dot(wv, x2b.v[k0]);
-                a3 += dot(wv, x3b.v[k0]);
+        const uint64_t cat_va = D_FLD(desc_va, ctrl_cat_va)[0];
+        CohBufF32 gb = CohBufF32(D_FLD(desc_va, ctrl_gate_va)[0]);
+        for (uint t0 = 0u; t0 < n_tok; t0 += 4u) {
+            const uint tc     = min(4u, n_tok - t0);
+            const uint c1_idx = t0 + min(1u, tc - 1u);
+            const uint c2_idx = t0 + min(2u, tc - 1u);
+            const uint c3_idx = t0 + min(3u, tc - 1u);
+            float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+            if (row < 64u) {
+                ConstBufVec4 wb  = ConstBufVec4(D_FLD(desc_va, ctrl_down_w_va)[3] + uint64_t(row) * 4608ul * 4ul);
+                CohBufVec4   x0b = CohBufVec4(cat_va + uint64_t(t0     * 4608u) * 4ul);
+                CohBufVec4   x1b = CohBufVec4(cat_va + uint64_t(c1_idx * 4608u) * 4ul);
+                CohBufVec4   x2b = CohBufVec4(cat_va + uint64_t(c2_idx * 4608u) * 4ul);
+                CohBufVec4   x3b = CohBufVec4(cat_va + uint64_t(c3_idx * 4608u) * 4ul);
+                for (uint k0 = tid128; k0 < 1152u; k0 += 128u) {
+                    vec4 wv = wb.v[k0];
+                    a0 += dot(wv, x0b.v[k0]);
+                    a1 += dot(wv, x1b.v[k0]);
+                    a2 += dot(wv, x2b.v[k0]);
+                    a3 += dot(wv, x3b.v[k0]);
+                }
             }
-        }
-        float s0 = subgroupAdd(a0), s1 = subgroupAdd(a1), s2 = subgroupAdd(a2), s3 = subgroupAdd(a3);
-        if (ln == 0u) {
-            const uint bo = half_wg * 16u + sg4;
-            sh_cur[bo + 0u]  = s0;
-            sh_cur[bo + 4u]  = s1;
-            sh_cur[bo + 8u]  = s2;
-            sh_cur[bo + 12u] = s3;
-        }
-        barrier();
-        if (row < 64u && sg4 == 0u && ln == 0u) {
-            CohBufF32 gb = CohBufF32(D_FLD(desc_va, ctrl_gate_va)[0]);
-            const uint bo = half_wg * 16u;
-            gb.v[0u * 64u + row] = sh_cur[bo + 0u] + sh_cur[bo + 1u] + sh_cur[bo + 2u] + sh_cur[bo + 3u];
-            if (n_tok > 1u) gb.v[1u * 64u + row] = sh_cur[bo + 4u]  + sh_cur[bo + 5u]  + sh_cur[bo + 6u]  + sh_cur[bo + 7u];
-            if (n_tok > 2u) gb.v[2u * 64u + row] = sh_cur[bo + 8u]  + sh_cur[bo + 9u]  + sh_cur[bo + 10u] + sh_cur[bo + 11u];
-            if (n_tok > 3u) gb.v[3u * 64u + row] = sh_cur[bo + 12u] + sh_cur[bo + 13u] + sh_cur[bo + 14u] + sh_cur[bo + 15u];
+            float s0 = subgroupAdd(a0), s1 = subgroupAdd(a1), s2 = subgroupAdd(a2), s3 = subgroupAdd(a3);
+            if (ln == 0u) {
+                const uint bo = half_wg * 16u + sg4;
+                sh_cur[bo + 0u]  = s0;
+                sh_cur[bo + 4u]  = s1;
+                sh_cur[bo + 8u]  = s2;
+                sh_cur[bo + 12u] = s3;
+            }
+            barrier();
+            if (row < 64u && sg4 == 0u && ln == 0u) {
+                const uint bo = half_wg * 16u;
+                gb.v[(t0 + 0u) * 64u + row] = sh_cur[bo + 0u] + sh_cur[bo + 1u] + sh_cur[bo + 2u] + sh_cur[bo + 3u];
+                if (tc > 1u) gb.v[(t0 + 1u) * 64u + row] = sh_cur[bo + 4u]  + sh_cur[bo + 5u]  + sh_cur[bo + 6u]  + sh_cur[bo + 7u];
+                if (tc > 2u) gb.v[(t0 + 2u) * 64u + row] = sh_cur[bo + 8u]  + sh_cur[bo + 9u]  + sh_cur[bo + 10u] + sh_cur[bo + 11u];
+                if (tc > 3u) gb.v[(t0 + 3u) * 64u + row] = sh_cur[bo + 12u] + sh_cur[bo + 13u] + sh_cur[bo + 14u] + sh_cur[bo + 15u];
+            }
+            if (t0 + 4u < n_tok) barrier();
         }
     }
     agx_sense_barrier(pc.barrier_va, pc.n_wg, local_sense);
@@ -1797,17 +1801,13 @@ void main() {
     agx_sense_barrier(pc.barrier_va, pc.n_wg, local_sense);
 #endif
 
-    // Phase 3: 1-Wave 40-Core 2-SG/Row Router GEMM (scalar a0..a3, single unified loop, <= 52 GPR32!)
+    // Phase 3: 1-Wave 40-Core 2-SG/Row Router GEMM (M = 2..8 chunked by 4, <= 52 GPR32!)
     const uint n_exp = D_FLD(desc_va, n_expert);
     {
         const uint64_t rw_va  = D_FLD(desc_va, router_w_va);
         const uint     rw_wt  = D_FLD(desc_va, router_wtype);
         const uint     rw_rb  = D_FLD(desc_va, router_row_B);
         const uint64_t xq_va  = D_FLD(desc_va, x_q_va);
-        CohBufVec4     x0b    = CohBufVec4(xq_va);
-        CohBufVec4     x1b    = CohBufVec4(xq_va + uint64_t(t1_idx * D) * 4ul);
-        CohBufVec4     x2b    = CohBufVec4(xq_va + uint64_t(t2_idx * D) * 4ul);
-        CohBufVec4     x3b    = CohBufVec4(xq_va + uint64_t(t3_idx * D) * 4ul);
         CohBufF32      lb     = CohBufF32(D_FLD(desc_va, router_logits_va));
         const uint     pair   = sg >> 1u;
         const uint     sg2    = sg & 1u;
@@ -1815,45 +1815,55 @@ void main() {
 
         for (uint base = 0u; base < n_exp; base += 160u) {
             const uint row = base + pair * 40u + wg;
-            float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
-            if (row < n_exp) {
-                const uint64_t r_va = rw_va + uint64_t(row) * uint64_t(rw_rb);
-                ConstBufVec4  wb0 = ConstBufVec4(r_va);
-                ConstBufUvec2 wb2 = ConstBufUvec2(r_va);
-                for (uint k0 = tid64; k0 < D4; k0 += 64u) {
-                    vec4 wv;
-                    if (rw_wt == 0u) {
-                        wv = wb0.v[k0];
-                    } else {
-                        uvec2 p = wb2.v[k0];
-                        wv = (rw_wt == 2u)
-                           ? vec4(uintBitsToFloat((p.x & 0xFFFFu) << 16u), uintBitsToFloat(p.x & 0xFFFF0000u),
-                                  uintBitsToFloat((p.y & 0xFFFFu) << 16u), uintBitsToFloat(p.y & 0xFFFF0000u))
-                           : vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y));
+            for (uint t0 = 0u; t0 < n_tok; t0 += 4u) {
+                const uint tc     = min(4u, n_tok - t0);
+                const uint c1_idx = t0 + min(1u, tc - 1u);
+                const uint c2_idx = t0 + min(2u, tc - 1u);
+                const uint c3_idx = t0 + min(3u, tc - 1u);
+                CohBufVec4 x0b = CohBufVec4(xq_va + uint64_t(t0     * D) * 4ul);
+                CohBufVec4 x1b = CohBufVec4(xq_va + uint64_t(c1_idx * D) * 4ul);
+                CohBufVec4 x2b = CohBufVec4(xq_va + uint64_t(c2_idx * D) * 4ul);
+                CohBufVec4 x3b = CohBufVec4(xq_va + uint64_t(c3_idx * D) * 4ul);
+                float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+                if (row < n_exp) {
+                    const uint64_t r_va = rw_va + uint64_t(row) * uint64_t(rw_rb);
+                    ConstBufVec4  wb0 = ConstBufVec4(r_va);
+                    ConstBufUvec2 wb2 = ConstBufUvec2(r_va);
+                    for (uint k0 = tid64; k0 < D4; k0 += 64u) {
+                        vec4 wv;
+                        if (rw_wt == 0u) {
+                            wv = wb0.v[k0];
+                        } else {
+                            uvec2 p = wb2.v[k0];
+                            wv = (rw_wt == 2u)
+                               ? vec4(uintBitsToFloat((p.x & 0xFFFFu) << 16u), uintBitsToFloat(p.x & 0xFFFF0000u),
+                                      uintBitsToFloat((p.y & 0xFFFFu) << 16u), uintBitsToFloat(p.y & 0xFFFF0000u))
+                               : vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y));
+                        }
+                        a0 += dot(wv, x0b.v[k0]);
+                        a1 += dot(wv, x1b.v[k0]);
+                        a2 += dot(wv, x2b.v[k0]);
+                        a3 += dot(wv, x3b.v[k0]);
                     }
-                    a0 += dot(wv, x0b.v[k0]);
-                    a1 += dot(wv, x1b.v[k0]);
-                    a2 += dot(wv, x2b.v[k0]);
-                    a3 += dot(wv, x3b.v[k0]);
                 }
+                float s0 = subgroupAdd(a0), s1 = subgroupAdd(a1), s2 = subgroupAdd(a2), s3 = subgroupAdd(a3);
+                if (ln == 0u) {
+                    const uint bo = pair * 8u + sg2;
+                    sh_cur[bo + 0u] = s0;
+                    sh_cur[bo + 2u] = s1;
+                    sh_cur[bo + 4u] = s2;
+                    sh_cur[bo + 6u] = s3;
+                }
+                barrier();
+                if (row < n_exp && sg2 == 0u && ln == 0u) {
+                    const uint bo = pair * 8u;
+                    lb.v[(t0 + 0u) * n_exp + row] = sh_cur[bo + 0u] + sh_cur[bo + 1u];
+                    if (tc > 1u) lb.v[(t0 + 1u) * n_exp + row] = sh_cur[bo + 2u] + sh_cur[bo + 3u];
+                    if (tc > 2u) lb.v[(t0 + 2u) * n_exp + row] = sh_cur[bo + 4u] + sh_cur[bo + 5u];
+                    if (tc > 3u) lb.v[(t0 + 3u) * n_exp + row] = sh_cur[bo + 6u] + sh_cur[bo + 7u];
+                }
+                if (t0 + 4u < n_tok || base + 160u < n_exp) barrier();
             }
-            float s0 = subgroupAdd(a0), s1 = subgroupAdd(a1), s2 = subgroupAdd(a2), s3 = subgroupAdd(a3);
-            if (ln == 0u) {
-                const uint bo = pair * 8u + sg2;
-                sh_cur[bo + 0u] = s0;
-                sh_cur[bo + 2u] = s1;
-                sh_cur[bo + 4u] = s2;
-                sh_cur[bo + 6u] = s3;
-            }
-            barrier();
-            if (row < n_exp && sg2 == 0u && ln == 0u) {
-                const uint bo = pair * 8u;
-                lb.v[0u * n_exp + row] = sh_cur[bo + 0u] + sh_cur[bo + 1u];
-                if (n_tok > 1u) lb.v[1u * n_exp + row] = sh_cur[bo + 2u] + sh_cur[bo + 3u];
-                if (n_tok > 2u) lb.v[2u * n_exp + row] = sh_cur[bo + 4u] + sh_cur[bo + 5u];
-                if (n_tok > 3u) lb.v[3u * n_exp + row] = sh_cur[bo + 6u] + sh_cur[bo + 7u];
-            }
-            if (base + 160u < n_exp) barrier();
         }
     }
     agx_sense_barrier(pc.barrier_va, pc.n_wg, local_sense);
@@ -1939,10 +1949,7 @@ void main() {
 
     const uint64_t d0_va      = pc.descs_va;
     const uint64_t d1_va      = pc.descs_va + 1152ul;
-    const uint     n_tok      = min(D_FLD(d0_va, n_tokens), 4u);
-    const uint     t1_idx     = min(1u, n_tok - 1u);
-    const uint     t2_idx     = min(2u, n_tok - 1u);
-    const uint     t3_idx     = min(3u, n_tok - 1u);
+    const uint     n_tok      = min(D_FLD(d0_va, n_tokens), 8u);
     const uint     D          = 2304u;
     const uint     D4         = D >> 2u;
     const float    inv_D      = 1.0 / 2304.0;
@@ -2045,9 +2052,12 @@ void main() {
             }
             barrier();
 
+            const bool do_norm = (flags0 & PFLAG_POST_FFN_DO_NORM) != 0u;
+            const uint64_t mix_exp_va = D_FLD(d0_va, next_mix_export_va);
             for (uint q = 0u; q < Q; ++q) {
                 CohBufVec4 db = CohBufVec4(D_FLD(d0_va, next_mix_out_va)[q] + tok_B);
                 const float wb = sh_prob[q][B];
+                float ss_y = 0.0;
                 for (uint i4 = tid; i4 < D4; i4 += 256u) {
                     uint b = i4 << 2u;
                     vec4 yv = wb * vec4(sh_cur[b], sh_cur[b + 1u], sh_cur[b + 2u], sh_cur[b + 3u]);
@@ -2056,11 +2066,36 @@ void main() {
                         yv += sh_prob[q][s] * CohBufVec4(x_va).v[i4];
                     }
                     db.v[i4] = yv;
+#if HAS_LOOP == 0
+                    if (do_norm) ss_y += dot(yv, yv);
+#endif
                 }
+#if HAS_LOOP == 0
+                if (do_norm) {
+                    const float rms = inversesqrt(wg_sum1_256(ss_y, sg, ln) * inv_D + D_FLD(d0_va, rms_eps));
+                    ConstBufVec4 nw = ConstBufVec4(D_FLD(d0_va, next_norm_w_va)[q]);
+                    const bool do_exp = (q == 0u && mix_exp_va != 0ul);
+                    CohBufVec4 eb = CohBufVec4(mix_exp_va + tok_B);
+                    for (uint i4 = tid; i4 < D4; i4 += 256u) {
+                        vec4 ov = (db.v[i4] * rms) * nw.v[i4];
+                        db.v[i4] = ov;
+                        if (do_exp) eb.v[i4] = ov;
+                    }
+                }
+#endif
             }
         }
     }
     agx_sense_barrier(pc.barrier_va, pc.n_wg, local_sense);
+
+#if HAS_LOOP == 0
+    // Wave 9: Non-loop parallel M-token transition (kills 24 1-WG serial k_w4_stage_post_ffn stalls!)
+    if (wg == 0u) {
+        store_conv_rollback_256(hist_cell0_va, D_FLD(d0_va, moe_out_va), D_FLD(d0_va, cell_va)[3],
+                                4352u, n_tok, D_FLD(d0_va, rollback_slots), D_FLD(d0_va, rollback_stride_f32), tid);
+    }
+}
+#else
 
     // Phase 1: pass[v+1] Parallel M-token msg_mix (WGs 0..M-1) + norm_cat/qkv_mix (WGs M..4M-1)
     const uint flags1   = D_FLD(d1_va, flags);
@@ -2236,7 +2271,7 @@ void main() {
     }
     agx_sense_barrier(pc.barrier_va, pc.n_wg, local_sense);
 
-    // Phase 2: 1-Wave 40-Core 1-SG/Row 3x ctrl_down (0 WG barriers, scalar a0..a3, <= 52 GPR32!)
+    // Phase 2: 1-Wave 40-Core 1-SG/Row 2x-Unrolled 3x ctrl_down (0 WG bar, M=2..8 chunked by 4, <= 56 GPR32!)
     {
         const uint r = sg * 40u + wg;
         if (r < 192u) {
@@ -2244,25 +2279,34 @@ void main() {
             const uint     row    = r & 63u;
             ConstBufVec4   wb     = ConstBufVec4(D_FLD(d1_va, ctrl_down_w_va)[c] + uint64_t(row) * 4608ul * 4ul);
             const uint64_t cat_va = D_FLD(d1_va, ctrl_cat_va)[c];
-            CohBufVec4 x0b = CohBufVec4(cat_va);
-            CohBufVec4 x1b = CohBufVec4(cat_va + uint64_t(t1_idx * 4608u) * 4ul);
-            CohBufVec4 x2b = CohBufVec4(cat_va + uint64_t(t2_idx * 4608u) * 4ul);
-            CohBufVec4 x3b = CohBufVec4(cat_va + uint64_t(t3_idx * 4608u) * 4ul);
-            float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
-            for (uint k0 = ln; k0 < 1152u; k0 += 32u) {
-                vec4 wv = wb.v[k0];
-                a0 += dot(wv, x0b.v[k0]);
-                a1 += dot(wv, x1b.v[k0]);
-                a2 += dot(wv, x2b.v[k0]);
-                a3 += dot(wv, x3b.v[k0]);
-            }
-            float s0 = subgroupAdd(a0), s1 = subgroupAdd(a1), s2 = subgroupAdd(a2), s3 = subgroupAdd(a3);
-            if (ln == 0u) {
-                CohBufF32 gb = CohBufF32(D_FLD(d1_va, ctrl_gate_va)[c]);
-                gb.v[0u * 64u + row] = s0;
-                if (n_tok > 1u) gb.v[1u * 64u + row] = s1;
-                if (n_tok > 2u) gb.v[2u * 64u + row] = s2;
-                if (n_tok > 3u) gb.v[3u * 64u + row] = s3;
+            CohBufF32      gb     = CohBufF32(D_FLD(d1_va, ctrl_gate_va)[c]);
+            for (uint t0 = 0u; t0 < n_tok; t0 += 4u) {
+                const uint tc     = min(4u, n_tok - t0);
+                const uint c1_idx = t0 + min(1u, tc - 1u);
+                const uint c2_idx = t0 + min(2u, tc - 1u);
+                const uint c3_idx = t0 + min(3u, tc - 1u);
+                CohBufVec4 x0b = CohBufVec4(cat_va + uint64_t(t0     * 4608u) * 4ul);
+                CohBufVec4 x1b = CohBufVec4(cat_va + uint64_t(c1_idx * 4608u) * 4ul);
+                CohBufVec4 x2b = CohBufVec4(cat_va + uint64_t(c2_idx * 4608u) * 4ul);
+                CohBufVec4 x3b = CohBufVec4(cat_va + uint64_t(c3_idx * 4608u) * 4ul);
+                float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+                // 1152 = 18 * 64 exact! 2x unroll doubles DRAM MLP across 85 MB F32 ctrl_down!
+                for (uint k0 = ln; k0 < 1152u; k0 += 64u) {
+                    const uint k1 = k0 + 32u;
+                    vec4 wv0 = wb.v[k0];
+                    vec4 wv1 = wb.v[k1];
+                    a0 += dot(wv0, x0b.v[k0]) + dot(wv1, x0b.v[k1]);
+                    a1 += dot(wv0, x1b.v[k0]) + dot(wv1, x1b.v[k1]);
+                    a2 += dot(wv0, x2b.v[k0]) + dot(wv1, x2b.v[k1]);
+                    a3 += dot(wv0, x3b.v[k0]) + dot(wv1, x3b.v[k1]);
+                }
+                float s0 = subgroupAdd(a0), s1 = subgroupAdd(a1), s2 = subgroupAdd(a2), s3 = subgroupAdd(a3);
+                if (ln == 0u) {
+                    gb.v[(t0 + 0u) * 64u + row] = s0;
+                    if (tc > 1u) gb.v[(t0 + 1u) * 64u + row] = s1;
+                    if (tc > 2u) gb.v[(t0 + 2u) * 64u + row] = s2;
+                    if (tc > 3u) gb.v[(t0 + 3u) * 64u + row] = s3;
+                }
             }
         }
     }
@@ -2332,6 +2376,7 @@ void main() {
                                 4352u, n_tok, D_FLD(d0_va, rollback_slots), D_FLD(d0_va, rollback_stride_f32), tid);
     }
 }
+#endif // HAS_LOOP == 0
 
 #endif // HYBRID_MODE == 3 / 4
 

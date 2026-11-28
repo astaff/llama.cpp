@@ -58,6 +58,7 @@ layout(buffer_reference, std430, buffer_reference_align = 8)  readonly buffer Co
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer ConstBufUvec4 { uvec4     v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 2)  buffer BufF16          { float16_t v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 2)  readonly buffer ConstBufF16   { float16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8)  readonly buffer ConstBufF16Vec4 { f16vec4 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 2)  buffer BufU16          { uint16_t  v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 2)  readonly buffer ConstBufU16   { uint16_t  v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 1)  readonly buffer ConstBufI8    { int8_t    v[]; };
@@ -1032,6 +1033,7 @@ layout(push_constant) uniform PushArgs {
     float    embd_scale;
     float    rms_eps;
     uint     pad0;
+    uint64_t out_norm_f16_va;
 } pc;
 
 shared float s_buf[3072];
@@ -1106,8 +1108,12 @@ void main() {
 
     if (pc.attn_norm0_va != 0ul) {
         float ir = inversesqrt(wg_sum_256(ss, sg, ln) / float(D) + pc.rms_eps);
+        const uint64_t norm_f16_va = (pc.out_norm_f16_va != 0ul)
+            ? (pc.out_norm_f16_va + uint64_t(tok * D) * 2ul) : 0ul;
         for (uint i = tid; i < D; i += 256u) {
-            BufF32(norm_va).v[i] = (s_buf[i] * ir) * ConstBufF32(pc.attn_norm0_va).v[i];
+            float y = (s_buf[i] * ir) * ConstBufF32(pc.attn_norm0_va).v[i];
+            BufF32(norm_va).v[i] = y;
+            if (norm_f16_va != 0ul) BufF16(norm_f16_va).v[i] = float16_t(y);
         }
     }
 }
@@ -1387,10 +1393,12 @@ void main() {
         }
         if (pc.va4 != 0ul && pc.va6 != 0ul) {
             float ir = inversesqrt(wg_sum_256(ss, sg, ln) / float(D) + pc.f0);
+            const uint64_t f16_va = (pc.va8 != 0ul) ? (pc.va8 + uint64_t(tok * D) * 2ul) : 0ul;
             for (uint i = tid; i < D; i += 256u) {
                 float y = (s_buf[i] * ir) * ConstBufF32(pc.va4).v[i];
                 BufF32(pc.va6 + off).v[i] = y;
                 if (pc.va7 != 0ul) BufF32(pc.va7 + off).v[i] = y;
+                if (f16_va != 0ul) BufF16(f16_va).v[i] = float16_t(y);
             }
         }
         return;
@@ -1502,10 +1510,15 @@ void main() {
 
 #elif DSPARK_FUSED_MODE == 8
 // ============================================================================
-// Mode 8: Fused Q8_0_8BLK M=1..4 FFN Gate + Up + GLU (1x sh_x read, 0 gu_out!)
+// Mode 8: Fused Q8_0_8BLK M=1..8 FFN Gate + Up + GLU (1x sh_x read, 0 gu_out!)
+//   - Compiled with -DBATCH_CAP=4 (4 KB SRAM) or -DBATCH_CAP=8 (8 KB SRAM -> still 4 WGs/core!)
 //   - Grid: ((N + 15) / 16, 1, 1), Local: (256, 1, 1) [8 SGs = 16 rows/WG]
-//   - Ping-pong overlapped Gate/Up DRAM prefetch -> <= 52 GPR32, 4 KB SRAM, 0:0 spills!
+//   - Optional y_f16_va mirror feeds direct-L1 FP16 ffn_down Q8 GEMV!
 // ============================================================================
+#ifndef BATCH_CAP
+#define BATCH_CAP 4
+#endif
+
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PushArgs {
@@ -1519,20 +1532,27 @@ layout(push_constant) uniform PushArgs {
     uint     glu_op;
     float    glu_alpha;
     float    glu_limit;
+    uint64_t y_f16_va;
 } pc;
 
-shared f16vec4 sh_x[2][4][64]; // 4,096 B (XOR-swizzled 0 bank conflicts!)
+shared f16vec4 sh_x[2][BATCH_CAP][64]; // 4 KB (M<=4) or 8 KB (M<=8), XOR-swizzled 0 bank conflicts
 
 void load_sh_x(ConstBufVec4 xb, uint tid, uint buf, uint c, uint k4_lim) {
-    const uint m    = tid >> 6u;
+    const uint m0   = tid >> 6u;
     const uint idx  = tid & 63u;
     const uint l    = idx >> 2u;
     const uint j    = idx & 3u;
     const uint swiz = (j << 4u) | (l ^ (j << 2u));
     const uint col4 = c * 64u + idx;
-    sh_x[buf][m][swiz] = (m < pc.M && col4 < k4_lim)
-        ? f16vec4(xb.v[m * k4_lim + col4])
+    sh_x[buf][m0][swiz] = (m0 < pc.M && col4 < k4_lim)
+        ? f16vec4(xb.v[m0 * k4_lim + col4])
         : f16vec4(float16_t(0.0));
+#if BATCH_CAP > 4
+    const uint m1 = m0 + 4u;
+    sh_x[buf][m1][swiz] = (m1 < pc.M && col4 < k4_lim)
+        ? f16vec4(xb.v[m1 * k4_lim + col4])
+        : f16vec4(float16_t(0.0));
+#endif
 }
 
 void main() {
@@ -1556,8 +1576,12 @@ void main() {
     const uint s2 = 32u | (lane16 ^ 8u);
     const uint s3 = 48u | (lane16 ^ 12u);
 
-    float acc_g[4] = float[4](0.0, 0.0, 0.0, 0.0);
-    float acc_u[4] = float[4](0.0, 0.0, 0.0, 0.0);
+    float acc_g[BATCH_CAP];
+    float acc_u[BATCH_CAP];
+    [[unroll]] for (uint m = 0u; m < uint(BATCH_CAP); ++m) {
+        acc_g[m] = 0.0;
+        acc_u[m] = 0.0;
+    }
 
     uvec4 qv = uvec4(0u);
     float dv = 0.0;
@@ -1584,7 +1608,7 @@ void main() {
         }
         const uint k0 = c * 256u + lane16 * 16u;
         if (r_valid && k0 < pc.K) {
-            [[unroll]] for (uint m = 0u; m < 4u; ++m) {
+            [[unroll]] for (uint m = 0u; m < uint(BATCH_CAP); ++m) {
                 const f16vec4 x0 = sh_x[buf][m][s0];
                 const f16vec4 x1 = sh_x[buf][m][s1];
                 const f16vec4 x2 = sh_x[buf][m][s2];
@@ -1616,7 +1640,7 @@ void main() {
             }
         }
         if (r_valid && k0 < pc.K) {
-            [[unroll]] for (uint m = 0u; m < 4u; ++m) {
+            [[unroll]] for (uint m = 0u; m < uint(BATCH_CAP); ++m) {
                 const f16vec4 x0 = sh_x[buf][m][s0];
                 const f16vec4 x1 = sh_x[buf][m][s1];
                 const f16vec4 x2 = sh_x[buf][m][s2];
@@ -1639,7 +1663,7 @@ void main() {
     }
 
     BufF32 yb = BufF32(pc.y_va);
-    [[unroll]] for (uint m = 0u; m < 4u; ++m) {
+    [[unroll]] for (uint m = 0u; m < uint(BATCH_CAP); ++m) {
         acc_g[m] += subgroupShuffleXor(acc_g[m], 1u);
         acc_g[m] += subgroupShuffleXor(acc_g[m], 2u);
         acc_g[m] += subgroupShuffleXor(acc_g[m], 4u);
@@ -1666,7 +1690,11 @@ void main() {
             } else {
                 y = max(g, 0.0) * u;
             }
-            yb.v[m * pc.N + row] = y;
+            const uint idx = m * pc.N + row;
+            yb.v[idx] = y;
+            if (pc.y_f16_va != 0ul) {
+                BufF16(pc.y_f16_va).v[idx] = float16_t(y);
+            }
         }
     }
 }
@@ -2006,6 +2034,395 @@ void main() {
                 BufU16(bva + 2ul).v[ln >> 1u] =
                     uint16_t((uint(q) & 0xFFu) | ((uint(q_hi) & 0xFFu) << 8u));
             }
+        }
+    }
+}
+
+#elif DSPARK_FUSED_MODE == 12
+// ============================================================================
+// Mode 12: Wave 9 Zero-SRAM, Zero-Barrier 128T (32 SGs/core!) M=1..8 Q8_0_8BLK GEMV
+//   - Compiled with -DBATCH_CAP=4|8 -DX_IS_F16=1|0
+//   - Grid: ((N + 7) / 8, 1, 1), Local: (128, 1, 1) [4 SGs = 8 rows/WG, 0 B SRAM, 0 barriers!]
+//   - Direct-L1 FP16 X (18 KB @ M=4,K=2304 < 32 KB L1!), 1-chunk weight prefetch, f16vec2 FMA!
+//   - Pushes DSpark body (167 -> 450+ GB/s) & LM head (398 -> 500 GB/s) to wire ceiling!
+// ============================================================================
+#ifndef BATCH_CAP
+#define BATCH_CAP 4
+#endif
+#ifndef X_IS_F16
+#define X_IS_F16 1
+#endif
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushArgs {
+    uint64_t w_va;
+    uint64_t x_va;
+    uint64_t y_va;
+    uint     M;
+    uint     N;
+    uint     K;
+    uint     x_stride;
+    uint     y_stride;
+    uint     pad0;
+} pc;
+
+void main() {
+    const uint lane   = gl_SubgroupInvocationID; // 0..31
+    const uint sg_id  = gl_SubgroupID;           // 0..3
+    const uint row    = (gl_WorkGroupID.x * 4u + sg_id) * 2u + (lane >> 4u);
+    if (row >= pc.N) return;
+
+    const uint lane16   = lane & 15u;
+    const uint d_slot   = lane16 >> 1u;
+    const uint n_chunks = pc.K >> 8u;
+    if (n_chunks == 0u) return;
+
+    const uint n_tok  = max(pc.M, 1u);
+    const uint x_str4 = pc.x_stride >> 2u;
+    const uint rchk0  = row * n_chunks;
+
+    AgxBufQ8_8Blk wb = AgxBufQ8_8Blk(pc.w_va);
+#if X_IS_F16
+    ConstBufF16Vec4 xb = ConstBufF16Vec4(pc.x_va);
+#else
+    ConstBufVec4    xb = ConstBufVec4(pc.x_va);
+#endif
+
+    float acc[BATCH_CAP];
+    [[unroll]] for (uint m = 0u; m < uint(BATCH_CAP); ++m) {
+        acc[m] = 0.0;
+    }
+
+    uvec4 qv = wb.blk[rchk0].qs[lane16];
+    float d  = float(unpackFloat2x16(uint(wb.blk[rchk0].d[d_slot])).x) * 128.0;
+
+    for (uint c = 0u; c + 1u < n_chunks; ++c) {
+        const uvec4 qv_n = wb.blk[rchk0 + c + 1u].qs[lane16];
+        const float d_n  = float(unpackFloat2x16(uint(wb.blk[rchk0 + c + 1u].d[d_slot])).x) * 128.0;
+
+        const f16vec4 w0 = agx_q8_u32_magic_norm_to_f16vec4(qv.x);
+        const f16vec4 w1 = agx_q8_u32_magic_norm_to_f16vec4(qv.y);
+        const f16vec4 w2 = agx_q8_u32_magic_norm_to_f16vec4(qv.z);
+        const f16vec4 w3 = agx_q8_u32_magic_norm_to_f16vec4(qv.w);
+        const uint c4 = c * 64u + lane16 * 4u;
+
+        [[unroll]] for (uint m = 0u; m < uint(BATCH_CAP); ++m) {
+            const uint mi  = min(m, n_tok - 1u);
+            const uint xo  = mi * x_str4 + c4;
+#if X_IS_F16
+            const f16vec4 x0 = xb.v[xo + 0u];
+            const f16vec4 x1 = xb.v[xo + 1u];
+            const f16vec4 x2 = xb.v[xo + 2u];
+            const f16vec4 x3 = xb.v[xo + 3u];
+#else
+            const f16vec4 x0 = f16vec4(xb.v[xo + 0u]);
+            const f16vec4 x1 = f16vec4(xb.v[xo + 1u]);
+            const f16vec4 x2 = f16vec4(xb.v[xo + 2u]);
+            const f16vec4 x3 = f16vec4(xb.v[xo + 3u]);
+#endif
+            f16vec2 dp2 = w0.xy * x0.xy;
+            dp2 = fma(w0.zw, x0.zw, dp2);
+            dp2 = fma(w1.xy, x1.xy, dp2);
+            dp2 = fma(w1.zw, x1.zw, dp2);
+            dp2 = fma(w2.xy, x2.xy, dp2);
+            dp2 = fma(w2.zw, x2.zw, dp2);
+            dp2 = fma(w3.xy, x3.xy, dp2);
+            dp2 = fma(w3.zw, x3.zw, dp2);
+            acc[m] = fma(float(dp2.x + dp2.y), d, acc[m]);
+        }
+        qv = qv_n;
+        d  = d_n;
+    }
+
+    // Final chunk
+    {
+        const f16vec4 w0 = agx_q8_u32_magic_norm_to_f16vec4(qv.x);
+        const f16vec4 w1 = agx_q8_u32_magic_norm_to_f16vec4(qv.y);
+        const f16vec4 w2 = agx_q8_u32_magic_norm_to_f16vec4(qv.z);
+        const f16vec4 w3 = agx_q8_u32_magic_norm_to_f16vec4(qv.w);
+        const uint c4 = (n_chunks - 1u) * 64u + lane16 * 4u;
+
+        [[unroll]] for (uint m = 0u; m < uint(BATCH_CAP); ++m) {
+            const uint mi  = min(m, n_tok - 1u);
+            const uint xo  = mi * x_str4 + c4;
+#if X_IS_F16
+            const f16vec4 x0 = xb.v[xo + 0u];
+            const f16vec4 x1 = xb.v[xo + 1u];
+            const f16vec4 x2 = xb.v[xo + 2u];
+            const f16vec4 x3 = xb.v[xo + 3u];
+#else
+            const f16vec4 x0 = f16vec4(xb.v[xo + 0u]);
+            const f16vec4 x1 = f16vec4(xb.v[xo + 1u]);
+            const f16vec4 x2 = f16vec4(xb.v[xo + 2u]);
+            const f16vec4 x3 = f16vec4(xb.v[xo + 3u]);
+#endif
+            f16vec2 dp2 = w0.xy * x0.xy;
+            dp2 = fma(w0.zw, x0.zw, dp2);
+            dp2 = fma(w1.xy, x1.xy, dp2);
+            dp2 = fma(w1.zw, x1.zw, dp2);
+            dp2 = fma(w2.xy, x2.xy, dp2);
+            dp2 = fma(w2.zw, x2.zw, dp2);
+            dp2 = fma(w3.xy, x3.xy, dp2);
+            dp2 = fma(w3.zw, x3.zw, dp2);
+            acc[m] = fma(float(dp2.x + dp2.y), d, acc[m]);
+        }
+    }
+
+    BufF32 yb = BufF32(pc.y_va);
+    [[unroll]] for (uint m = 0u; m < uint(BATCH_CAP); ++m) {
+        acc[m] += subgroupShuffleXor(acc[m], 1u);
+        acc[m] += subgroupShuffleXor(acc[m], 2u);
+        acc[m] += subgroupShuffleXor(acc[m], 4u);
+        acc[m] += subgroupShuffleXor(acc[m], 8u);
+        if (lane16 == 0u && m < pc.M) {
+            yb.v[m * pc.y_stride + row] = acc[m];
+        }
+    }
+}
+
+#elif DSPARK_FUSED_MODE == 13
+// ============================================================================
+// Mode 13: Wave 9 160-WG x 256T (32 SGs/core!) SLC-Pinned Q4_32 Markov W2 + SRAM Top-64!
+//   - Grid: (160, n_blocks, 1), Local: (256, 1, 1) [4 WGs/core x 8 SGs = 32 SGs/core!]
+//   - 7,716 B TG-SRAM <= 8,192 B (guaranteed 4 WGs/core!):
+//       s_mk_pair[128] (512B, pre-packed f16vec2 -> 0 F32->F16 casts in loop!)
+//       s_logits[1280] (5,120B, chunk <= 1280 -> 0 memoryBarrierBuffer, 0 global re-reads!)
+//       s_val[256] + s_idx[256] + s_t2[8] + s_cnt (2,084B)
+//   - 1-row software prefetch + Exact Top-2 Pigeonhole across 32 disjoint streams!
+// ============================================================================
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#define DSPARK_F_HAS_W2_BIAS (1u << 2)
+#define DSPARK_F_EMIT_TOP64  (1u << 3)
+
+layout(push_constant) uniform PushArgs {
+    uint64_t markov_va;
+    uint64_t w2_va;
+    uint64_t w2_bias_va;
+    uint64_t base_va;
+    uint64_t out_logits_va;
+    uint64_t cand_val_va;
+    uint64_t cand_idx_va;
+    uint     rank;
+    uint     n_vocab;
+    uint     n_blocks;
+    uint     block_drafts;
+    uint     draft_pos;
+    uint     n_splits;
+    uint     w2_wtype;
+    uint     w2_row_bytes;
+    uint     flags;
+    float    w2_scale;
+    float    softcap;
+    float    inv_softcap;
+    uint     base_stride_f32;
+    uint     pad0;
+} pc;
+
+shared f16vec2 s_mk_pair[128]; //   512 B (pre-packed (m[k], m[k+4]) matching Q4_32 nibbles!)
+shared float   s_logits[1280]; // 5,120 B (up to V=204,800 @ 160 splits -> 0 global re-reads!)
+shared float   s_val[256];     // 1,024 B
+shared int     s_idx[256];     // 1,024 B
+shared float   s_t2[8];        //    32 B (Top-2 Pigeonhole threshold reduction across 8 SGs)
+shared uint    s_cnt;          //     4 B -> TOTAL 7,716 B <= 8,192 B (4 WGs/core = 32 SGs/core!)
+
+void bitonic_sort_desc13(uint n, uint tid) {
+    const uint half_n = n >> 1u;
+    for (uint k = 2u; k <= n; k <<= 1u) {
+        for (uint j = k >> 1u; j > 0u; j >>= 1u) {
+            if (tid < half_n) {
+                uint low_mask = j - 1u;
+                uint lo = ((tid & ~low_mask) << 1u) | (tid & low_mask);
+                uint hi = lo | j;
+                bool asc_dir = ((lo & k) == 0u);
+                float va = s_val[lo]; int ia = s_idx[lo];
+                float vb = s_val[hi]; int ib = s_idx[hi];
+                bool a_before = comes_before_desc(va, ia, vb, ib);
+                if (asc_dir ? (!a_before) : a_before) {
+                    s_val[lo] = vb; s_idx[lo] = ib;
+                    s_val[hi] = va; s_idx[hi] = ia;
+                }
+            }
+            barrier();
+        }
+    }
+}
+
+void main() {
+    const uint split = gl_WorkGroupID.x;
+    const uint blk   = gl_WorkGroupID.y;
+    if (split >= pc.n_splits || blk >= pc.n_blocks) return;
+
+    const uint tid     = gl_LocalInvocationID.x; // 0..255
+    const uint sg      = tid >> 5u;              // 0..7
+    const uint ln      = tid & 31u;              // 0..31
+    const uint row_in8 = sg * 4u + (ln >> 3u);   // 0..31 (32 disjoint row-streams!)
+    const uint l8      = ln & 7u;                // 0..7  (32 weights/lane)
+
+    // Pre-pack R=256 markov vector into f16vec2(m[k0+j], m[k0+4+j]) ONCE per WG!
+    if (tid < 128u) {
+        const uint64_t mk_va = pc.markov_va + uint64_t(blk) * 256ul * 4ul;
+        ConstBufF32 mb = ConstBufF32(mk_va);
+        const uint base_k = (tid >> 2u) * 8u;
+        const uint j      = tid & 3u;
+        s_mk_pair[tid] = f16vec2(float16_t(mb.v[base_k + j]), float16_t(mb.v[base_k + j + 4u]));
+    }
+    barrier();
+
+    const uint V        = pc.n_vocab;
+    const uint base_str = (pc.base_stride_f32 > 0u) ? pc.base_stride_f32 : V;
+    const uint chunk    = (V + pc.n_splits - 1u) / pc.n_splits;
+    const uint beg      = split * chunk;
+    const uint end      = min(beg + chunk, V);
+    const uint n_local  = (end > beg) ? (end - beg) : 0u;
+    const uint slot_idx = blk * pc.block_drafts + pc.draft_pos;
+    const uint out_off  = slot_idx * V;
+    const uint base_off = slot_idx * base_str;
+
+    const bool has_bias  = (pc.flags & DSPARK_F_HAS_W2_BIAS) != 0u && pc.w2_bias_va != 0ul;
+    const bool do_cap    = (pc.softcap > 0.0);
+    const bool emit_top  = (pc.flags & DSPARK_F_EMIT_TOP64) != 0u;
+    const float neg_inf  = uintBitsToFloat(0xFF800000u);
+    const float pos_inf  = uintBitsToFloat(0x7F800000u);
+    const f16vec2 kBias  = f16vec2(float16_t(1032.0));
+    const uint p_base    = l8 * 16u;
+
+    ConstBufF32 bb = ConstBufF32(pc.base_va);
+    BufF32      ob = BufF32(pc.out_logits_va);
+
+    float b0 = neg_inf;
+    float b1 = neg_inf;
+
+    uint  v  = beg + row_in8;
+    float d  = 0.0;
+    uvec4 qp = uvec4(0u);
+    if (v < end) {
+        const uint64_t rva = pc.w2_va + uint64_t(v) * 144ul;
+        d  = float(ConstBufF16(rva).v[l8]);
+        qp = ConstBufUvec4(rva + 16ul).v[l8];
+    }
+
+    while (v < end) {
+        const uint v_next = v + 32u;
+        float d_n  = 0.0;
+        uvec4 qp_n = uvec4(0u);
+        if (v_next < end) {
+            const uint64_t rva_n = pc.w2_va + uint64_t(v_next) * 144ul;
+            d_n  = float(ConstBufF16(rva_n).v[l8]);
+            qp_n = ConstBufUvec4(rva_n + 16ul).v[l8];
+        }
+
+        f16vec2 dp2 = f16vec2(float16_t(0.0));
+        [[unroll]] for (uint w_i = 0u; w_i < 4u; ++w_i) {
+            const uint pw = (w_i == 0u) ? qp.x : ((w_i == 1u) ? qp.y : ((w_i == 2u) ? qp.z : qp.w));
+            const uint pi = p_base + w_i * 4u;
+            dp2 = fma(unpackFloat2x16(( pw         & 0x000F000Fu) | 0x64006400u) - kBias, s_mk_pair[pi + 0u], dp2);
+            dp2 = fma(unpackFloat2x16(((pw >>  4u) & 0x000F000Fu) | 0x64006400u) - kBias, s_mk_pair[pi + 1u], dp2);
+            dp2 = fma(unpackFloat2x16(((pw >>  8u) & 0x000F000Fu) | 0x64006400u) - kBias, s_mk_pair[pi + 2u], dp2);
+            dp2 = fma(unpackFloat2x16(((pw >> 12u) & 0x000F000Fu) | 0x64006400u) - kBias, s_mk_pair[pi + 3u], dp2);
+        }
+        float acc = float(dp2.x + dp2.y) * d;
+        acc += subgroupShuffleXor(acc, 1u);
+        acc += subgroupShuffleXor(acc, 2u);
+        acc += subgroupShuffleXor(acc, 4u);
+        if (l8 == 0u) {
+            float bias = acc * pc.w2_scale;
+            if (has_bias) bias += ConstBufF32(pc.w2_bias_va).v[v];
+            float logit = bb.v[base_off + v] + bias;
+            if (do_cap) logit = pc.softcap * tanh(logit * pc.inv_softcap);
+            ob.v[out_off + v] = logit;
+            if (emit_top) {
+                s_logits[v - beg] = logit;
+                if (logit >= b0) {
+                    b1 = b0;
+                    b0 = logit;
+                } else if (logit > b1) {
+                    b1 = logit;
+                }
+            }
+        }
+        v  = v_next;
+        d  = d_n;
+        qp = qp_n;
+    }
+
+    if (!emit_top) return;
+
+    // Exact Top-2 Pigeonhole across 32 disjoint streams: 32 * 2 = 64 distinct elements >= thresh!
+    float sg_min = subgroupMin((l8 == 0u) ? b1 : pos_inf);
+    if (ln == 0u) s_t2[sg] = sg_min;
+    if (tid == 0u) s_cnt = 0u;
+    barrier();
+
+    float thresh = min(min(min(s_t2[0], s_t2[1]), min(s_t2[2], s_t2[3])),
+                       min(min(s_t2[4], s_t2[5]), min(s_t2[6], s_t2[7])));
+    if (n_local <= 64u) thresh = neg_inf;
+
+    // Pass 2: scan TG-SRAM s_logits[] directly (0 global memory reads, 0 memoryBarrierBuffer!)
+    for (uint i = tid; i < n_local; i += 256u) {
+        float lv = s_logits[i];
+        if (lv >= thresh) {
+            uint pos = atomicAdd(s_cnt, 1u);
+            if (pos < 256u) {
+                s_val[pos] = lv;
+                s_idx[pos] = int(beg + i);
+            }
+        }
+    }
+    barrier();
+
+    const uint tot = s_cnt;
+    const uint cand_base = (blk * pc.n_splits + split) * 64u;
+    if (tot <= 256u) {
+        const uint n_sort = (tot <= 64u) ? 64u : ((tot <= 128u) ? 128u : 256u);
+        if (tid < n_sort && tid >= tot) {
+            s_val[tid] = neg_inf;
+            s_idx[tid] = 0x7FFFFFFF;
+        }
+        barrier();
+        bitonic_sort_desc13(n_sort, tid);
+        if (tid < 64u) {
+            BufF32(pc.cand_val_va).v[cand_base + tid] = s_val[tid];
+            BufI32(pc.cand_idx_va).v[cand_base + tid] = s_idx[tid];
+        }
+    } else {
+        // Exact 64-pass SRAM fallback if >256 tied elements >= thresh
+        float last_v = pos_inf;
+        int   last_i = -1;
+        for (uint k = 0u; k < 64u; ++k) {
+            float bv = neg_inf;
+            int   bi = 0x7FFFFFFF;
+            for (uint i = tid; i < n_local; i += 256u) {
+                float lv = s_logits[i];
+                int   vi = int(beg + i);
+                if (k > 0u && (lv > last_v || (lv == last_v && vi <= last_i))) continue;
+                if (comes_before_desc(lv, vi, bv, bi)) { bv = lv; bi = vi; }
+            }
+            for (uint off = 16u; off > 0u; off >>= 1u) {
+                float ov = subgroupShuffleXor(bv, off);
+                int   oi = subgroupShuffleXor(bi, off);
+                if (comes_before_desc(ov, oi, bv, bi)) { bv = ov; bi = oi; }
+            }
+            if (ln == 0u) { s_val[sg] = bv; s_idx[sg] = bi; }
+            barrier();
+            if (sg == 0u) {
+                float rv = (ln < 8u) ? s_val[ln] : neg_inf;
+                int   ri = (ln < 8u) ? s_idx[ln] : 0x7FFFFFFF;
+                for (uint off = 16u; off > 0u; off >>= 1u) {
+                    float ov = subgroupShuffleXor(rv, off);
+                    int   oi = subgroupShuffleXor(ri, off);
+                    if (comes_before_desc(ov, oi, rv, ri)) { rv = ov; ri = oi; }
+                }
+                if (ln == 0u) { s_val[128u + k] = rv; s_idx[128u + k] = ri; }
+            }
+            barrier();
+            last_v = s_val[128u + k];
+            last_i = s_idx[128u + k];
+        }
+        if (tid < 64u) {
+            BufF32(pc.cand_val_va).v[cand_base + tid] = s_val[128u + tid];
+            BufI32(pc.cand_idx_va).v[cand_base + tid] = s_idx[128u + tid];
         }
     }
 }

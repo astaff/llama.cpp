@@ -353,6 +353,7 @@ struct agx_w7_dspark_inp_block_push {
     float    embd_scale;
     float    rms_eps;
     uint32_t pad0;
+    uint64_t out_norm_f16_va; // Wave 9: optional FP16 mirror of out_norm_va for direct-L1 Q8 GEMV
 };
 static_assert(sizeof(agx_w7_dspark_inp_block_push) <= 256, "agx_w7_dspark_inp_block_push > 256B");
 
@@ -425,20 +426,35 @@ struct agx_w7_dspark_post_op_push {
 };
 static_assert(sizeof(agx_w7_dspark_post_op_push) <= 256, "agx_w7_dspark_post_op_push > 256B");
 
-// DSPARK_FUSED_MODE == 8: Fused Q8_0_8BLK M=1..4 Gate + Up + GLU (1x sh_x read, 0 va_gu_out traffic!)
+// DSPARK_FUSED_MODE == 8: Fused Q8_0_8BLK M=1..8 Gate + Up + GLU (1x sh_x read, 0 va_gu_out traffic!)
 struct agx_w7_dspark_gate_up_glu_push {
     uint64_t wg_va;
     uint64_t wu_va;
     uint64_t x_va;
     uint64_t y_va;
-    uint32_t M;       // 1..4
+    uint32_t M;       // 1..8
     uint32_t N;       // n_ff (e.g. 9216)
     uint32_t K;       // n_embd (e.g. 2304, multiple of 4)
     uint32_t glu_op;  // 0=REGLU, 1=GEGLU, 2=SWIGLU, 3=SWIGLU_OAI, 5=GEGLU_QUICK
     float    glu_alpha;
     float    glu_limit;
+    uint64_t y_f16_va; // Wave 9: optional FP16 mirror of y_va for direct-L1 ffn_down Q8 GEMV
 };
 static_assert(sizeof(agx_w7_dspark_gate_up_glu_push) <= 256, "agx_w7_dspark_gate_up_glu_push > 256B");
+
+// Wave 9: Zero-SRAM, zero-barrier 128T (32 SGs/core) M=1..8 Q8_0_8BLK GEMV (DSPARK_FUSED_MODE=12)
+struct agx_w9_q8_gemv_m_push {
+    uint64_t w_va;
+    uint64_t x_va;      // F16 [M, x_stride] when X_IS_F16=1, else F32 [M, x_stride]
+    uint64_t y_va;      // F32 [M, y_stride]
+    uint32_t M;         // 1..8
+    uint32_t N;
+    uint32_t K;         // multiple of 256 (or 16)
+    uint32_t x_stride;  // elements
+    uint32_t y_stride;  // elements
+    uint32_t pad0;
+};
+static_assert(sizeof(agx_w9_q8_gemv_m_push) == 48, "agx_w9_q8_gemv_m_push must be 48B");
 
 // Wave 8 DSpark MTP Silicon-Ceiling Accelerators (agx_inkling2_dspark_mtp.comp DSPARK_FUSED_MODE=9..11)
 #define AGX_W8_WTYPE_Q4_32          5u
@@ -713,6 +729,6 @@ struct agx_w5_attn_in_push {
     uint32_t dyn_k_row_B;
     uint32_t dyn_v_wtype;
     uint32_t dyn_v_row_B;
-    uint32_t pad0;
+    uint32_t n_tokens;       // 1 for B=1, 2..8 for Wave 9 M=2..8 coalesced attn_in!
 };
 static_assert(sizeof(agx_w5_attn_in_push) == 152, "agx_w5_attn_in_push must be 152B (<= 256B)");

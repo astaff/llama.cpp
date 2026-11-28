@@ -2,11 +2,17 @@
 #include "agx-compiler.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
+
+#if defined(__linux__)
+#    include <sched.h>
+#endif
 
 #if defined(__GNUC__) || defined(__clang__)
 #    define AGX_LIKELY(x)   __builtin_expect(!!(x), 1)
@@ -584,6 +590,7 @@ struct agx_cdm_stream {
     agx_barrier_mode last_barrier_mode = AGX_BARRIER_NONE;
     bool             last_launch_elidable = false;
     bool             terminated       = false;
+    bool             rings_dirty      = false;
     bool             has_external_args = false;
     bool             last_submit_has_ts = false;
     bool             allow_replay     = true;
@@ -608,6 +615,13 @@ struct agx_cdm_stream {
     std::chrono::steady_clock::time_point reset_tp{};
     agx_cdm_stats       stats_at_reset{};
     bool                has_reset_tp = false;
+
+    // Wave 9 Breakthrough A: 4-tier cmd_offset EMA + P-core clock-gated WFE wait
+    // Tiers: 0 (<1KB Inject), 1 (<8KB Draft), 2 (<48KB Verify/Decode), 3 (>=48KB Prefill)
+    double              ema_wait_us[4]  = { 0.0, 0.0, 0.0, 0.0 };
+    uint32_t            last_tier       = 0;
+    std::chrono::steady_clock::time_point submit_tp{};
+    double              last_ioctl_ms   = 0.0;
 };
 
 agx_cdm_stream * agx_cdm_stream_create(agx_drm_device * dev,
@@ -1208,6 +1222,253 @@ bool agx_cdm_barrier(agx_cdm_stream * s, agx_barrier_mode mode) {
     return true;
 }
 
+static inline uint32_t agx_cmd_offset_tier(size_t cmd_bytes) {
+    if (cmd_bytes < 1024u)  return 0u; // tiny (e.g. DSpark Inject MK ~0.3 KB)
+    if (cmd_bytes < 8192u)  return 1u; // small (e.g. DSpark Draft MK ~2 KB)
+    if (cmd_bytes < 49152u) return 2u; // medium (e.g. Target Decode/Verify ~12-28 KB)
+    return 3u;                         // large (e.g. Prefill >= 48 KB)
+}
+
+static inline void agx_update_asymmetric_ema(double & ema, double sample_us) {
+    if (sample_us <= 0.0) {
+        return;
+    }
+    if (ema <= 0.0) {
+        ema = sample_us;
+    } else if (sample_us < ema) {
+        ema = 0.50 * ema + 0.50 * sample_us;
+    } else {
+        ema = 0.85 * ema + 0.15 * sample_us;
+    }
+}
+
+#if defined(__linux__) && defined(__aarch64__)
+static void agx_pin_decode_thread_once() {
+    static const bool no_pin = []() {
+        const char * v = std::getenv("GGML_AGX_NO_PIN_DECODE");
+        return v && v[0] && v[0] != '0';
+    }();
+    static thread_local bool tl_pinned = false;
+    if (tl_pinned || no_pin) {
+        return;
+    }
+    tl_pinned = true;
+
+    cpu_set_t cur;
+    CPU_ZERO(&cur);
+    if (sched_getaffinity(0, sizeof(cur), &cur) != 0 || CPU_COUNT(&cur) <= 1) {
+        return;
+    }
+
+    // Pick the first allowed CPU with the highest cpufreq max (P-core, e.g. cpu4/cpu5 on M4 Max),
+    // keeping other P-cores dark and never pinning to an E-core!
+    int      best_cpu  = -1;
+    uint64_t best_freq = 0;
+    for (int c = 0; c < CPU_SETSIZE; ++c) {
+        if (!CPU_ISSET(c, &cur)) {
+            continue;
+        }
+        char path[96];
+        std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", c);
+        uint64_t freq = 0;
+        if (FILE * f = std::fopen(path, "r")) {
+            unsigned long long khz = 0;
+            if (std::fscanf(f, "%llu", &khz) == 1) {
+                freq = static_cast<uint64_t>(khz);
+            }
+            std::fclose(f);
+        }
+        if (best_cpu < 0 || freq > best_freq) {
+            best_cpu  = c;
+            best_freq = freq;
+        }
+    }
+    // Fallback if cpufreq sysfs is unavailable: prefer first allowed CPU >= 4, else >= 1
+    if (best_freq == 0) {
+        best_cpu = -1;
+        for (int c = 4; c < CPU_SETSIZE; ++c) {
+            if (CPU_ISSET(c, &cur)) { best_cpu = c; break; }
+        }
+        if (best_cpu < 0) {
+            for (int c = 1; c < CPU_SETSIZE; ++c) {
+                if (CPU_ISSET(c, &cur)) { best_cpu = c; break; }
+            }
+        }
+    }
+    if (best_cpu >= 0) {
+        cpu_set_t one;
+        CPU_ZERO(&one);
+        CPU_SET(best_cpu, &one);
+        (void) sched_setaffinity(0, sizeof(one), &one);
+    }
+}
+#endif
+
+static int agx_cdm_wait_timeline_adaptive(agx_cdm_stream * s, uint64_t pt) {
+    // GGML_AGX_WAIT_MODE:
+    //   wfe   (default on Linux aarch64): ARM64 clock-gated `sevl; wfe; wfe` + tight tail + prefill sleep
+    //         Prevents Linux schedutil PELT P-core clock collapse (4.104 -> 1.260 GHz) after >5 ms sleep!
+    //   block : original blocking DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT
+    //   spin  : pure non-blocking yield poll
+    static const int wait_mode = []() {
+        const char * m = std::getenv("GGML_AGX_WAIT_MODE");
+        if (m && m[0]) {
+            if (std::strcmp(m, "block") == 0) return 1;
+            if (std::strcmp(m, "spin")  == 0) return 2;
+            if (std::strcmp(m, "wfe")   == 0) return 0;
+        }
+#if defined(__linux__) && defined(__aarch64__)
+        return 0;
+#else
+        return 1;
+#endif
+    }();
+
+    if (wait_mode == 1) {
+        return agx_drm_wait_timeline(s->dev, pt, UINT64_MAX);
+    }
+
+    auto is_not_ready = [](int r) -> bool {
+        return r == -ETIME || r == -ETIMEDOUT;
+    };
+
+    if (wait_mode == 2) {
+        for (;;) {
+            const int r = agx_drm_wait_timeline(s->dev, pt, 0u);
+            if (!is_not_ready(r)) {
+                return r;
+            }
+#if defined(__aarch64__)
+            for (int y = 0; y < 32; ++y) {
+                __asm__ __volatile__("yield" ::: "memory");
+            }
+#endif
+        }
+    }
+
+#if defined(__linux__) && defined(__aarch64__)
+    static const int64_t sleep_min_est_us = []() -> int64_t {
+        const char * v = std::getenv("GGML_AGX_SLEEP_MIN_EST_US");
+        return (v && v[0]) ? std::atoll(v) : 100000;
+    }();
+    static const int64_t warm_margin_us = []() -> int64_t {
+        const char * v = std::getenv("GGML_AGX_WARM_MARGIN_US");
+        return (v && v[0]) ? std::atoll(v) : 6000;
+    }();
+    static const int64_t tight_tail_us = []() -> int64_t {
+        const char * v = std::getenv("GGML_AGX_TIGHT_TAIL_US");
+        return (v && v[0]) ? std::atoll(v) : 350;
+    }();
+    static const int64_t subms_spin_us = []() -> int64_t {
+        const char * v = std::getenv("GGML_AGX_SUBMS_SPIN_US");
+        return (v && v[0]) ? std::atoll(v) : 600;
+    }();
+
+    agx_pin_decode_thread_once();
+
+    const uint32_t tier   = s->last_tier;
+    const double   est_us = s->ema_wait_us[tier];
+
+    auto elapsed_since_submit_us = [&]() -> int64_t {
+        const auto now = std::chrono::steady_clock::now();
+        return std::max<int64_t>(0, std::chrono::duration_cast<std::chrono::microseconds>(now - s->submit_tp).count());
+    };
+
+    // Cold huge prefill (tier 3, no EMA yet): block cleanly instead of burning 102 ms in WFE.
+    if (est_us <= 0.0 && tier == 3u) {
+        return agx_drm_wait_timeline(s->dev, pt, UINT64_MAX);
+    }
+
+    // Warm long prefill (> 100 ms): sleep in kernel up to (est_us - 6 ms), then wake into WFE so P-core ramps to 4.1+ GHz!
+    if (est_us > static_cast<double>(sleep_min_est_us)) {
+        const int64_t sleep_us = static_cast<int64_t>(est_us) - elapsed_since_submit_us() - warm_margin_us;
+        if (sleep_us > 1000) {
+            const int r = agx_drm_wait_timeline(s->dev, pt, static_cast<uint64_t>(sleep_us) * 1000ULL);
+            if (!is_not_ready(r)) {
+                return r;
+            }
+        }
+    }
+
+    // Sub-ms submits (e.g. DSpark Inject 0.08 ms): immediate low-latency yield poll (< 5 us completion catch!)
+    if (tier == 0u || (est_us > 0.0 && est_us <= static_cast<double>(subms_spin_us))) {
+        for (uint32_t tp = 0u; tp < 4096u; ++tp) {
+            const int r = agx_drm_wait_timeline(s->dev, pt, 0u);
+            if (!is_not_ready(r)) {
+                return r;
+            }
+            for (int y = 0; y < 32; ++y) {
+                __asm__ __volatile__("yield" ::: "memory");
+            }
+        }
+    }
+
+    // Clock-gated ARM64 double-WFE (~100 us arch-timer event stream, <1% sys, keeps P-core pinned at 4.1+ GHz!)
+    // ERET from ioctl sets evReg=1; SEVL+WFE clears it so the 2nd WFE genuinely clock-gates the core!
+    for (uint32_t wfe_poll = 0u; wfe_poll < 1024u; ++wfe_poll) {
+        const int r = agx_drm_wait_timeline(s->dev, pt, 0u);
+        if (!is_not_ready(r)) {
+            return r;
+        }
+        if (est_us > 0.0 && elapsed_since_submit_us() + tight_tail_us >= static_cast<int64_t>(est_us)) {
+            for (uint32_t tp = 0u; tp < 4096u; ++tp) {
+                const int rt = agx_drm_wait_timeline(s->dev, pt, 0u);
+                if (!is_not_ready(rt)) {
+                    return rt;
+                }
+                for (int y = 0; y < 64; ++y) {
+                    __asm__ __volatile__("yield" ::: "memory");
+                }
+            }
+        }
+        __asm__ __volatile__("sevl; wfe; wfe" ::: "memory");
+    }
+
+    // Safety fallback for unexpectedly long graphs (> 102 ms)
+    return agx_drm_wait_timeline(s->dev, pt, UINT64_MAX);
+#else
+    return agx_drm_wait_timeline(s->dev, pt, UINT64_MAX);
+#endif
+}
+
+static inline void agx_clean_dcache_range(const void * ptr, size_t bytes) {
+    if (!ptr || bytes == 0u) {
+        return;
+    }
+#if defined(__aarch64__)
+    static const bool no_clean = []() {
+        const char * v = std::getenv("GGML_AGX_NO_DC_CVAC");
+        return v && v[0] && v[0] != '0';
+    }();
+    if (no_clean) {
+        return;
+    }
+    static const size_t dline = []() -> size_t {
+        uint64_t ctr = 0;
+        __asm__ __volatile__("mrs %0, ctr_el0" : "=r"(ctr));
+        const uint64_t dmin = (ctr >> 16) & 0xFu;
+        const size_t sz = static_cast<size_t>(4u) << dmin;
+        return (sz >= 16u && sz <= 256u) ? sz : 64u;
+    }();
+    uintptr_t addr = reinterpret_cast<uintptr_t>(ptr) & ~(dline - 1u);
+    const uintptr_t end = reinterpret_cast<uintptr_t>(ptr) + bytes;
+    for (; addr < end; addr += dline) {
+        __asm__ __volatile__("dc cvac, %0" :: "r"(addr) : "memory");
+    }
+#else
+    (void) ptr;
+    (void) bytes;
+#endif
+}
+
+static inline void agx_dsb_sy() {
+#if defined(__aarch64__)
+    __asm__ __volatile__("dsb sy" ::: "memory");
+#else
+    __sync_synchronize();
+#endif
+}
+
 int agx_cdm_submit_recorded(agx_cdm_stream * s, bool wait, uint64_t * out_gpu_ns) {
     if (!s || !s->terminated || s->cmd_offset == 0) {
         return -EINVAL;
@@ -1219,12 +1480,27 @@ int agx_cdm_submit_recorded(agx_cdm_stream * s, bool wait, uint64_t * out_gpu_ns
         auto * ts = static_cast<uint64_t *>(s->ts_bo->cpu_ptr);
         ts[0] = 0;
         ts[1] = 0;
+        agx_clean_dcache_range(ts, 2u * sizeof(uint64_t));
     }
     s->last_submit_has_ts = want_ts;
+    s->last_tier          = agx_cmd_offset_tier(s->cmd_offset);
+    s->submit_tp          = std::chrono::steady_clock::now();
 
-    // Ensure all CPU writes to command stream, Ioto arena, and arg ring are visible
-    // to the GPU before ringing the kernel submission doorbell.
-    __sync_synchronize();
+    // Clean dirty ASAHI_GEM_WRITEBACK command/ioto/arg BO lines to PoC before ringing the GPU doorbell
+    // (matches Mesa hk_queue.c / cache_ops_aarch64.c for G17P AGX_CAP_CACHED_CMD_MEMORY).
+    if (s->rings_dirty) {
+        if (s->cmd_bo && s->cmd_bo->cpu_ptr && s->cmd_offset > 0u) {
+            agx_clean_dcache_range(s->cmd_bo->cpu_ptr, s->cmd_offset);
+        }
+        if (s->ioto_bo && s->ioto_bo->cpu_ptr && s->ioto_offset > 0u) {
+            agx_clean_dcache_range(s->ioto_bo->cpu_ptr, s->ioto_offset);
+        }
+        if (s->arg_bo && s->arg_bo->cpu_ptr && s->arg_offset > 0u) {
+            agx_clean_dcache_range(s->arg_bo->cpu_ptr, s->arg_offset);
+        }
+        s->rings_dirty = false;
+    }
+    agx_dsb_sy();
 
     uint64_t pt = 0;
     const int ret = agx_drm_submit_cdm(
@@ -1236,6 +1512,10 @@ int agx_cdm_submit_recorded(agx_cdm_stream * s, bool wait, uint64_t * out_gpu_ns
         sizeof(uint64_t),
         &pt,
         0u);
+    if (g_agx_stats_enabled()) {
+        const auto t_after_ioctl = std::chrono::steady_clock::now();
+        s->last_ioctl_ms = std::chrono::duration<double, std::milli>(t_after_ioctl - s->submit_tp).count();
+    }
     if (ret != 0) {
         return ret;
     }
@@ -1262,13 +1542,15 @@ int agx_cdm_submit(agx_cdm_stream * s, bool wait, uint64_t * out_gpu_ns) {
     }
 
     if (!s->terminated) {
-        // Ensure final stream writes are visible to host CPU and cross-alias VAs
-        agx_cdm_barrier(s, AGX_BARRIER_MEMORY_HOST);
+        // Reserve full host-memory visibility (0x6000157c) for host-synced submits;
+        // async GPU-only submits only need intra-VM USC visibility (0x60001560).
+        agx_cdm_barrier(s, wait ? AGX_BARRIER_MEMORY_HOST : AGX_BARRIER_STRONG_USC);
 
         uint8_t * cmd = static_cast<uint8_t *>(s->cmd_bo->cpu_ptr);
         store_le32(cmd + s->cmd_offset, AGX3_CDM_TERMINATE_WORD);
         s->cmd_offset += AGX3_CDM_TERMINATE_BYTES;
         s->terminated = true;
+        s->rings_dirty = true;
     }
 
     const bool emit_stats = g_agx_stats_enabled();
@@ -1294,10 +1576,10 @@ int agx_cdm_submit(agx_cdm_stream * s, bool wait, uint64_t * out_gpu_ns) {
             : 0.0;
         const double wait_ms = std::chrono::duration<double, std::milli>(t_done - t_sub).count();
         const double gpu_ms  = static_cast<double>(gpu_ns_local) * 1e-6;
-        AGX_LOG_INFO("stats submit=#%llu | cpu_encode=%.3fms gpu=%.3fms wait=%.3fms (drm_oh=%.3fms) | "
+        AGX_LOG_INFO("stats submit=#%llu | cpu_encode=%.3fms ioctl=%.3fms gpu=%.3fms wait=%.3fms (drm_oh=%.3fms) | "
                      "disp=%llu (ind=%llu) strong_usc=%llu elided=%llu | ring(cmd=%.1fK ioto=%.1fK arg=%.1fK tmpl=%zu)",
                      (unsigned long long) s->stats.submits,
-                     encode_ms, gpu_ms, wait_ms, std::max(0.0, wait_ms - gpu_ms),
+                     encode_ms, s->last_ioctl_ms, gpu_ms, wait_ms, std::max(0.0, wait_ms - gpu_ms),
                      (unsigned long long) s->last_rec_disp, (unsigned long long) s->last_rec_ind,
                      (unsigned long long) s->last_rec_usc, (unsigned long long) s->last_rec_elid,
                      static_cast<double>(s->cmd_offset) / 1024.0,
@@ -1319,11 +1601,15 @@ int agx_cdm_wait(agx_cdm_stream * s, uint64_t * out_gpu_ns) {
         return 0;
     }
 
-    const int ret = agx_drm_wait_timeline(s->dev, s->in_flight_point, UINT64_MAX);
+    const int ret = agx_cdm_wait_timeline_adaptive(s, s->in_flight_point);
     s->in_flight_point = 0;
     if (ret != 0) {
         return ret;
     }
+
+    const auto done_tp = std::chrono::steady_clock::now();
+    const double wall_us = std::chrono::duration<double, std::micro>(done_tp - s->submit_tp).count();
+    agx_update_asymmetric_ema(s->ema_wait_us[s->last_tier], wall_us);
 
     uint64_t gpu_ns = 0;
     if (s->last_submit_has_ts && s->ts_bo) {
@@ -1354,7 +1640,8 @@ void agx_cdm_zero_sense_barrier(agx_cdm_stream * s) {
     }
     auto * st = static_cast<agx_sense_barrier_state *>(s->sense_barrier_bo->cpu_ptr);
     std::memset(st, 0, sizeof(*st));
-    __sync_synchronize();
+    agx_clean_dcache_range(st, sizeof(*st));
+    agx_dsb_sy();
 }
 
 void agx_cdm_reset_sense_barrier(agx_cdm_stream * s, uint32_t n_workgroups) {
@@ -1364,7 +1651,8 @@ void agx_cdm_reset_sense_barrier(agx_cdm_stream * s, uint32_t n_workgroups) {
     auto * st = static_cast<agx_sense_barrier_state *>(s->sense_barrier_bo->cpu_ptr);
     std::memset(st, 0, sizeof(*st));
     st->n_workgroups = n_workgroups;
-    __sync_synchronize();
+    agx_clean_dcache_range(st, sizeof(*st));
+    agx_dsb_sy();
 }
 
 void agx_cdm_get_stats(const agx_cdm_stream * s, agx_cdm_stats * out) {
@@ -1475,6 +1763,7 @@ bool agx_cdm_stream_try_replay(agx_cdm_stream * s,
         st->epoch   = 0u;
         st->stage   = 0u;
         st->pass    = 0u;
+        agx_clean_dcache_range(st, sizeof(*st));
     }
 
     const auto t_sub = emit_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -1498,11 +1787,11 @@ bool agx_cdm_stream_try_replay(agx_cdm_stream * s,
         const double encode_ms = std::chrono::duration<double, std::milli>(t_sub - t_enter).count();
         const double wait_ms   = std::chrono::duration<double, std::milli>(t_done - t_sub).count();
         const double gpu_ms    = static_cast<double>(gpu_ns_local) * 1e-6;
-        AGX_LOG_INFO("stats submit=#%llu [REPLAY #%llu] | cpu_encode=%.3fms gpu=%.3fms wait=%.3fms (drm_oh=%.3fms) | "
+        AGX_LOG_INFO("stats submit=#%llu [REPLAY #%llu] | cpu_encode=%.3fms ioctl=%.3fms gpu=%.3fms wait=%.3fms (drm_oh=%.3fms) | "
                      "disp=%llu (ind=%llu) strong_usc=%llu elided=%llu | ring(cmd=%.1fK ioto=%.1fK arg=%.1fK tmpl=%zu)",
                      (unsigned long long) s->stats.submits,
                      (unsigned long long) s->replay.hit_count,
-                     encode_ms, gpu_ms, wait_ms, std::max(0.0, wait_ms - gpu_ms),
+                     encode_ms, s->last_ioctl_ms, gpu_ms, wait_ms, std::max(0.0, wait_ms - gpu_ms),
                      (unsigned long long) s->last_rec_disp, (unsigned long long) s->last_rec_ind,
                      (unsigned long long) s->last_rec_usc, (unsigned long long) s->last_rec_elid,
                      static_cast<double>(s->cmd_offset) / 1024.0,
