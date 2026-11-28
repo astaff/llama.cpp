@@ -87,6 +87,7 @@ layout(buffer_reference, scalar, buffer_reference_align = 4)  coherent buffer Co
 layout(buffer_reference, scalar, buffer_reference_align = 2)  coherent buffer CohBufF16     { float16_t v[]; };
 layout(buffer_reference, scalar, buffer_reference_align = 2)  coherent buffer CohBufU16     { uint16_t  v[]; };
 layout(buffer_reference, scalar, buffer_reference_align = 8)  coherent buffer CohBufUvec2   { uvec2     v[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 8)  coherent buffer CohBufF16Vec4 { f16vec4   v[]; };
 
 layout(buffer_reference, std430, buffer_reference_align = 4) coherent buffer SenseBarrierBuf {
     uint arrived;
@@ -115,6 +116,10 @@ layout(buffer_reference, std430, buffer_reference_align = 4) coherent buffer Sen
 #define PFLAG_FUSE_WO           (1u << 14)
 #define PFLAG_FUSE_SINK_PROJ    (1u << 15)
 #define PFLAG_FUSE_DYN_CONV     (1u << 16)
+#define PFLAG_K_ROT_64          (1u << 17)
+#define PFLAG_V_ROT_64          (1u << 18)
+#define PFLAG_BANDED_REL_PACK   (1u << 19)
+#define PFLAG_EMIT_X_F16        (1u << 20)
 
 struct W5PassDesc {
     uint64_t x_q_va;
@@ -253,7 +258,9 @@ struct W5PassDesc {
     uint     n_tokens;
     uint     rollback_slots;
     uint     rollback_stride_f32;
-    uint     reserved[25];
+    uint     rel_qp_off;
+    uint64_t next_mix_f16_va[3];
+    uint     reserved[18];
 };
 
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer W5PassDescBuf {
@@ -329,6 +336,21 @@ void fwht128_in_reg(inout float reg[4], uint lane) {
     float b0 = a0 + a1, b1 = a0 - a1, b2 = a2 + a3, b3 = a2 - a3;
     reg[0] = b0 + b2; reg[1] = b1 + b3;
     reg[2] = b0 - b2; reg[3] = b1 - b3;
+}
+
+void fwht64_in_reg(inout float reg[4], uint lane) {
+    const float sc = 0.125;
+    [[unroll]] for (uint k = 0u; k < 4u; ++k) reg[k] *= sc;
+    [[unroll]] for (uint h = 1u; h < 32u; h <<= 1u) {
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+            float a = reg[k];
+            float b = subgroupShuffleXor(a, h);
+            reg[k] = ((lane & h) == 0u) ? (a + b) : (b - a);
+        }
+    }
+    float a0 = reg[0], a1 = reg[1], a2 = reg[2], a3 = reg[3];
+    reg[0] = a0 + a1; reg[1] = a0 - a1;
+    reg[2] = a2 + a3; reg[3] = a2 - a3;
 }
 
 void store_kv_head_coh(uint64_t row_va, uint head, float reg[4], uint lane) {
@@ -409,20 +431,29 @@ float dot_rel_bias_row_sh(uint64_t b_va, uint wtype, uint n_rel) {
     return acc;
 }
 
-vec4 load_ext_kv_coh(uint64_t base_va, uint nb1, uint nb2, uint kv_idx, uint h_kv, uint lane) {
-    const uint64_t row_va = base_va + uint64_t(kv_idx) * uint64_t(nb1) + uint64_t(h_kv) * uint64_t(nb2);
+vec4 load_ext_kv_opt(uint64_t head_base_va, uint nb1, uint kv_idx, uint lane, bool use_coh) {
+    const uint64_t row_va = head_base_va + uint64_t(kv_idx) * uint64_t(nb1);
 #if KV_Q8 == 0
-    uvec2 p = CohBufUvec2(row_va).v[lane];
+    uvec2 p = use_coh ? CohBufUvec2(row_va).v[lane] : ConstBufUvec2(row_va).v[lane];
     return vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y));
 #else
-    uint blk = lane >> 3u;
-    uint sub16 = (lane & 7u) * 2u;
-    uint64_t blk_va = row_va + uint64_t(blk) * 34ul;
-    float sc = float(CohBufF16(blk_va).v[0]);
-    CohBufU16 qb = CohBufU16(blk_va + 2ul);
-    f16vec2 lo = agx_q8_u16_magic_to_f16vec2(uint(qb.v[sub16 + 0u]));
-    f16vec2 hi = agx_q8_u16_magic_to_f16vec2(uint(qb.v[sub16 + 1u]));
-    return vec4(lo, hi) * sc;
+    const uint blk = lane >> 3u;
+    const uint sub16 = (lane & 7u) * 2u;
+    const uint64_t blk_va = row_va + uint64_t(blk) * 34ul;
+    float sc;
+    uint w0, w1;
+    if (use_coh) {
+        sc = float(CohBufF16(blk_va).v[0]);
+        CohBufU16 qb = CohBufU16(blk_va + 2ul);
+        w0 = uint(qb.v[sub16 + 0u]);
+        w1 = uint(qb.v[sub16 + 1u]);
+    } else {
+        sc = float(ConstBufF16(blk_va).v[0]);
+        ConstBufU16 qb = ConstBufU16(blk_va + 2ul);
+        w0 = uint(qb.v[sub16 + 0u]);
+        w1 = uint(qb.v[sub16 + 1u]);
+    }
+    return vec4(agx_q8_u16_magic_to_f16vec2(w0), agx_q8_u16_magic_to_f16vec2(w1)) * sc;
 #endif
 }
 
@@ -442,12 +473,16 @@ void main() {
     uint local_sense = sh_init_sense;
 
     const uint64_t desc_va = pc.descs_va;
-    const uint flags  = D_FLD(desc_va, flags);
-    const bool is_swa = (flags & PFLAG_IS_SWA) != 0u;
-    const bool fwht_k = (flags & PFLAG_HAS_K_ROT) != 0u;
-    const bool fwht_v = (flags & PFLAG_HAS_V_ROT) != 0u;
+    const uint flags     = D_FLD(desc_va, flags);
+    const uint n_kv_all  = D_FLD(desc_va, n_kv);
+    const bool use_sh_m  = (n_kv_all <= 1024u);
+    const bool is_swa    = (flags & PFLAG_IS_SWA) != 0u;
+    const bool fwht_k    = (flags & PFLAG_HAS_K_ROT) != 0u;
+    const bool fwht_v    = (flags & PFLAG_HAS_V_ROT) != 0u;
+    const bool fwht64_k  = (flags & PFLAG_K_ROT_64) != 0u;
+    const bool fwht64_v  = (flags & PFLAG_V_ROT_64) != 0u;
 
-    // Phase 1: WGs 0..23 Q(in SRAM) + R + RelBias -> kq_mask_f16; WGs 24..39 K/V conv+store
+    // Phase 1: WGs 0..23 Q(in sh_q_head) + R + RelBias -> sh_mask (<=1024) or SLC kq_mask_f16 (<=4096); WGs 24..39 K/V conv+store
     if (wg < 24u) {
         const uint head = wg;
         const uint64_t qkv_buf_va = D_FLD(desc_va, qkv_buf_va);
@@ -469,10 +504,13 @@ void main() {
                 sc *= 1.0 + D_FLD(desc_va, log_scale_alpha) * log(max(1.0, pos_p1 * D_FLD(desc_va, inv_log_floor)));
             }
             [[unroll]] for (uint k = 0u; k < 4u; ++k) reg[k] *= sc;
-            if (fwht_k) fwht128_in_reg(reg, ln);
-            // Keep Q directly in sh_q_head[0..127] — ZERO SLC round-trip to q_out!
+            if (fwht_k) {
+                if (fwht64_k) fwht64_in_reg(reg, ln);
+                else          fwht128_in_reg(reg, ln);
+            }
+            // Pre-scale Q by 1/sqrt(128) and keep directly in sh_q_head[0..127] — ZERO SLC round-trip & -4 GPR32 in Phase 2!
             [[unroll]] for (uint k = 0u; k < 4u; ++k) {
-                sh_q_head[k * 32u + ln] = reg[k];
+                sh_q_head[k * 32u + ln] = reg[k] * 0.08838834764831845;
             }
         }
         if (sg == 1u) {
@@ -493,25 +531,26 @@ void main() {
         }
         barrier();
 
-        const float    sink       = CohBufF32(D_FLD(desc_va, sinks_va)).v[head];
-        const uint64_t rpos_va    = D_FLD(desc_va, rel_pos_va);
-        const uint64_t bmask_va   = D_FLD(desc_va, base_mask_va);
-        const uint64_t dst_row_va = D_FLD(desc_va, kq_mask_va) + uint64_t(head * D_FLD(desc_va, kq_mask_stride)) * 2ul;
-        const bool     bmask_f16  = (flags & PFLAG_BMASK_F16) != 0u;
-        const uint     n_kv       = D_FLD(desc_va, n_kv);
-        const uint     n_extent   = D_FLD(desc_va, n_extent);
-        const uint     n_rel      = D_FLD(desc_va, n_rel);
-        const uint64_t rb_va      = D_FLD(desc_va, rel_bias_va);
-        const uint     bias_wt    = D_FLD(desc_va, bias_wtype);
-        const uint     bias_nb1   = D_FLD(desc_va, bias_nb1_B);
+        const float    sink        = CohBufF32(D_FLD(desc_va, sinks_va)).v[head];
+        const uint64_t rpos_va     = D_FLD(desc_va, rel_pos_va);
+        const uint64_t bmask_va    = D_FLD(desc_va, base_mask_va);
+        const uint64_t dst_row_va  = D_FLD(desc_va, kq_mask_va) + uint64_t(head * D_FLD(desc_va, kq_mask_stride)) * 2ul;
+        const bool     bmask_f16   = (flags & PFLAG_BMASK_F16) != 0u;
+        const bool     banded_pack = (flags & PFLAG_BANDED_REL_PACK) != 0u;
+        const int      b_qp        = banded_pack ? ConstBufI32(rpos_va).v[D_FLD(desc_va, rel_qp_off)] : 0;
+        const uint     n_kv        = n_kv_all;
+        const uint     n_extent    = D_FLD(desc_va, n_extent);
+        const uint     n_rel       = D_FLD(desc_va, n_rel);
+        const uint64_t rb_va       = D_FLD(desc_va, rel_bias_va);
+        const uint     bias_wt     = D_FLD(desc_va, bias_wtype);
+        const uint     bias_nb1    = D_FLD(desc_va, bias_nb1_B);
 
-        const bool     use_sh_m   = (n_kv <= 1024u);
         CohBufF16 dst_m = CohBufF16(dst_row_va);
         for (uint j = tid; j < n_kv; j += LOCAL_X) {
             float bm = bmask_f16 ? float(ConstBufF16(bmask_va).v[j]) : ConstBufF32(bmask_va).v[j];
             float16_t mv16 = float16_t(bm);
             if (bm > -1.0e20) {
-                int d_idx = ConstBufI32(rpos_va).v[j];
+                int d_idx = banded_pack ? (b_qp - ConstBufI32(rpos_va).v[j]) : ConstBufI32(rpos_va).v[j];
                 float acc = 0.0;
                 if (d_idx >= 0 && uint(d_idx) < n_extent) {
                     acc = dot_rel_bias_row_sh(rb_va + uint64_t(d_idx) * uint64_t(bias_nb1), bias_wt, n_rel);
@@ -533,7 +572,8 @@ void main() {
         const uint64_t idxs_va   = is_v ? D_FLD(desc_va, v_idxs_va)   : D_FLD(desc_va, k_idxs_va);
         const uint     store_nb1 = is_v ? D_FLD(desc_va, v_store_nb1) : D_FLD(desc_va, k_store_nb1);
         const bool     ids_i64   = is_v ? ((flags & PFLAG_V_IDS_I64) != 0u) : ((flags & PFLAG_K_IDS_I64) != 0u);
-        const bool     do_fwht   = is_v ? fwht_v : fwht_k;
+        const bool     do_fwht   = is_v ? fwht_v   : fwht_k;
+        const bool     do_fwht64 = is_v ? fwht64_v : fwht64_k;
         const float    res_sc    = D_FLD(desc_va, kv_conv_res_scale);
 
         const int src_cell = max(ConstBufI32(D_FLD(desc_va, s_copy_va)).v[0], 0);
@@ -566,7 +606,10 @@ void main() {
             ? (D_FLD(desc_va, qk_clip) / max(sqrt(sum_sq), D_FLD(desc_va, qk_clip)))
             : inversesqrt(sum_sq * (1.0 / 128.0) + D_FLD(desc_va, rms_eps));
         [[unroll]] for (uint k = 0u; k < 4u; ++k) reg[k] *= sc;
-        if (do_fwht) fwht128_in_reg(reg, ln);
+        if (do_fwht) {
+            if (do_fwht64) fwht64_in_reg(reg, ln);
+            else           fwht128_in_reg(reg, ln);
+        }
 
         int64_t dst_row = ids_i64 ? ConstBufI64(idxs_va).v[0] : int64_t(ConstBufI32(idxs_va).v[0]);
         if (dst_row >= 0l) {
@@ -576,35 +619,42 @@ void main() {
 
     agx_sense_barrier(pc.barrier_va, pc.n_wg, local_sense);
 
-    // Phase 2: 24-WG (8 sgs/head) FlashAttention Decode + Optional FWHT128 + Qgate -> attn_out
+    // Phase 2: Ultra-lean <= 56 GPR32 1-barrier FlashAttention (sh_mask for <=1024, SLC kq_mask for SWA <=4096)
+    // Uses non-coherent L1/L2/SLC-cached ConstBuf for all old KV rows (CohBuf only on newly written row!).
     if (wg < 24u) {
         const uint h_q  = wg;
         const uint h_kv = h_q / 3u;
-        const uint n_kv = D_FLD(desc_va, n_kv);
+        const uint n_kv = n_kv_all;
         const uint q4   = ln * 4u;
-        const vec4 q_reg = vec4(sh_q_head[q4], sh_q_head[q4 + 1u], sh_q_head[q4 + 2u], sh_q_head[q4 + 3u])
-                         * 0.08838834764831845;
 
-        const uint64_t mask_row_va = D_FLD(desc_va, kq_mask_va) + uint64_t(h_q * D_FLD(desc_va, kq_mask_stride)) * 2ul;
-        const uint64_t k_va  = D_FLD(desc_va, k_va);
-        const uint64_t v_va  = D_FLD(desc_va, v_va);
-        const uint     k_nb1 = D_FLD(desc_va, k_nb1);
-        const uint     k_nb2 = D_FLD(desc_va, k_nb2);
-        const uint     v_nb1 = D_FLD(desc_va, v_nb1);
-        const uint     v_nb2 = D_FLD(desc_va, v_nb2);
+        const uint64_t k_va      = D_FLD(desc_va, k_va);
+        const uint64_t v_va      = D_FLD(desc_va, v_va);
+        const uint64_t k_h_va    = k_va + uint64_t(h_kv) * uint64_t(D_FLD(desc_va, k_nb2));
+        const uint64_t v_h_va    = v_va + uint64_t(h_kv) * uint64_t(D_FLD(desc_va, v_nb2));
+        const uint     k_nb1     = D_FLD(desc_va, k_nb1);
+        const uint     v_nb1     = D_FLD(desc_va, v_nb1);
+        const int      coh_k_row = (D_FLD(desc_va, k_store_va) == k_va)
+            ? (((flags & PFLAG_K_IDS_I64) != 0u) ? int(ConstBufI64(D_FLD(desc_va, k_idxs_va)).v[0]) : ConstBufI32(D_FLD(desc_va, k_idxs_va)).v[0])
+            : -2;
+        const int      coh_v_row = (D_FLD(desc_va, v_store_va) == v_va)
+            ? (((flags & PFLAG_V_IDS_I64) != 0u) ? int(ConstBufI64(D_FLD(desc_va, v_idxs_va)).v[0]) : ConstBufI32(D_FLD(desc_va, v_idxs_va)).v[0])
+            : -2;
+        const uint64_t mask_va   = D_FLD(desc_va, kq_mask_va) + uint64_t(h_q * D_FLD(desc_va, kq_mask_stride)) * 2ul;
 
         float m_i = -3.402823466e+38 * 0.5;
         float l_i = 0.0;
         vec4  o_i = vec4(0.0);
 
-        const bool use_sh_m = (n_kv <= 1024u);
-        CohBufF16 mb = CohBufF16(mask_row_va);
         for (uint kv = sg; kv < n_kv; kv += N_SG) {
-            float mv = use_sh_m ? float(sh_mask[kv]) : float(mb.v[kv]);
+            float mv = use_sh_m ? float(sh_mask[kv]) : float(CohBufF16(mask_va).v[kv]);
             if (!(mv > -1.0e30)) continue;
-            vec4 k_reg = load_ext_kv_coh(k_va, k_nb1, k_nb2, kv, h_kv, ln);
-            vec4 v_reg = load_ext_kv_coh(v_va, v_nb1, v_nb2, kv, h_kv, ln);
-            float score = subgroupAdd(dot(q_reg, k_reg)) + mv;
+            float score;
+            {
+                vec4 k_reg = load_ext_kv_opt(k_h_va, k_nb1, kv, ln, (coh_k_row == -2) || (int(kv) == coh_k_row));
+                vec4 q_reg = vec4(sh_q_head[q4], sh_q_head[q4 + 1u], sh_q_head[q4 + 2u], sh_q_head[q4 + 3u]);
+                score = subgroupAdd(dot(q_reg, k_reg)) + mv;
+            }
+            vec4 v_reg = load_ext_kv_opt(v_h_va, v_nb1, kv, ln, (coh_v_row == -2) || (int(kv) == coh_v_row));
             float m_new = max(m_i, score);
             float alpha = exp(m_i - m_new);
             float p_w   = exp(score - m_new);
@@ -655,7 +705,8 @@ void main() {
                 subgroupMemoryBarrierShared();
                 float reg[4];
                 [[unroll]] for (uint k = 0u; k < 4u; ++k) reg[k] = sh_q_head[k * 32u + ln];
-                fwht128_in_reg(reg, ln);
+                if (fwht64_v) fwht64_in_reg(reg, ln);
+                else          fwht128_in_reg(reg, ln);
                 CohBufF32 ao = CohBufF32(D_FLD(desc_va, attn_out_va));
                 CohBufF32 qg = CohBufF32(qgate_va);
                 const uint base = h_q * 128u;
@@ -1958,12 +2009,12 @@ void main() {
     const int      src_cell0     = max(ConstBufI32(D_FLD(d0_va, s_copy_va)).v[0], 0);
     const uint64_t hist_cell0_va = D_FLD(d0_va, r_l_va) + uint64_t(src_cell0) * uint64_t(D_FLD(d0_va, r_nb1_f32)) * 4ul;
 
-    // Phase 0: WGs 0..M-1 Parallel M-token stage_post_ffn[v]
+    // Phase 0a: WGs 0..M-1 Parallel M-token ffn_post_conv + residual add
+    float ss_cur = 0.0;
+    const uint flags0 = D_FLD(d0_va, flags);
     if (wg < n_tok) {
         const uint     tok         = wg;
         const uint64_t tok_B       = uint64_t(tok * D) * 4ul;
-        const uint     flags0      = D_FLD(d0_va, flags);
-        const bool     do_mix      = (flags0 & PFLAG_POST_FFN_DO_MIX) != 0u;
         const uint64_t conv_src_va = D_FLD(d0_va, moe_out_va);
         const uint64_t res_va      = D_FLD(d0_va, ffn_inp_va) + tok_B;
         const uint64_t conv_w_va   = D_FLD(d0_va, ffn_post_conv_w_va);
@@ -1971,7 +2022,6 @@ void main() {
         const uint64_t export_va   = D_FLD(d0_va, export_l_out_va);
         const float    res_sc      = D_FLD(d0_va, post_conv_res_scale);
 
-        float ss_cur = 0.0;
         for (uint ch = tid; ch < D; ch += 256u) {
             const uint64_t past_va = hist_cell0_va + uint64_t((4352u + ch) * 3u) * 4ul;
             CohBufF32 pb = CohBufF32(past_va);
@@ -1988,7 +2038,23 @@ void main() {
             CohBufF32(cur_out_va).v[ch] = out_v;
             if (export_va != 0ul) CohBufF32(export_va + tok_B).v[ch] = out_v;
         }
+    }
 
+#if HAS_LOOP == 0
+    // Wave 10: Synchronize right after conv read so WG n_tok runs WAR-free rollback IN PARALLEL with depth-mix + norm!
+    agx_sense_barrier(pc.barrier_va, pc.n_wg, local_sense);
+    if (wg == n_tok) {
+        store_conv_rollback_256(hist_cell0_va, D_FLD(d0_va, moe_out_va), D_FLD(d0_va, cell_va)[3],
+                                4352u, n_tok, D_FLD(d0_va, rollback_slots), D_FLD(d0_va, rollback_stride_f32), tid);
+        return;
+    }
+#endif
+
+    // Phase 0b: WGs 0..M-1 Depth-mix (+ fused RMSNorm + optional FP16 mirror when HAS_LOOP==0)
+    if (wg < n_tok) {
+        const uint     tok    = wg;
+        const uint64_t tok_B  = uint64_t(tok * D) * 4ul;
+        const bool     do_mix = (flags0 & PFLAG_POST_FFN_DO_MIX) != 0u;
         if (do_mix) {
             const uint     B        = D_FLD(d0_va, post_ffn_n_blocks);
             const uint     S        = B + 1u;
@@ -2054,6 +2120,8 @@ void main() {
 
             const bool do_norm = (flags0 & PFLAG_POST_FFN_DO_NORM) != 0u;
             const uint64_t mix_exp_va = D_FLD(d0_va, next_mix_export_va);
+            const bool emit_f16 = (flags0 & PFLAG_EMIT_X_F16) != 0u;
+            const uint64_t tok_f16_B = uint64_t(tok * D) * 2ul;
             for (uint q = 0u; q < Q; ++q) {
                 CohBufVec4 db = CohBufVec4(D_FLD(d0_va, next_mix_out_va)[q] + tok_B);
                 const float wb = sh_prob[q][B];
@@ -2076,26 +2144,23 @@ void main() {
                     ConstBufVec4 nw = ConstBufVec4(D_FLD(d0_va, next_norm_w_va)[q]);
                     const bool do_exp = (q == 0u && mix_exp_va != 0ul);
                     CohBufVec4 eb = CohBufVec4(mix_exp_va + tok_B);
+                    const uint64_t f16_va = emit_f16 ? D_FLD(d0_va, next_mix_f16_va)[q] : 0ul;
+                    CohBufF16Vec4 fb = CohBufF16Vec4(f16_va + tok_f16_B);
                     for (uint i4 = tid; i4 < D4; i4 += 256u) {
                         vec4 ov = (db.v[i4] * rms) * nw.v[i4];
                         db.v[i4] = ov;
                         if (do_exp) eb.v[i4] = ov;
+                        if (f16_va != 0ul) fb.v[i4] = f16vec4(ov);
                     }
                 }
 #endif
             }
         }
     }
-    agx_sense_barrier(pc.barrier_va, pc.n_wg, local_sense);
-
 #if HAS_LOOP == 0
-    // Wave 9: Non-loop parallel M-token transition (kills 24 1-WG serial k_w4_stage_post_ffn stalls!)
-    if (wg == 0u) {
-        store_conv_rollback_256(hist_cell0_va, D_FLD(d0_va, moe_out_va), D_FLD(d0_va, cell_va)[3],
-                                4352u, n_tok, D_FLD(d0_va, rollback_slots), D_FLD(d0_va, rollback_stride_f32), tid);
-    }
 }
 #else
+    agx_sense_barrier(pc.barrier_va, pc.n_wg, local_sense);
 
     // Phase 1: pass[v+1] Parallel M-token msg_mix (WGs 0..M-1) + norm_cat/qkv_mix (WGs M..4M-1)
     const uint flags1   = D_FLD(d1_va, flags);
@@ -2362,15 +2427,30 @@ void main() {
     }
     agx_sense_barrier(pc.barrier_va, pc.n_wg, local_sense);
 
-    // Phase 4: WGs 0..3M-1 Parallel batch_rmsnorm -> x_q, x_k, x_v + WG 3M WAR-free cell_va[3] rollback store!
+    // Phase 4: WGs 0..3M-1 Parallel batch_rmsnorm -> x_q, x_k, x_v (+ optional FP16 mirrors!) + WG 3M WAR-free cell_va[3] rollback store!
     if (wg < 3u * n_tok) {
-        const uint     c      = wg / n_tok;
-        const uint     tok    = wg - c * n_tok;
-        const uint64_t tok_B  = uint64_t(tok * D) * 4ul;
-        const uint64_t dst_va = ((c == 0u) ? D_FLD(d1_va, x_q_va)
-                              : ((c == 1u) ? D_FLD(d1_va, x_k_va) : D_FLD(d1_va, x_v_va))) + tok_B;
-        wg_rmsnorm_weighted_256(D_FLD(d1_va, ctrl_gain_va)[c] + tok_B, D_FLD(d1_va, attn_norm_w_va)[c],
-                                dst_va, D_FLD(d1_va, rms_eps), tid, sg, ln);
+        const uint     c        = wg / n_tok;
+        const uint     tok      = wg - c * n_tok;
+        const uint64_t tok_B    = uint64_t(tok * D) * 4ul;
+        const uint64_t dst_va   = ((c == 0u) ? D_FLD(d1_va, x_q_va)
+                                : ((c == 1u) ? D_FLD(d1_va, x_k_va) : D_FLD(d1_va, x_v_va))) + tok_B;
+        const uint64_t f16_base = ((flags1 & PFLAG_EMIT_X_F16) != 0u) ? D_FLD(d1_va, next_mix_f16_va)[c] : 0ul;
+        const uint64_t src_va   = D_FLD(d1_va, ctrl_gain_va)[c] + tok_B;
+        CohBufVec4     sb       = CohBufVec4(src_va);
+        ConstBufVec4   nw       = ConstBufVec4(D_FLD(d1_va, attn_norm_w_va)[c]);
+        CohBufVec4     db       = CohBufVec4(dst_va);
+        CohBufF16Vec4  fb       = CohBufF16Vec4(f16_base + uint64_t(tok * D) * 2ul);
+        float ss = 0.0;
+        for (uint i4 = tid; i4 < D4; i4 += LOCAL_X) {
+            vec4 v = sb.v[i4];
+            ss += dot(v, v);
+        }
+        float rms = inversesqrt(wg_sum1_256(ss, sg, ln) * inv_D + D_FLD(d1_va, rms_eps));
+        for (uint i4 = tid; i4 < D4; i4 += LOCAL_X) {
+            vec4 ov = (sb.v[i4] * rms) * nw.v[i4];
+            db.v[i4] = ov;
+            if (f16_base != 0ul) fb.v[i4] = f16vec4(ov);
+        }
     } else if (wg == 3u * n_tok) {
         store_conv_rollback_256(hist_cell0_va, D_FLD(d0_va, moe_out_va), D_FLD(d0_va, cell_va)[3],
                                 4352u, n_tok, D_FLD(d0_va, rollback_slots), D_FLD(d0_va, rollback_stride_f32), tid);

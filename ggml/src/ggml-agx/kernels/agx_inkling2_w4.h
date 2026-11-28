@@ -19,6 +19,9 @@
 #define AGX_W4_QKV_FLAG_BASE_MASK_F16  (1u << 6)
 #define AGX_W4_QKV_FLAG_FUSE_REL_MASK  (1u << 7)
 #define AGX_W4_QKV_FLAG_PACK_QGATE     (1u << 8)
+#define AGX_W10_QKV_FLAG_FWHT64_K      (1u << 9)
+#define AGX_W10_QKV_FLAG_FWHT64_V      (1u << 10)
+#define AGX_W10_QKV_FLAG_BANDED_REL_PACK (1u << 11)
 
 struct alignas(16) agx_w4_qkv_prep_desc {
     uint64_t q_raw_va;
@@ -153,6 +156,23 @@ struct agx_w4_rel_mask_push {
     uint32_t base_mask_is_f16;
 };
 static_assert(sizeof(agx_w4_rel_mask_push) <= 256, "agx_w4_rel_mask_push > 256B");
+
+// Wave 10: O(n_kv) Banded Rel-Bias Table Projection (rel_bias[eff_rows, n_rel] @ R[M, 24, n_rel] -> [M, 24, eff_rows])
+// + optional inline compact sinks[M, 24] copy when sinks are strided inside qkv_buf.
+struct agx_w10_rel_table_push {
+    uint64_t r_va;
+    uint64_t rel_bias_va;
+    uint64_t dst_va;
+    uint64_t sinks_src_va;
+    uint64_t sinks_dst_va;
+    uint32_t n_rel;
+    uint32_t eff_rows;
+    uint32_t n_tokens;
+    uint32_t bias_wtype;
+    uint32_t bias_nb1_B;
+    uint32_t sinks_stride_f32;
+};
+static_assert(sizeof(agx_w10_rel_table_push) == 64, "agx_w10_rel_table_push must be 64B (<= 256B)");
 
 struct agx_w4_fwht_qgate_push {
     uint64_t attn_va;
@@ -365,6 +385,8 @@ static_assert(sizeof(agx_w7_dspark_inp_block_push) <= 256, "agx_w7_dspark_inp_bl
 #define AGX_W7_DSPARK_QKV_KV_Q8_0     (1u << 5)
 #define AGX_W7_DSPARK_QKV_K_IDS_I64   (1u << 6)
 #define AGX_W7_DSPARK_QKV_V_IDS_I64   (1u << 7)
+#define AGX_W7_DSPARK_QKV_FWHT64_K    (1u << 8)
+#define AGX_W7_DSPARK_QKV_FWHT64_V    (1u << 9)
 
 struct agx_w7_dspark_qkv_rope_push {
     uint64_t q_raw_va;
@@ -548,6 +570,10 @@ static_assert(sizeof(agx_w8_dspark_inject_kv_push) <= 256, "agx_w8_dspark_inject
 #define AGX_W5_PFLAG_FUSE_WO           (1u << 14)
 #define AGX_W5_PFLAG_FUSE_SINK_PROJ    (1u << 15)
 #define AGX_W5_PFLAG_FUSE_DYN_CONV     (1u << 16)
+#define AGX_W5_PFLAG_K_ROT_64          (1u << 17)
+#define AGX_W5_PFLAG_V_ROT_64          (1u << 18)
+#define AGX_W5_PFLAG_BANDED_REL_PACK   (1u << 19)
+#define AGX_W5_PFLAG_EMIT_X_F16        (1u << 20)
 
 struct alignas(16) agx_w5_pass_desc {
     // 1. SLC Arena / Activation VAs (30 x u64)
@@ -693,8 +719,12 @@ struct alignas(16) agx_w5_pass_desc {
     uint32_t n_tokens;
     uint32_t rollback_slots;
     uint32_t rollback_stride_f32;
-    uint32_t reserved[25]; // pad to 1152 B = exact 9 x 128B cache lines
+    uint32_t rel_qp_off;         // Wave 10: I32 offset of q_pos in rel_pos_pack (when PFLAG_BANDED_REL_PACK)
+    uint64_t next_mix_f16_va[3]; // Wave 10: optional FP16 mirrors of next_mix_out_va / x_{q,k,v} (when PFLAG_EMIT_X_F16)
+    uint32_t reserved[18];       // pad to 1152 B = exact 9 x 128B cache lines
 };
+static_assert(offsetof(agx_w5_pass_desc, rel_qp_off) == 1052, "agx_w5_pass_desc rel_qp_off offset");
+static_assert(offsetof(agx_w5_pass_desc, next_mix_f16_va) == 1056, "agx_w5_pass_desc next_mix_f16_va offset");
 static_assert(sizeof(agx_w5_pass_desc) == 1152, "agx_w5_pass_desc must be 1152B (9 x 128B cache lines)");
 
 struct agx_w5_persist_push {
@@ -730,5 +760,9 @@ struct agx_w5_attn_in_push {
     uint32_t dyn_v_wtype;
     uint32_t dyn_v_row_B;
     uint32_t n_tokens;       // 1 for B=1, 2..8 for Wave 9 M=2..8 coalesced attn_in!
+    uint32_t x_is_f16;       // Wave 10: 1 -> read x_{q,k,v}_f16_va in Q8_0_8BLK hot path
+    uint64_t x_q_f16_va;
+    uint64_t x_k_f16_va;
+    uint64_t x_v_f16_va;
 };
-static_assert(sizeof(agx_w5_attn_in_push) == 152, "agx_w5_attn_in_push must be 152B (<= 256B)");
+static_assert(sizeof(agx_w5_attn_in_push) == 176, "agx_w5_attn_in_push must be 176B (<= 256B)");

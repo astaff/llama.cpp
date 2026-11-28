@@ -1133,6 +1133,8 @@ layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 #define QKV_KV_Q8_0   (1u << 5)
 #define QKV_K_IDS_I64 (1u << 6)
 #define QKV_V_IDS_I64 (1u << 7)
+#define QKV_FWHT64_K  (1u << 8)
+#define QKV_FWHT64_V  (1u << 9)
 
 layout(push_constant) uniform PushArgs {
     uint64_t q_raw_va;
@@ -1183,6 +1185,21 @@ void fwht128_reg(inout float reg[4], uint ln) {
     float b0 = a0 + a1, b1 = a0 - a1, b2 = a2 + a3, b3 = a2 - a3;
     reg[0] = b0 + b2; reg[1] = b1 + b3;
     reg[2] = b0 - b2; reg[3] = b1 - b3;
+}
+
+void fwht64_reg11(inout float reg[4], uint ln) {
+    const float sc = 0.125;
+    [[unroll]] for (uint k = 0u; k < 4u; ++k) reg[k] *= sc;
+    [[unroll]] for (uint h = 1u; h < 32u; h <<= 1u) {
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+            float a = reg[k];
+            float b = subgroupShuffleXor(a, h);
+            reg[k] = ((ln & h) == 0u) ? (a + b) : (b - a);
+        }
+    }
+    float a0 = reg[0], a1 = reg[1], a2 = reg[2], a3 = reg[3];
+    reg[0] = a0 + a1; reg[1] = a0 - a1;
+    reg[2] = a2 + a3; reg[3] = a2 - a3;
 }
 
 void store_kv_head(uint64_t row_va, uint head, uint hd, bool kv_q8, uint ln) {
@@ -1271,13 +1288,16 @@ void main() {
         subgroupMemoryBarrierShared();
     }
 
-    // 3. Optional FWHT128 (hd == 128)
-    const bool do_fwht = (hd == 128u) &&
+    // 3. Optional FWHT128 / FWHT64 (hd == 128)
+    const bool do_fwht128 = (hd == 128u) &&
         ((is_q || is_k) ? ((pc.flags & QKV_FWHT_K) != 0u) : ((pc.flags & QKV_FWHT_V) != 0u));
-    if (do_fwht) {
+    const bool do_fwht64  = (hd == 128u) &&
+        ((is_q || is_k) ? ((pc.flags & QKV_FWHT64_K) != 0u) : ((pc.flags & QKV_FWHT64_V) != 0u));
+    if (do_fwht128 || do_fwht64) {
         float reg[4];
         [[unroll]] for (uint k = 0u; k < 4u; ++k) reg[k] = s_h[k * 32u + ln];
-        fwht128_reg(reg, ln);
+        if (do_fwht64) fwht64_reg11(reg, ln);
+        else           fwht128_reg(reg, ln);
         [[unroll]] for (uint k = 0u; k < 4u; ++k) s_h[k * 32u + ln] = reg[k];
         subgroupMemoryBarrierShared();
     }
@@ -1890,6 +1910,8 @@ layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 #define QKV_KV_Q8_0   (1u << 5)
 #define QKV_K_IDS_I64 (1u << 6)
 #define QKV_V_IDS_I64 (1u << 7)
+#define QKV_FWHT64_K  (1u << 8)
+#define QKV_FWHT64_V  (1u << 9)
 
 layout(push_constant) uniform PushArgs {
     uint64_t k_raw_base_va;
@@ -1937,6 +1959,21 @@ void fwht128_reg11(inout float reg[4], uint ln) {
     float b0 = a0 + a1, b1 = a0 - a1, b2 = a2 + a3, b3 = a2 - a3;
     reg[0] = b0 + b2; reg[1] = b1 + b3;
     reg[2] = b0 - b2; reg[3] = b1 - b3;
+}
+
+void fwht64_reg11(inout float reg[4], uint ln) {
+    const float sc = 0.125;
+    [[unroll]] for (uint k = 0u; k < 4u; ++k) reg[k] *= sc;
+    [[unroll]] for (uint h = 1u; h < 32u; h <<= 1u) {
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+            float a = reg[k];
+            float b = subgroupShuffleXor(a, h);
+            reg[k] = ((ln & h) == 0u) ? (a + b) : (b - a);
+        }
+    }
+    float a0 = reg[0], a1 = reg[1], a2 = reg[2], a3 = reg[3];
+    reg[0] = a0 + a1; reg[1] = a0 - a1;
+    reg[2] = a2 + a3; reg[3] = a2 - a3;
 }
 
 void main() {
@@ -1994,12 +2031,15 @@ void main() {
         subgroupMemoryBarrierShared();
     }
 
-    const bool do_fwht = (hd == 128u) &&
+    const bool do_fwht128 = (hd == 128u) &&
         (is_k ? ((flags & QKV_FWHT_K) != 0u) : ((flags & QKV_FWHT_V) != 0u));
-    if (do_fwht) {
+    const bool do_fwht64  = (hd == 128u) &&
+        (is_k ? ((flags & QKV_FWHT64_K) != 0u) : ((flags & QKV_FWHT64_V) != 0u));
+    if (do_fwht128 || do_fwht64) {
         float reg[4];
         [[unroll]] for (uint k = 0u; k < 4u; ++k) reg[k] = s_h[k * 32u + ln];
-        fwht128_reg11(reg, ln);
+        if (do_fwht64) fwht64_reg11(reg, ln);
+        else           fwht128_reg11(reg, ln);
         [[unroll]] for (uint k = 0u; k < 4u; ++k) s_h[k * 32u + ln] = reg[k];
         subgroupMemoryBarrierShared();
     }

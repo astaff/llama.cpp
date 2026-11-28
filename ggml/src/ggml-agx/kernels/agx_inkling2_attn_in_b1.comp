@@ -28,8 +28,15 @@
 #ifndef BATCH_M
 #define BATCH_M 1
 #endif
+#ifndef X_IS_F16
+#define X_IS_F16 0
+#endif
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+#if BATCH_M > 1 && X_IS_F16 == 1
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer BufF16Vec4R { f16vec4 v[]; };
+#endif
 
 layout(push_constant, scalar) uniform PushArgs {
     uint64_t w_attn_in_va;
@@ -56,6 +63,10 @@ layout(push_constant, scalar) uniform PushArgs {
     uint     dyn_v_wtype;
     uint     dyn_v_row_B;
     uint     n_tokens;
+    uint     x_is_f16;
+    uint64_t x_q_f16_va;
+    uint64_t x_k_f16_va;
+    uint64_t x_v_f16_va;
 } pc;
 
 #if BATCH_M == 1
@@ -250,19 +261,31 @@ void main() {
 
     // 1. Primary Q8_0_8BLK W_attn_in path: 0 SRAM, 0 barriers, 1-chunk weight prefetch, f16vec2 FMA!
     if (row < pc.total_coal_rows) {
+#if X_IS_F16 == 1
+        uint64_t x_va    = pc.x_q_f16_va;
+#else
         uint64_t x_va    = pc.x_q_va;
+#endif
         uint64_t y_va    = pc.qkv_buf_va;
         uint     y_i     = row;
         uint     y_str   = pc.q_prefix_rows;
         if (row >= pc.q_prefix_rows) {
             const uint rem = row - pc.q_prefix_rows;
             if (rem < pc.wk_rows) {
+#if X_IS_F16 == 1
+                x_va  = pc.x_k_f16_va;
+#else
                 x_va  = pc.x_k_va;
+#endif
                 y_va  = pc.k_raw_va;
                 y_i   = rem;
                 y_str = pc.wk_rows;
             } else {
+#if X_IS_F16 == 1
+                x_va  = pc.x_v_f16_va;
+#else
                 x_va  = pc.x_v_va;
+#endif
                 y_va  = pc.v_raw_va;
                 y_i   = rem - pc.wk_rows;
                 y_str = pc.wv_rows;
@@ -270,7 +293,11 @@ void main() {
         }
 
         AgxBufQ8_8Blk w_buf  = AgxBufQ8_8Blk(pc.w_attn_in_va);
+#if X_IS_F16 == 1
+        BufF16Vec4R   x_buf4 = BufF16Vec4R(x_va);
+#else
         AgxBufVec4R   x_buf4 = AgxBufVec4R(x_va);
+#endif
         const uint K4        = 576u; // 2304 / 4
         const uint row_chk0  = row * 9u;
         const uint d_slot    = lane16 >> 1u;
@@ -295,10 +322,17 @@ void main() {
             [[unroll]] for (uint m = 0u; m < uint(BATCH_M); ++m) {
                 const uint    mi = min(m, n_tok - 1u);
                 const uint    xb = mi * K4 + c4;
+#if X_IS_F16 == 1
+                const f16vec4 x0 = x_buf4.v[xb + 0u];
+                const f16vec4 x1 = x_buf4.v[xb + 1u];
+                const f16vec4 x2 = x_buf4.v[xb + 2u];
+                const f16vec4 x3 = x_buf4.v[xb + 3u];
+#else
                 const f16vec4 x0 = f16vec4(x_buf4.v[xb + 0u]);
                 const f16vec4 x1 = f16vec4(x_buf4.v[xb + 1u]);
                 const f16vec4 x2 = f16vec4(x_buf4.v[xb + 2u]);
                 const f16vec4 x3 = f16vec4(x_buf4.v[xb + 3u]);
+#endif
                 f16vec2 dp2 = w0.xy * x0.xy;
                 dp2 = fma(w0.zw, x0.zw, dp2);
                 dp2 = fma(w1.xy, x1.xy, dp2);

@@ -130,6 +130,8 @@ static const char * k_glsl_rmsnorm_f32 = R"GLSL(
 #version 450
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
@@ -137,6 +139,7 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufF32 { float v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer BufF16 { float16_t v[]; };
 
 layout(push_constant) uniform PushArgs {
     uint64_t src_va;
@@ -145,6 +148,8 @@ layout(push_constant) uniform PushArgs {
     uint     n_embd;
     uint     n_rows;
     float    eps;
+    uint     pad0;
+    uint64_t dst_f16_va;
 } pc;
 
 shared float s_red[8];
@@ -157,8 +162,9 @@ void main() {
     const uint lane_id = tid & 31u;
     const uint D       = pc.n_embd;
 
-    const uint64_t s_va = pc.src_va + uint64_t(row) * uint64_t(D) * 4ul;
-    const uint64_t d_va = pc.dst_va + uint64_t(row) * uint64_t(D) * 4ul;
+    const uint64_t s_va   = pc.src_va + uint64_t(row) * uint64_t(D) * 4ul;
+    const uint64_t d_va   = pc.dst_va + uint64_t(row) * uint64_t(D) * 4ul;
+    const uint64_t d16_va = (pc.dst_f16_va != 0ul) ? (pc.dst_f16_va + uint64_t(row) * uint64_t(D) * 2ul) : 0ul;
 
     float ss = 0.0;
     for (uint i = tid; i < D; i += 256u) {
@@ -177,11 +183,15 @@ void main() {
     float inv_rms = s_red[0];
     if (pc.w_va != 0ul) {
         for (uint i = tid; i < D; i += 256u) {
-            BufF32(d_va).v[i] = (ConstBufF32(s_va).v[i] * inv_rms) * ConstBufF32(pc.w_va).v[i];
+            float ov = (ConstBufF32(s_va).v[i] * inv_rms) * ConstBufF32(pc.w_va).v[i];
+            BufF32(d_va).v[i] = ov;
+            if (d16_va != 0ul) BufF16(d16_va).v[i] = float16_t(ov);
         }
     } else {
         for (uint i = tid; i < D; i += 256u) {
-            BufF32(d_va).v[i] = ConstBufF32(s_va).v[i] * inv_rms;
+            float ov = ConstBufF32(s_va).v[i] * inv_rms;
+            BufF32(d_va).v[i] = ov;
+            if (d16_va != 0ul) BufF16(d16_va).v[i] = float16_t(ov);
         }
     }
 }
@@ -232,7 +242,10 @@ struct rmsnorm_f32_push {
     uint32_t n_embd;
     uint32_t n_rows;
     float    eps;
+    uint32_t pad0;
+    uint64_t dst_f16_va;
 };
+static_assert(sizeof(rmsnorm_f32_push) == 48, "rmsnorm_f32_push must be 48B");
 
 struct copy_f32_push {
     uint64_t src_va;
@@ -350,12 +363,15 @@ static const char * k_glsl_w4_gather_f32 = R"GLSL(
 #version 450
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufF32 { float v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufI32 { int v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer BufF16 { float16_t v[]; };
 
 layout(push_constant) uniform PushArgs {
     uint64_t src_va;
@@ -364,6 +380,7 @@ layout(push_constant) uniform PushArgs {
     uint64_t dst2_va;
     uint     n_embd;
     uint     n_out;
+    uint64_t dst_f16_va;
 } pc;
 
 void main() {
@@ -376,6 +393,9 @@ void main() {
     if (pc.dst2_va != 0ul) {
         BufF32(pc.dst2_va).v[row * pc.n_embd + col] = val;
     }
+    if (pc.dst_f16_va != 0ul) {
+        BufF16(pc.dst_f16_va).v[row * pc.n_embd + col] = float16_t(val);
+    }
 }
 )GLSL";
 
@@ -386,7 +406,634 @@ struct w4_gather_f32_push {
     uint64_t dst2_va;
     uint32_t n_embd;
     uint32_t n_out;
+    uint64_t dst_f16_va;
 };
+static_assert(sizeof(w4_gather_f32_push) == 48, "w4_gather_f32_push must be 48B");
+
+// Wave 10: O(n_kv) Banded Rel-Bias Table Projection (64T = 2 SGs, 3 KB SRAM -> 100% coalesced 128B stores!)
+// Loads rel_bias[e, 0..n_rel-1] ONCE per (e, tok), multiplies all 24 heads in registers -> rel_table[tok, h, e]!
+static const char * k_glsl_w10_rel_bias_table = R"GLSL(
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4)  buffer BufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  readonly buffer ConstBufF32   { float    v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer ConstBufVec4  { vec4     v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  readonly buffer ConstBufU32   { uint     v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8)  readonly buffer ConstBufUvec2 { uvec2    v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer ConstBufUvec4 { uvec4    v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2)  readonly buffer ConstBufU16   { uint16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 1)  readonly buffer ConstBufI8    { int8_t   v[]; };
+
+layout(push_constant) uniform PushArgs {
+    uint64_t r_va;
+    uint64_t rel_bias_va;
+    uint64_t dst_va;
+    uint64_t sinks_src_va;
+    uint64_t sinks_dst_va;
+    uint     n_rel;
+    uint     eff_rows;
+    uint     n_tokens;
+    uint     bias_wtype;
+    uint     bias_nb1_B;
+    uint     sinks_stride_f32;
+} pc;
+
+shared vec4 sh_r[24][8]; // 3,072 B: 24 heads x 32 floats (zero-padded for n_rel < 32)
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint tok = gl_WorkGroupID.y;
+    if (tok >= pc.n_tokens) return;
+
+    const uint n_rel = min(pc.n_rel, 32u);
+    ConstBufF32 rb = ConstBufF32(pc.r_va);
+    for (uint idx = tid; idx < 24u * 8u; idx += 64u) {
+        const uint h = idx >> 3u;
+        const uint g = idx & 7u;
+        const uint k = g << 2u;
+        const uint base = (tok * 24u + h) * pc.n_rel + k;
+        vec4 rv = vec4(0.0);
+        if (k + 0u < n_rel) rv.x = rb.v[base + 0u];
+        if (k + 1u < n_rel) rv.y = rb.v[base + 1u];
+        if (k + 2u < n_rel) rv.z = rb.v[base + 2u];
+        if (k + 3u < n_rel) rv.w = rb.v[base + 3u];
+        sh_r[h][g] = rv;
+    }
+    if (gl_WorkGroupID.x == 0u && tid < 24u && pc.sinks_dst_va != 0ul) {
+        BufF32(pc.sinks_dst_va).v[tok * 24u + tid] =
+            ConstBufF32(pc.sinks_src_va).v[tok * pc.sinks_stride_f32 + tid];
+    }
+    barrier();
+
+    const uint e = gl_WorkGroupID.x * 64u + tid;
+    if (e >= pc.eff_rows) return;
+
+    vec4 w[8];
+    [[unroll]] for (uint g = 0u; g < 8u; ++g) w[g] = vec4(0.0);
+
+    const uint64_t b_va = pc.rel_bias_va + uint64_t(e) * uint64_t(pc.bias_nb1_B);
+    const uint wt = pc.bias_wtype;
+    if (wt == 2u) {
+        // BF16 (Inkling-2-Mini default!): 4 x 16B uvec4 loads for n_rel = 32!
+        const uint n8 = n_rel >> 3u;
+        ConstBufUvec4 bb = ConstBufUvec4(b_va);
+        for (uint p_i = 0u; p_i < n8; ++p_i) {
+            uvec4 p = bb.v[p_i];
+            w[p_i * 2u + 0u] = vec4(
+                uintBitsToFloat((p.x & 0xFFFFu) << 16u),
+                uintBitsToFloat(p.x & 0xFFFF0000u),
+                uintBitsToFloat((p.y & 0xFFFFu) << 16u),
+                uintBitsToFloat(p.y & 0xFFFF0000u));
+            w[p_i * 2u + 1u] = vec4(
+                uintBitsToFloat((p.z & 0xFFFFu) << 16u),
+                uintBitsToFloat(p.z & 0xFFFF0000u),
+                uintBitsToFloat((p.w & 0xFFFFu) << 16u),
+                uintBitsToFloat(p.w & 0xFFFF0000u));
+        }
+        if ((n_rel & 7u) != 0u) {
+            const uint rem0 = n8 * 8u;
+            for (uint k = rem0; k < n_rel; ++k) {
+                uint u = uint(ConstBufU16(b_va).v[k]);
+                w[k >> 2u][k & 3u] = uintBitsToFloat(u << 16u);
+            }
+        }
+    } else if (wt == 1u) {
+        const uint n8 = n_rel >> 3u;
+        ConstBufUvec4 bb = ConstBufUvec4(b_va);
+        for (uint p_i = 0u; p_i < n8; ++p_i) {
+            uvec4 p = bb.v[p_i];
+            w[p_i * 2u + 0u] = vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y));
+            w[p_i * 2u + 1u] = vec4(unpackHalf2x16(p.z), unpackHalf2x16(p.w));
+        }
+        if ((n_rel & 7u) != 0u) {
+            const uint rem0 = n8 * 8u;
+            for (uint k = rem0; k < n_rel; ++k) {
+                uint u = uint(ConstBufU16(b_va).v[k]);
+                w[k >> 2u][k & 3u] = unpackHalf2x16(u).x;
+            }
+        }
+    } else if (wt == 0u) {
+        const uint n4 = n_rel >> 2u;
+        ConstBufVec4 bb = ConstBufVec4(b_va);
+        for (uint g = 0u; g < n4; ++g) w[g] = bb.v[g];
+        if ((n_rel & 3u) != 0u) {
+            for (uint k = n4 * 4u; k < n_rel; ++k) w[k >> 2u][k & 3u] = ConstBufF32(b_va).v[k];
+        }
+    } else if (wt == 4u) {
+        // Q8_0_8BLK (272B chunk: d[8] at +0, qs[256] at +16; n_rel <= 32 -> block 0 only!)
+        float ds = unpackHalf2x16(uint(ConstBufU16(b_va).v[0])).x;
+        for (uint g = 0u; g < 8u; ++g) {
+            if (g * 4u < n_rel) {
+                uint pk = ConstBufU32(b_va + 16ul).v[g];
+                w[g] = vec4(
+                    float(bitfieldExtract(int(pk),  0, 8)),
+                    float(bitfieldExtract(int(pk),  8, 8)),
+                    float(bitfieldExtract(int(pk), 16, 8)),
+                    float(bitfieldExtract(int(pk), 24, 8))) * ds;
+            }
+        }
+    } else {
+        // Q8_0_RAW (34B block)
+        float ds = unpackHalf2x16(uint(ConstBufU16(b_va).v[0])).x;
+        for (uint k = 0u; k < n_rel; ++k) {
+            w[k >> 2u][k & 3u] = float(ConstBufI8(b_va + 2ul).v[k]) * ds;
+        }
+    }
+
+    BufF32 ob = BufF32(pc.dst_va);
+    const uint n4_eff = (n_rel + 3u) >> 2u;
+    const uint base_t = tok * 24u * pc.eff_rows + e;
+    for (uint h = 0u; h < 24u; ++h) {
+        float acc = 0.0;
+        for (uint g = 0u; g < n4_eff; ++g) {
+            acc += dot(w[g], sh_r[h][g]);
+        }
+        ob.v[base_t + h * pc.eff_rows] = acc;
+    }
+}
+)GLSL";
+
+// Wave 10: Lazy-compiled FWHT64-capable variant of agx_inkling2_qkv_prep_store.comp
+// Matches struct agx_w4_qkv_prep_desc verbatim; adds QKV_FLAG_FWHT64_K (1<<9) & QKV_FLAG_FWHT64_V (1<<10)
+// so -ctk q8_0 -ctv q8_0 (n_rot_k=128, n_rot_v=64) writes exact H_64-rotated V vectors into KV cache!
+static const char * k_glsl_w10_qkv_prep_store_rot64 = R"GLSL(
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer ConstBufVec4 { vec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufI32 { int v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer ConstBufI64 { int64_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufU32 { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer ConstBufUvec2 { uvec2 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer BufF16 { float16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) readonly buffer ConstBufF16 { float16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer BufU16 { uint16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) readonly buffer ConstBufU16 { uint16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 1) readonly buffer ConstBufI8 { int8_t v[]; };
+
+#define QKV_FLAG_IS_FULL_ATTN   (1u << 0)
+#define QKV_FLAG_FWHT_K         (1u << 1)
+#define QKV_FLAG_FWHT_V         (1u << 2)
+#define QKV_FLAG_KV_Q8_0        (1u << 3)
+#define QKV_FLAG_K_IDS_I64      (1u << 4)
+#define QKV_FLAG_V_IDS_I64      (1u << 5)
+#define QKV_FLAG_BASE_MASK_F16  (1u << 6)
+#define QKV_FLAG_FUSE_REL_MASK  (1u << 7)
+#define QKV_FLAG_PACK_QGATE     (1u << 8)
+#define QKV_FLAG_FWHT64_K       (1u << 9)
+#define QKV_FLAG_FWHT64_V       (1u << 10)
+#define QKV_FLAG_BANDED_REL_PACK (1u << 11)
+
+struct QkvPrepDesc {
+    uint64_t q_raw_va;
+    uint64_t k_raw_va;
+    uint64_t v_raw_va;
+    uint64_t r_raw_va;
+    uint64_t sinks_va;
+    uint64_t qgate_raw_va;
+    uint64_t qgate_compact_va;
+    uint64_t k_dyn_va;
+    uint64_t v_dyn_va;
+
+    uint64_t q_clip_va;
+    uint64_t r_clip_va;
+    uint64_t k_conv_w_va;
+    uint64_t v_conv_w_va;
+    uint64_t rel_bias_va;
+    uint64_t inp_pos_va;
+
+    uint64_t r_l_va;
+    uint64_t s_copy_va;
+    uint64_t k_cell_va;
+    uint64_t v_cell_va;
+
+    uint64_t k_store_va;
+    uint64_t v_store_va;
+    uint64_t k_idxs_va;
+    uint64_t v_idxs_va;
+
+    uint64_t q_out_va;
+    uint64_t r_out_va;
+    uint64_t rel_pos_va;
+    uint64_t base_mask_va;
+    uint64_t kq_mask_out_va;
+
+    uint     q_raw_stride_f32;
+    uint     k_raw_stride_f32;
+    uint     v_raw_stride_f32;
+    uint     r_raw_stride_f32;
+    uint     sinks_stride_f32;
+    uint     r_nb1_f32;
+    uint     rollback_slots;
+    uint     rollback_stride_f32;
+    uint     k_store_nb1_B;
+    uint     v_store_nb1_B;
+    uint     k_ids_nb0_B;
+    uint     v_ids_nb0_B;
+    uint     n_tokens;
+    uint     n_conv;
+    uint     n_rel;
+    uint     n_extent;
+    uint     n_kv;
+    uint     n_kv_mask_stride;
+    uint     rpos_nb1_B;
+    uint     bmask_nb1_B;
+    uint     bias_wtype;
+    uint     bias_nb1_B;
+    uint     flags;
+    uint     r_splits;
+    float    conv_res_scale;
+    float    qk_clip;
+    float    rel_clip;
+    float    rms_eps;
+    float    log_scale_alpha;
+    float    inv_log_floor;
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer DescBuf {
+    QkvPrepDesc d;
+};
+
+layout(push_constant) uniform PushArgs {
+    uint64_t desc_va;
+} pc;
+
+shared float s_r[32];
+
+void fwht128_in_reg(inout float reg[4], uint lane) {
+    const float sc = 0.08838834764831845;
+    [[unroll]] for (uint k = 0u; k < 4u; ++k) reg[k] *= sc;
+    [[unroll]] for (uint h = 1u; h < 32u; h <<= 1u) {
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+            float a = reg[k];
+            float b = subgroupShuffleXor(a, h);
+            reg[k] = ((lane & h) == 0u) ? (a + b) : (b - a);
+        }
+    }
+    float a0 = reg[0], a1 = reg[1], a2 = reg[2], a3 = reg[3];
+    float b0 = a0 + a1, b1 = a0 - a1, b2 = a2 + a3, b3 = a2 - a3;
+    reg[0] = b0 + b2; reg[1] = b1 + b3;
+    reg[2] = b0 - b2; reg[3] = b1 - b3;
+}
+
+void fwht64_in_reg(inout float reg[4], uint lane) {
+    const float sc = 0.125;
+    [[unroll]] for (uint k = 0u; k < 4u; ++k) reg[k] *= sc;
+    [[unroll]] for (uint h = 1u; h < 32u; h <<= 1u) {
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+            float a = reg[k];
+            float b = subgroupShuffleXor(a, h);
+            reg[k] = ((lane & h) == 0u) ? (a + b) : (b - a);
+        }
+    }
+    float a0 = reg[0], a1 = reg[1], a2 = reg[2], a3 = reg[3];
+    reg[0] = a0 + a1; reg[1] = a0 - a1;
+    reg[2] = a2 + a3; reg[3] = a2 - a3;
+}
+
+void store_kv_head(uint64_t row_va, uint head, float reg[4], uint lane, bool is_q8) {
+    if (!is_q8) {
+        uint64_t h_va = row_va + uint64_t(head * 128u) * 2ul;
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+            BufF16(h_va).v[k * 32u + lane] = float16_t(reg[k]);
+        }
+    } else {
+        uint64_t h_va = row_va + uint64_t(head * 4u) * 34ul;
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+            float val  = reg[k];
+            float amax = subgroupMax(abs(val));
+            float d    = amax * (1.0 / 127.0);
+            float id   = (d != 0.0) ? (1.0 / d) : 0.0;
+            int   q    = clamp(int(round(val * id)), -127, 127);
+            uint64_t bva = h_va + uint64_t(k) * 34ul;
+            if (lane == 0u) BufF16(bva).v[0] = float16_t(d);
+            int q_hi = subgroupShuffleXor(q, 1u);
+            if ((lane & 1u) == 0u) {
+                BufU16(bva + 2ul).v[lane >> 1u] =
+                    uint16_t((uint(q) & 0xFFu) | ((uint(q_hi) & 0xFFu) << 8u));
+            }
+        }
+    }
+}
+
+float eval_conv4_tap(uint64_t raw_va, uint raw_stride_f32, uint ch, uint t,
+                     float p0, float p1, float p2, uint lag) {
+    if (t >= lag) return ConstBufF32(raw_va).v[(t - lag) * raw_stride_f32 + ch];
+    uint idx = 3u - (lag - t);
+    return (idx == 0u) ? p0 : ((idx == 1u) ? p1 : p2);
+}
+
+#define Q_FLD(f) (DescBuf(pc.desc_va).d.f)
+
+void process_kv_head_all_tokens(
+        bool is_v, uint head, uint lane,
+        bool is_full, bool do_fwht128, bool do_fwht64, bool kv_q8) {
+    const uint64_t raw_va     = is_v ? Q_FLD(v_raw_va)         : Q_FLD(k_raw_va);
+    const uint raw_stride     = is_v ? Q_FLD(v_raw_stride_f32) : Q_FLD(k_raw_stride_f32);
+    const uint64_t conv_w_va  = is_v ? Q_FLD(v_conv_w_va)      : Q_FLD(k_conv_w_va);
+    const uint64_t dyn_va     = is_v ? Q_FLD(v_dyn_va)         : Q_FLD(k_dyn_va);
+    const uint64_t cell_va    = is_v ? Q_FLD(v_cell_va)        : Q_FLD(k_cell_va);
+    const uint64_t store_va   = is_v ? Q_FLD(v_store_va)       : Q_FLD(k_store_va);
+    const uint64_t idxs_va    = is_v ? Q_FLD(v_idxs_va)        : Q_FLD(k_idxs_va);
+    const uint store_nb1_B    = is_v ? Q_FLD(v_store_nb1_B)    : Q_FLD(k_store_nb1_B);
+    const uint ids_nb0_B      = is_v ? Q_FLD(v_ids_nb0_B)      : Q_FLD(k_ids_nb0_B);
+    const uint flags          = Q_FLD(flags);
+    const bool ids_i64        = is_v ? ((flags & QKV_FLAG_V_IDS_I64) != 0u)
+                                     : ((flags & QKV_FLAG_K_IDS_I64) != 0u);
+    const uint conv_ch_off    = is_v ? 1024u : 0u;
+    const uint n_tok          = Q_FLD(n_tokens);
+    const float conv_res_sc   = Q_FLD(conv_res_scale);
+    const float qk_clip       = Q_FLD(qk_clip);
+    const float rms_eps       = Q_FLD(rms_eps);
+
+    const int src_cell = max(ConstBufI32(Q_FLD(s_copy_va)).v[0], 0);
+    const uint64_t hist_cell_va = Q_FLD(r_l_va) + uint64_t(src_cell) * uint64_t(Q_FLD(r_nb1_f32)) * 4ul;
+
+    for (uint t = 0u; t < n_tok; ++t) {
+        float reg[4];
+        float ss = 0.0;
+        for (uint k = 0u; k < 4u; ++k) {
+            const uint ch = head * 128u + k * 32u + lane;
+            const uint64_t past_va = hist_cell_va + uint64_t((conv_ch_off + ch) * 3u) * 4ul;
+            float p0 = ConstBufF32(past_va).v[0];
+            float p1 = ConstBufF32(past_va).v[1];
+            float p2 = ConstBufF32(past_va).v[2];
+
+            float x3 = eval_conv4_tap(raw_va, raw_stride, ch, t, p0, p1, p2, 3u);
+            float x2 = eval_conv4_tap(raw_va, raw_stride, ch, t, p0, p1, p2, 2u);
+            float x1 = eval_conv4_tap(raw_va, raw_stride, ch, t, p0, p1, p2, 1u);
+            float x0 = ConstBufF32(raw_va).v[t * raw_stride + ch];
+
+            vec4 cw = ConstBufVec4(conv_w_va).v[ch];
+            float csum = x3 * cw.x + x2 * cw.y + x1 * cw.z + x0 * cw.w;
+            if (is_full && dyn_va != 0ul) {
+                vec4 dw = ConstBufVec4(dyn_va).v[t * 8u + head];
+                csum += x0 * dw.x + x1 * dw.y + x2 * dw.z + x3 * dw.w;
+            }
+            float v = (x0 + csum) * conv_res_sc;
+            reg[k] = v;
+            ss += v * v;
+        }
+
+        float sum_sq = subgroupAdd(ss);
+        float sc = (!is_v)
+            ? (qk_clip / max(sqrt(sum_sq), qk_clip))
+            : inversesqrt(sum_sq * (1.0 / 128.0) + rms_eps);
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) reg[k] *= sc;
+        if (do_fwht64)       fwht64_in_reg(reg, lane);
+        else if (do_fwht128) fwht128_in_reg(reg, lane);
+
+        const uint64_t id_va = idxs_va + uint64_t(t) * uint64_t(ids_nb0_B);
+        int64_t dst_row = ids_i64 ? ConstBufI64(id_va).v[0] : int64_t(ConstBufI32(id_va).v[0]);
+        if (dst_row >= 0l) {
+            store_kv_head(store_va + uint64_t(dst_row) * uint64_t(store_nb1_B), head, reg, lane, kv_q8);
+        }
+    }
+
+    if (cell_va != 0ul) {
+        const uint Kw = min(Q_FLD(rollback_slots), n_tok);
+        const uint rb_stride = Q_FLD(rollback_stride_f32);
+        for (uint k = 0u; k < 4u; ++k) {
+            const uint ch = head * 128u + k * 32u + lane;
+            const uint64_t past_va = hist_cell_va + uint64_t((conv_ch_off + ch) * 3u) * 4ul;
+            float p0 = ConstBufF32(past_va).v[0];
+            float p1 = ConstBufF32(past_va).v[1];
+            float p2 = ConstBufF32(past_va).v[2];
+            for (uint w = 0u; w < Kw; ++w) {
+                const uint slot  = (Kw - 1u) - w;
+                const uint t_end = (n_tok - Kw) + w;
+                const uint64_t dst_slot_va = cell_va +
+                    uint64_t(slot) * uint64_t(rb_stride) * 4ul +
+                    uint64_t(ch * 3u) * 4ul;
+                BufF32(dst_slot_va).v[0] = eval_conv4_tap(raw_va, raw_stride, ch, t_end, p0, p1, p2, 2u);
+                BufF32(dst_slot_va).v[1] = eval_conv4_tap(raw_va, raw_stride, ch, t_end, p0, p1, p2, 1u);
+                BufF32(dst_slot_va).v[2] = ConstBufF32(raw_va).v[t_end * raw_stride + ch];
+            }
+        }
+    }
+}
+
+float dot_rel_bias_row(uint64_t b_va, uint wtype, uint n_rel) {
+    float acc = 0.0;
+    if (wtype == 2u) {
+        const uint n4 = n_rel >> 2u;
+        for (uint g = 0u; g < n4; ++g) {
+            uvec2 p = ConstBufUvec2(b_va).v[g];
+            uint k = g << 2u;
+            vec4 w = vec4(
+                uintBitsToFloat((p.x & 0xFFFFu) << 16u),
+                uintBitsToFloat(p.x & 0xFFFF0000u),
+                uintBitsToFloat((p.y & 0xFFFFu) << 16u),
+                uintBitsToFloat(p.y & 0xFFFF0000u));
+            acc += dot(w, vec4(s_r[k], s_r[k + 1u], s_r[k + 2u], s_r[k + 3u]));
+        }
+    } else if (wtype == 1u) {
+        const uint n4 = n_rel >> 2u;
+        for (uint g = 0u; g < n4; ++g) {
+            uvec2 p = ConstBufUvec2(b_va).v[g];
+            uint k = g << 2u;
+            vec4 w = vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y));
+            acc += dot(w, vec4(s_r[k], s_r[k + 1u], s_r[k + 2u], s_r[k + 3u]));
+        }
+    } else if (wtype == 0u) {
+        const uint n4 = n_rel >> 2u;
+        for (uint g = 0u; g < n4; ++g) {
+            uint k = g << 2u;
+            acc += dot(ConstBufVec4(b_va).v[g], vec4(s_r[k], s_r[k + 1u], s_r[k + 2u], s_r[k + 3u]));
+        }
+    } else if (wtype == 4u) {
+        const uint n_chunks = (n_rel + 255u) >> 8u;
+        for (uint c = 0u; c < n_chunks; ++c) {
+            uint64_t cva = b_va + uint64_t(c) * 272ul;
+            uint blk_end = min(8u, (n_rel - c * 256u + 31u) >> 5u);
+            for (uint b = 0u; b < blk_end; ++b) {
+                float ds = unpackHalf2x16(uint(ConstBufU16(cva).v[b])).x;
+                float p = 0.0;
+                uint base_k = c * 256u + b * 32u;
+                for (uint w = 0u; w < 8u; ++w) {
+                    uint pk = ConstBufU32(cva + 16ul).v[b * 8u + w];
+                    uint kk = base_k + w * 4u;
+                    if (kk < n_rel) {
+                        p += float(bitfieldExtract(int(pk),  0, 8)) * s_r[kk + 0u]
+                           + float(bitfieldExtract(int(pk),  8, 8)) * s_r[kk + 1u]
+                           + float(bitfieldExtract(int(pk), 16, 8)) * s_r[kk + 2u]
+                           + float(bitfieldExtract(int(pk), 24, 8)) * s_r[kk + 3u];
+                    }
+                }
+                acc += ds * p;
+            }
+        }
+    } else {
+        for (uint k = 0u; k < n_rel; k += 32u) {
+            uint64_t blk_va = b_va + uint64_t(k >> 5u) * 34ul;
+            float ds = unpackHalf2x16(uint(ConstBufU16(blk_va).v[0])).x;
+            float p = 0.0;
+            for (uint o = 0u; o < 32u && (k + o) < n_rel; ++o) {
+                p += float(ConstBufI8(blk_va + 2ul).v[o]) * s_r[k + o];
+            }
+            acc += ds * p;
+        }
+    }
+    return acc;
+}
+
+void main() {
+    const uint wg  = gl_WorkGroupID.x;
+    const uint tok = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint sg  = tid >> 5u;
+    const uint ln  = tid & 31u;
+
+    const uint n_tok = Q_FLD(n_tokens);
+    if (tok >= n_tok) return;
+
+    const uint flags    = Q_FLD(flags);
+    const bool is_full  = (flags & QKV_FLAG_IS_FULL_ATTN) != 0u;
+    const bool fwht_k   = (flags & QKV_FLAG_FWHT_K) != 0u;
+    const bool fwht_v   = (flags & QKV_FLAG_FWHT_V) != 0u;
+    const bool fwht64_k = (flags & QKV_FLAG_FWHT64_K) != 0u;
+    const bool fwht64_v = (flags & QKV_FLAG_FWHT64_V) != 0u;
+    const bool kv_q8    = (flags & QKV_FLAG_KV_Q8_0) != 0u;
+
+    if (wg < 24u) {
+        if (sg != 0u) return;
+        const uint head = wg;
+        const uint64_t q_raw_va  = Q_FLD(q_raw_va);
+        const uint64_t q_clip_va = Q_FLD(q_clip_va);
+        const uint q_stride      = Q_FLD(q_raw_stride_f32);
+        float reg[4];
+        float ss = 0.0;
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+            const uint ch = head * 128u + k * 32u + ln;
+            float x = ConstBufF32(q_raw_va).v[tok * q_stride + ch]
+                    * ConstBufF32(q_clip_va).v[ch];
+            reg[k] = x;
+            ss += x * x;
+        }
+        const float qk_clip = Q_FLD(qk_clip);
+        float sc = qk_clip / max(sqrt(subgroupAdd(ss)), qk_clip);
+        if (is_full) {
+            float pos_p1 = float(ConstBufI32(Q_FLD(inp_pos_va)).v[tok]) + 1.0;
+            sc *= 1.0 + Q_FLD(log_scale_alpha) * log(max(1.0, pos_p1 * Q_FLD(inv_log_floor)));
+        }
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) reg[k] *= sc;
+        if (fwht64_k)     fwht64_in_reg(reg, ln);
+        else if (fwht_k)  fwht128_in_reg(reg, ln);
+        const uint q_base = (tok * 24u + head) * 128u;
+        const uint64_t q_out_va = Q_FLD(q_out_va);
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+            BufF32(q_out_va).v[q_base + k * 32u + ln] = reg[k];
+        }
+        if ((flags & QKV_FLAG_PACK_QGATE) != 0u && Q_FLD(qgate_compact_va) != 0ul) {
+            const uint64_t qg_raw = Q_FLD(qgate_raw_va);
+            const uint64_t qg_dst = Q_FLD(qgate_compact_va);
+            [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+                const uint ch = head * 128u + k * 32u + ln;
+                BufF32(qg_dst).v[q_base + k * 32u + ln] =
+                    ConstBufF32(qg_raw).v[tok * q_stride + ch];
+            }
+        }
+        return;
+    }
+
+    if (wg < 32u) {
+        if (sg != 0u || tok != 0u) return;
+        process_kv_head_all_tokens(false, wg - 24u, ln, is_full, fwht_k, fwht64_k, kv_q8);
+        return;
+    }
+
+    if (wg < 40u) {
+        if (sg != 0u || tok != 0u) return;
+        process_kv_head_all_tokens(true, wg - 32u, ln, is_full, fwht_v, fwht64_v, kv_q8);
+        return;
+    }
+
+    const uint r_splits = max(Q_FLD(r_splits), 1u);
+    const uint r_wg     = wg - 40u;
+    const uint head     = r_wg / r_splits;
+    const uint r_sp     = r_wg - head * r_splits;
+    if (head >= 24u) return;
+
+    const uint n_rel = Q_FLD(n_rel);
+    if (sg == 0u) {
+        float rv = 0.0;
+        if (ln < n_rel) {
+            const uint ch = head * n_rel + ln;
+            rv = ConstBufF32(Q_FLD(r_raw_va)).v[tok * Q_FLD(r_raw_stride_f32) + ch] *
+                 ConstBufF32(Q_FLD(r_clip_va)).v[ch];
+        }
+        const float rel_clip = Q_FLD(rel_clip);
+        float sc = rel_clip / max(sqrt(subgroupAdd(rv * rv)), rel_clip);
+        if (is_full) {
+            float pos_p1 = float(ConstBufI32(Q_FLD(inp_pos_va)).v[tok]) + 1.0;
+            sc *= 1.0 + Q_FLD(log_scale_alpha) * log(max(1.0, pos_p1 * Q_FLD(inv_log_floor)));
+        }
+        float out_r = rv * sc;
+        if (ln < 32u) s_r[ln] = out_r;
+        if ((flags & QKV_FLAG_FUSE_REL_MASK) == 0u && r_sp == 0u && ln < n_rel) {
+            BufF32(Q_FLD(r_out_va)).v[(tok * 24u + head) * n_rel + ln] = out_r;
+        }
+    }
+
+    if ((flags & QKV_FLAG_FUSE_REL_MASK) == 0u) return;
+    barrier();
+
+    const float sink = ConstBufF32(Q_FLD(sinks_va)).v[tok * Q_FLD(sinks_stride_f32) + head];
+    const bool     banded_pack  = (flags & QKV_FLAG_BANDED_REL_PACK) != 0u;
+    const uint64_t rpos_base_va = Q_FLD(rel_pos_va);
+    const uint64_t rpos_row_va  = rpos_base_va + uint64_t(tok) * uint64_t(Q_FLD(rpos_nb1_B));
+    const int      b_qp         = banded_pack ? ConstBufI32(rpos_base_va).v[Q_FLD(rpos_nb1_B) + tok] : 0;
+    const uint64_t bmask_row_va = Q_FLD(base_mask_va) + uint64_t(tok) * uint64_t(Q_FLD(bmask_nb1_B));
+    const uint64_t dst_row_va   = Q_FLD(kq_mask_out_va) +
+        uint64_t((head * n_tok + tok) * Q_FLD(n_kv_mask_stride)) * 2ul;
+    const bool bmask_f16 = (flags & QKV_FLAG_BASE_MASK_F16) != 0u;
+    const uint n_kv      = Q_FLD(n_kv);
+    const uint n_extent  = Q_FLD(n_extent);
+    const uint64_t rel_bias_va = Q_FLD(rel_bias_va);
+    const uint bias_wtype      = Q_FLD(bias_wtype);
+    const uint bias_nb1_B      = Q_FLD(bias_nb1_B);
+
+    const uint chunk = (n_kv + r_splits - 1u) / r_splits;
+    const uint j_beg = r_sp * chunk;
+    const uint j_end = min(j_beg + chunk, n_kv);
+
+    for (uint j = j_beg + tid; j < j_end; j += 128u) {
+        float bm = bmask_f16 ? float(ConstBufF16(bmask_row_va).v[j]) : ConstBufF32(bmask_row_va).v[j];
+        if (!(bm > -1.0e20)) {
+            BufF16(dst_row_va).v[j] = float16_t(bm);
+            continue;
+        }
+        int d_idx = banded_pack ? (b_qp - ConstBufI32(rpos_base_va).v[j]) : ConstBufI32(rpos_row_va).v[j];
+        float acc = 0.0;
+        if (d_idx >= 0 && uint(d_idx) < n_extent) {
+            uint64_t b_va = rel_bias_va + uint64_t(d_idx) * uint64_t(bias_nb1_B);
+            acc = dot_rel_bias_row(b_va, bias_wtype, n_rel);
+        }
+        BufF16(dst_row_va).v[j] = float16_t((acc - sink) + bm);
+    }
+}
+#undef Q_FLD
+)GLSL";
 
 static const char * k_glsl_w4_fill_f32 = R"GLSL(
 #version 450
@@ -541,7 +1188,10 @@ struct agx_inkling2_engine {
     const agx_kernel * k_w4_gather_f32      = nullptr;
     const agx_kernel * k_w4_fill_f32        = nullptr;
     const agx_kernel * k_w4_scatter_rows_f32 = nullptr;
-    bool               w4_compiled          = false;
+    const agx_kernel * k_w10_rel_bias_table  = nullptr;
+    const agx_kernel * k_w10_qkv_prep_store_rot64 = nullptr;
+    bool               w10_qkv_rot64_tried   = false;
+    bool               w4_compiled           = false;
 
     // Wave 5 Persistent 40-WG SENSE_BARRIER B=1 Megakernel kernels
     // k_w5_persist_attn[kv_q8][has_loop]
@@ -553,6 +1203,8 @@ struct agx_inkling2_engine {
     const agx_kernel * k_w5_attn_in_b1             = nullptr;
     const agx_kernel * k_w9_attn_in_m4             = nullptr;
     const agx_kernel * k_w9_attn_in_m8             = nullptr;
+    const agx_kernel * k_w9_attn_in_m4_f16         = nullptr;
+    const agx_kernel * k_w9_attn_in_m8_f16         = nullptr;
     const agx_kernel * k_w5_hybrid_qkv_flash[2]      = {};
     const agx_kernel * k_w5_hybrid_post_attn_rtr[2]  = {};
     const agx_kernel * k_w5_hybrid_post_ffn_ctrl     = nullptr;
@@ -1441,7 +2093,7 @@ static bool encode_inkling2_layer(agx_inkling2_engine *             eng,
         const uint64_t srcs[3] = { inp_q_va, inp_k_va, inp_v_va };
         const struct ggml_tensor * norms[3] = { layer.attn_q_inp_norm, layer.attn_k_inp_norm, layer.attn_v_inp_norm };
         for (int j = 0; j < 3; ++j) {
-            rmsnorm_f32_push np{ srcs[j], agx_tensor_gpu_va(norms[j]), eng->va_qkv_norm[j], D, n_tokens, hp.f_norm_rms_eps };
+            rmsnorm_f32_push np{ srcs[j], agx_tensor_gpu_va(norms[j]), eng->va_qkv_norm[j], D, n_tokens, hp.f_norm_rms_eps, 0u, 0ull };
             if (!agx_cdm_dispatch(stream, eng->k_rmsnorm_f32, n_tokens, 1, 1, &np, sizeof(np),
                                   j == 2 ? AGX_BARRIER_STRONG_USC : AGX_BARRIER_NONE)) {
                 return false;
@@ -1452,7 +2104,7 @@ static bool encode_inkling2_layer(agx_inkling2_engine *             eng,
         inp_v_va = eng->va_qkv_norm[2];
     } else if (!layer.attn_res_query) {
         // Layer 0 SWA (no attn_res_query): single RMSNorm
-        rmsnorm_f32_push np{ cur_va, agx_tensor_gpu_va(layer.attn_norm), eng->va_qkv_norm[0], D, n_tokens, hp.f_norm_rms_eps };
+        rmsnorm_f32_push np{ cur_va, agx_tensor_gpu_va(layer.attn_norm), eng->va_qkv_norm[0], D, n_tokens, hp.f_norm_rms_eps, 0u, 0ull };
         if (!agx_cdm_dispatch(stream, eng->k_rmsnorm_f32, n_tokens, 1, 1, &np, sizeof(np), AGX_BARRIER_STRONG_USC)) {
             return false;
         }
@@ -2095,6 +2747,9 @@ bool agx_inkling2_precompile_w4(agx_inkling2_engine * eng) {
     eng->k_w4_gather_f32       = compile_inline("agx_w4_gather_f32",    k_glsl_w4_gather_f32);
     eng->k_w4_fill_f32         = compile_inline("agx_w4_fill_f32",      k_glsl_w4_fill_f32);
     eng->k_w4_scatter_rows_f32 = compile_inline("agx_w4_scatter_rows_f32", k_glsl_w4_scatter_rows_f32);
+    eng->k_w10_rel_bias_table       = compile_inline("agx_w10_rel_bias_table", k_glsl_w10_rel_bias_table);
+    eng->k_w10_qkv_prep_store_rot64 = compile_inline("agx_w10_qkv_prep_store_rot64", k_glsl_w10_qkv_prep_store_rot64);
+    eng->w10_qkv_rot64_tried        = true;
 
     eng->w4_compiled = eng->k_w4_qkv_prep_store && eng->k_w4_stage_post_attn &&
                        eng->k_w4_stage_post_ffn && eng->k_w4_rel_bias_mask &&
@@ -2109,8 +2764,22 @@ bool agx_inkling2_precompile_w4(agx_inkling2_engine * eng) {
                        eng->k_w8_dspark_inject_kv &&
                        eng->k_w4_router_topk &&
                        eng->k_w4_gather_f32 && eng->k_w4_fill_f32 &&
-                       eng->k_w4_scatter_rows_f32;
+                       eng->k_w4_scatter_rows_f32 && eng->k_w10_rel_bias_table &&
+                       eng->k_w10_qkv_prep_store_rot64;
     return eng->w4_compiled;
+}
+
+static const agx_kernel * ensure_w10_qkv_rot64_kernel(agx_inkling2_engine * eng) {
+    if (!eng || !eng->ctx || !eng->ctx->compiler) return nullptr;
+    if (!eng->w10_qkv_rot64_tried) {
+        eng->w10_qkv_rot64_tried = true;
+        agx_compile_opts opts;
+        opts.is_hot_kernel     = true;
+        opts.strict_zero_spill = true;
+        eng->k_w10_qkv_prep_store_rot64 = agx_compiler_compile_glsl(
+            eng->ctx->compiler, "agx_w10_qkv_prep_store_rot64", k_glsl_w10_qkv_prep_store_rot64, opts);
+    }
+    return eng->k_w10_qkv_prep_store_rot64;
 }
 
 static const agx_kernel * compile_w5_persist_kernel(
@@ -2225,11 +2894,19 @@ static bool ensure_w5_hybrid_m_kernels(agx_inkling2_engine * eng) {
         a4.defines.emplace_back("BATCH_M=4");
         eng->k_w9_attn_in_m4 = agx_compiler_compile_file(comp, "agx_w9_attn_in_m4", "agx_inkling2_attn_in_b1.comp", a4);
 
+        agx_compile_opts a4_f16 = a4;
+        a4_f16.defines.emplace_back("X_IS_F16=1");
+        eng->k_w9_attn_in_m4_f16 = agx_compiler_compile_file(comp, "agx_w9_attn_in_m4_f16", "agx_inkling2_attn_in_b1.comp", a4_f16);
+
         agx_compile_opts a8;
         a8.is_hot_kernel     = true;
         a8.strict_zero_spill = true;
         a8.defines.emplace_back("BATCH_M=8");
         eng->k_w9_attn_in_m8 = agx_compiler_compile_file(comp, "agx_w9_attn_in_m8", "agx_inkling2_attn_in_b1.comp", a8);
+
+        agx_compile_opts a8_f16 = a8;
+        a8_f16.defines.emplace_back("X_IS_F16=1");
+        eng->k_w9_attn_in_m8_f16 = agx_compiler_compile_file(comp, "agx_w9_attn_in_m8_f16", "agx_inkling2_attn_in_b1.comp", a8_f16);
     }
     eng->w5_hybrid_m_ok = eng->k_w5_hybrid_post_attn_rtr_m[0] &&
                           eng->k_w5_hybrid_post_attn_rtr_m[1] &&
@@ -2272,6 +2949,10 @@ struct agx_w4_slc_layout {
     uint64_t dspark_state;      // extra + ...                    (16,384 B)
     uint64_t dspark_markov;     // extra + ...                    (16,384 B)
     uint64_t dspark_prev;       // extra + ...                    (4,096 B)
+    uint64_t x_q_f16;           // Wave 10: FP16 mirror of x_q    (36,864 B, 18 KB @ M=4 < 32 KB L1!)
+    uint64_t x_k_f16;           // Wave 10: FP16 mirror of x_k    (36,864 B)
+    uint64_t x_v_f16;           // Wave 10: FP16 mirror of x_v    (36,864 B)
+    uint64_t sinks_compact;     // Wave 10: packed [M, 24] sinks  (1,024 B)
 
     // 40-core Loop Controller & DSpark scratch inside `slc->sconv_state` (3,833,856 B, unused by MK!)
     uint64_t ctrl_cat[3];       // 3 * (8 * 4608 * 4 = 147,456 B) = 442,368 B
@@ -2313,6 +2994,10 @@ static agx_w4_slc_layout agx_w4_partition_slc(const agx_slc_arena * slc) {
     L.dspark_state    = take_extra(16384u);
     L.dspark_markov   = take_extra(16384u);
     L.dspark_prev     = take_extra(4096u);
+    L.x_q_f16         = take_extra(kEmbdB / 2u);
+    L.x_k_f16         = take_extra(kEmbdB / 2u);
+    L.x_v_f16         = take_extra(kEmbdB / 2u);
+    L.sinks_compact   = take_extra(1024u);
 
     uint64_t scur = slc->sconv_state;
     auto take_sc = [&](size_t sz) -> uint64_t {
@@ -2358,7 +3043,8 @@ static constexpr bool agx_w5_verify_w4_sublayout() {
     // 3. extra_scratch sub-slices (including dedicated moe_out strictly disjoint from x_v!)
     constexpr uint64_t ex_sizes[] = {
         98304u, 98304u, 24576u, kEmbdB, kEmbdB, kEmbdB /* moe_out */,
-        4096u, 4096u, AGX_SLC_ARENA_QKV_BUF_BYTES, 16384u, 16384u, 4096u
+        4096u, 4096u, AGX_SLC_ARENA_QKV_BUF_BYTES, 16384u, 16384u, 4096u,
+        kEmbdB / 2u, kEmbdB / 2u, kEmbdB / 2u, 1024u
     };
     uint64_t cur = AGX_SLC_ARENA_OFF_EXTRA_SCRATCH;
     uint64_t moe_out_off = 0;
@@ -2726,6 +3412,9 @@ struct w4_pass_runtime {
     bool     has_loop      = false;
     bool     has_k_rot     = false;
     bool     has_v_rot     = false;
+    uint32_t k_rot_dim     = 0;     // 0, 64, or 128
+    uint32_t v_rot_dim     = 0;     // 0, 64, or 128
+    bool     has_banded_rel = false; // ggml_flash_attn_ext_add_banded_rel_bias (src[6]/src[7] + 2D sinks)
     bool     kv_is_q8      = false;
     bool     k_ids_is_i64  = true;
     bool     v_ids_is_i64  = true;
@@ -2748,13 +3437,17 @@ struct w4_pass_runtime {
     uint32_t k_ids_nb0     = 0;
     uint32_t v_ids_nb0     = 0;
 
-    // Mask & relative pos
-    uint64_t rel_pos_va    = 0;
-    uint32_t rpos_nb1      = 0;
-    uint64_t base_mask_va  = 0;
-    uint32_t bmask_nb1     = 0;
-    uint64_t graph_mask_va = 0; // fallback VA of fa->src[3] when n_kv is huge
-    uint32_t graph_mask_nb1 = 0;
+    // Mask & relative pos (legacy kq_b OR O(n_kv) banded rel_table + rel_pos_pack)
+    uint64_t rel_pos_va      = 0;
+    uint32_t rpos_nb1        = 0;
+    uint64_t base_mask_va    = 0;
+    uint32_t bmask_nb1       = 0;
+    uint64_t graph_mask_va   = 0; // fallback VA of fa->src[3] when n_kv is huge
+    uint32_t graph_mask_nb1  = 0;
+    uint64_t rel_table_va    = 0; // fa->src[6] [rel_table_len, 24, M] F32
+    uint64_t rel_pos_pack_va = 0; // fa->src[7] packed I32 [cell_pos | q_pos | tile64_minmax]
+    uint32_t rel_table_len   = 0; // eff_rows <= rel_extent
+    uint32_t rel_extent      = 0; // fa->op_params[6]
 
     // Recurrent shortconv state (llama.cpp's r_l[il])
     uint64_t r_l_va        = 0;
@@ -3103,12 +3796,27 @@ static bool discover_inkling2_cgraph(const struct ggml_cgraph * cgraph, w4_disco
         W4_MK_FAIL("rs_s_copy->ne[0]=%lld != 1", (long long) rs_s_copy->ne[0]);
     }
 
-    // Harvest attn_rel_bias from fa_nodes[v]->src[3] BEFORE weight check:
+    // Harvest attn_rel_bias from fa_nodes[v]->src[6] (banded) or src[3] (legacy) BEFORE weight check:
     // Because BF16 GGML_OP_PAD may run on CPU in split 0, the GPU split often sees the
     // already-padded [n_rel, n_extent+1] GPU split-copy as table->src[0] without the original weight name!
     for (uint32_t v = 0; v < 48; ++v) {
         uint32_t ip = (v < 18u) ? v : ((v < 30u) ? (6u + (v - 18u)) : ((v < 42u) ? (6u + (v - 30u)) : (18u + (v - 42u))));
         if (out.W.layers[ip].attn_rel_bias) continue;
+        if (ggml_flash_attn_ext_has_banded_rel_bias(fa_nodes[v])) {
+            const struct ggml_tensor * tbl = fa_nodes[v]->src[6];
+            if (tbl) {
+                if (tbl->op == GGML_OP_CONT) tbl = tbl->src[0];
+                tbl = w4_strip_views(tbl);
+                if (tbl && tbl->op == GGML_OP_MUL_MAT && tbl->src[0]) {
+                    const struct ggml_tensor * rb = w4_strip_views(tbl->src[0]);
+                    if (rb && agx_tensor_gpu_va(rb) != 0) {
+                        out.W.layers[ip].attn_rel_bias = rb;
+                        out.rel_bias_padded[ip]        = false;
+                    }
+                }
+            }
+            continue;
+        }
         const struct ggml_tensor * m_in  = fa_nodes[v]->src[3];
         const struct ggml_tensor * add_m = (m_in && m_in->op == GGML_OP_CPY) ? m_in->src[0] : m_in;
         if (!add_m || add_m->op != GGML_OP_ADD || !add_m->src[0]) continue;
@@ -3328,49 +4036,85 @@ static bool discover_inkling2_cgraph(const struct ggml_cgraph * cgraph, w4_disco
         P.graph_mask_nb1 = (uint32_t) m_in->nb[1];
         if (!P.k_va || !P.v_va || !P.graph_mask_va) W4_MK_FAIL("v=%u missing kv/mask VA", v);
 
-        // Detect k_rot Hadamard on Q/K
+        // Detect k_rot Hadamard on Q/K (exact block size: 64 or 128!)
         const struct ggml_tensor * q_root = w4_strip_views(q_in);
         if (q_root && q_root->op == GGML_OP_MUL_MAT &&
             ggml_get_op_params_i32(q_root, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+            const uint32_t rd = (q_root->src[0]) ? (uint32_t) q_root->src[0]->ne[0] : 128u;
+            if (rd != 64u && rd != 128u) W4_MK_FAIL("v=%u unsupported k_rot_dim=%u", v, rd);
             P.has_k_rot = true;
+            P.k_rot_dim = rd;
         }
-        // Detect v_rot Hadamard on kqv_out right after fa_nodes[v]
+        // Detect v_rot Hadamard on kqv_out right after fa_nodes[v] (exact block size: 64 or 128!)
         const int next_idx = fa_node_idx[v] + 1;
-        for (int j = next_idx; j < std::min(cgraph->n_nodes, next_idx + 6); ++j) {
+        for (int j = next_idx; j < std::min(cgraph->n_nodes, next_idx + 8); ++j) {
             const struct ggml_tensor * cand = cgraph->nodes[j];
             if (cand && cand->op == GGML_OP_MUL_MAT &&
-                ggml_get_op_params_i32(cand, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
-                w4_strip_views(cand->src[1]) == fa) {
-                P.has_v_rot = true;
-                break;
+                ggml_get_op_params_i32(cand, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+                const struct ggml_tensor * s1 = w4_strip_views(cand->src[1]);
+                if (s1 == fa || (s1 && s1->op == GGML_OP_CONT && w4_strip_views(s1->src[0]) == fa)) {
+                    const uint32_t rd = (cand->src[0]) ? (uint32_t) cand->src[0]->ne[0] : 128u;
+                    if (rd != 64u && rd != 128u) W4_MK_FAIL("v=%u unsupported v_rot_dim=%u", v, rd);
+                    P.has_v_rot = true;
+                    P.v_rot_dim = rd;
+                    break;
+                }
             }
         }
 
-        // Unwrap kq_mask_rel_pos -> ADD(kq_b, raw_mask) -> rel_pos + base_mask
-        const struct ggml_tensor * add_m = (m_in->op == GGML_OP_CPY) ? m_in->src[0] : m_in;
-        if (!add_m || add_m->op != GGML_OP_ADD || !add_m->src[0] || !add_m->src[1]) {
-            W4_MK_FAIL("v=%u m_in unwrap failed (op=%d)", v, add_m ? (int) add_m->op : -1);
-        }
-        const struct ggml_tensor * kq_b_t = add_m->src[0];
-        const struct ggml_tensor * raw_m  = add_m->src[1];
-        if (raw_m->op == GGML_OP_CPY) raw_m = raw_m->src[0];
-        if (!raw_m || (raw_m->type != GGML_TYPE_F16 && raw_m->type != GGML_TYPE_F32)) {
-            W4_MK_FAIL("v=%u raw_m bad type=%d", v, raw_m ? (int) raw_m->type : -1);
-        }
-        P.base_mask_va = agx_tensor_gpu_va(raw_m);
-        P.bmask_nb1    = (uint32_t) raw_m->nb[1];
-        P.bmask_is_f16 = (raw_m->type == GGML_TYPE_F16);
+        if (ggml_flash_attn_ext_has_banded_rel_bias(fa)) {
+            // Wave 10: O(n_kv) banded rel-bias FA (src[3]=1-head base_mask, src[6]=rel_table, src[7]=rel_pos_pack, 2D sinks)
+            const struct ggml_tensor * raw_m = (m_in->op == GGML_OP_CPY) ? m_in->src[0] : m_in;
+            const struct ggml_tensor * rtab  = fa->src[6];
+            const struct ggml_tensor * rpos  = fa->src[7];
+            if (!raw_m || (raw_m->type != GGML_TYPE_F16 && raw_m->type != GGML_TYPE_F32) ||
+                raw_m->ne[2] != 1 || !rtab || rtab->type != GGML_TYPE_F32 ||
+                !rpos || rpos->type != GGML_TYPE_I32) {
+                W4_MK_FAIL("v=%u banded fa invalid raw_m/rtab/rpos", v);
+            }
+            if (out.W.layers[ip].attn_rel_bias->ne[0] > 32) {
+                W4_MK_FAIL("v=%u banded n_rel=%lld > 32", v, (long long) out.W.layers[ip].attn_rel_bias->ne[0]);
+            }
+            P.has_banded_rel  = true;
+            P.base_mask_va    = agx_tensor_gpu_va(raw_m);
+            P.bmask_nb1       = (uint32_t) raw_m->nb[1];
+            P.bmask_is_f16    = (raw_m->type == GGML_TYPE_F16);
+            P.rel_table_va    = agx_tensor_gpu_va(rtab);
+            P.rel_pos_pack_va = agx_tensor_gpu_va(rpos);
+            P.rel_table_len   = (uint32_t) rtab->ne[0];
+            P.rel_extent      = (uint32_t) fa->op_params[6];
+            P.rel_pos_va      = P.rel_pos_pack_va; // for B=1 SWA HYBRID_MODE=0 banded pack mode!
+            P.rpos_nb1        = 0u;
+            if (!P.base_mask_va || !P.rel_table_va || !P.rel_pos_pack_va || P.rel_table_len == 0u) {
+                W4_MK_FAIL("v=%u banded missing VA/len", v);
+            }
+        } else {
+            // Unwrap kq_mask_rel_pos -> ADD(kq_b, raw_mask) -> rel_pos + base_mask
+            const struct ggml_tensor * add_m = (m_in->op == GGML_OP_CPY) ? m_in->src[0] : m_in;
+            if (!add_m || add_m->op != GGML_OP_ADD || !add_m->src[0] || !add_m->src[1]) {
+                W4_MK_FAIL("v=%u m_in unwrap failed (op=%d)", v, add_m ? (int) add_m->op : -1);
+            }
+            const struct ggml_tensor * kq_b_t = add_m->src[0];
+            const struct ggml_tensor * raw_m  = add_m->src[1];
+            if (raw_m->op == GGML_OP_CPY) raw_m = raw_m->src[0];
+            if (!raw_m || (raw_m->type != GGML_TYPE_F16 && raw_m->type != GGML_TYPE_F32)) {
+                W4_MK_FAIL("v=%u raw_m bad type=%d", v, raw_m ? (int) raw_m->type : -1);
+            }
+            P.base_mask_va = agx_tensor_gpu_va(raw_m);
+            P.bmask_nb1    = (uint32_t) raw_m->nb[1];
+            P.bmask_is_f16 = (raw_m->type == GGML_TYPE_F16);
 
-        // kq_b_t = CONT(PERMUTE(RESHAPE(GET_ROWS(table, rel_pos))))
-        const struct ggml_tensor * gr = kq_b_t;
-        if (gr->op == GGML_OP_CONT) gr = gr->src[0];
-        gr = w4_strip_views(gr);
-        if (!gr || gr->op != GGML_OP_GET_ROWS || !gr->src[1] || gr->src[1]->type != GGML_TYPE_I32) {
-            W4_MK_FAIL("v=%u kq_b gr unwrap failed (op=%d)", v, gr ? (int) gr->op : -1);
+            // kq_b_t = CONT(PERMUTE(RESHAPE(GET_ROWS(table, rel_pos))))
+            const struct ggml_tensor * gr = kq_b_t;
+            if (gr->op == GGML_OP_CONT) gr = gr->src[0];
+            gr = w4_strip_views(gr);
+            if (!gr || gr->op != GGML_OP_GET_ROWS || !gr->src[1] || gr->src[1]->type != GGML_TYPE_I32) {
+                W4_MK_FAIL("v=%u kq_b gr unwrap failed (op=%d)", v, gr ? (int) gr->op : -1);
+            }
+            P.rel_pos_va = agx_tensor_gpu_va(gr->src[1]);
+            P.rpos_nb1   = (uint32_t) gr->src[1]->nb[1];
+            if (!P.base_mask_va || !P.rel_pos_va) W4_MK_FAIL("v=%u missing bmask/rpos VA", v);
         }
-        P.rel_pos_va = agx_tensor_gpu_va(gr->src[1]);
-        P.rpos_nb1   = (uint32_t) gr->src[1]->nb[1];
-        if (!P.base_mask_va || !P.rel_pos_va) W4_MK_FAIL("v=%u missing bmask/rpos VA", v);
 
         // Recurrent state base r_l[il] from rs_get_rows[v]
         const struct ggml_tensor * r_src = rs_get_rows[v]->src[0];
@@ -3623,6 +4367,8 @@ struct w7_dspark_layer_desc {
     bool     kv_is_q8      = false;
     bool     has_k_rot     = false;
     bool     has_v_rot     = false;
+    uint32_t k_rot_dim     = 0;
+    uint32_t v_rot_dim     = 0;
 
     uint64_t k_store_va    = 0;
     uint64_t v_store_va    = 0;
@@ -3972,22 +4718,33 @@ static bool discover_dspark_draft_cgraph(const struct ggml_cgraph * cgraph, w7_d
         std::memcpy(&L.max_bias,      (const char *) fa->op_params + 4, sizeof(float));
         std::memcpy(&L.logit_softcap, (const char *) fa->op_params + 8, sizeof(float));
 
-        // Hadamard rotation checks
+        // Hadamard rotation checks (exact block size: 64 or 128!)
         const struct ggml_tensor * q_root = w4_strip_views(q_in);
         if (q_root && q_root->op == GGML_OP_MUL_MAT &&
             ggml_get_op_params_i32(q_root, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+            const uint32_t rd = (q_root->src[0]) ? (uint32_t) q_root->src[0]->ne[0] : 128u;
+            if ((rd != 64u && rd != 128u) || out.head_dim != 128u) {
+                W7_DSP_FAIL("layer %u unsupported k_rot_dim=%u (hd=%u)", il, rd, out.head_dim);
+            }
             L.has_k_rot = true;
+            L.k_rot_dim = rd;
         }
-        for (int j = fa_idx[il] + 1; j < std::min(cgraph->n_nodes, fa_idx[il] + 6); ++j) {
+        for (int j = fa_idx[il] + 1; j < std::min(cgraph->n_nodes, fa_idx[il] + 8); ++j) {
             const struct ggml_tensor * cand = cgraph->nodes[j];
             if (cand && cand->op == GGML_OP_MUL_MAT &&
-                ggml_get_op_params_i32(cand, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
-                w4_strip_views(cand->src[1]) == fa) {
-                L.has_v_rot = true;
-                break;
+                ggml_get_op_params_i32(cand, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+                const struct ggml_tensor * s1 = w4_strip_views(cand->src[1]);
+                if (s1 == fa || (s1 && s1->op == GGML_OP_CONT && w4_strip_views(s1->src[0]) == fa)) {
+                    const uint32_t rd = (cand->src[0]) ? (uint32_t) cand->src[0]->ne[0] : 128u;
+                    L.has_v_rot = true;
+                    L.v_rot_dim = rd;
+                    break;
+                }
             }
         }
-        if (L.has_v_rot) W7_DSP_FAIL("layer %u v_rot on draft unsupported", il);
+        if (L.has_v_rot && (L.v_rot_dim != 64u || out.head_dim != 128u)) {
+            W7_DSP_FAIL("layer %u v_rot_dim=%u on draft unsupported (only 64 supported)", il, L.v_rot_dim);
+        }
 
         // Scan window [win_beg, win_end) for RoPE, K/V SET_ROWS, and GLU
         const int win_beg = (il == 0u) ? 0 : fa_idx[il - 1u];
@@ -4305,6 +5062,8 @@ struct w8_dspark_inject_layer {
     bool     kv_is_q8     = false;
     bool     has_k_rot    = false;
     bool     has_v_rot    = false;
+    uint32_t k_rot_dim    = 0;
+    uint32_t v_rot_dim    = 0;
     bool     has_rope     = false;
 };
 
@@ -4503,10 +5262,13 @@ static bool discover_dspark_inject_cgraph(const struct ggml_cgraph * cgraph, w8_
         if (nd->src[1]->type != GGML_TYPE_I64 && nd->src[1]->type != GGML_TYPE_I32) return false;
 
         bool has_rot = false;
+        uint32_t rot_dim = 0u;
         const struct ggml_tensor * rope_nd = nullptr;
         const struct ggml_tensor * t = w4_strip_views(nd->src[0]);
         if (t && t->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(t, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
             if (out.head_dim != 128u) return false;
+            rot_dim = (t->src[0]) ? (uint32_t) t->src[0]->ne[0] : 128u;
+            if (rot_dim != 64u && rot_dim != 128u) return false;
             has_rot = true;
             t = w4_strip_views(t->src[1]);
         }
@@ -4555,6 +5317,7 @@ static bool discover_dspark_inject_cgraph(const struct ggml_cgraph * cgraph, w8_
             L.k_ids_nb0    = (uint32_t) nd->src[1]->nb[0];
             L.kv_is_q8     = is_q8;
             L.has_k_rot    = has_rot;
+            L.k_rot_dim    = rot_dim;
             if (rope_nd) {
                 const uint32_t mode = (uint32_t) ggml_get_op_params_i32(rope_nd, 2);
                 if (mode & 8u) return false;
@@ -4589,6 +5352,7 @@ static bool discover_dspark_inject_cgraph(const struct ggml_cgraph * cgraph, w8_
             L.v_ids_is_i64 = (nd->src[1]->type == GGML_TYPE_I64);
             L.v_ids_nb0    = (uint32_t) nd->src[1]->nb[0];
             L.has_v_rot    = has_rot;
+            L.v_rot_dim    = rot_dim;
             if (L.k_store_va && L.kv_is_q8 != is_q8) return false;
             L.kv_is_q8     = is_q8;
         }
@@ -4825,8 +5589,10 @@ static bool execute_dspark_inject_cgraph(agx_backend_context *          ctx,
             kpc.layer_flags[il]   = (!L.wv_ctx ? AGX_W7_DSPARK_QKV_SHARED_KV : 0u) |
                                     (L.has_rope ? AGX_W7_DSPARK_QKV_HAS_ROPE : 0u) |
                                     ((G.rope_mode & 2u) ? AGX_W7_DSPARK_QKV_ROPE_NEOX : 0u) |
-                                    (L.has_k_rot ? AGX_W7_DSPARK_QKV_FWHT_K : 0u) |
-                                    (L.has_v_rot ? AGX_W7_DSPARK_QKV_FWHT_V : 0u) |
+                                    (L.k_rot_dim == 128u ? AGX_W7_DSPARK_QKV_FWHT_K : 0u) |
+                                    (L.k_rot_dim ==  64u ? AGX_W7_DSPARK_QKV_FWHT64_K : 0u) |
+                                    (L.v_rot_dim == 128u ? AGX_W7_DSPARK_QKV_FWHT_V : 0u) |
+                                    (L.v_rot_dim ==  64u ? AGX_W7_DSPARK_QKV_FWHT64_V : 0u) |
                                     (L.kv_is_q8 ? AGX_W7_DSPARK_QKV_KV_Q8_0 : 0u) |
                                     (L.k_ids_is_i64 ? AGX_W7_DSPARK_QKV_K_IDS_I64 : 0u) |
                                     (L.v_ids_is_i64 ? AGX_W7_DSPARK_QKV_V_IDS_I64 : 0u);
@@ -4837,7 +5603,9 @@ static bool execute_dspark_inject_cgraph(agx_backend_context *          ctx,
         }
     }
 
-    if (agx_cdm_submit(stream, true, nullptr) != 0) {
+    const char * async_inj_env = std::getenv("GGML_AGX_ASYNC_INJECT");
+    const bool   async_inject  = (async_inj_env && async_inj_env[0] && async_inj_env[0] != '0');
+    if (agx_cdm_submit(stream, !async_inject, nullptr) != 0) {
         AGX_LOG_ERROR("execute_dspark_inject_cgraph: CDM submit failed");
         return false;
     }
@@ -5062,8 +5830,10 @@ static bool execute_dspark_draft_cgraph(agx_backend_context *         ctx,
             qpc.flags            = (!L.wv ? AGX_W7_DSPARK_QKV_SHARED_KV : 0u) |
                                    (L.has_rope ? AGX_W7_DSPARK_QKV_HAS_ROPE : 0u) |
                                    ((L.rope_mode & 2u) ? AGX_W7_DSPARK_QKV_ROPE_NEOX : 0u) |
-                                   (L.has_k_rot ? AGX_W7_DSPARK_QKV_FWHT_K : 0u) |
-                                   (L.has_v_rot ? AGX_W7_DSPARK_QKV_FWHT_V : 0u) |
+                                   (L.k_rot_dim == 128u ? AGX_W7_DSPARK_QKV_FWHT_K : 0u) |
+                                   (L.k_rot_dim ==  64u ? AGX_W7_DSPARK_QKV_FWHT64_K : 0u) |
+                                   (L.v_rot_dim == 128u ? AGX_W7_DSPARK_QKV_FWHT_V : 0u) |
+                                   (L.v_rot_dim ==  64u ? AGX_W7_DSPARK_QKV_FWHT64_V : 0u) |
                                    (L.kv_is_q8 ? AGX_W7_DSPARK_QKV_KV_Q8_0 : 0u) |
                                    (L.k_ids_is_i64 ? AGX_W7_DSPARK_QKV_K_IDS_I64 : 0u) |
                                    (L.v_ids_is_i64 ? AGX_W7_DSPARK_QKV_V_IDS_I64 : 0u);
@@ -5090,6 +5860,7 @@ static bool execute_dspark_draft_cgraph(agx_backend_context *         ctx,
             attn.logit_softcap = L.logit_softcap;
             attn.flags         = (L.kq_mask_va ? (L.kq_mask_f16 ? AGX_ATTN_FLAG_HAS_MASK_F16 : AGX_ATTN_FLAG_HAS_MASK_F32) : 0u) |
                                  (L.sinks_va ? AGX_ATTN_FLAG_SINK_PER_HEAD : 0u) |
+                                 (L.v_rot_dim == 64u ? AGX_ATTN_FLAG_FWHT64 : 0u) |
                                  (L.max_bias > 0.0f ? AGX_ATTN_FLAG_ALIBI : 0u) |
                                  (L.logit_softcap > 0.0f ? AGX_ATTN_FLAG_SOFTCAP : 0u);
             attn.q_va          = va_q_out;
@@ -5534,9 +6305,13 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
         return false;
     }
 
-    // Layer 0 has no attn_res_query -> run single RMSNorm(va_h_0, blk.0.attn_norm) -> L.x_q
+    // Layer 0 has no attn_res_query -> run single RMSNorm(va_h_0, blk.0.attn_norm) -> L.x_q (+ L.x_q_f16 for M>=2!)
+    bool x_f16_ready = (M >= 2u);
     {
-        rmsnorm_f32_push np{ va_h_0, agx_tensor_gpu_va(W.layers[0].attn_norm), L.x_q, D, M, hp.f_norm_rms_eps };
+        rmsnorm_f32_push np{
+            va_h_0, agx_tensor_gpu_va(W.layers[0].attn_norm), L.x_q,
+            D, M, hp.f_norm_rms_eps, 0u, (M >= 2u) ? L.x_q_f16 : 0ull
+        };
         if (!agx_cdm_dispatch(stream, eng->k_rmsnorm_f32, M, 1u, 1u, &np, sizeof(np), AGX_BARRIER_STRONG_USC)) {
             return false;
         }
@@ -5574,6 +6349,9 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
 
         const uint32_t kv_q8_0 = G.passes[0].kv_is_q8 ? 1u : 0u;
         bool w5_ok = true;
+        bool pass_use_b1_hybrid_fa[48] = {};
+        bool any_pass_ext_fa = false;
+        bool any_pass_banded_or_rot64 = false;
         uint32_t pass_moe_idx[48] = {};
         agx_w5_pass_desc descs[48];
         std::memset(descs, 0, sizeof(descs));
@@ -5620,10 +6398,17 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
 
             const uint32_t mask_row_stride = (P.n_kv + 7u) & ~7u;
             const size_t   mask_need_B     = (size_t) 24u * mask_row_stride * sizeof(uint16_t);
-            if (mask_need_B > L.kq_mask_f16_bytes || P.n_kv > 4096u) {
-                if (mk_dbg) std::fprintf(stderr, "[ggml-agx W5 PERSIST FALLBACK] v=%u n_kv=%u mask_B=%zu > %zu\n",
-                                         v, P.n_kv, mask_need_B, L.kq_mask_f16_bytes);
-                w5_ok = false; break;
+            // Wave 10: SWA KV cache is padded to n_swa + n_ubatch (up to 3072/4096 cells, only 1024 active!).
+            // Keep ALL 40 SWA passes (<= 4096) and short Full passes (<= 1024) in ultra-lean <=56 GPR32 HYBRID_MODE=0;
+            // route Full passes > 1024 straight to GQA_GRP=3 split-K PASS_MODE=0 (3x KV sharing, 120-240 WGs)!
+            const bool     b1_hybrid_fa_ok = (mask_need_B <= L.kq_mask_f16_bytes) &&
+                                             (P.is_swa ? (P.n_kv <= 4096u) : (P.n_kv <= 1024u));
+            pass_use_b1_hybrid_fa[v] = b1_hybrid_fa_ok;
+            if (!b1_hybrid_fa_ok) {
+                any_pass_ext_fa = true;
+            }
+            if (P.has_banded_rel || P.k_rot_dim == 64u || P.v_rot_dim == 64u) {
+                any_pass_banded_or_rot64 = true;
             }
             if (P.has_loop) {
                 if (hp.gate_rank != 64u) {
@@ -5824,18 +6609,22 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
             }
 
             // 7. Scalars & Flags
-            d.flags = (P.is_swa        ? AGX_W5_PFLAG_IS_SWA            : 0u) |
-                      (same_qkv_inp    ? AGX_W5_PFLAG_SAME_QKV_INP      : 0u) |
-                      (need_qkv_mix    ? AGX_W5_PFLAG_NEED_QKV_MIX      : 0u) |
-                      (P.has_k_rot     ? AGX_W5_PFLAG_HAS_K_ROT         : 0u) |
-                      (P.has_v_rot     ? AGX_W5_PFLAG_HAS_V_ROT         : 0u) |
-                      (P.k_ids_is_i64  ? AGX_W5_PFLAG_K_IDS_I64         : 0u) |
-                      (P.v_ids_is_i64  ? AGX_W5_PFLAG_V_IDS_I64         : 0u) |
-                      (P.bmask_is_f16  ? AGX_W5_PFLAG_BMASK_F16         : 0u) |
-                      (!new_block      ? AGX_W5_PFLAG_POST_ATTN_ADD_RES : 0u) |
-                      (!P.has_loop     ? AGX_W5_PFLAG_POST_ATTN_DO_NORM : 0u) |
-                      (post_ffn_do_mix ? AGX_W5_PFLAG_POST_FFN_DO_MIX   : 0u) |
-                      (post_ffn_do_norm? AGX_W5_PFLAG_POST_FFN_DO_NORM  : 0u);
+            d.flags = (P.is_swa           ? AGX_W5_PFLAG_IS_SWA            : 0u) |
+                      (same_qkv_inp       ? AGX_W5_PFLAG_SAME_QKV_INP      : 0u) |
+                      (need_qkv_mix       ? AGX_W5_PFLAG_NEED_QKV_MIX      : 0u) |
+                      (P.has_k_rot        ? AGX_W5_PFLAG_HAS_K_ROT         : 0u) |
+                      (P.has_v_rot        ? AGX_W5_PFLAG_HAS_V_ROT         : 0u) |
+                      (P.k_rot_dim == 64u ? AGX_W5_PFLAG_K_ROT_64          : 0u) |
+                      (P.v_rot_dim == 64u ? AGX_W5_PFLAG_V_ROT_64          : 0u) |
+                      (P.has_banded_rel   ? AGX_W5_PFLAG_BANDED_REL_PACK   : 0u) |
+                      (P.k_ids_is_i64     ? AGX_W5_PFLAG_K_IDS_I64         : 0u) |
+                      (P.v_ids_is_i64     ? AGX_W5_PFLAG_V_IDS_I64         : 0u) |
+                      (P.bmask_is_f16     ? AGX_W5_PFLAG_BMASK_F16         : 0u) |
+                      (!new_block         ? AGX_W5_PFLAG_POST_ATTN_ADD_RES : 0u) |
+                      (!P.has_loop        ? AGX_W5_PFLAG_POST_ATTN_DO_NORM : 0u) |
+                      (post_ffn_do_mix    ? AGX_W5_PFLAG_POST_FFN_DO_MIX   : 0u) |
+                      (post_ffn_do_norm   ? AGX_W5_PFLAG_POST_FFN_DO_NORM  : 0u);
+            d.rel_qp_off          = P.has_banded_rel ? P.n_kv : 0u;
             d.total_coal_rows     = C.total_coal_rows;
             d.q_prefix_rows       = C.q_prefix_rows;
             d.wk_rows             = C.row_cnt[4];
@@ -5886,8 +6675,10 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
             }
             const bool use_hybrid = !force_chunk && !force_split && hybrid_router_ok &&
                                     ensure_w5_hybrid_kernels(eng, kv_q8_0);
-            const bool use_chunk  = !use_hybrid && !force_split && ensure_w5_chunk_kernels(eng, kv_q8_0);
-            const bool use_split  = !use_hybrid && !use_chunk   && ensure_w5_split_kernels(eng, kv_q8_0);
+            const bool use_chunk  = !use_hybrid && !force_split && !any_pass_ext_fa && !any_pass_banded_or_rot64 &&
+                                    ensure_w5_chunk_kernels(eng, kv_q8_0);
+            const bool use_split  = !use_hybrid && !use_chunk   && !any_pass_ext_fa && !any_pass_banded_or_rot64 &&
+                                    ensure_w5_split_kernels(eng, kv_q8_0);
             if (use_hybrid || use_chunk || use_split) {
                 void * descs_cpu = nullptr;
                 const uint64_t descs_gpu_va = agx_cdm_alloc_args(stream, sizeof(descs), AGX_CACHE_LINE_BYTES, &descs_cpu);
@@ -5959,14 +6750,207 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
                         }
 
                         // Op 2: Lean <= 56 GPR32 40-WG x 512T Fused qkv_prep_store + uvec4 RelBias + 16-SG FlashAttn + Qgate
+                        // OR Wave 10 O(n_kv) Banded Split-K Flash-Decode for Full-Attn passes at n_kv = 2k..250K+!
                         agx_w5_persist_push ppc{};
                         ppc.descs_va   = descs_gpu_va + (uint64_t) v * sizeof(agx_w5_pass_desc);
                         ppc.barrier_va = slc->sense_barrier_va;
                         ppc.n_passes   = 1u;
                         ppc.n_wg       = 40u;
-                        if (!agx_cdm_dispatch(stream, eng->k_w5_hybrid_qkv_flash[kv_q8_0],
-                                              40u, 1u, 1u, &ppc, sizeof(ppc), AGX_BARRIER_STRONG_USC)) {
-                            return false;
+                        if (pass_use_b1_hybrid_fa[v]) {
+                            if (!agx_cdm_dispatch(stream, eng->k_w5_hybrid_qkv_flash[kv_q8_0],
+                                                  40u, 1u, 1u, &ppc, sizeof(ppc), AGX_BARRIER_STRONG_USC)) {
+                                return false;
+                            }
+                        } else {
+                            // Long-context Full-Attn pass (B=1): qkv_prep_store + banded rel_table + 40-core split-K PASS_MODE=0!
+                            const uint64_t q_raw_b1     = slc->qkv_buf + (uint64_t) C.row_off[0] * sizeof(float);
+                            const uint64_t qgate_raw_b1 = slc->qkv_buf + (uint64_t) C.row_off[1] * sizeof(float);
+                            const uint64_t r_raw_b1     = slc->qkv_buf + (uint64_t) C.row_off[2] * sizeof(float);
+                            const bool     need_rot64   = (P.k_rot_dim == 64u || P.v_rot_dim == 64u);
+                            const agx_kernel * k_qkv    = need_rot64 ? ensure_w10_qkv_rot64_kernel(eng) : eng->k_w4_qkv_prep_store;
+                            if (!k_qkv) return false;
+
+                            agx_w4_qkv_prep_desc qd{};
+                            qd.q_raw_va            = q_raw_b1;
+                            qd.k_raw_va            = d.k_raw_va;
+                            qd.v_raw_va            = d.v_raw_va;
+                            qd.r_raw_va            = r_raw_b1;
+                            qd.sinks_va            = d.sinks_va;
+                            qd.qgate_raw_va        = qgate_raw_b1;
+                            qd.k_dyn_va            = d.k_dyn_va;
+                            qd.v_dyn_va            = d.v_dyn_va;
+                            qd.q_clip_va           = d.q_clip_va;
+                            qd.r_clip_va           = d.r_clip_va;
+                            qd.k_conv_w_va         = d.k_conv_w_va;
+                            qd.v_conv_w_va         = d.v_conv_w_va;
+                            qd.rel_bias_va         = d.rel_bias_va;
+                            qd.inp_pos_va          = G.inp_pos_va;
+                            qd.r_l_va              = P.r_l_va;
+                            qd.s_copy_va           = G.s_copy_va;
+                            qd.k_cell_va           = P.cell_va[0];
+                            qd.v_cell_va           = P.cell_va[1];
+                            qd.k_store_va          = P.k_store_va;
+                            qd.v_store_va          = P.v_store_va;
+                            qd.k_idxs_va           = P.k_idxs_va;
+                            qd.v_idxs_va           = P.v_idxs_va;
+                            qd.q_out_va            = L.q_out;
+                            qd.r_out_va            = L.r_out;
+                            qd.rel_pos_va          = P.rel_pos_va;
+                            qd.base_mask_va        = P.base_mask_va;
+                            qd.kq_mask_out_va      = P.graph_mask_va;
+                            qd.q_raw_stride_f32    = C.q_prefix_rows;
+                            qd.k_raw_stride_f32    = C.row_cnt[4];
+                            qd.v_raw_stride_f32    = C.row_cnt[5];
+                            qd.r_raw_stride_f32    = C.q_prefix_rows;
+                            qd.sinks_stride_f32    = 24u;
+                            qd.r_nb1_f32           = P.r_nb1_f32;
+                            qd.rollback_slots      = P.rollback_slots;
+                            qd.rollback_stride_f32 = P.rollback_stride_f32;
+                            qd.k_store_nb1_B       = P.k_store_nb1;
+                            qd.v_store_nb1_B       = P.v_store_nb1;
+                            qd.k_ids_nb0_B         = P.k_ids_nb0;
+                            qd.v_ids_nb0_B         = P.v_ids_nb0;
+                            qd.n_tokens            = 1u;
+                            qd.n_conv              = 4u;
+                            qd.n_rel               = d.n_rel;
+                            qd.n_extent            = d.n_extent;
+                            qd.n_kv                = P.n_kv;
+                            qd.n_kv_mask_stride    = P.graph_mask_nb1 / 2u;
+                            qd.rpos_nb1_B          = P.rpos_nb1;
+                            qd.bmask_nb1_B         = P.bmask_nb1;
+                            qd.bias_wtype          = d.bias_wtype;
+                            qd.bias_nb1_B          = d.bias_nb1_B;
+                            qd.flags               = (!P.is_swa ? AGX_W4_QKV_FLAG_IS_FULL_ATTN : 0u) |
+                                                     (P.k_rot_dim == 128u ? AGX_W4_QKV_FLAG_FWHT_K : 0u) |
+                                                     (P.k_rot_dim ==  64u ? AGX_W10_QKV_FLAG_FWHT64_K : 0u) |
+                                                     (P.v_rot_dim == 128u ? AGX_W4_QKV_FLAG_FWHT_V : 0u) |
+                                                     (P.v_rot_dim ==  64u ? AGX_W10_QKV_FLAG_FWHT64_V : 0u) |
+                                                     (P.kv_is_q8 ? AGX_W4_QKV_FLAG_KV_Q8_0 : 0u) |
+                                                     (P.k_ids_is_i64 ? AGX_W4_QKV_FLAG_K_IDS_I64 : 0u) |
+                                                     (P.v_ids_is_i64 ? AGX_W4_QKV_FLAG_V_IDS_I64 : 0u) |
+                                                     (P.bmask_is_f16 ? AGX_W4_QKV_FLAG_BASE_MASK_F16 : 0u);
+                            qd.r_splits            = 1u;
+                            qd.conv_res_scale      = d.kv_conv_res_scale;
+                            qd.qk_clip             = d.qk_clip;
+                            qd.rel_clip            = d.rel_clip;
+                            qd.rms_eps             = d.rms_eps;
+                            qd.log_scale_alpha     = d.log_scale_alpha;
+                            qd.inv_log_floor       = d.inv_log_floor;
+                            void * qd_cpu = nullptr;
+                            uint64_t qd_va = agx_cdm_alloc_args(stream, sizeof(qd), 16, &qd_cpu);
+                            if (!qd_va || !qd_cpu) return false;
+                            std::memcpy(qd_cpu, &qd, sizeof(qd));
+                            agx_w4_desc_va_push qpc{ qd_va };
+                            if (!agx_cdm_dispatch(stream, k_qkv, 64u, 1u, 1u, &qpc, sizeof(qpc), AGX_BARRIER_STRONG_USC)) {
+                                return false;
+                            }
+
+                            if (P.has_banded_rel) {
+                                agx_w10_rel_table_push rtc{};
+                                rtc.r_va             = L.r_out;
+                                rtc.rel_bias_va      = d.rel_bias_va;
+                                rtc.dst_va           = P.rel_table_va;
+                                rtc.sinks_src_va     = 0ull;
+                                rtc.sinks_dst_va     = 0ull;
+                                rtc.n_rel            = d.n_rel;
+                                rtc.eff_rows         = P.rel_table_len;
+                                rtc.n_tokens         = 1u;
+                                rtc.bias_wtype       = d.bias_wtype;
+                                rtc.bias_nb1_B       = d.bias_nb1_B;
+                                rtc.sinks_stride_f32 = 24u;
+                                if (!agx_cdm_dispatch(stream, eng->k_w10_rel_bias_table,
+                                                      (P.rel_table_len + 63u) / 64u, 1u, 1u,
+                                                      &rtc, sizeof(rtc), AGX_BARRIER_STRONG_USC)) {
+                                    return false;
+                                }
+                            } else {
+                                agx_w4_rel_mask_push rmc{};
+                                rmc.r_va             = L.r_out;
+                                rmc.rel_bias_va      = d.rel_bias_va;
+                                rmc.sinks_va         = d.sinks_va;
+                                rmc.rel_pos_va       = P.rel_pos_va;
+                                rmc.base_mask_va     = P.base_mask_va;
+                                rmc.dst_va           = P.graph_mask_va;
+                                rmc.n_rel            = d.n_rel;
+                                rmc.n_extent         = d.n_extent;
+                                rmc.n_kv             = P.n_kv;
+                                rmc.n_kv_stride      = P.graph_mask_nb1 / 2u;
+                                rmc.n_head           = 24u;
+                                rmc.n_tokens         = 1u;
+                                rmc.sinks_stride_f32 = 24u;
+                                rmc.rpos_nb1_B       = P.rpos_nb1;
+                                rmc.bmask_nb1_B      = P.bmask_nb1;
+                                rmc.bias_wtype       = d.bias_wtype;
+                                rmc.bias_nb1_B       = d.bias_nb1_B;
+                                rmc.base_mask_is_f16 = P.bmask_is_f16 ? 1u : 0u;
+                                if (!agx_cdm_dispatch(stream, eng->k_w4_rel_bias_mask,
+                                                      (P.n_kv + 63u) / 64u, 24u, 1u,
+                                                      &rmc, sizeof(rmc), AGX_BARRIER_STRONG_USC)) {
+                                    return false;
+                                }
+                            }
+
+                            agx_attn_stage_args attn{};
+                            attn.n_tokens      = 1u;
+                            attn.n_kv          = P.n_kv;
+                            attn.n_head_q      = 24u;
+                            attn.n_head_kv     = 8u;
+                            attn.head_dim      = 128u;
+                            attn.kq_scale      = 1.0f / std::sqrt(128.0f);
+                            attn.flags         = (P.v_rot_dim == 64u ? AGX_ATTN_FLAG_FWHT64 : 0u) |
+                                                 (P.v_rot_dim != 128u ? AGX_ATTN_FLAG_QGATE_F32 : 0u);
+                            attn.q_va          = L.q_out;
+                            attn.q_nb1         = 24u * 128u * sizeof(float);
+                            attn.q_nb2         = 128u * sizeof(float);
+                            attn.out_va        = slc->attn_out;
+                            attn.q_gate_va     = (P.v_rot_dim != 128u) ? qgate_raw_b1 : 0ull;
+                            attn.ext_k_dtype   = P.kv_is_q8 ? AGX_KV_Q8_0_GGML : AGX_KV_F16;
+                            attn.ext_v_dtype   = P.kv_is_q8 ? AGX_KV_Q8_0_GGML : AGX_KV_F16;
+                            attn.ext_k_va      = P.k_va;
+                            attn.ext_v_va      = P.v_va;
+                            attn.ext_k_nb1     = P.k_nb1;
+                            attn.ext_k_nb2     = P.k_nb2;
+                            attn.ext_v_nb1     = P.v_nb1;
+                            attn.ext_v_nb2     = P.v_nb2;
+                            if (P.has_banded_rel) {
+                                attn.flags          |= AGX_ATTN_FLAG_BANDED_REL_BIAS |
+                                                       AGX_ATTN_FLAG_SINK_PER_TOK_HEAD |
+                                                       (P.bmask_is_f16 ? AGX_ATTN_FLAG_HAS_MASK_F16 : AGX_ATTN_FLAG_HAS_MASK_F32);
+                                attn.n_rel_extent    = P.rel_extent;
+                                attn.rel_table_len   = P.rel_table_len;
+                                attn.rel_table_va    = P.rel_table_va;
+                                attn.rel_pos_pack_va = P.rel_pos_pack_va;
+                                attn.rel_cp_off      = 0u;
+                                attn.rel_qp_off      = P.n_kv;
+                                attn.rel_tm_off      = P.n_kv + 1u;
+                                attn.sinks_va        = d.sinks_va;
+                                attn.kq_mask_va      = P.base_mask_va;
+                                attn.ext_mask_nb1    = P.bmask_nb1;
+                                attn.ext_mask_nb2    = 0u;
+                                attn.ext_mask_ne2    = 1u;
+                            } else {
+                                attn.flags          |= AGX_ATTN_FLAG_HAS_MASK_F16 | AGX_ATTN_FLAG_REL_TABLE_SINK;
+                                attn.kq_mask_va      = P.graph_mask_va;
+                                attn.ext_mask_nb1    = P.graph_mask_nb1;
+                                attn.ext_mask_nb2    = P.graph_mask_nb1;
+                                attn.ext_mask_ne2    = 24u;
+                            }
+                            if (!agx_kv_hybrid_dispatch_full_attn(kv_pool, stream, attn, AGX_BARRIER_STRONG_USC)) {
+                                return false;
+                            }
+                            if (P.v_rot_dim == 128u) {
+                                agx_w4_fwht_qgate_push fpc{};
+                                fpc.attn_va          = slc->attn_out;
+                                fpc.qgate_va         = qgate_raw_b1;
+                                fpc.n_head           = 24u;
+                                fpc.n_tokens         = 1u;
+                                fpc.qgate_stride_f32 = C.q_prefix_rows;
+                                fpc.do_fwht128       = 1u;
+                                if (!agx_cdm_dispatch(stream, eng->k_w4_fwht_qgate, 24u, 1u, 1u,
+                                                      &fpc, sizeof(fpc), AGX_BARRIER_STRONG_USC)) {
+                                    return false;
+                                }
+                            }
                         }
 
                         // Op 3: Full-wire-speed 515 GB/s W_o
@@ -6146,6 +7130,12 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
     const bool   no_m_post_ffn_par = (no_mpffn_env && no_mpffn_env[0] && no_mpffn_env[0] != '0');
     const char * no_attnm_env = std::getenv("GGML_AGX_NO_ATTN_IN_M");
     const bool   no_attn_in_m = (no_attnm_env && no_attnm_env[0] && no_attnm_env[0] != '0');
+    const char * v_f32_ain_env = std::getenv("GGML_AGX_VERIFY_F32_ATTN_IN");
+    const bool   verify_f32_attn_in = (v_f32_ain_env && v_f32_ain_env[0] && v_f32_ain_env[0] != '0');
+    const char * v_leg_wo_env  = std::getenv("GGML_AGX_VERIFY_LEGACY_WO");
+    const bool   verify_legacy_wo   = (v_leg_wo_env && v_leg_wo_env[0] && v_leg_wo_env[0] != '0');
+    const char * v_leg_lm_env  = std::getenv("GGML_AGX_VERIFY_LEGACY_LM");
+    const bool   verify_legacy_lm   = (v_leg_lm_env && v_leg_lm_env[0] && v_leg_lm_env[0] != '0');
 
     uint64_t w5m_descs_gpu_va = 0ull;
     bool     use_w5_m_hybrid  = false;
@@ -6255,16 +7245,24 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
 
             bool post_ffn_do_mix  = false;
             bool post_ffn_do_norm = false;
+            bool emit_x_f16 = P.has_loop;
+            if (P.has_loop) {
+                d.next_mix_f16_va[0] = L.x_q_f16;
+                d.next_mix_f16_va[1] = L.x_k_f16;
+                d.next_mix_f16_va[2] = L.x_v_f16;
+            }
             if (is_final_pass) {
                 d.ffn_bptrs_va       = alloc_block_ptrs(m_blocks);
                 d.next_attn_query_va = agx_tensor_gpu_va(W.output_res_query);
                 d.next_norm_w_va[0]  = agx_tensor_gpu_va(W.output_norm);
                 d.next_mix_out_va[0] = L.x_q;
+                d.next_mix_f16_va[0] = L.x_q_f16;
                 d.next_mix_export_va = G.export_out_norm;
                 d.post_ffn_n_blocks  = (uint32_t) m_blocks.size();
                 d.post_ffn_n_queries = 1u;
                 post_ffn_do_mix      = true;
                 post_ffn_do_norm     = true;
+                emit_x_f16           = true;
                 if (!d.ffn_bptrs_va) { m_ok = false; break; }
             } else if (!is_pass_reset) {
                 const auto & Pn      = G.passes[v + 1u];
@@ -6285,7 +7283,11 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
                     d.next_mix_out_va[0] = L.x_q;
                     d.next_mix_out_va[1] = L.x_k;
                     d.next_mix_out_va[2] = L.x_v;
+                    d.next_mix_f16_va[0] = L.x_q_f16;
+                    d.next_mix_f16_va[1] = L.x_k_f16;
+                    d.next_mix_f16_va[2] = L.x_v_f16;
                     post_ffn_do_norm     = true;
+                    emit_x_f16           = true;
                 }
                 m_attn_ready = true;
                 if (!d.ffn_bptrs_va) { m_ok = false; break; }
@@ -6296,7 +7298,8 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
                       (!new_block       ? AGX_W5_PFLAG_POST_ATTN_ADD_RES : 0u) |
                       (!P.has_loop      ? AGX_W5_PFLAG_POST_ATTN_DO_NORM : 0u) |
                       (post_ffn_do_mix  ? AGX_W5_PFLAG_POST_FFN_DO_MIX   : 0u) |
-                      (post_ffn_do_norm ? AGX_W5_PFLAG_POST_FFN_DO_NORM  : 0u);
+                      (post_ffn_do_norm ? AGX_W5_PFLAG_POST_FFN_DO_NORM  : 0u) |
+                      (emit_x_f16       ? AGX_W5_PFLAG_EMIT_X_F16        : 0u);
             d.r_nb1_f32           = P.r_nb1_f32;
             d.n_expert            = hp.n_expert;
             d.n_ff_exp            = hp.n_ff_exp;
@@ -6345,6 +7348,7 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
         const bool skip_qkv_ctrl = w5m_qkv_ctrl_done;
         w5m_qkv_ctrl_done = false;
         if (P.has_loop && !skip_qkv_ctrl) {
+            x_f16_ready = false;
             // Compute cross-pass messages = mix(bank, va_bank_out, loop->msg_query) -> slc->h_msg
             uint64_t msg_states[2] = { bank[0], va_bank_out };
             if (!agx_inkling2_dispatch_depth_mix(eng, stream, msg_states, 2u,
@@ -6500,7 +7504,10 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
         bool ran_attn_in_m = false;
         if (!no_attn_in_m && M >= 2u && M <= 8u && use_coal &&
             C.in_coal[0] && C.in_coal[1] && C.in_coal[2] && C.in_coal[4] && C.in_coal[5]) {
-            const agx_kernel * k_attn_m = (M <= 4u) ? eng->k_w9_attn_in_m4 : eng->k_w9_attn_in_m8;
+            const agx_kernel * k_attn_f16 = (M <= 4u) ? eng->k_w9_attn_in_m4_f16 : eng->k_w9_attn_in_m8_f16;
+            const agx_kernel * k_attn_f32 = (M <= 4u) ? eng->k_w9_attn_in_m4     : eng->k_w9_attn_in_m8;
+            const bool use_f16_ain = x_f16_ready && !verify_f32_attn_in && (k_attn_f16 != nullptr);
+            const agx_kernel * k_attn_m = use_f16_ain ? k_attn_f16 : k_attn_f32;
             uint32_t sink_rb = 0u, dk_rb = 0u, dv_rb = 0u;
             const uint32_t sink_wt = (!C.in_coal[3] && layer.attn_sink_proj)
                 ? agx_inkling2_tensor_wtype(layer.attn_sink_proj, &sink_rb) : 0u;
@@ -6556,6 +7563,10 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
                 apc.dyn_v_wtype     = dv_wt;
                 apc.dyn_v_row_B     = dv_rb;
                 apc.n_tokens        = M;
+                apc.x_is_f16        = use_f16_ain ? 1u : 0u;
+                apc.x_q_f16_va      = L.x_q_f16;
+                apc.x_k_f16_va      = same_qkv_inp ? L.x_q_f16 : L.x_k_f16;
+                apc.x_v_f16_va      = same_qkv_inp ? L.x_q_f16 : L.x_v_f16;
                 const uint32_t tot_rows = C.total_coal_rows + (!C.in_coal[3] ? 24u : 0u) + (!P.is_swa ? 64u : 0u);
                 if (!agx_cdm_dispatch(stream, k_attn_m, (tot_rows + 7u) / 8u, 1u, 1u,
                                       &apc, sizeof(apc), AGX_BARRIER_STRONG_USC)) {
@@ -6644,14 +7655,24 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
         agx_cdm_barrier_usc(stream);
         }
 
-        // ---- Stage 1a: 1-Dispatch Fused Q/K/V/R ShortConv + State-Store + Clip/Norm + Tau + FWHT + KV-Store + kq_mask_f16! ----
+        // ---- Stage 1a: 1-Dispatch Fused Q/K/V/R ShortConv + State-Store + Clip/Norm + Tau + FWHT(128/64) + KV-Store + [kq_mask_f16 | banded rel_table]! ----
+        // Wave 10: SWA KV cache is padded to n_swa + n_ubatch (e.g. 1536..3072 cells) with only 1024 unmasked keys.
+        // Inline-pack ALL 40 SWA layers into SLC L.kq_mask_f16 via QKV_FLAG_BANDED_REL_PACK (-40 disp, -40 STRONG_USC barriers, -15.7 MB DRAM!),
+        // and reserve banded rel_table + PASS_MODE=4 tile64_minmax strictly for Full-Attn layers!
         const uint32_t mask_row_stride = (P.n_kv + 7u) & ~7u;
         const size_t   mask_need_B     = (size_t) 24u * M * mask_row_stride * sizeof(uint16_t);
-        const bool     use_slc_mask    = (mask_need_B <= L.kq_mask_f16_bytes);
+        const bool     use_banded_swa_inline = P.has_banded_rel && P.is_swa && (P.n_kv <= 4096u) &&
+                                               (mask_need_B <= L.kq_mask_f16_bytes);
+        const bool     use_banded_table      = P.has_banded_rel && !use_banded_swa_inline;
+        const bool     use_slc_mask    = (!use_banded_table) && (mask_need_B <= L.kq_mask_f16_bytes);
         const uint64_t kq_mask_va      = use_slc_mask ? L.kq_mask_f16 : P.graph_mask_va;
         const uint32_t kq_mask_stride  = use_slc_mask ? mask_row_stride : (P.graph_mask_nb1 / 2u);
-        const bool     fuse_rel_inline = (P.n_kv <= 2048u);
+        const bool     fuse_rel_inline = use_banded_swa_inline || ((!P.has_banded_rel) && (P.n_kv <= 2048u));
         const bool     need_pack_qgate = (M > 1u) && (raw_stride[1] != 3072u);
+        const bool     need_pack_sinks = use_banded_table && (M > 1u) && (raw_stride[3] != 24u);
+        const bool     need_w10_qkv    = (P.k_rot_dim == 64u || P.v_rot_dim == 64u || use_banded_swa_inline);
+        const agx_kernel * k_qkv_prep  = need_w10_qkv ? ensure_w10_qkv_rot64_kernel(eng) : eng->k_w4_qkv_prep_store;
+        if (!k_qkv_prep) return false;
 
         {
             agx_w4_qkv_prep_desc qd{};
@@ -6684,7 +7705,7 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
 
             qd.q_out_va         = L.q_out;
             qd.r_out_va         = L.r_out;
-            qd.rel_pos_va       = P.rel_pos_va;
+            qd.rel_pos_va       = use_banded_swa_inline ? P.rel_pos_pack_va : P.rel_pos_va;
             qd.base_mask_va     = P.base_mask_va;
             qd.kq_mask_out_va   = kq_mask_va;
 
@@ -6706,14 +7727,17 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
             qd.n_extent            = (uint32_t) (layer.attn_rel_bias->ne[1] - (G.rel_bias_padded[P.ip] ? 1 : 0));
             qd.n_kv                = P.n_kv;
             qd.n_kv_mask_stride    = kq_mask_stride;
-            qd.rpos_nb1_B          = P.rpos_nb1;
+            qd.rpos_nb1_B          = use_banded_swa_inline ? P.n_kv : P.rpos_nb1;
             qd.bmask_nb1_B         = P.bmask_nb1;
             uint32_t rb_tmp = 0;
             qd.bias_wtype          = agx_inkling2_tensor_wtype(layer.attn_rel_bias, &rb_tmp);
             qd.bias_nb1_B          = rb_tmp;
             qd.flags               = (!P.is_swa ? AGX_W4_QKV_FLAG_IS_FULL_ATTN : 0u) |
-                                     (P.has_k_rot ? AGX_W4_QKV_FLAG_FWHT_K : 0u) |
-                                     (P.has_v_rot ? AGX_W4_QKV_FLAG_FWHT_V : 0u) |
+                                     (P.k_rot_dim == 128u ? AGX_W4_QKV_FLAG_FWHT_K : 0u) |
+                                     (P.k_rot_dim ==  64u ? AGX_W10_QKV_FLAG_FWHT64_K : 0u) |
+                                     (P.v_rot_dim == 128u ? AGX_W4_QKV_FLAG_FWHT_V : 0u) |
+                                     (P.v_rot_dim ==  64u ? AGX_W10_QKV_FLAG_FWHT64_V : 0u) |
+                                     (use_banded_swa_inline ? AGX_W10_QKV_FLAG_BANDED_REL_PACK : 0u) |
                                      (P.kv_is_q8 ? AGX_W4_QKV_FLAG_KV_Q8_0 : 0u) |
                                      (P.k_ids_is_i64 ? AGX_W4_QKV_FLAG_K_IDS_I64 : 0u) |
                                      (P.v_ids_is_i64 ? AGX_W4_QKV_FLAG_V_IDS_I64 : 0u) |
@@ -6733,7 +7757,7 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
             if (!d_va || !d_cpu) return false;
             std::memcpy(d_cpu, &qd, sizeof(qd));
             agx_w4_desc_va_push pc{ d_va };
-            if (!agx_cdm_dispatch(stream, eng->k_w4_qkv_prep_store, 40u + 24u * qd.r_splits, M, 1u,
+            if (!agx_cdm_dispatch(stream, k_qkv_prep, 40u + 24u * qd.r_splits, M, 1u,
                                   &pc, sizeof(pc), AGX_BARRIER_STRONG_USC)) {
                 return false;
             }
@@ -6746,7 +7770,27 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
             }
         }
 
-        if (!fuse_rel_inline) {
+        if (use_banded_table) {
+            uint32_t rb_tmp = 0;
+            const uint32_t rb_wt = agx_inkling2_tensor_wtype(layer.attn_rel_bias, &rb_tmp);
+            agx_w10_rel_table_push rtc{};
+            rtc.r_va             = L.r_out;
+            rtc.rel_bias_va      = agx_tensor_gpu_va(layer.attn_rel_bias);
+            rtc.dst_va           = P.rel_table_va;
+            rtc.sinks_src_va     = need_pack_sinks ? raw_va[3] : 0ull;
+            rtc.sinks_dst_va     = need_pack_sinks ? L.sinks_compact : 0ull;
+            rtc.n_rel            = (uint32_t) layer.attn_rel_bias->ne[0];
+            rtc.eff_rows         = P.rel_table_len;
+            rtc.n_tokens         = M;
+            rtc.bias_wtype       = rb_wt;
+            rtc.bias_nb1_B       = rb_tmp;
+            rtc.sinks_stride_f32 = raw_stride[3];
+            if (!agx_cdm_dispatch(stream, eng->k_w10_rel_bias_table,
+                                  (P.rel_table_len + 63u) / 64u, M, 1u,
+                                  &rtc, sizeof(rtc), AGX_BARRIER_STRONG_USC)) {
+                return false;
+            }
+        } else if (!fuse_rel_inline) {
             agx_w4_rel_mask_push rmc{};
             rmc.r_va             = L.r_out;
             rmc.rel_bias_va      = agx_tensor_gpu_va(layer.attn_rel_bias);
@@ -6773,8 +7817,13 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
             }
         }
 
-        // ---- Stage 1b: FlashAttention (+ fused sigmoid(qgate) when !has_v_rot) -> slc->attn_out ----
-        const uint64_t qgate_cont_va = need_pack_qgate ? L.qgate_compact : raw_va[1];
+        // ---- Stage 1b: FlashAttention (+ fused FWHT64 + sigmoid(qgate) + optional OUT_F16!) -> slc->attn_out ----
+        const uint64_t qgate_cont_va  = need_pack_qgate ? L.qgate_compact : raw_va[1];
+        const agx_kernel * k_wo_m_f16 = (M <= 4u) ? eng->k_w9_q8_gemv_m4_f16 : eng->k_w9_q8_gemv_m8_f16;
+        const bool use_w10_wo_f16 = !verify_legacy_wo && (M >= 2u && M <= 8u) && !mk_dump &&
+                                    (P.v_rot_dim != 128u) && (k_wo_m_f16 != nullptr) &&
+                                    (layer.wo->type == GGML_TYPE_Q8_0) && agx_tensor_is_repacked(layer.wo) &&
+                                    (layer.wo->ne[0] == 3072) && (layer.wo->ne[1] == (int64_t) D);
         {
             agx_attn_stage_args attn{};
             attn.n_tokens      = M;
@@ -6783,17 +7832,14 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
             attn.n_head_kv     = 8u;
             attn.head_dim      = 128u;
             attn.kq_scale      = 1.0f / std::sqrt(128.0f);
-            attn.flags         = AGX_ATTN_FLAG_HAS_MASK_F16 | AGX_ATTN_FLAG_REL_TABLE_SINK |
-                                 (!P.has_v_rot ? AGX_ATTN_FLAG_QGATE_F32 : 0u);
+            attn.flags         = (P.v_rot_dim == 64u ? AGX_ATTN_FLAG_FWHT64 : 0u) |
+                                 (P.v_rot_dim != 128u ? AGX_ATTN_FLAG_QGATE_F32 : 0u) |
+                                 (use_w10_wo_f16 ? AGX_ATTN_FLAG_OUT_F16 : 0u);
             attn.q_va          = L.q_out;
             attn.q_nb1         = 24u * 128u * sizeof(float);
             attn.q_nb2         = 128u * sizeof(float);
             attn.out_va        = slc->attn_out;
-            attn.q_gate_va     = !P.has_v_rot ? qgate_cont_va : 0ull;
-            attn.kq_mask_va    = kq_mask_va;
-            attn.ext_mask_nb1  = kq_mask_stride * sizeof(uint16_t);
-            attn.ext_mask_nb2  = M * kq_mask_stride * sizeof(uint16_t);
-            attn.ext_mask_ne2  = 24u;
+            attn.q_gate_va     = (P.v_rot_dim != 128u) ? qgate_cont_va : 0ull;
             attn.ext_k_dtype   = P.kv_is_q8 ? AGX_KV_Q8_0_GGML : AGX_KV_F16;
             attn.ext_v_dtype   = P.kv_is_q8 ? AGX_KV_Q8_0_GGML : AGX_KV_F16;
             attn.ext_k_va      = P.k_va;
@@ -6802,6 +7848,29 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
             attn.ext_k_nb2     = P.k_nb2;
             attn.ext_v_nb1     = P.v_nb1;
             attn.ext_v_nb2     = P.v_nb2;
+            if (use_banded_table) {
+                attn.flags          |= AGX_ATTN_FLAG_BANDED_REL_BIAS |
+                                       AGX_ATTN_FLAG_SINK_PER_TOK_HEAD |
+                                       (P.bmask_is_f16 ? AGX_ATTN_FLAG_HAS_MASK_F16 : AGX_ATTN_FLAG_HAS_MASK_F32);
+                attn.n_rel_extent    = P.rel_extent;
+                attn.rel_table_len   = P.rel_table_len;
+                attn.rel_table_va    = P.rel_table_va;
+                attn.rel_pos_pack_va = P.rel_pos_pack_va;
+                attn.rel_cp_off      = 0u;
+                attn.rel_qp_off      = P.n_kv;
+                attn.rel_tm_off      = P.n_kv + M;
+                attn.sinks_va        = need_pack_sinks ? L.sinks_compact : raw_va[3];
+                attn.kq_mask_va      = P.base_mask_va;
+                attn.ext_mask_nb1    = P.bmask_nb1;
+                attn.ext_mask_nb2    = 0u;
+                attn.ext_mask_ne2    = 1u;
+            } else {
+                attn.flags          |= AGX_ATTN_FLAG_HAS_MASK_F16 | AGX_ATTN_FLAG_REL_TABLE_SINK;
+                attn.kq_mask_va      = kq_mask_va;
+                attn.ext_mask_nb1    = kq_mask_stride * sizeof(uint16_t);
+                attn.ext_mask_nb2    = M * kq_mask_stride * sizeof(uint16_t);
+                attn.ext_mask_ne2    = 24u;
+            }
             if (!agx_kv_hybrid_dispatch_full_attn(kv_pool, stream, attn, AGX_BARRIER_STRONG_USC)) {
                 return false;
             }
@@ -6809,7 +7878,7 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
                 slc_dump_f32("v0.attn_out", slc->attn_out, 3072u);
             }
         }
-        if (P.has_v_rot) {
+        if (P.v_rot_dim == 128u) {
             agx_w4_fwht_qgate_push fpc{};
             fpc.attn_va          = slc->attn_out;
             fpc.qgate_va         = raw_va[1];
@@ -6823,9 +7892,25 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
             }
         }
 
-        // ---- Stage 1c: W_o GEMM -> L.x_k (wo_out) ----
-        if (!dispatch_dense_mm(ctx, stream, layer.wo, slc->attn_out, L.x_k, M, AGX_BARRIER_STRONG_USC)) {
-            return false;
+        // ---- Stage 1c: W_o GEMM -> L.x_k (direct-L1 FP16 0-SRAM 0-barrier Q8 GEMV for M=2..8!) ----
+        if (use_w10_wo_f16) {
+            agx_w9_q8_gemv_m_push wpc{};
+            wpc.w_va     = agx_tensor_gpu_va(layer.wo);
+            wpc.x_va     = slc->attn_out;
+            wpc.y_va     = L.x_k;
+            wpc.M        = M;
+            wpc.N        = D;
+            wpc.K        = 3072u;
+            wpc.x_stride = 3072u;
+            wpc.y_stride = D;
+            if (!agx_cdm_dispatch(stream, k_wo_m_f16, (D + 7u) / 8u, 1u, 1u,
+                                  &wpc, sizeof(wpc), AGX_BARRIER_STRONG_USC)) {
+                return false;
+            }
+        } else {
+            if (!dispatch_dense_mm(ctx, stream, layer.wo, slc->attn_out, L.x_k, M, AGX_BARRIER_STRONG_USC)) {
+                return false;
+            }
         }
 
         // ---- Stage 2a + FFN Loop Ctrl + Stage 2b (Router): 1-dispatch M=2..8 Hybrid OR unfused ----
@@ -7077,21 +8162,24 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
             }
             if (!is_pass_reset) attn_inputs_ready = true;
             w5m_qkv_ctrl_done = true;
+            x_f16_ready       = true;
             if (!emit_layer_inp_stores(P.layer_inp_stores, next_cur_va)) {
                 return false;
             }
         } else if (use_w5_m_hybrid && !no_m_post_ffn_par && eng->k_w5_hybrid_post_ffn_nl_m != nullptr) {
-            // Wave 9: Parallel M-WG non-loop transition (kills all 24 serial 1-WG k_w4_stage_post_ffn stalls!)
+            // Wave 10: Lean (M+1)-WG parallel non-loop transition (overlapped conv rollback + FP16 mirror!)
+            const uint32_t nl_wgs = M + 1u;
             agx_w5_persist_push ppc{};
             ppc.descs_va   = w5m_descs_gpu_va + (uint64_t) v * sizeof(agx_w5_pass_desc);
             ppc.barrier_va = slc->sense_barrier_va;
             ppc.n_passes   = 1u;
-            ppc.n_wg       = 40u;
+            ppc.n_wg       = nl_wgs;
             if (!agx_cdm_dispatch(stream, eng->k_w5_hybrid_post_ffn_nl_m,
-                                  40u, 1u, 1u, &ppc, sizeof(ppc), AGX_BARRIER_STRONG_USC)) {
+                                  nl_wgs, 1u, 1u, &ppc, sizeof(ppc), AGX_BARRIER_STRONG_USC)) {
                 return false;
             }
             if (!is_final_pass && !is_pass_reset) attn_inputs_ready = true;
+            x_f16_ready = true;
             if (!emit_layer_inp_stores(P.layer_inp_stores, next_cur_va)) {
                 return false;
             }
@@ -7099,6 +8187,7 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
                 return false;
             }
         } else {
+            x_f16_ready = false;
             agx_w4_stage_prep_desc sd{};
             sd.conv_src_va         = L.moe_out;
             sd.res_va              = va_ffn_inp;
@@ -7185,20 +8274,26 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
     // ------------------------------------------------------------------------
     // Final: Optional inp_out_ids Gather + Q8_0 LM Head + Softcap/Trunc -> result_output
     // ------------------------------------------------------------------------
-    uint64_t lm_in_va = L.x_q;
+    uint64_t lm_in_va     = L.x_q;
+    uint64_t lm_in_f16_va = L.x_q_f16;
+    bool     lm_f16_ready = (!ran_w5_persistent && x_f16_ready);
     if (G.inp_out_ids_va != 0ull) {
+        const bool emit_lm_f16 = (G.n_out >= 2u && G.n_out <= 8u);
         w4_gather_f32_push gp{};
-        gp.src_va  = L.x_q;
-        gp.ids_va  = G.inp_out_ids_va;
-        gp.dst_va  = L.x_k;
-        gp.dst2_va = G.result_norm_va;
-        gp.n_embd  = D;
-        gp.n_out   = G.n_out;
+        gp.src_va     = L.x_q;
+        gp.ids_va     = G.inp_out_ids_va;
+        gp.dst_va     = L.x_k;
+        gp.dst2_va    = G.result_norm_va;
+        gp.n_embd     = D;
+        gp.n_out      = G.n_out;
+        gp.dst_f16_va = emit_lm_f16 ? L.x_k_f16 : 0ull;
         if (!agx_cdm_dispatch(stream, eng->k_w4_gather_f32, (D + 255u) / 256u, G.n_out, 1u,
                               &gp, sizeof(gp), AGX_BARRIER_STRONG_USC)) {
             return false;
         }
-        lm_in_va = L.x_k;
+        lm_in_va     = L.x_k;
+        lm_in_f16_va = L.x_k_f16;
+        lm_f16_ready = emit_lm_f16;
     } else if (G.result_norm_va != 0ull) {
         copy_f32_push cp{ L.x_q, G.result_norm_va, G.n_out * D, 0u };
         if (!agx_cdm_dispatch(stream, eng->k_copy_f32, (G.n_out * D + 255u) / 256u, 1u, 1u,
@@ -7210,18 +8305,37 @@ extern "C" bool agx_inkling2_try_execute(agx_backend_context * ctx, struct ggml_
     {
         agx_weight_layout lm_layout = AGX_WEIGHT_F32;
         if (!agx_gemm_infer_weight_layout(W.output, &lm_layout)) return false;
-        agx_gemm_desc d{};
-        d.w_va         = agx_tensor_gpu_va(W.output);
-        d.x_va         = lm_in_va;
-        d.y_va         = G.lm_head_pad_va;
-        d.M            = G.n_out;
-        d.N            = hp.n_vocab_padded;
-        d.K            = D;
-        d.layout       = lm_layout;
-        d.prec_f32     = true; // matches prec_policy.set_acc(output, GGML_PREC_F32)
-        d.post_barrier = AGX_BARRIER_STRONG_USC;
-        if (!agx_gemm_dispatch(ctx, stream, d)) {
-            return false;
+        const agx_kernel * k_lm_f16 = (G.n_out <= 4u) ? eng->k_w9_q8_gemv_m4_f16 : eng->k_w9_q8_gemv_m8_f16;
+        if (!verify_legacy_lm && G.n_out >= 2u && G.n_out <= 8u &&
+            lm_layout == AGX_WEIGHT_Q8_0_REPACKED && lm_f16_ready &&
+            (D % 256u) == 0u && k_lm_f16 != nullptr) {
+            agx_w9_q8_gemv_m_push lpc{};
+            lpc.w_va     = agx_tensor_gpu_va(W.output);
+            lpc.x_va     = lm_in_f16_va;
+            lpc.y_va     = G.lm_head_pad_va;
+            lpc.M        = G.n_out;
+            lpc.N        = hp.n_vocab_padded;
+            lpc.K        = D;
+            lpc.x_stride = D;
+            lpc.y_stride = hp.n_vocab_padded;
+            if (!agx_cdm_dispatch(stream, k_lm_f16, (hp.n_vocab_padded + 7u) / 8u, 1u, 1u,
+                                  &lpc, sizeof(lpc), AGX_BARRIER_STRONG_USC)) {
+                return false;
+            }
+        } else {
+            agx_gemm_desc d{};
+            d.w_va         = agx_tensor_gpu_va(W.output);
+            d.x_va         = lm_in_va;
+            d.y_va         = G.lm_head_pad_va;
+            d.M            = G.n_out;
+            d.N            = hp.n_vocab_padded;
+            d.K            = D;
+            d.layout       = lm_layout;
+            d.prec_f32     = true; // matches prec_policy.set_acc(output, GGML_PREC_F32)
+            d.post_barrier = AGX_BARRIER_STRONG_USC;
+            if (!agx_gemm_dispatch(ctx, stream, d)) {
+                return false;
+            }
         }
     }
 
