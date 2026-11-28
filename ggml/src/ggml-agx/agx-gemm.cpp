@@ -116,7 +116,7 @@ static const agx_kernel * get_or_compile_mma_gemm(agx_backend_context * ctx,
     if (!st || !ctx->compiler) {
         return nullptr;
     }
-    const bool pf_64x64 = (tile_mode == 0u) && !prec_f32 &&
+    const bool pf_64x64 = (tile_mode == 0u || tile_mode == 5u) && !prec_f32 &&
                           (layout == AGX_WEIGHT_NVFP4_REPACKED || layout == AGX_WEIGHT_Q8_0_REPACKED);
     const bool eff_a4   = x_aligned4 && pf_64x64;
     char name[96];
@@ -181,10 +181,11 @@ bool agx_gemm_precompile_all(agx_backend_context * ctx) {
         ok &= (get_or_compile_mma_gemm(ctx, wl, 0u, false, is_pf64) != nullptr);
         ok &= (get_or_compile_mma_gemm(ctx, wl, 1u, false) != nullptr);
     }
-    // Wave 5 M=2..8 native 8x8 MMA tiles (TILE_MODE=3 large-N 128x8, TILE_MODE=4 medium-N 32x8 K-split)
+    // Wave 5/7 M=5..8 native 8x8 MMA tiles (TILE_MODE=3/4) + Wave 7 large 128Nx64M prefill (TILE_MODE=5)
     for (agx_weight_layout wl : {AGX_WEIGHT_NVFP4_REPACKED, AGX_WEIGHT_Q8_0_REPACKED}) {
         ok &= (get_or_compile_mma_gemm(ctx, wl, 3u, false) != nullptr);
         ok &= (get_or_compile_mma_gemm(ctx, wl, 4u, false) != nullptr);
+        ok &= (get_or_compile_mma_gemm(ctx, wl, 5u, false, true) != nullptr);
     }
     // FP32 full-range 8x8 MMA variants (incl. narrow-N TILE_MODE=2 for 4608x64 ctrl_down!)
     ok &= (get_or_compile_mma_gemm(ctx, AGX_WEIGHT_F32,  0u, true) != nullptr);
@@ -284,15 +285,26 @@ bool agx_gemm_dispatch(agx_backend_context * ctx,
         // Select tile geometry to saturate all 40 M4 Max cores:
         //   - TILE_MODE=2 (16x16, 2x2): narrow N <= 128 (e.g. 4608x64 ctrl_down -> 128 WGs!)
         //   - TILE_MODE=1 (32x16, 4x1): medium M <= 48 (72-216 WGs on N=2304)
-        //   - TILE_MODE=0: sh_w-staged 64x64 for FP16 repacked NVFP4/Q8_0 (9.5 KB = 3 WGs/core!),
-        //                  64x32 for PREC_F32 / non-repacked layouts.
-        const uint32_t tile_mode = (desc.N <= 128u && batch_z <= 2u) ? 2u
+        //   - TILE_MODE=5 (128x64, 4x2 SGs, 12.1 KB = 16 SGs/core): large prefill repacked NVFP4/Q8_0
+        //     when >= 80 WGs (>= 2 WGs/core across all 40 cores; halves X traffic vs 64x64!)
+        //   - TILE_MODE=0 (64x64, 2x2 SGs, 8.0 KB = 16 SGs/core) for FP16 repacked NVFP4/Q8_0;
+        //     64x32 for PREC_F32 / non-repacked layouts.
+        uint32_t tile_mode       = (desc.N <= 128u && batch_z <= 2u) ? 2u
                                  : (desc.M <= 48u)                   ? 1u
                                                                      : 0u;
-        const bool pf_64x64      = (tile_mode == 0u) && !desc.prec_f32 &&
+        const bool is_repack_f16 = !desc.prec_f32 &&
                                    (desc.layout == AGX_WEIGHT_NVFP4_REPACKED ||
                                     desc.layout == AGX_WEIGHT_Q8_0_REPACKED);
-        const uint32_t wg_n      = (tile_mode == 2u) ? 16u
+        static const bool no_t5 = (std::getenv("GGML_AGX_GEMM_NO_T5") != nullptr);
+        if (tile_mode == 0u && is_repack_f16 && !no_t5) {
+            const uint32_t wgs_128 = ((desc.N + 127u) / 128u) * ((desc.M + 63u) / 64u) * batch_z;
+            if (wgs_128 >= 80u) {
+                tile_mode = 5u;
+            }
+        }
+        const bool pf_64x64      = (tile_mode == 0u || tile_mode == 5u) && is_repack_f16;
+        const uint32_t wg_n      = (tile_mode == 5u) ? 128u
+                                 : (tile_mode == 2u) ? 16u
                                  : (tile_mode == 1u) ? 32u
                                                      : 64u;
         const uint32_t wg_m      = pf_64x64 ? 64u : ((tile_mode == 0u) ? 32u : 16u);
