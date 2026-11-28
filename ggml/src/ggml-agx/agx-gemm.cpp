@@ -204,12 +204,26 @@ static const agx_kernel * get_or_compile_mma_gemm(agx_backend_context * ctx,
     const bool m8_direct   = (tile_mode == 3u || tile_mode == 4u) && !prec_f32 && is_repacked;
     const bool eff_a4      = x_aligned4   && pf_64x64;
     const bool eff_f16     = x_is_f16     && pf_64x64;
-    const bool eff_k128    = k_aligned128 && pf_64x64 && (layout == AGX_WEIGHT_NVFP4_REPACKED);
+    const bool eff_k128    = k_aligned128 && pf_64x64;
     const bool eff_bz1     = batch_z1     && (pf_64x64 || m8_direct);
 
+    // Wave 11 M4 Max silicon winner (task-8215/8221: NVFP4 12.64 TF, Q8_0 12.85 TF, pp2048 1,159.23 t/s!):
+    //   - K_PAIRS=1 (4,096 B SRAM, 143-159 GPRs -> 5 WGs/core = 20 ActSGs/core @ t0, 0 bank conflicts, 0 drains!)
+    //   - Set GGML_AGX_GEMM_K128=1 to A/B K_PAIRS=2 (TILE_K=128, 8,192 B SRAM -> 4 WGs/core = 16 ActSGs).
     static const uint32_t pf_k_pairs = []() -> uint32_t {
-        const char * v = std::getenv("GGML_AGX_GEMM_NO_K128");
-        return (v && v[0] && v[0] != '0') ? 1u : 2u;
+        const char * k128 = std::getenv("GGML_AGX_GEMM_K128");
+        if (k128 && k128[0] && k128[0] != '0') {
+            return 2u;
+        }
+        const char * no_k128 = std::getenv("GGML_AGX_GEMM_NO_K128");
+        if (no_k128 && no_k128[0] && no_k128[0] == '0') {
+            return 2u;
+        }
+        return 1u;
+    }();
+    static const uint32_t pf_pair_swiz = []() -> uint32_t {
+        const char * v = std::getenv("GGML_AGX_GEMM_NO_PAIR_SWIZ");
+        return (v && v[0] && v[0] != '0') ? 0u : 1u;
     }();
     static const int env_shx_pad = []() -> int {
         const char * v = std::getenv("GGML_AGX_GEMM_SHX_PAD");
@@ -219,10 +233,12 @@ static const agx_kernel * get_or_compile_mma_gemm(agx_backend_context * ctx,
         }
         return -1;
     }();
-    // TILE_MODE=5 (256T): SH_X_PAD=2 (8,704 B -> 3 WGs/core = 24 ActSGs, 0 bank conflicts).
-    // TILE_MODE=0 (128T): SH_X_PAD=0 (8,192 B -> 4 WGs/core = 16 ActSGs, +33% over 8,704 B!).
-    const uint32_t pf_shx_pad = (env_shx_pad >= 0) ? static_cast<uint32_t>(env_shx_pad)
-                                                   : ((tile_mode == 0u) ? 0u : 2u);
+    // Wave 11 default (SH_X_PAIR_SWIZ=1, K_PAIRS=1): pair-transposed XOR-swizzled uvec4 sh_x[16][16]
+    // (exact 4,096 B SRAM, 143-159 GPRs -> 5 WGs/core = 20 ActSGs/core @ t0, 0 bank conflicts, 0 drains).
+    // Legacy SH_X_PAIR_SWIZ=0 (GGML_AGX_GEMM_NO_PAIR_SWIZ=1): t0 PAD=0, t5 PAD=2.
+    const uint32_t pf_shx_pad = pf_pair_swiz ? 0u
+                              : ((env_shx_pad >= 0) ? static_cast<uint32_t>(env_shx_pad)
+                                                    : ((tile_mode == 0u) ? 0u : 2u));
     static const int env_unroll_kp = []() -> int {
         const char * v = std::getenv("GGML_AGX_GEMM_UNROLL_KP");
         if (v && v[0]) {
@@ -230,18 +246,14 @@ static const agx_kernel * get_or_compile_mma_gemm(agx_backend_context * ctx,
         }
         return -1;
     }();
-    // Wave 10 M4 Max silicon winner (task-8130: +1.03 TFLOPS Q8_0, +0.43 TFLOPS NVFP4, +8.8 t/s pp2048):
-    //   - TILE_MODE=0 (128T, 64x32, PAD=0 = 8,192 B -> 4 WGs/core = 16 ActSGs): UNROLL_KP=1 overlaps
-    //     s_kp=1 weight loads inside s_kp=0's 64 matmads at 0 occupancy loss!
-    //   - TILE_MODE=5 (256T, 128x32, PAD=2): UNROLL_KP=0 keeps lower GPR footprint.
     const uint32_t pf_unroll_kp = (env_unroll_kp >= 0) ? static_cast<uint32_t>(env_unroll_kp)
-                                                       : ((tile_mode == 0u && pf_k_pairs > 1u) ? 1u : 0u);
+                                                       : ((pf_k_pairs > 1u && (tile_mode == 0u || pf_pair_swiz)) ? 1u : 0u);
 
     char name[128];
     if (pf_64x64) {
-        std::snprintf(name, sizeof(name), "agx_mma_gemm_w10_w%u_t%u_p0_a%u_kp%u_pad%u_f%u_k%u_z%u_u%u",
+        std::snprintf(name, sizeof(name), "agx_mma_gemm_w11c_w%u_t%u_p0_a%u_kp%u_sw%u_pad%u_f%u_k%u_z%u_u%u",
                       static_cast<uint32_t>(layout), tile_mode,
-                      eff_a4 ? 1u : 0u, pf_k_pairs, pf_shx_pad,
+                      eff_a4 ? 1u : 0u, pf_k_pairs, pf_pair_swiz, pf_shx_pad,
                       eff_f16 ? 1u : 0u, eff_k128 ? 1u : 0u,
                       eff_bz1 ? 1u : 0u, pf_unroll_kp);
     } else if (m8_direct) {
@@ -263,6 +275,7 @@ static const agx_kernel * get_or_compile_mma_gemm(agx_backend_context * ctx,
     opts.defines.push_back(std::string("X_ALIGNED4=") + (eff_a4 ? "1" : "0"));
     if (pf_64x64) {
         opts.defines.push_back(std::string("K_PAIRS=") + std::to_string(pf_k_pairs));
+        opts.defines.push_back(std::string("SH_X_PAIR_SWIZ=") + std::to_string(pf_pair_swiz));
         opts.defines.push_back(std::string("SH_X_PAD=") + std::to_string(pf_shx_pad));
         opts.defines.push_back(std::string("X_IS_F16=") + (eff_f16 ? "1" : "0"));
         opts.defines.push_back(std::string("K_ALIGNED128=") + (eff_k128 ? "1" : "0"));
@@ -303,17 +316,16 @@ bool agx_gemm_precompile_all(agx_backend_context * ctx) {
     ok &= (get_or_compile_q8_mxfp8_vecmat(ctx, 0u, 4u, false, 4u, true) != nullptr);
     ok &= (get_or_compile_q8_mxfp8_vecmat(ctx, 0u, 4u, false, 8u, true) != nullptr);
 
-    // Wave 10 hot repacked MMA tiles:
+    // Wave 11 hot repacked MMA tiles:
     //   - t3/t4 (M=5..8 direct-register 32/30 ActSGs!)
-    //   - t0 (default prefill 128T 64x32 PAD=0 UNROLL_KP=1: 12.58+ TFLOPS Q8_0, 11.86+ TFLOPS NVFP4!)
+    //   - t0 (default prefill 128T 64x32 SH_X_PAIR_SWIZ=1 exact 8,192 B 0-bank-conflict UNROLL_KP=1)
     //   - t1 (medium M=9..48)
     for (agx_weight_layout wl : {AGX_WEIGHT_NVFP4_REPACKED, AGX_WEIGHT_Q8_0_REPACKED}) {
-        const bool is_nv = (wl == AGX_WEIGHT_NVFP4_REPACKED);
         ok &= (get_or_compile_mma_gemm(ctx, wl, 3u, false, false, false, false, true) != nullptr);
         ok &= (get_or_compile_mma_gemm(ctx, wl, 4u, false, false, false, false, true) != nullptr);
         ok &= (get_or_compile_mma_gemm(ctx, wl, 1u, false) != nullptr);
-        ok &= (get_or_compile_mma_gemm(ctx, wl, 0u, false, true, false, is_nv, true) != nullptr);
-        ok &= (get_or_compile_mma_gemm(ctx, wl, 0u, false, true, true,  is_nv, true) != nullptr);
+        ok &= (get_or_compile_mma_gemm(ctx, wl, 0u, false, true, false, true, true) != nullptr);
+        ok &= (get_or_compile_mma_gemm(ctx, wl, 0u, false, true, true,  true, true) != nullptr);
     }
     ok &= (gemm_get_cvt_f16_kernel(ctx, get_gemm_state(ctx)) != nullptr);
     // FP32/BF16 full-range 8x8 MMA variants (incl. narrow-N TILE_MODE=2 for 4608x64 ctrl_down!)
@@ -474,7 +486,18 @@ bool agx_gemm_dispatch(agx_backend_context * ctx,
             return 4096u;
         }();
         const bool mma_a4   = pf_64x64 && ((desc.K & 3u) == 0u) && ((x_stride & 3u) == 0u);
-        const bool mma_k128 = pf_64x64 && ((desc.K & 127u) == 0u);
+        static const uint32_t pf_tile_k_mask = []() -> uint32_t {
+            const char * k128 = std::getenv("GGML_AGX_GEMM_K128");
+            if (k128 && k128[0] && k128[0] != '0') {
+                return 127u;
+            }
+            const char * no_k128 = std::getenv("GGML_AGX_GEMM_NO_K128");
+            if (no_k128 && no_k128[0] && no_k128[0] == '0') {
+                return 127u;
+            }
+            return 63u;
+        }();
+        const bool mma_k128 = pf_64x64 && ((desc.K & pf_tile_k_mask) == 0u);
         bool       use_f16  = false;
         auto *     st       = get_gemm_state(ctx);
         if (mma_a4 && batch_z == 1u && desc.M >= 64u && desc.N >= bf16_min_n && x_stride == desc.K) {
@@ -511,6 +534,21 @@ bool agx_gemm_dispatch(agx_backend_context * ctx,
         }
         const uint32_t gx = (desc.N + wg_n - 1u) / wg_n;
         const uint32_t gy = (desc.M + wg_m - 1u) / wg_m;
+        // Wave 11 2D WG L2/SLC tile swizzle via pc._pad (0/1 = off; default 4 for large grids).
+        // Keeps M-strips together along N so concurrent cores share W strips in L2/48 MiB SLC!
+        static const int env_swizzle_m = []() -> int {
+            const char * v = std::getenv("GGML_AGX_GEMM_SWIZZLE_M");
+            if (v && v[0]) {
+                return std::atoi(v);
+            }
+            return -1;
+        }();
+        if (pf_64x64) {
+            const uint32_t swiz = (env_swizzle_m >= 0)
+                ? static_cast<uint32_t>(env_swizzle_m)
+                : ((gx >= 32u && gy >= 8u) ? 4u : 0u);
+            pc._pad = (swiz > 1u && gy > 1u && gx > 1u) ? std::min(swiz, gy) : 0u;
+        }
         const bool ok = agx_cdm_dispatch(stream, k, gx, gy, batch_z, &pc, sizeof(pc), desc.post_barrier);
         if (ok && use_f16) {
             agx_cdm_stats cst{};

@@ -418,8 +418,16 @@ static const agx_kernel * get_moe_exec_kernel(agx_moe_runner *  r,
     else return nullptr;
 
     if (!*slot) {
+        // Wave 11 M4 Max silicon winner (task-8221: pp2048 1,159.23 t/s, Code 8k/16k/32k beat S23!):
+        //   - MOE_K_PAIRS=2 (exact 8,192 B SRAM MOE_SRAM_MINIMAL, pair-swizzled 0 bank conflicts)
+        //   - MOE_UNROLL_KP=0 default (set GGML_AGX_MOE_UNROLL_KP=1 or GGML_AGX_MOE_NO_K128=1 to A/B).
+        //   - M=5..8 (GEMM_TILE_M_SML=8) stays 100% untouched on MOE_K_PAIRS=2, MOE_UNROLL_KP=1.
         static const bool no_k128 = []() {
             const char * v = std::getenv("GGML_AGX_MOE_NO_K128");
+            return v && v[0] && v[0] != '0';
+        }();
+        static const bool no_pair_swiz = []() {
+            const char * v = std::getenv("GGML_AGX_MOE_NO_PAIR_SWIZ");
             return v && v[0] && v[0] != '0';
         }();
         static const int env_shx_pad = []() -> int {
@@ -447,16 +455,23 @@ static const agx_kernel * get_moe_exec_kernel(agx_moe_runner *  r,
             opts.defines.push_back("BATCH_CAP=" + std::to_string(bcap));
         }
         bool eff_unroll_kp = false;
+        bool eff_pair_swiz = false;
+        uint32_t eff_k_pairs = 2u;
         uint32_t eff_sgs = 8u;
         if (stage == 2u || stage == 3u) {
             eff_sgs = moe_prefill_gemm_sgs(eff_tile_m);
             const bool is_4sg_m32 = (eff_sgs == 4u && eff_tile_m == AGX_MOE_GEMM_TILE_M);
             const int eff_pad = (env_shx_pad >= 0) ? env_shx_pad : (is_4sg_m32 ? 0 : 2);
+            eff_pair_swiz = !no_pair_swiz && (eff_tile_m >= 16u);
+            eff_k_pairs   = (eff_tile_m == AGX_MOE_GEMM_TILE_M_BIG || no_k128) ? 1u : 2u;
             if (eff_tile_m != AGX_MOE_GEMM_TILE_M) {
                 opts.defines.push_back("GEMM_TILE_M=" + std::to_string(eff_tile_m));
             }
             if (eff_sgs != 8u) {
                 opts.defines.push_back("MOE_GEMM_SGS=" + std::to_string(eff_sgs));
+            }
+            if (eff_pair_swiz) {
+                opts.defines.push_back("MOE_SH_PAIR_SWIZ=1");
             }
             if (eff_tile_m == AGX_MOE_GEMM_TILE_M_SML) {
                 eff_unroll_kp = !m8_no_unroll_kp;
@@ -464,12 +479,12 @@ static const agx_kernel * get_moe_exec_kernel(agx_moe_runner *  r,
                     opts.defines.push_back("MOE_UNROLL_KP=0");
                 }
             } else {
-                eff_unroll_kp = (env_unroll_kp > 0);
+                eff_unroll_kp = (env_unroll_kp > 0) && (eff_k_pairs > 1u);
                 if (eff_unroll_kp) {
                     opts.defines.push_back("MOE_UNROLL_KP=1");
                 }
             }
-            if (no_k128) {
+            if (eff_k_pairs == 1u) {
                 opts.defines.push_back("MOE_K_PAIRS=1");
             }
             if (eff_pad != 2) {
@@ -490,12 +505,14 @@ static const agx_kernel * get_moe_exec_kernel(agx_moe_runner *  r,
         }
         opts.is_hot_kernel     = true;
         opts.strict_zero_spill = true;
-        const std::string prefix = (stage == 2u || stage == 3u) ? "fused_moe_w10_s" : "fused_moe_s";
+        const std::string prefix = (stage == 2u || stage == 3u) ? "fused_moe_w11c_s" : "fused_moe_s";
         const std::string kname = prefix + std::to_string(stage)
                                 + "_w" + std::to_string(wm)
                                 + (stage <= 1u ? ("_b" + std::to_string(bcap)) : "")
                                 + (tslot == 3u ? "_m8" : (tslot == 1u ? "_m48" : (tslot == 2u ? "_m64" : "")))
                                 + ((stage == 2u || stage == 3u) && eff_sgs == 4u && tslot == 0u ? "_sg4" : "")
+                                + ((stage == 2u || stage == 3u) && eff_k_pairs == 1u ? "_kp1" : "")
+                                + ((stage == 2u || stage == 3u) && !eff_pair_swiz && eff_tile_m >= 16u ? "_nosw" : "")
                                 + (use_f32 ? "_f32" : "")
                                 + (use_if16 ? "_if16" : "")
                                 + (use_xf16 ? "_xf16" : "")
