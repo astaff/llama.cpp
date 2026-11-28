@@ -2021,6 +2021,64 @@ void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatc
     ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
 }
 
+void llama_kv_cache::set_input_rel_pos_pack(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t n_kv, uint32_t n_stream_ub) const {
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    const uint32_t n_tokens = ubatch->n_tokens;
+    GGML_ASSERT(n_stream_ub > 0 && n_tokens % n_stream_ub == 0);
+    const uint32_t n_tps     = n_tokens / n_stream_ub;
+    const uint32_t n_tiles64 = (n_kv + 63u) / 64u;
+    const size_t   total_i32 = (size_t)n_stream_ub * n_kv + n_tokens + (size_t)n_stream_ub * n_tiles64 * 2u;
+    GGML_ASSERT((size_t)dst->ne[0] == total_i32);
+
+    const bool direct_host = dst->buffer && ggml_backend_buffer_is_host(dst->buffer);
+    int32_t * out = nullptr;
+    if (direct_host) {
+        out = (int32_t *)dst->data;
+    } else {
+        rel_pos_buf.resize(total_i32);
+        out = rel_pos_buf.data();
+    }
+    int32_t * cell_pos = out;
+    int32_t * q_pos    = out + (size_t)n_stream_ub * n_kv;
+    int32_t * t_minmax = q_pos + n_tokens;
+
+    constexpr int32_t POS_EMPTY_CELL = -1073741824;
+    constexpr int32_t POS_INF_MIN    =  1073741824;
+
+    for (uint32_t s = 0; s < n_stream_ub; ++s) {
+        const uint32_t strm = seq_to_stream.at(ubatch->seq_id[s * n_tps][0]);
+        const auto & cells  = v_cells.at(strm);
+        int32_t * cp_s      = cell_pos + (size_t)s * n_kv;
+        int32_t * tm_s      = t_minmax + (size_t)s * n_tiles64 * 2u;
+        for (uint32_t b = 0; b < n_tiles64; ++b) {
+            const uint32_t j0 = b * 64u;
+            const uint32_t j1 = std::min(n_kv, j0 + 64u);
+            int32_t bmin = POS_INF_MIN;
+            int32_t bmax = POS_EMPTY_CELL;
+            for (uint32_t j = j0; j < j1; ++j) {
+                if (cells.is_empty(j)) {
+                    cp_s[j] = POS_EMPTY_CELL;
+                } else {
+                    const int32_t p = (int32_t)cells.pos_get(j);
+                    cp_s[j] = p;
+                    if (p < bmin) bmin = p;
+                    if (p > bmax) bmax = p;
+                }
+            }
+            tm_s[b * 2u + 0u] = bmin;
+            tm_s[b * 2u + 1u] = bmax;
+        }
+        for (uint32_t ii = 0; ii < n_tps; ++ii) {
+            const uint32_t i = s * n_tps + ii;
+            GGML_ASSERT(seq_to_stream.at(ubatch->seq_id[i][0]) == strm);
+            q_pos[i] = (int32_t)ubatch->pos[i];
+        }
+    }
+    if (!direct_host) {
+        ggml_backend_tensor_set(dst, out, 0, total_i32 * sizeof(int32_t));
+    }
+}
+
 void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
     const uint32_t n_tokens = ubatch.n_tokens;
 
@@ -3126,6 +3184,10 @@ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama
 
 void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
     kv->set_input_relative_pos(dst, ubatch, extent);
+}
+
+void llama_kv_cache_context::set_input_rel_pos_pack(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t n_stream_ub) const {
+    kv->set_input_rel_pos_pack(dst, ubatch, n_kv, n_stream_ub);
 }
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {

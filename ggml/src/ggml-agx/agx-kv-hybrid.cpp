@@ -168,8 +168,16 @@ struct agx_push_full_attn {
     float    logit_softcap;
     float    m0;
     float    m1;
+
+    uint64_t rel_pos_pack_va;
+    uint32_t rel_table_len;
+    uint32_t rel_cp_off;
+    uint32_t rel_qp_off;
+    uint32_t rel_tm_off;
+    uint32_t _pad0;
+    uint32_t _pad1;
 };
-static_assert(sizeof(agx_push_full_attn) == 192, "agx_push_full_attn must match GLSL PushAttn (192B)");
+static_assert(sizeof(agx_push_full_attn) == 224, "agx_push_full_attn must match GLSL PushAttn (224B)");
 
 struct agx_push_kv_append {
     uint64_t k_src_va;
@@ -290,7 +298,7 @@ static const agx_kernel * get_full_phase1_kernel(agx_kv_hybrid_pool * pool,
         opts.defines.push_back("N_SG=4");
         opts.is_hot_kernel     = true;
         opts.strict_zero_spill = true;
-        const std::string name = "fused_full_flash_decode_p1_d" + std::to_string(head_dim)
+        const std::string name = "fused_full_flash_decode_p1w9_d" + std::to_string(head_dim)
                                + "_k" + std::to_string(ik) + "_v" + std::to_string(iv);
         pool->k_full_phase1[hs][ik][iv] = agx_compiler_compile_file(
             pool->compiler, name.c_str(), "fused_full_flash_decode.comp", opts);
@@ -309,7 +317,7 @@ static const agx_kernel * get_full_phase2_kernel(agx_kv_hybrid_pool * pool, uint
         opts.defines.push_back("HEAD_DIM=" + std::to_string(head_dim));
         opts.is_hot_kernel     = true;
         opts.strict_zero_spill = true;
-        const std::string name = "fused_full_flash_decode_p2_d" + std::to_string(head_dim);
+        const std::string name = "fused_full_flash_decode_p2w9_d" + std::to_string(head_dim);
         pool->k_full_phase2[hs] = agx_compiler_compile_file(
             pool->compiler, name.c_str(), "fused_full_flash_decode.comp", opts);
     }
@@ -330,10 +338,10 @@ static const agx_kernel * get_full_prefill_kernel(agx_kv_hybrid_pool * pool,
         opts.defines.push_back("HEAD_DIM=128");
         opts.defines.push_back("KV_DTYPE_K=" + std::to_string(ik));
         opts.defines.push_back("KV_DTYPE_V=" + std::to_string(iv));
-        opts.defines.push_back("N_SG=4");
+        opts.defines.push_back("N_SG=8");
         opts.is_hot_kernel     = true;
         opts.strict_zero_spill = true;
-        const std::string name = "fused_full_flash_prefill_d128_k" + std::to_string(ik)
+        const std::string name = "fused_full_flash_prefill_w9_d128_k" + std::to_string(ik)
                                + "_v" + std::to_string(iv);
         pool->k_full_prefill[ik][iv] = agx_compiler_compile_file(
             pool->compiler, name.c_str(), "fused_full_flash_decode.comp", opts);
@@ -357,7 +365,7 @@ static const agx_kernel * get_full_prefill_m8_kernel(agx_kv_hybrid_pool * pool,
         opts.defines.push_back("KV_DTYPE_V=" + std::to_string(iv));
         opts.is_hot_kernel     = true;
         opts.strict_zero_spill = true;
-        const std::string name = "fused_full_flash_m8_d128_k" + std::to_string(ik)
+        const std::string name = "fused_full_flash_m8w9_d128_k" + std::to_string(ik)
                                + "_v" + std::to_string(iv);
         pool->k_full_prefill_m8[ik][iv] = agx_compiler_compile_file(
             pool->compiler, name.c_str(), "fused_full_flash_decode.comp", opts);
@@ -810,6 +818,11 @@ bool agx_kv_hybrid_dispatch_full_attn(agx_kv_hybrid_pool *        pool,
     pc.logit_softcap    = args.logit_softcap;
     pc.m0               = m0;
     pc.m1               = m1;
+    pc.rel_pos_pack_va  = args.rel_pos_pack_va;
+    pc.rel_table_len    = args.rel_table_len;
+    pc.rel_cp_off       = args.rel_cp_off;
+    pc.rel_qp_off       = args.rel_qp_off;
+    pc.rel_tm_off       = args.rel_tm_off;
 
     if (is_paged) {
         pc.k_or_pt_va    = agx_kv_hybrid_full_page_table_va(pool, args.logical_slot);
@@ -829,39 +842,64 @@ bool agx_kv_hybrid_dispatch_full_attn(agx_kv_hybrid_pool *        pool,
         pc.ext_mask_ne2  = args.ext_mask_ne2 ? args.ext_mask_ne2 : 1u;
     }
 
-    // Tiled Multi-Q 8x8 FP16 Coopmat Prefill fastpath (32 Q/WG, 16 KV/tile, FP32 online softmax + causal/SWA skip!)
-    // Triggers for non-paged D=128 prefill with F16/F8_E4M3/Q8_0 KV (preserves full F32 accuracy for F32 KV).
-    if (!is_paged && args.head_dim == 128u && args.n_tokens >= 16u && args.n_kv >= 32u &&
+    static const bool disable_p3 = []() {
+        const char * e = std::getenv("GGML_AGX_FA_P3_DISABLE");
+        return e && std::atoi(e) != 0;
+    }();
+    static const uint32_t pf4_split_min_kv = []() {
+        const char * e = std::getenv("GGML_AGX_PF4_SPLIT_MIN_KV");
+        if (e && *e) {
+            int v = std::atoi(e);
+            if (v > 0) return static_cast<uint32_t>(v);
+        }
+        return 128u;
+    }();
+    auto compute_pf4_splits = [&](uint32_t n_kv_v, uint32_t n_hq_v, uint32_t n_tok_v) -> uint32_t {
+        if (n_kv_v < pf4_split_min_kv) {
+            return 1u;
+        }
+        const uint32_t gy       = (n_tok_v + 7u) / 8u;
+        const uint32_t base_wgs = std::max<uint32_t>(1u, n_hq_v * gy);
+        const uint32_t max_by_kv = std::max<uint32_t>(1u, (n_kv_v + 63u) / 64u);
+        uint32_t sp = 1u;
+        if (n_kv_v <= 512u) {
+            sp = (base_wgs >= 40u) ? 1u : 2u;
+        } else if (n_kv_v <= 2048u) {
+            sp = (base_wgs >= 80u) ? 2u : 4u;
+        } else {
+            const uint32_t want = (base_wgs >= 160u) ? 1u : ((160u + base_wgs - 1u) / base_wgs);
+            sp = std::max<uint32_t>(want, (n_kv_v + 255u) / 256u);
+        }
+        sp = std::min<uint32_t>(sp, max_by_kv);
+        sp = std::min<uint32_t>(sp, AGX_KV_MAX_SPLITS);
+        return std::max<uint32_t>(1u, sp);
+    };
+
+    // Wave 9 Lean 8-SG Br=16 Bc=64 Zero-K/V-SRAM Coopmat Prefill fastpath
+    // (10.5 KB SRAM -> 3 WGs/core = 24 SGs/core, <= 64 GPR32, 2 barriers/64 KV, native O(n_kv) banded rel-bias!)
+    if (!disable_p3 && !is_paged && args.head_dim == 128u && args.n_tokens >= 16u && args.n_kv >= 32u &&
         k_dt != AGX_KV_F32 && v_dt != AGX_KV_F32 &&
+        k_dt != AGX_KV_Q8_0_PLANAR && v_dt != AGX_KV_Q8_0_PLANAR &&
         (args.flags & (AGX_ATTN_FLAG_CAUSAL | AGX_ATTN_FLAG_HAS_REL_TABLE)) == 0u) {
         const agx_kernel * k_pf = get_full_prefill_kernel(pool, k_dt, v_dt);
         if (k_pf) {
             pc.n_splits   = 1u;
             pc.partial_va = ((args.flags & AGX_ATTN_FLAG_KV_BOUNDS) != 0u) ? args.kv_bounds_va : 0ull;
-            const uint32_t grid_y = (args.n_tokens + 31u) / 32u;
+            const uint32_t grid_y = (args.n_tokens + 15u) / 16u;
             return agx_cdm_dispatch(stream, k_pf, args.n_head_q, grid_y, 1u,
                                     &pc, sizeof(pc), post_barrier);
         }
     }
 
-    // DSpark M=2..15 Split-K 8x8 FP16 Coopmat fastpath (1 sg = 8 Q/WG, 8x KV reuse, 0 WG barriers!)
-    // Eliminates 8x redundant KV DRAM loads during speculative verify (M=5..8)!
+    // DSpark M=2..15 Split-K 8x8 FP16 Coopmat fastpath (2 SGs = 8 Q/WG, 8x KV reuse, banded rel-bias!)
     if (!is_paged && args.head_dim == 128u && args.n_tokens >= 2u && args.n_tokens < 16u &&
         args.n_kv >= 32u && k_dt != AGX_KV_F32 && v_dt != AGX_KV_F32 &&
+        k_dt != AGX_KV_Q8_0_PLANAR && v_dt != AGX_KV_Q8_0_PLANAR &&
         (args.flags & (AGX_ATTN_FLAG_CAUSAL | AGX_ATTN_FLAG_HAS_REL_TABLE)) == 0u) {
         const agx_kernel * k_pf4 = get_full_prefill_m8_kernel(pool, k_dt, v_dt);
         if (k_pf4) {
-            const uint32_t grid_y   = (args.n_tokens + 7u) / 8u;
-            const uint32_t base_wgs = std::max<uint32_t>(1u, args.n_head_q * grid_y);
-            uint32_t pf4_splits = 1u;
-            if (args.n_kv > 512u) {
-                const uint32_t max_by_kv = std::max<uint32_t>(1u, (args.n_kv + 63u) / 64u);
-                const uint32_t want      = (base_wgs >= 160u) ? 1u : ((160u + base_wgs - 1u) / base_wgs);
-                pf4_splits = std::max<uint32_t>(want, (args.n_kv + 255u) / 256u);
-                pf4_splits = std::min<uint32_t>(pf4_splits, max_by_kv);
-                pf4_splits = std::min<uint32_t>(pf4_splits, AGX_KV_MAX_SPLITS);
-                pf4_splits = std::max<uint32_t>(1u, pf4_splits);
-            }
+            const uint32_t grid_y     = (args.n_tokens + 7u) / 8u;
+            const uint32_t pf4_splits = compute_pf4_splits(args.n_kv, args.n_head_q, args.n_tokens);
             if (pf4_splits == 1u) {
                 pc.n_splits   = 1u;
                 pc.partial_va = 0;
@@ -963,14 +1001,36 @@ bool agx_kv_hybrid_supports_ggml_flash_attn(const struct ggml_tensor * dst) {
     const ggml_tensor * k     = dst->src[1]; // [D, KV, Hkv, B]
     const ggml_tensor * v     = dst->src[2]; // [D, KV, Hkv, B]
     const ggml_tensor * mask  = dst->src[3]; // optional [KV, N, Hmask, B]
-    const ggml_tensor * sinks = dst->src[4]; // optional [Hq]
+    const ggml_tensor * sinks = dst->src[4]; // optional [Hq] or [Hq, N*B]
 
     if (!q || !k || !v) {
         return false;
     }
-    // Reject sparse kv_rows / bias_table / bias_indices extensions not implemented on GPU
-    if (dst->src[5] || dst->src[6] || dst->src[7]) {
+    // Reject sparse kv_rows; accept src[6]/src[7] ONLY for banded relative-position bias (op_params[5] == 2)
+    if (dst->src[5]) {
         return false;
+    }
+    const bool has_banded = ggml_flash_attn_ext_has_banded_rel_bias(dst);
+    if (!has_banded && (dst->src[6] || dst->src[7])) {
+        return false;
+    }
+    if (has_banded) {
+        const ggml_tensor * rtab = dst->src[6];
+        const ggml_tensor * rpos = dst->src[7];
+        const int32_t extent     = dst->op_params[6];
+        if (!rtab || !rpos || !mask || extent <= 0 || extent > 65535) {
+            return false;
+        }
+        if (rtab->type != GGML_TYPE_F32 || !ggml_is_contiguous(rtab) ||
+            rtab->ne[0] <= 0 || rtab->ne[0] > 65535 ||
+            rtab->ne[1] != q->ne[2] || rtab->ne[2] != q->ne[1] * q->ne[3] || rtab->ne[3] != 1) {
+            return false;
+        }
+        const int64_t n_tiles64 = (k->ne[1] + 63) / 64;
+        const int64_t req_pos   = q->ne[3] * k->ne[1] + q->ne[1] * q->ne[3] + q->ne[3] * n_tiles64 * 2;
+        if (rpos->type != GGML_TYPE_I32 || !ggml_is_contiguous(rpos) || rpos->ne[0] < req_pos) {
+            return false;
+        }
     }
     if (q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return false;
@@ -1005,8 +1065,16 @@ bool agx_kv_hybrid_supports_ggml_flash_attn(const struct ggml_tensor * dst) {
             return false;
         }
     }
-    if (sinks && (sinks->type != GGML_TYPE_F32 || !ggml_is_contiguous(sinks))) {
-        return false;
+    if (sinks) {
+        if (sinks->type != GGML_TYPE_F32 || !ggml_is_contiguous(sinks) || sinks->ne[0] != q->ne[2]) {
+            return false;
+        }
+        if (sinks->ne[1] != 1 && sinks->ne[1] != q->ne[1] * q->ne[3]) {
+            return false;
+        }
+        if (sinks->ne[2] != 1 || sinks->ne[3] != 1) {
+            return false;
+        }
     }
     return true;
 }
@@ -1026,12 +1094,34 @@ bool agx_kv_hybrid_ggml_flash_attn_uses_scratch(const struct ggml_tensor * dst) 
     const uint32_t n_tokens = static_cast<uint32_t>(q->ne[1]);
     const uint32_t n_kv     = static_cast<uint32_t>(k->ne[1]);
     const uint32_t n_head_q = static_cast<uint32_t>(q->ne[2]);
-    if (head_dim == 128u && n_tokens >= 16u && n_kv >= 32u && k_dt != AGX_KV_F32 && v_dt != AGX_KV_F32) {
+    static const bool disable_p3 = []() {
+        const char * e = std::getenv("GGML_AGX_FA_P3_DISABLE");
+        return e && std::atoi(e) != 0;
+    }();
+    static const uint32_t pf4_split_min_kv = []() {
+        const char * e = std::getenv("GGML_AGX_PF4_SPLIT_MIN_KV");
+        if (e && *e) {
+            int v = std::atoi(e);
+            if (v > 0) return static_cast<uint32_t>(v);
+        }
+        return 128u;
+    }();
+    if (!disable_p3 && head_dim == 128u && n_tokens >= 16u && n_kv >= 32u &&
+        k_dt != AGX_KV_F32 && v_dt != AGX_KV_F32 &&
+        k_dt != AGX_KV_Q8_0_PLANAR && v_dt != AGX_KV_Q8_0_PLANAR) {
         return false; // PASS_MODE=3 single-pass coopmat prefill never uses split_partial_bo
     }
-    if (head_dim == 128u && n_tokens >= 2u && n_tokens < 16u && n_kv >= 32u && n_kv <= 512u &&
-        k_dt != AGX_KV_F32 && v_dt != AGX_KV_F32) {
-        return false; // PASS_MODE=4 pf4_splits == 1
+    if (head_dim == 128u && n_tokens >= 2u && n_tokens < 16u && n_kv >= 32u &&
+        k_dt != AGX_KV_F32 && v_dt != AGX_KV_F32 &&
+        k_dt != AGX_KV_Q8_0_PLANAR && v_dt != AGX_KV_Q8_0_PLANAR) {
+        if (n_kv < pf4_split_min_kv) {
+            return false; // PASS_MODE=4 pf4_splits == 1
+        }
+        const uint32_t gy = (n_tokens + 7u) / 8u;
+        if (n_kv <= 512u && n_head_q * gy >= 40u) {
+            return false;
+        }
+        return true; // PASS_MODE=4 split-K uses split_partial_bo
     }
     return choose_flash_decode_splits(n_kv, n_head_q, n_tokens) > 1u;
 }
@@ -1048,7 +1138,10 @@ bool agx_kv_hybrid_dispatch_ggml_flash_attn_ext(agx_kv_hybrid_pool *            
     const ggml_tensor * k     = dst->src[1]; // [D, KV, Hkv, B]
     const ggml_tensor * v     = dst->src[2]; // [D, KV, Hkv, B]
     const ggml_tensor * mask  = dst->src[3]; // optional [KV, N, Hmask, B]
-    const ggml_tensor * sinks = dst->src[4]; // optional [Hq]
+    const ggml_tensor * sinks = dst->src[4]; // optional [Hq] or [Hq, N*B]
+    const bool has_banded     = ggml_flash_attn_ext_has_banded_rel_bias(dst);
+    const ggml_tensor * rtab  = has_banded ? dst->src[6] : nullptr;
+    const ggml_tensor * rpos  = has_banded ? dst->src[7] : nullptr;
 
     agx_kv_dtype k_dt = AGX_KV_F16;
     agx_kv_dtype v_dt = AGX_KV_F16;
@@ -1067,14 +1160,20 @@ bool agx_kv_hybrid_dispatch_ggml_flash_attn_ext(agx_kv_hybrid_pool *            
     const uint64_t out_nb3      = (epi && epi->out_va && epi->out_nb3) ? epi->out_nb3 : static_cast<uint64_t>(dst->nb[3]);
     const uint64_t base_mask_va = mask  ? agx_tensor_gpu_va(mask)  : 0;
     const uint64_t sinks_va     = sinks ? agx_tensor_gpu_va(sinks) : 0;
+    const uint64_t base_rtab_va = rtab  ? agx_tensor_gpu_va(rtab)  : 0;
+    const uint64_t base_rpos_va = rpos  ? agx_tensor_gpu_va(rpos)  : 0;
 
-    if (!base_q_va || !base_k_va || !base_v_va || !base_out_va || (mask && !base_mask_va) || (sinks && !sinks_va)) {
+    if (!base_q_va || !base_k_va || !base_v_va || !base_out_va || (mask && !base_mask_va) ||
+        (sinks && !sinks_va) || (has_banded && (!base_rtab_va || !base_rpos_va))) {
         return false;
     }
 
-    const int64_t B   = q->ne[3];
-    const int64_t rk3 = q->ne[3] / k->ne[3];
-    const int64_t rv3 = q->ne[3] / v->ne[3];
+    const int64_t  B          = q->ne[3];
+    const int64_t  rk3        = q->ne[3] / k->ne[3];
+    const int64_t  rv3        = q->ne[3] / v->ne[3];
+    const uint32_t n_tiles64  = static_cast<uint32_t>((k->ne[1] + 63) / 64);
+    const uint32_t rel_extent = has_banded ? static_cast<uint32_t>(dst->op_params[6]) : 0u;
+    const uint32_t rel_t_len  = rtab ? static_cast<uint32_t>(rtab->ne[0]) : 0u;
 
     for (int64_t b = 0; b < B; ++b) {
         agx_attn_stage_args args = {};
@@ -1119,8 +1218,23 @@ bool agx_kv_hybrid_dispatch_ggml_flash_attn_ext(agx_kv_hybrid_pool *            
             args.flags       |= (mask->type == GGML_TYPE_F16) ? AGX_ATTN_FLAG_HAS_MASK_F16 : AGX_ATTN_FLAG_HAS_MASK_F32;
         }
         if (sinks) {
-            args.sinks_va = sinks_va;
-            args.flags   |= AGX_ATTN_FLAG_SINK_PER_HEAD;
+            if (sinks->ne[1] > 1) {
+                args.sinks_va = sinks_va + static_cast<uint64_t>(b * q->ne[1] * q->ne[2]) * sizeof(float);
+                args.flags   |= AGX_ATTN_FLAG_SINK_PER_TOK_HEAD;
+            } else {
+                args.sinks_va = sinks_va;
+                args.flags   |= AGX_ATTN_FLAG_SINK_PER_HEAD;
+            }
+        }
+        if (has_banded) {
+            args.flags           |= AGX_ATTN_FLAG_BANDED_REL_BIAS;
+            args.n_rel_extent     = rel_extent;
+            args.rel_table_len    = rel_t_len;
+            args.rel_table_va     = base_rtab_va + static_cast<uint64_t>(b * q->ne[1] * q->ne[2] * rtab->ne[0]) * sizeof(float);
+            args.rel_pos_pack_va  = base_rpos_va;
+            args.rel_cp_off       = static_cast<uint32_t>(b * k->ne[1]);
+            args.rel_qp_off       = static_cast<uint32_t>(B * k->ne[1] + b * q->ne[1]);
+            args.rel_tm_off       = static_cast<uint32_t>(B * k->ne[1] + B * q->ne[1] + b * n_tiles64 * 2u);
         }
 
         const agx_barrier_mode b_bar = (b + 1 == B) ? post_barrier : AGX_BARRIER_NONE;

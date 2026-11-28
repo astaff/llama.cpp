@@ -60,6 +60,7 @@ enum agx_attn_flags : uint32_t {
     AGX_ATTN_FLAG_Q_F16             = 1u << 15,// Q input is F16 instead of F32
     AGX_ATTN_FLAG_OUT_F16           = 1u << 16,// attn_out is F16 instead of F32
     AGX_ATTN_FLAG_KV_BOUNDS         = 1u << 17,// partial_va holds uvec2[n_q_tiles] [kv_beg, kv_end) in PASS_MODE=3
+    AGX_ATTN_FLAG_BANDED_REL_BIAS   = 1u << 18,// O(n_kv) banded rel_table [M,Hq,eff_rows] + rel_pos_pack [cell_pos|q_pos|tile64_minmax]
 };
 
 struct agx_kv_hybrid_config {
@@ -170,6 +171,11 @@ struct agx_attn_stage_args {
     uint32_t     q_nb1;             // optional Q token byte stride (0 -> n_head_q * head_dim * elem)
     uint32_t     q_nb2;             // optional Q head byte stride  (0 -> head_dim * elem)
     uint64_t     kv_bounds_va;      // optional uvec2[n_q_tiles] active [kv_beg, kv_end) bounds (PASS_MODE=3)
+    uint64_t     rel_pos_pack_va;   // optional packed I32 [cell_pos | q_pos | tile64_minmax]
+    uint32_t     rel_table_len;     // eff_rows of rel_table (<= n_rel_extent)
+    uint32_t     rel_cp_off;        // I32 offset to cell_pos for this batch
+    uint32_t     rel_qp_off;        // I32 offset to q_pos for this batch
+    uint32_t     rel_tm_off;        // I32 offset to tile64_minmax for this batch
 };
 
 // Dispatch fused SWA-1024 ring attention (single-wave 40-core, zero split-K reduce).

@@ -2834,10 +2834,10 @@ shared uint s_bits[4][8];
 
 void main() {
     const uint q_tile = gl_WorkGroupID.x;
-    const uint q0     = q_tile * 32u;
+    const uint q0     = q_tile * 16u;
     const uint tid    = gl_LocalInvocationID.x;
-    const uint ql     = tid >> 2u;       // 0..31
-    const uint kl4    = (tid & 3u) * 4u; // 0, 4, 8, 12
+    const uint ql     = tid >> 3u;       // 0..15 (matches Wave 9 PASS_MODE=3 PF_BR=16!)
+    const uint kl4    = (tid & 7u) * 4u; // 0, 4, 8, 12, 16, 20, 24, 28 (32 KV/iter)
 
     uint my_min = 0xFFFFFFFFu;
     uint my_max = 0u;
@@ -2847,14 +2847,14 @@ void main() {
         const uint64_t rva  = pc.mask_va + uint64_t(q0 + ql) * uint64_t(pc.mask_nb1);
         const bool vec_f16  = (pc.is_f16 != 0u) && ((pc.mask_va & 7ul) == 0ul) && ((pc.mask_nb1 & 7u) == 0u);
         const bool vec_f32  = (pc.is_f16 == 0u) && ((pc.mask_va & 15ul) == 0ul) && ((pc.mask_nb1 & 15u) == 0u);
-        for (uint kv0 = 0u; kv0 < pc.n_kv; kv0 += 16u) {
+        for (uint kv0 = 0u; kv0 < pc.n_kv; kv0 += 32u) {
             const uint rem = pc.n_kv - kv0;
             bool ok = false;
-            if (rem >= 16u && vec_f16) {
+            if (rem >= 32u && vec_f16) {
                 uvec2 p = ConstBufUvec2(rva + uint64_t(kv0 + kl4) * 2ul).v[0];
                 vec4 mv = vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y));
                 ok = (mv.x > -1.0e30) || (mv.y > -1.0e30) || (mv.z > -1.0e30) || (mv.w > -1.0e30);
-            } else if (rem >= 16u && vec_f32) {
+            } else if (rem >= 32u && vec_f32) {
                 vec4 mv = ConstBufVec4(rva + uint64_t(kv0 + kl4) * 4ul).v[0];
                 ok = (mv.x > -1.0e30) || (mv.y > -1.0e30) || (mv.z > -1.0e30) || (mv.w > -1.0e30);
             } else {
@@ -2868,10 +2868,10 @@ void main() {
             }
             if (ok) {
                 my_min = min(my_min, kv0);
-                my_max = max(my_max, min(kv0 + 16u, pc.n_kv));
-                const uint t_idx = kv0 >> 4u;
-                if (t_idx < 256u) {
-                    my_bits[t_idx >> 5u] |= (1u << (t_idx & 31u));
+                my_max = max(my_max, min(kv0 + 32u, pc.n_kv));
+                const uint t64 = kv0 >> 6u;
+                if (t64 < 256u) {
+                    my_bits[t64 >> 5u] |= (1u << (t64 & 31u));
                 }
             }
         }
@@ -2898,15 +2898,15 @@ void main() {
         if (gmin >= gmax) {
             gmin = pc.n_kv;
             gmax = 0u;
-        } else if (pc.n_kv <= 4096u) {
+        } else if (pc.n_kv <= 16384u) {
             uint valid_cnt = 0u;
             for (uint w = 0u; w < 8u; ++w) {
                 uint u = s_bits[0][w] | s_bits[1][w] | s_bits[2][w] | s_bits[3][w];
                 valid_cnt += uint(bitCount(u));
             }
-            const uint span_tiles = ((gmax + 15u) >> 4u) - (gmin >> 4u);
+            const uint span_tiles = ((gmax + 63u) >> 6u) - (gmin >> 6u);
             if (valid_cnt == span_tiles) {
-                gmax |= 0x80000000u; // contiguous active span (zero -INF hole tiles!)
+                gmax |= 0x80000000u; // contiguous active 64-KV span (zero -INF hole tiles!)
             }
         }
         BufUvec2W(pc.bounds_va).v[q_tile] = uvec2(gmin, gmax);
@@ -3157,7 +3157,7 @@ void main() {
     uint bnd_beg = 0u;
     uint bnd_end = pc.n_kv;
     if (pc.bounds_va != 0ul) {
-        uvec2 bnd = ConstBufUvec2(pc.bounds_va).v[tok >> 5u];
+        uvec2 bnd = ConstBufUvec2(pc.bounds_va).v[tok >> 4u];
         bnd_beg = bnd.x;
         bnd_end = bnd.y & 0x7FFFFFFFu;
         const uint wg_span = ((pc.flags & 4u) != 0u) ? 512u : 128u;
@@ -3436,7 +3436,7 @@ struct agx_exec_item {
     struct ggml_tensor * node               = nullptr;
     uint32_t             gx = 1, gy = 1, gz = 1;
     uint32_t             nodes_covered      = 1;
-    agx_va_range         reads[8]           = {};
+    agx_va_range         reads[12]          = {};
     uint8_t              n_reads            = 0;
     agx_va_range         writes[4]          = {};
     uint8_t              n_writes           = 0;
@@ -3459,7 +3459,7 @@ struct agx_exec_item {
     uint8_t                 alias_flags      = 0; // item-specific alias trampoline bitmask
 
     void add_read(agx_va_range r) {
-        if (r.beg < r.end && n_reads < 8u) reads[n_reads++] = r;
+        if (r.beg < r.end && n_reads < 12u) reads[n_reads++] = r;
     }
     void add_write(agx_va_range w) {
         if (w.beg < w.end && n_writes < 4u) writes[n_writes++] = w;
@@ -3510,6 +3510,8 @@ struct agx_graph_exec_state {
     size_t                      fa_bounds_cap_B = 0;
     agx_bo *                    redirect_tmp_bo = nullptr;
     size_t                      redirect_tmp_cap_B = 0;
+    agx_bo *                    ctrl_pipe_bo   = nullptr;
+    size_t                      ctrl_pipe_cap_B = 0;
     agx_graph_exec_stats        stats          = {};
     bool                        initialized    = false;
 };
@@ -3545,8 +3547,8 @@ static agx_graph_exec_state * get_exec_state(agx_backend_context * ctx) {
         st->k_full_shortconv       = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_full_shortconv",       k_glsl_full_shortconv,       opts);
         st->k_sconv_prep_store     = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_sconv_prep_store",     k_glsl_sconv_prep_store,     opts);
         st->k_router_topk_norm     = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_router_topk_norm",     k_glsl_router_topk_norm,     opts);
-        st->k_rel_bias_gather      = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_rel_bias_gather",      k_glsl_rel_bias_gather,      opts);
-        st->k_fa_mask_bounds       = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_fa_mask_bounds",       k_glsl_fa_mask_bounds,       opts);
+        st->k_rel_bias_gather      = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_rel_bias_gather_w9",   k_glsl_rel_bias_gather,      opts);
+        st->k_fa_mask_bounds       = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_fa_mask_bounds_w9",    k_glsl_fa_mask_bounds,       opts);
         st->initialized            = (st->k_bin_op && st->k_unary_op && st->k_cpy_cast && st->k_row_reduce &&
                                       st->k_softmax && st->k_get_rows && st->k_set_rows && st->k_concat_pad &&
                                       st->k_ssm_conv && st->k_rope && st->k_topk_argsort && st->k_glu &&
@@ -3844,6 +3846,11 @@ void agx_graph_exec_cleanup(agx_backend_context * ctx) {
             st->redirect_tmp_bo = nullptr;
             st->redirect_tmp_cap_B = 0;
         }
+        if (st->ctrl_pipe_bo) {
+            agx_bo_free(ctx->drm, st->ctrl_pipe_bo);
+            st->ctrl_pipe_bo = nullptr;
+            st->ctrl_pipe_cap_B = 0;
+        }
         delete st;
         ctx->graph_exec_state = nullptr;
     }
@@ -3932,9 +3939,10 @@ static bool can_gemm_redirect(const struct ggml_tensor * dst) {
 static bool dispatch_gemm_to_va(agx_backend_context *      ctx,
                                 agx_cdm_stream *           stream,
                                 const struct ggml_tensor * dst,
-                                uint64_t                   out_va,
+                                uint64_t                   out_va_override,
+                                uint64_t                   x_va_override,
                                 agx_barrier_mode           post_barrier) {
-    if (!can_gemm_redirect(dst) || out_va == 0ull) {
+    if (!can_gemm_redirect(dst) || (out_va_override == 0ull && x_va_override == 0ull)) {
         return false;
     }
     const struct ggml_tensor * src0 = dst->src[0];
@@ -3943,9 +3951,10 @@ static bool dispatch_gemm_to_va(agx_backend_context *      ctx,
     if (!agx_gemm_infer_weight_layout(src0, &layout)) {
         return false;
     }
-    const uint64_t w_va = agx_tensor_gpu_va(src0);
-    const uint64_t x_va = agx_tensor_gpu_va(src1);
-    if (w_va == 0ull || x_va == 0ull) {
+    const uint64_t w_va   = agx_tensor_gpu_va(src0);
+    const uint64_t x_va   = (x_va_override   != 0ull) ? x_va_override   : agx_tensor_gpu_va(src1);
+    const uint64_t out_va = (out_va_override != 0ull) ? out_va_override : agx_tensor_gpu_va(dst);
+    if (w_va == 0ull || x_va == 0ull || out_va == 0ull) {
         return false;
     }
     const int64_t K    = src0->ne[0];
@@ -4046,6 +4055,10 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                                      std::getenv("GGML_AGX_NO_REL_SKIP")[0] == '1');
     const bool no_redirect        = (std::getenv("GGML_AGX_NO_REDIRECT") != nullptr &&
                                      std::getenv("GGML_AGX_NO_REDIRECT")[0] == '1');
+    const bool no_ctrl_pipe       = (std::getenv("GGML_AGX_NO_CTRL_PIPE") != nullptr &&
+                                     std::getenv("GGML_AGX_NO_CTRL_PIPE")[0] == '1');
+    const bool no_weak_war        = (std::getenv("GGML_AGX_NO_WEAK_WAR") != nullptr &&
+                                     std::getenv("GGML_AGX_NO_WEAK_WAR")[0] == '1');
     const bool print_stats    = (std::getenv("GGML_AGX_STATS") != nullptr &&
                                  std::getenv("GGML_AGX_STATS")[0] == '1');
     uint32_t fusion_mask     = no_fusion ? 0u : 0xFFFFFFFFu;
@@ -4383,12 +4396,12 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
     uint64_t g_mix = 0, g_moe_wsum = 0, g_ssm_res = 0, g_moe_norm = 0;
     uint64_t g_prep_store = 0, g_full_sconv = 0, g_router = 0, g_rel_bias = 0, g_cont_abs = 0, g_fused_moe = 0;
     uint64_t g_sprep = 0, g_fa_epi = 0, g_mix_rms = 0, g_rel_bskip = 0;
-    uint64_t g_ctrl_ovlp = 0, g_redir = 0;
+    uint64_t g_ctrl_ovlp = 0, g_redir = 0, g_ctrl_pipe = 0, g_wfi_bar = 0;
     std::vector<uint8_t> alias_scratch_locked(n_exec, 0u);
     std::vector<agx_exec_item> pre_items;
 
-    // 4-slot SLC-writeback zero-copy GEMM/MoE output redirect pool:
-    // Eliminates gallocr VA-reuse fusion blocks on faepi (wqkv_gate), control() W_gain overlap,
+    // 4-slot SLC-writeback zero-copy GEMM/MoE/FA output redirect pool:
+    // Eliminates gallocr VA-reuse fusion blocks on faepi (wqkv_gate & tail_n->wo),
     // and post-ShortConv (wo_out / moe_out) alias trampolines without any emit_f32_copy!
     constexpr size_t k_redir_slots = 4u;
     size_t redir_slot_cap_B = 0u;
@@ -4399,9 +4412,10 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
         for (size_t e = 0; e < n_exec; ++e) {
             const struct ggml_tensor * nd = cgraph->nodes[st->exec_nodes[e]];
             if (nd && nd->type == GGML_TYPE_F32 && nd->ne[0] > 0 && nd->ne[0] <= 8192 &&
-                (nd->op == GGML_OP_MUL_MAT || nd->op == GGML_OP_MUL_MAT_ID || nd->op == GGML_OP_ADD)) {
+                (nd->op == GGML_OP_MUL_MAT || nd->op == GGML_OP_MUL_MAT_ID ||
+                 nd->op == GGML_OP_ADD || nd->op == GGML_OP_MUL)) {
                 const size_t nb = ggml_nbytes(nd);
-                if (nb > max_redir_elem_B) max_redir_elem_B = nb;
+                if (nb <= 32u * 1024u * 1024u && nb > max_redir_elem_B) max_redir_elem_B = nb;
             }
         }
         if (max_redir_elem_B > 0u) {
@@ -4424,8 +4438,10 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
         }
     }
 
-    auto try_reserve_redir_slot = [&](size_t e_lo, size_t e_hi, size_t need_B, agx_va_range * out_r) -> bool {
+    auto try_reserve_redir_slot = [&](size_t e_lo, size_t e_hi, size_t need_B,
+                                      agx_va_range * out_r, int * out_slot = nullptr) -> bool {
         *out_r = { 0, 0 };
+        if (out_slot) *out_slot = -1;
         if (no_redirect || !st->redirect_tmp_bo || need_B == 0u || need_B > redir_slot_cap_B ||
             e_lo > e_hi || e_hi >= n_exec) {
             return false;
@@ -4443,11 +4459,69 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                 redir_rr = (s + 1u) % k_redir_slots;
                 const uint64_t bva = st->redirect_tmp_bo->gpu_va + s * redir_slot_cap_B;
                 *out_r = { bva, bva + need_B };
+                if (out_slot) *out_slot = (int) s;
                 return true;
             }
         }
         return false;
     };
+
+    auto unlock_redir_slot = [&](int slot, size_t e_lo, size_t e_hi) {
+        if (slot < 0 || (size_t) slot >= k_redir_slots || e_lo > e_hi || e_hi >= n_exec) return;
+        for (size_t j = e_lo; j <= e_hi; ++j) {
+            redir_slot_locked[(size_t) slot][j] = 0u;
+        }
+    };
+
+    // Wave 9: 3-bank zero-copy scratch BO for Inkling 2 `control()` streams (Fusion 4):
+    // Breaks gallocr VA sharing across the 3 independent Q/K/V `control()` streams per looped layer
+    // so all 3 execute in 4 lockstep waves (3x NORM_CAT -> 3x W_down -> 6x W_fg -> 3x CTRL_MIX),
+    // eliminating up to ~192 strong_usc barriers on pp512/pp2048!
+    constexpr size_t k_ctrl_pipe_banks = 3u;
+    size_t ctrl_n1_B = 0u, ctrl_n2_B = 0u, ctrl_n3_B = 0u, ctrl_n7_B = 0u, ctrl_bank_B = 0u;
+    size_t ctrl_pipe_rr = 0u;
+    if (!no_fusion && !no_ctrl_pipe && !(ctrl_use_sram) && n_exec >= 32u) {
+        size_t n_ctrl_cand = 0u;
+        size_t m1 = 0u, m2 = 0u, m3 = 0u, m7 = 0u;
+        for (size_t e = 0; e + 10u < n_exec; ++e) {
+            const struct ggml_tensor * nd = cgraph->nodes[st->exec_nodes[e]];
+            if (!nd || nd->op != GGML_OP_CONCAT || nd->ne[1] != 2 || nd->ne[3] != 1) continue;
+            const struct ggml_tensor * c1 = cgraph->nodes[st->exec_nodes[e + 1u]];
+            const struct ggml_tensor * c2 = cgraph->nodes[st->exec_nodes[e + 2u]];
+            const struct ggml_tensor * c3 = cgraph->nodes[st->exec_nodes[e + 3u]];
+            const struct ggml_tensor * c7 = cgraph->nodes[st->exec_nodes[e + 7u]];
+            if (c1->op == GGML_OP_RMS_NORM && c2->op == GGML_OP_MUL_MAT &&
+                c3->op == GGML_OP_MUL_MAT && c7->op == GGML_OP_MUL_MAT) {
+                n_ctrl_cand++;
+                m1 = std::max(m1, ggml_nbytes(c1));
+                m2 = std::max(m2, ggml_nbytes(c2));
+                m3 = std::max(m3, ggml_nbytes(c3));
+                m7 = std::max(m7, ggml_nbytes(c7));
+            }
+        }
+        if (n_ctrl_cand >= 2u && m1 > 0u && m2 > 0u && m3 > 0u && m7 > 0u) {
+            const size_t s1 = agx_align_up(m1, AGX_PAGE_SIZE);
+            const size_t s2 = agx_align_up(m2, AGX_PAGE_SIZE);
+            const size_t s3 = agx_align_up(m3, AGX_PAGE_SIZE);
+            const size_t s7 = agx_align_up(m7, AGX_PAGE_SIZE);
+            const size_t bank_B  = s1 + s2 + s3 + s7;
+            const size_t total_B = bank_B * k_ctrl_pipe_banks;
+            if (total_B <= 384u * 1024u * 1024u) {
+                if (!st->ctrl_pipe_bo || st->ctrl_pipe_cap_B < total_B) {
+                    if (st->ctrl_pipe_bo) agx_bo_free(ctx->drm, st->ctrl_pipe_bo);
+                    const uint32_t cflags = (total_B <= 32u * 1024u * 1024u)
+                        ? (AGX_BO_SLC_PIN | AGX_BO_WRITEBACK)
+                        : (AGX_BO_SLC_STREAM | AGX_BO_WRITEBACK);
+                    st->ctrl_pipe_bo    = agx_bo_alloc(ctx->drm, total_B, cflags, "ge-ctrl-pipe");
+                    st->ctrl_pipe_cap_B = st->ctrl_pipe_bo ? total_B : 0u;
+                }
+                if (st->ctrl_pipe_bo) {
+                    ctrl_n1_B = s1; ctrl_n2_B = s2; ctrl_n3_B = s3; ctrl_n7_B = s7;
+                    ctrl_bank_B = bank_B;
+                }
+            }
+        }
+    }
 
     // Map `Fusion 12` kq_b_rel_pos output tensor -> underlying 1-head base mask tensor
     // so `ITEM_REL_BIAS` & `PASS_MODE=3` FlashAttn share 1 Wave-0 [kv_beg, kv_end) bounds scan!
@@ -4472,7 +4546,7 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
     std::vector<fa_bounds_slot> fa_bounds_slots;
     fa_bounds_slots.reserve(8u);
     size_t fa_bounds_used_B = 0u;
-    const size_t k_fa_bounds_pool_B = 65536u; // 64 KiB fixed VA pool (covers >= 16 unique masks up to M=16384)
+    const size_t k_fa_bounds_pool_B = 131072u; // 128 KiB fixed VA pool (covers >= 16 unique masks at Br=16 up to M=16384)
 
     auto get_or_alloc_fa_bounds = [&](const struct ggml_tensor * bm,
                                       uint32_t n_kv_u,
@@ -4496,7 +4570,7 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                 return true;
             }
         }
-        const uint32_t n_qt = (n_tok_u + 31u) / 32u;
+        const uint32_t n_qt = (n_tok_u + 15u) / 16u;
         const size_t need_B = agx_align_up((size_t) n_qt * 8u, 256u);
         if (fa_bounds_used_B + need_B > k_fa_bounds_pool_B) return false;
         if (!st->fa_bounds_bo || st->fa_bounds_cap_B < k_fa_bounds_pool_B) {
@@ -5187,7 +5261,21 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                                 return (nb0 > 1u) ? va_disjoint(d, s) : va_same_or_disjoint(d, s);
                             };
 
+                            const size_t n1_bytes = ggml_nbytes(n1);
+                            const size_t n2_bytes = ggml_nbytes(n2);
+                            const size_t n3_bytes = ggml_nbytes(n3);
                             const size_t n7_bytes = ggml_nbytes(n7);
+                            const bool can_ctrl_pipe =
+                                !no_ctrl_pipe && st->ctrl_pipe_bo != nullptr && ctrl_bank_B > 0u &&
+                                n1_bytes > 0u && n1_bytes <= ctrl_n1_B &&
+                                n2_bytes > 0u && n2_bytes <= ctrl_n2_B &&
+                                n3_bytes > 0u && n3_bytes <= ctrl_n3_B &&
+                                n7_bytes > 0u && n7_bytes <= ctrl_n7_B &&
+                                can_gemm_redirect(n2) && can_gemm_redirect(n3) && can_gemm_redirect(n7) &&
+                                n2->src[1] && ggml_is_contiguous(n2->src[1]) && n2->src[1]->view_offs == 0 &&
+                                n3->src[1] && ggml_is_contiguous(n3->src[1]) && n3->src[1]->view_offs == 0 &&
+                                n7->src[1] && ggml_is_contiguous(n7->src[1]) && n7->src[1]->view_offs == 0;
+
                             bool can_redir_n7 = !no_redirect && st->redirect_tmp_bo &&
                                                 n7_bytes > 0u && n7_bytes <= redir_slot_cap_B &&
                                                 st->use_map.get(n7) == 1u && can_gemm_redirect(n7);
@@ -5201,6 +5289,11 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
 
                             auto check_ctrl_va = [&](const struct ggml_tensor * ca, uint32_t c_nb0,
                                                      const struct ggml_tensor * ma, uint32_t m_nb0) -> bool {
+                                if (can_ctrl_pipe &&
+                                    dst_ok_with(final_dst, ca, c_nb0) &&
+                                    dst_ok_with(final_dst, ma, m_nb0)) {
+                                    return true;
+                                }
                                 const bool base_ok =
                                     va_disjoint(n1, ca) && va_disjoint(n1, ma) &&
                                     va_disjoint(n2, ca) && va_disjoint(n2, ma) &&
@@ -5252,7 +5345,118 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
 
                                 const uint32_t slice_beg = (uint32_t) st->items.size();
                                 const uint32_t extra_cov = (ec_cur >= 0 ? 1u : 0u) + (ec_msg >= 0 ? 1u : 0u);
+                                const bool use_ctrl_pipe =
+                                    can_ctrl_pipe &&
+                                    dst_ok_with(final_dst, cur_act, cur_nb0) &&
+                                    dst_ok_with(final_dst, msg_act, msg_nb0);
 
+                                if (use_ctrl_pipe) {
+                                    const size_t bank = ctrl_pipe_rr++ % k_ctrl_pipe_banks;
+                                    const uint64_t b0 = st->ctrl_pipe_bo->gpu_va + bank * ctrl_bank_B;
+                                    const uint64_t va_n1 = b0;
+                                    const uint64_t va_n2 = va_n1 + ctrl_n1_B;
+                                    const uint64_t va_n3 = va_n2 + ctrl_n2_B;
+                                    const uint64_t va_n7 = va_n3 + ctrl_n3_B;
+                                    const agx_va_range r_n1 = { va_n1, va_n1 + n1_bytes };
+                                    const agx_va_range r_n2 = { va_n2, va_n2 + n2_bytes };
+                                    const agx_va_range r_n3 = { va_n3, va_n3 + n3_bytes };
+                                    const agx_va_range r_n7 = { va_n7, va_n7 + n7_bytes };
+                                    g_ctrl_pipe++;
+                                    g_ctrl_ovlp++;
+
+                                    // Sub-item 1: k_ctrl_norm_cat -> va_n1
+                                    {
+                                        ctrl_norm_cat_push ncpc{};
+                                        ncpc.cur_va   = agx_tensor_gpu_va(cur_act);
+                                        ncpc.msg_va   = agx_tensor_gpu_va(msg_act);
+                                        ncpc.dst_va   = va_n1;
+                                        ncpc.n_embd   = (uint32_t) n_embd;
+                                        ncpc.n_tokens = (uint32_t) n_tokens;
+                                        ncpc.eps      = eps_ctrl;
+                                        ncpc.cur_nb0  = cur_nb0;
+                                        ncpc.cur_nb1  = cur_nb1;
+                                        ncpc.msg_nb0  = msg_nb0;
+                                        ncpc.msg_nb1  = msg_nb1;
+                                        agx_exec_item it{};
+                                        it.kind          = ITEM_CTRL_NORM_CAT;
+                                        it.gx            = 2u;
+                                        it.gy            = ncpc.n_tokens;
+                                        it.gz            = 1u;
+                                        it.nodes_covered = 2u + extra_cov;
+                                        it.add_read(tensor_va_range(cur_act));
+                                        it.add_read(tensor_va_range(msg_act));
+                                        it.add_write(r_n1);
+                                        it.set_push(ncpc);
+                                        st->items.push_back(it);
+                                    }
+                                    // Sub-item 2: W_down (n2): va_n1 -> va_n2
+                                    {
+                                        agx_exec_item it{};
+                                        it.kind          = ITEM_GEMM_REDIRECT;
+                                        it.node          = n2;
+                                        it.va0           = va_n2;
+                                        it.va1           = va_n1;
+                                        it.nodes_covered = 1u;
+                                        it.add_read(tensor_va_range(n2->src[0]));
+                                        it.add_read(r_n1);
+                                        it.add_write(r_n2);
+                                        st->items.push_back(it);
+                                    }
+                                    // Sub-item 3: W_forget (n3): va_n2 -> va_n3
+                                    {
+                                        agx_exec_item it{};
+                                        it.kind          = ITEM_GEMM_REDIRECT;
+                                        it.node          = n3;
+                                        it.va0           = va_n3;
+                                        it.va1           = va_n2;
+                                        it.nodes_covered = 1u;
+                                        it.add_read(tensor_va_range(n3->src[0]));
+                                        it.add_read(r_n2);
+                                        it.add_write(r_n3);
+                                        st->items.push_back(it);
+                                    }
+                                    // Sub-item 4: W_gain (n7): va_n2 -> va_n7
+                                    {
+                                        agx_exec_item it{};
+                                        it.kind          = ITEM_GEMM_REDIRECT;
+                                        it.node          = n7;
+                                        it.va0           = va_n7;
+                                        it.va1           = va_n2;
+                                        it.nodes_covered = 1u;
+                                        it.add_read(tensor_va_range(n7->src[0]));
+                                        it.add_read(r_n2);
+                                        it.add_write(r_n7);
+                                        st->items.push_back(it);
+                                    }
+                                    // Sub-item 5: k_ctrl_mix (reads va_n3, va_n7 -> writes final_dst)
+                                    {
+                                        ctrl_mix_push mpc{};
+                                        mpc.cur_va    = agx_tensor_gpu_va(cur_act);
+                                        mpc.msg_va    = agx_tensor_gpu_va(msg_act);
+                                        mpc.forget_va = va_n3;
+                                        mpc.gain_va   = va_n7;
+                                        mpc.norm_w_va = norm_w ? agx_tensor_gpu_va(norm_w) : 0ull;
+                                        mpc.out_va    = agx_tensor_gpu_va(final_dst);
+                                        mpc.n_embd    = (uint32_t) n_embd;
+                                        mpc.n_tokens  = (uint32_t) n_tokens;
+                                        mpc.eps_norm  = eps_norm;
+                                        mpc.mode      = 0u;
+                                        mpc.cur_nb0   = cur_nb0; mpc.cur_nb1 = cur_nb1;
+                                        mpc.msg_nb0   = msg_nb0; mpc.msg_nb1 = msg_nb1;
+                                        agx_exec_item it{};
+                                        it.kind = ITEM_CTRL_MIX;
+                                        it.gx = mpc.n_tokens; it.gy = 1u; it.gz = 1u;
+                                        it.nodes_covered = (uint32_t) (advance + 1u - 5u);
+                                        it.add_read(tensor_va_range(cur_act));
+                                        it.add_read(tensor_va_range(msg_act));
+                                        it.add_read(r_n3);
+                                        it.add_read(r_n7);
+                                        if (norm_w) it.add_read(tensor_va_range(norm_w));
+                                        it.add_write(tensor_va_range(final_dst));
+                                        it.set_push(mpc);
+                                        st->items.push_back(it);
+                                    }
+                                } else {
                                 // Sub-item 1: k_ctrl_norm_cat -> n1
                                 {
                                     ctrl_norm_cat_push ncpc{};
@@ -5413,6 +5617,7 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                                         it.set_push(gpc);
                                         st->items.push_back(it);
                                     }
+                                }
                                 }
 
                                 anchors[e] = { slice_beg, (uint32_t) (st->items.size() - slice_beg) };
@@ -7095,7 +7300,9 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                                         int32_t anc_cur = -1;
                                         if (e_cur_p >= 0 && e_cur_p < anc) {
                                             if (anchors[(size_t) e_cur_p].cnt == 1u &&
-                                                st->items[anchors[(size_t) e_cur_p].beg].kind == ITEM_GENERIC_NODE &&
+                                                (st->items[anchors[(size_t) e_cur_p].beg].kind == ITEM_GENERIC_NODE ||
+                                                 (st->items[anchors[(size_t) e_cur_p].beg].kind == ITEM_GEMM_REDIRECT &&
+                                                  st->items[anchors[(size_t) e_cur_p].beg].va0 == 0ull)) &&
                                                 st->items[anchors[(size_t) e_cur_p].beg].node == cur &&
                                                 can_gemm_redirect(cur)) {
                                                 anc_cur = e_cur_p;
@@ -7115,7 +7322,7 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                                         if (anc_cur >= 0 && anc_cur < anc &&
                                             try_reserve_redir_slot((size_t) anc_cur, (size_t) anc, ggml_nbytes(cur), &cur_redir_r)) {
                                             auto & prod_it = st->items[anchors[(size_t) anc_cur].beg];
-                                            if (prod_it.kind == ITEM_GENERIC_NODE) {
+                                            if (prod_it.kind == ITEM_GENERIC_NODE || prod_it.kind == ITEM_GEMM_REDIRECT) {
                                                 prod_it.kind      = ITEM_GEMM_REDIRECT;
                                                 prod_it.va0       = cur_redir_r.beg;
                                                 prod_it.writes[0] = cur_redir_r;
@@ -7658,11 +7865,13 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
         //   Eliminates 48-96 dispatches, 48-96 strong_usc barriers, & 3.6-6.0 GB F32 DRAM RW!
         // --------------------------------------------------------------------
         if (node->op == GGML_OP_FLASH_ATTN_EXT && agx_kv_hybrid_supports_ggml_flash_attn(node)) {
-            const struct ggml_tensor * q     = node->src[0];
-            const struct ggml_tensor * k     = node->src[1];
-            const struct ggml_tensor * v     = node->src[2];
-            const struct ggml_tensor * mask  = node->src[3];
-            const struct ggml_tensor * sinks = node->src[4];
+            const struct ggml_tensor * q         = node->src[0];
+            const struct ggml_tensor * k         = node->src[1];
+            const struct ggml_tensor * v         = node->src[2];
+            const struct ggml_tensor * mask      = node->src[3];
+            const struct ggml_tensor * sinks     = node->src[4];
+            const struct ggml_tensor * rel_table = ggml_flash_attn_ext_has_banded_rel_bias(node) ? node->src[6] : nullptr;
+            const struct ggml_tensor * rel_pos   = ggml_flash_attn_ext_has_banded_rel_bias(node) ? node->src[7] : nullptr;
             const int64_t D  = q->ne[0];
             const int64_t N  = q->ne[1];
             const int64_t Hq = q->ne[2];
@@ -7770,19 +7979,22 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                 const bool fa_base_va_ok =
                     agx_tensor_gpu_va(tail_n) != 0ull &&
                     va_disjoint(tail_n, q) && va_disjoint(tail_n, k) && va_disjoint(tail_n, v) &&
-                    va_disjoint(tail_n, mask) && va_disjoint(tail_n, sinks);
+                    va_disjoint(tail_n, mask) && va_disjoint(tail_n, sinks) &&
+                    va_disjoint(tail_n, rel_table) && va_disjoint(tail_n, rel_pos);
                 const bool fa_va_ok = fa_base_va_ok && va_same_or_disjoint(tail_n, cur_qg);
 
                 if (fa_va_ok) {
-                    agx_va_range fa_ins[7];
-                    int32_t      fa_prods[7];
+                    agx_va_range fa_ins[10];
+                    int32_t      fa_prods[10];
                     int n_fa_ins = 0;
                     fa_ins[n_fa_ins] = tensor_va_range(q); fa_prods[n_fa_ins++] = tensor_prod_idx(q);
                     fa_ins[n_fa_ins] = tensor_va_range(k); fa_prods[n_fa_ins++] = tensor_prod_idx(k);
                     fa_ins[n_fa_ins] = tensor_va_range(v); fa_prods[n_fa_ins++] = tensor_prod_idx(v);
-                    if (mask)   { fa_ins[n_fa_ins] = tensor_va_range(mask);   fa_prods[n_fa_ins++] = tensor_prod_idx(mask); }
-                    if (sinks)  { fa_ins[n_fa_ins] = tensor_va_range(sinks);  fa_prods[n_fa_ins++] = tensor_prod_idx(sinks); }
-                    if (cur_qg) { fa_ins[n_fa_ins] = tensor_va_range(cur_qg); fa_prods[n_fa_ins++] = tensor_prod_idx(cur_qg); }
+                    if (mask)      { fa_ins[n_fa_ins] = tensor_va_range(mask);      fa_prods[n_fa_ins++] = tensor_prod_idx(mask); }
+                    if (sinks)     { fa_ins[n_fa_ins] = tensor_va_range(sinks);     fa_prods[n_fa_ins++] = tensor_prod_idx(sinks); }
+                    if (rel_table) { fa_ins[n_fa_ins] = tensor_va_range(rel_table); fa_prods[n_fa_ins++] = tensor_prod_idx(rel_table); }
+                    if (rel_pos)   { fa_ins[n_fa_ins] = tensor_va_range(rel_pos);   fa_prods[n_fa_ins++] = tensor_prod_idx(rel_pos); }
+                    if (cur_qg)    { fa_ins[n_fa_ins] = tensor_va_range(cur_qg);    fa_prods[n_fa_ins++] = tensor_prod_idx(cur_qg); }
 
                     agx_va_range fa_extra[1];
                     int n_fa_extra = 0;
@@ -7826,44 +8038,104 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                     }
                 }
 
-                // Rescue missed faepi when wqkv_gate MUL_MAT (`eqg > e`) reuses Qcur/kq_b freed VA (`36/48` visits!):
-                // Redirect `eqg` into an SLC-writeback slot so `wqkv_gate` co-issues with Q/K/V/R projections and
-                // `ITEM_FLASH_ATTN` fuses `SIGMOID(q_gate) * fa_out` in registers (`faepi: 12 -> 48/48`)!
-                if (!fa_committed && with_epi && fa_base_va_ok && !no_redirect && st->redirect_tmp_bo &&
-                    did_qgate && e_abs_sig < 0 && cur_qg && st->use_map.get(cur_qg) == 1u &&
-                    can_gemm_redirect(cur_qg)) {
-                    const int32_t eqg = st->exec_idx_map.get(cur_qg);
-                    if (eqg > (int32_t) e && !consumed[(size_t) eqg]) {
+                // Wave 9 Dual-VA Redirect Rescue (`faepi: 12 -> 48/48`):
+                // Rescues missed faepi when (a) `tail_n` (`um`) reused `Qcur`/`kq_b`/`rel_table` freed VA
+                // (`!fa_base_va_ok`, 36/48 visits!) via `out_redir_r` + `wo` `ITEM_GEMM_REDIRECT(va1=out_redir_r.beg)`,
+                // and/or (b) `wqkv_gate` (`eqg > e`) reused freed VA via `qg_redir_r`!
+                if (!fa_committed && with_epi && !no_redirect && st->redirect_tmp_bo &&
+                    agx_tensor_gpu_va(tail_n) != 0ull) {
+                    const int32_t eqg_cand = (did_qgate && e_abs_sig < 0 && cur_qg &&
+                                              st->use_map.get(cur_qg) == 1u && can_gemm_redirect(cur_qg))
+                                           ? st->exec_idx_map.get(cur_qg) : -1;
+                    const bool need_qg_redir = (eqg_cand > (int32_t) e && !consumed[(size_t) eqg_cand]);
+
+                    struct ggml_tensor * wo_cand = next_single_use_compute(tail_n, false);
+                    int32_t e_wo = -1;
+                    bool can_out_redir = false;
+                    if (wo_cand && can_gemm_redirect(wo_cand) && wo_cand->src[1] &&
+                        strip_reshape(wo_cand->src[1]) == tail_n &&
+                        chain_uses_exact(wo_cand->src[1], tail_n) &&
+                        ggml_is_contiguous(wo_cand->src[1]) &&
+                        wo_cand->src[1]->view_offs == 0 &&
+                        ggml_nbytes(tail_n) <= redir_slot_cap_B) {
+                        e_wo = st->exec_idx_map.get(wo_cand);
+                        if (e_wo > (int32_t) e && !consumed[(size_t) e_wo]) {
+                            can_out_redir = true;
+                        }
+                    }
+
+                    for (int opass = (fa_base_va_ok && need_qg_redir ? 0 : 1); opass < 2 && !fa_committed; ++opass) {
+                        const bool use_out_redir = (opass == 1);
+                        if (use_out_redir && !can_out_redir) break;
+                        if (!use_out_redir && !need_qg_redir) continue;
+
                         int32_t r_fset[5];
                         int r_fn = 0;
                         for (int k = 0; k < fn; ++k) r_fset[r_fn++] = epi_fset[k];
-                        r_fset[r_fn++] = eqg;
+                        if (need_qg_redir) r_fset[r_fn++] = eqg_cand;
 
-                        agx_va_range r_ins[8];
-                        int32_t      r_prods[8];
+                        agx_va_range r_ins[11];
+                        int32_t      r_prods[11];
                         int n_r_ins = 0;
                         r_ins[n_r_ins] = tensor_va_range(q);               r_prods[n_r_ins++] = tensor_prod_idx(q);
                         r_ins[n_r_ins] = tensor_va_range(k);               r_prods[n_r_ins++] = tensor_prod_idx(k);
                         r_ins[n_r_ins] = tensor_va_range(v);               r_prods[n_r_ins++] = tensor_prod_idx(v);
-                        if (mask)  { r_ins[n_r_ins] = tensor_va_range(mask);  r_prods[n_r_ins++] = tensor_prod_idx(mask); }
-                        if (sinks) { r_ins[n_r_ins] = tensor_va_range(sinks); r_prods[n_r_ins++] = tensor_prod_idx(sinks); }
-                        r_ins[n_r_ins] = tensor_va_range(cur_qg->src[0]);  r_prods[n_r_ins++] = tensor_prod_idx(cur_qg->src[0]);
-                        r_ins[n_r_ins] = tensor_va_range(cur_qg->src[1]);  r_prods[n_r_ins++] = tensor_prod_idx(cur_qg->src[1]);
+                        if (mask)      { r_ins[n_r_ins] = tensor_va_range(mask);      r_prods[n_r_ins++] = tensor_prod_idx(mask); }
+                        if (sinks)     { r_ins[n_r_ins] = tensor_va_range(sinks);     r_prods[n_r_ins++] = tensor_prod_idx(sinks); }
+                        if (rel_table) { r_ins[n_r_ins] = tensor_va_range(rel_table); r_prods[n_r_ins++] = tensor_prod_idx(rel_table); }
+                        if (rel_pos)   { r_ins[n_r_ins] = tensor_va_range(rel_pos);   r_prods[n_r_ins++] = tensor_prod_idx(rel_pos); }
 
-                        agx_va_range r_extra[2] = {
-                            tensor_va_range(cur_qg->src[0]),
-                            tensor_va_range(cur_qg->src[1]),
-                        };
+                        agx_va_range r_extra[2];
+                        int n_r_extra = 0;
+                        if (need_qg_redir) {
+                            r_ins[n_r_ins] = tensor_va_range(cur_qg->src[0]); r_prods[n_r_ins++] = tensor_prod_idx(cur_qg->src[0]);
+                            r_ins[n_r_ins] = tensor_va_range(cur_qg->src[1]); r_prods[n_r_ins++] = tensor_prod_idx(cur_qg->src[1]);
+                            r_extra[n_r_extra++] = tensor_va_range(cur_qg->src[0]);
+                            r_extra[n_r_extra++] = tensor_va_range(cur_qg->src[1]);
+                        } else if (cur_qg) {
+                            r_ins[n_r_ins] = tensor_va_range(cur_qg); r_prods[n_r_ins++] = tensor_prod_idx(cur_qg);
+                            r_extra[n_r_extra++] = tensor_va_range(cur_qg);
+                        }
+
                         agx_va_range fa_out_r  = tensor_va_range(tail_n);
                         int32_t      fa_out_ex = st->exec_idx_map.get(tail_n);
-                        const int32_t r_anc = find_safe_anchor(r_fset, r_fn, r_ins, r_prods, n_r_ins,
-                                                               r_extra, 2, &fa_out_r, &fa_out_ex, 1);
-                        agx_va_range qg_redir_r = { 0, 0 };
-                        if (r_anc >= 0 && try_reserve_redir_slot((size_t) r_anc, (size_t) r_anc, ggml_nbytes(cur_qg), &qg_redir_r)) {
-                            const size_t slice_B  = (size_t) (D * Hq * N) * sizeof(float);
-                            const size_t qg_slice = (size_t) (D * Hq * N) * ggml_type_size(cur_qg->type);
-                            const uint32_t sbeg   = (uint32_t) st->items.size();
+                        const int32_t r_anc = find_safe_anchor(
+                            r_fset, r_fn, r_ins, r_prods, n_r_ins,
+                            r_extra, n_r_extra,
+                            use_out_redir ? nullptr : &fa_out_r,
+                            use_out_redir ? nullptr : &fa_out_ex,
+                            use_out_redir ? 0 : 1);
+                        if (r_anc < 0) continue;
+                        if (use_out_redir && r_anc >= e_wo) continue;
 
+                        agx_va_range out_redir_r = { 0, 0 };
+                        agx_va_range qg_redir_r  = { 0, 0 };
+                        int out_slot = -1;
+                        bool slots_ok = true;
+                        if (use_out_redir) {
+                            slots_ok = try_reserve_redir_slot((size_t) r_anc, (size_t) e_wo,
+                                                              ggml_nbytes(tail_n), &out_redir_r, &out_slot);
+                        }
+                        if (slots_ok && need_qg_redir) {
+                            slots_ok = try_reserve_redir_slot((size_t) r_anc, (size_t) r_anc,
+                                                              ggml_nbytes(cur_qg), &qg_redir_r);
+                            if (!slots_ok && out_slot >= 0) {
+                                unlock_redir_slot(out_slot, (size_t) r_anc, (size_t) e_wo);
+                            }
+                        }
+                        if (!slots_ok) continue;
+
+                        if (!need_qg_redir && e_abs_sig >= 0) {
+                            anchors[(size_t) e_abs_sig].cnt = 0u;
+                            consumed[(size_t) e_abs_sig]    = 1u;
+                        }
+                        const size_t slice_B   = (size_t) (D * Hq * N) * sizeof(float);
+                        const size_t qg_elem_B = cur_qg ? ggml_type_size(cur_qg->type) : 4u;
+                        const size_t qg_slice  = (size_t) (D * Hq * N) * qg_elem_B;
+                        const uint32_t sbeg    = (uint32_t) st->items.size();
+                        uint32_t scnt = 0u;
+
+                        if (need_qg_redir) {
                             agx_exec_item git{};
                             git.kind          = ITEM_GEMM_REDIRECT;
                             git.node          = const_cast<struct ggml_tensor *>(cur_qg);
@@ -7873,36 +8145,58 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                             git.add_read(tensor_va_range(cur_qg->src[1]));
                             git.add_write(qg_redir_r);
                             st->items.push_back(git);
-
-                            agx_exec_item it{};
-                            it.kind              = ITEM_FLASH_ATTN;
-                            it.node              = node;
-                            it.nodes_covered     = (uint32_t) fn;
-                            it.uses_attn_scratch = agx_kv_hybrid_ggml_flash_attn_uses_scratch(node);
-                            it.fa_epi.extra_flags  = cur_flags;
-                            it.fa_epi.out_va       = agx_tensor_gpu_va(tail_n);
-                            it.fa_epi.out_nb3      = (uint64_t) slice_B;
-                            it.fa_epi.q_gate_va    = qg_redir_r.beg;
-                            it.fa_epi.q_gate_nb3   = (uint64_t) qg_slice;
-                            it.fa_epi.kv_bounds_va = bounds_va;
-                            it.add_read(tensor_va_range(q));
-                            it.add_read(tensor_va_range(k));
-                            it.add_read(tensor_va_range(v));
-                            if (mask)  it.add_read(tensor_va_range(mask));
-                            if (sinks) it.add_read(tensor_va_range(sinks));
-                            it.add_read(qg_redir_r);
-                            if (bounds_va != 0ull) it.add_read(bounds_r);
-                            it.add_write(fa_out_r);
-                            st->items.push_back(it);
-
-                            anchors[(size_t) r_anc] = { sbeg, 2u };
-                            for (int k = 0; k < r_fn; ++k) consumed[(size_t) r_fset[k]] = 1u;
-                            g_fa_epi++;
-                            g_redir++;
-                            if (did_fwht)  st->stats.fused_fwht_hits++;
-                            if (did_qgate) { st->stats.fused_sig_mul_hits++; g_sig_mul++; }
-                            fa_committed = true;
+                            scnt++;
                         }
+
+                        agx_exec_item it{};
+                        it.kind              = ITEM_FLASH_ATTN;
+                        it.node              = node;
+                        it.nodes_covered     = (uint32_t) fn + ((!need_qg_redir && e_abs_sig >= 0) ? 1u : 0u);
+                        it.uses_attn_scratch = agx_kv_hybrid_ggml_flash_attn_uses_scratch(node);
+                        it.fa_epi.extra_flags  = cur_flags;
+                        it.fa_epi.out_va       = use_out_redir ? out_redir_r.beg : agx_tensor_gpu_va(tail_n);
+                        it.fa_epi.out_nb3      = (uint64_t) slice_B;
+                        it.fa_epi.q_gate_va    = need_qg_redir ? qg_redir_r.beg : (cur_qg ? agx_tensor_gpu_va(cur_qg) : 0ull);
+                        it.fa_epi.q_gate_nb3   = (uint64_t) qg_slice;
+                        it.fa_epi.kv_bounds_va = bounds_va;
+                        it.add_read(tensor_va_range(q));
+                        it.add_read(tensor_va_range(k));
+                        it.add_read(tensor_va_range(v));
+                        if (mask)      it.add_read(tensor_va_range(mask));
+                        if (sinks)     it.add_read(tensor_va_range(sinks));
+                        if (rel_table) it.add_read(tensor_va_range(rel_table));
+                        if (rel_pos)   it.add_read(tensor_va_range(rel_pos));
+                        if (need_qg_redir)  it.add_read(qg_redir_r);
+                        else if (cur_qg)    it.add_read(tensor_va_range(cur_qg));
+                        if (bounds_va != 0ull) it.add_read(bounds_r);
+                        it.add_write(use_out_redir ? out_redir_r : fa_out_r);
+                        st->items.push_back(it);
+                        scnt++;
+
+                        anchors[(size_t) r_anc] = { sbeg, scnt };
+                        for (int k = 0; k < r_fn; ++k) consumed[(size_t) r_fset[k]] = 1u;
+
+                        if (use_out_redir) {
+                            agx_exec_item wo_it{};
+                            wo_it.kind          = ITEM_GEMM_REDIRECT;
+                            wo_it.node          = wo_cand;
+                            wo_it.va0           = 0ull;
+                            wo_it.va1           = out_redir_r.beg;
+                            wo_it.nodes_covered = 1u;
+                            wo_it.add_read(tensor_va_range(wo_cand->src[0]));
+                            wo_it.add_read(out_redir_r);
+                            wo_it.add_write(tensor_va_range(wo_cand));
+                            const uint32_t wo_idx = (uint32_t) st->items.size();
+                            st->items.push_back(wo_it);
+                            anchors[(size_t) e_wo]  = { wo_idx, 1u };
+                            consumed[(size_t) e_wo] = 1u;
+                            g_redir++;
+                        }
+                        if (need_qg_redir) g_redir++;
+                        g_fa_epi++;
+                        if (did_fwht)  st->stats.fused_fwht_hits++;
+                        if (did_qgate) { st->stats.fused_sig_mul_hits++; g_sig_mul++; }
+                        fa_committed = true;
                     }
                 }
             }
@@ -8096,29 +8390,48 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
     bool used_alias_scratch = false;
 
     auto ensure_item_ready = [&](const agx_exec_item & it) {
-        bool hazard = force_barrier;
-        if (!hazard && has_dispatched) {
+        bool need_strong   = force_barrier;
+        bool need_weak_war = false;
+        if (!need_strong && has_dispatched) {
             if ((it.uses_moe_scratch   && used_moe_scratch) ||
                 (it.uses_attn_scratch  && used_attn_scratch) ||
                 (it.uses_alias_scratch && used_alias_scratch)) {
-                hazard = true;
+                need_strong = true;
             }
-            for (uint8_t r = 0; !hazard && r < it.n_reads; ++r) {
-                if (ranges_overlap(dirty_vas, it.reads[r])) hazard = true;
+            for (uint8_t r = 0; !need_strong && r < it.n_reads; ++r) {
+                if (ranges_overlap(dirty_vas, it.reads[r])) need_strong = true;
             }
-            for (uint8_t w = 0; !hazard && w < it.n_writes; ++w) {
-                if (ranges_overlap(dirty_vas, it.writes[w]) || ranges_overlap(read_vas, it.writes[w])) {
-                    hazard = true;
+            for (uint8_t w = 0; !need_strong && w < it.n_writes; ++w) {
+                if (ranges_overlap(dirty_vas, it.writes[w])) {
+                    need_strong = true;
+                } else if (ranges_overlap(read_vas, it.writes[w])) {
+                    need_weak_war = true;
                 }
             }
         }
-        if (hazard && has_dispatched) {
+        if (need_strong && has_dispatched) {
             agx_cdm_barrier_usc(stream);
             dirty_vas.clear();
             read_vas.clear();
             used_moe_scratch   = false;
             used_attn_scratch  = false;
             used_alias_scratch = false;
+        } else if (need_weak_war && has_dispatched) {
+            if (no_weak_war) {
+                agx_cdm_barrier_usc(stream);
+                dirty_vas.clear();
+                read_vas.clear();
+                used_moe_scratch   = false;
+                used_attn_scratch  = false;
+                used_alias_scratch = false;
+            } else {
+                // Pure WAR hazard (zero RAW / WAW / scratch conflict): 0x60000160 WFI ordering-only
+                // barrier ensures all prior readers finish before this write; dirty_vas & scratch
+                // stay intact so every future RAW/WAW still receives a full STRONG_USC cache flush!
+                agx_cdm_barrier_wfi(stream);
+                read_vas.clear();
+                g_wfi_bar++;
+            }
         } else if (has_dispatched) {
             st->stats.barriers_elided++;
         }
@@ -8272,7 +8585,7 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
 
             case ITEM_GEMM_REDIRECT: {
                 if (!agx_gemm_init(ctx)) return GGML_STATUS_FAILED;
-                ok = dispatch_gemm_to_va(ctx, stream, it.node, it.va0, AGX_BARRIER_NONE);
+                ok = dispatch_gemm_to_va(ctx, stream, it.node, it.va0, it.va1, AGX_BARRIER_NONE);
             } break;
 
             case ITEM_ROUTER_TOPK:
@@ -8867,11 +9180,11 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
         const uint64_t d_elide = cdm_after.elided_barriers     - cdm_before.elided_barriers;
         const uint64_t d_sub   = cdm_after.submits             - cdm_before.submits;
         std::fprintf(stderr,
-                     "[ggml-agx STATS] nodes=%d exec=%zu items=%zu waves=%u wave_sched=%d dispatches=%llu submits=%llu usc_bar=%llu elided=%llu "
-                     "cpu_enc=%.2fms gpu=%.2fms fusions(prep=%llu sconv=%llu rel=%llu rtr=%llu cont=%llu rms=%llu situ=%llu ctrl=%llu mix=%llu moe=%llu wsum=%llu ssm=%llu mnorm=%llu clip=%llu sc=%llu addsc=%llu sigm=%llu sprep=%llu faepi=%llu mrms=%llu relb=%llu covlp=%llu redir=%llu)\n",
+                     "[ggml-agx STATS] nodes=%d exec=%zu items=%zu waves=%u wave_sched=%d dispatches=%llu submits=%llu usc_bar=%llu wfi_bar=%llu elided=%llu "
+                     "cpu_enc=%.2fms gpu=%.2fms fusions(prep=%llu sconv=%llu rel=%llu rtr=%llu cont=%llu rms=%llu situ=%llu ctrl=%llu mix=%llu moe=%llu wsum=%llu ssm=%llu mnorm=%llu clip=%llu sc=%llu addsc=%llu sigm=%llu sprep=%llu faepi=%llu mrms=%llu relb=%llu covlp=%llu redir=%llu cpipe=%llu)\n",
                      cgraph->n_nodes, n_exec, n_items, num_waves, no_wave_sched ? 0 : 1,
                      (unsigned long long) d_disp, (unsigned long long) d_sub,
-                     (unsigned long long) d_usc, (unsigned long long) d_elide,
+                     (unsigned long long) d_usc, (unsigned long long) g_wfi_bar, (unsigned long long) d_elide,
                      (double) cpu_encode_ns * 1e-6, (double) gpu_ns * 1e-6,
                      (unsigned long long) g_prep_store, (unsigned long long) g_full_sconv,
                      (unsigned long long) g_rel_bias, (unsigned long long) g_router,
@@ -8885,7 +9198,8 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                      (unsigned long long) g_sig_mul,
                      (unsigned long long) g_sprep, (unsigned long long) g_fa_epi,
                      (unsigned long long) g_mix_rms, (unsigned long long) g_rel_bskip,
-                     (unsigned long long) g_ctrl_ovlp, (unsigned long long) g_redir);
+                     (unsigned long long) g_ctrl_ovlp, (unsigned long long) g_redir,
+                     (unsigned long long) g_ctrl_pipe);
     }
 
     st->stats.graphs_executed++;
