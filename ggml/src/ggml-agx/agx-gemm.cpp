@@ -282,13 +282,13 @@ bool agx_gemm_dispatch(agx_backend_context * ctx,
     const bool use_mma = desc.force_mma || (!desc.force_vecmat && desc.M >= 9u);
 
     if (use_mma) {
-        // Select tile geometry to saturate all 40 M4 Max cores:
+        // Select tile geometry to saturate all 40 M4 Max cores (Vulkan S24 PF_NT=2, PF_RT=4 architecture):
         //   - TILE_MODE=2 (16x16, 2x2): narrow N <= 128 (e.g. 4608x64 ctrl_down -> 128 WGs!)
         //   - TILE_MODE=1 (32x16, 4x1): medium M <= 48 (72-216 WGs on N=2304)
-        //   - TILE_MODE=5 (128x64, 4x2 SGs, 12.1 KB = 16 SGs/core): large prefill repacked NVFP4/Q8_0
-        //     when >= 80 WGs (>= 2 WGs/core across all 40 cores; halves X traffic vs 64x64!)
-        //   - TILE_MODE=0 (64x64, 2x2 SGs, 8.0 KB = 16 SGs/core) for FP16 repacked NVFP4/Q8_0;
-        //     64x32 for PREC_F32 / non-repacked layouts.
+        //   - TILE_MODE=5 (128x32, 256T = 8 SGs, 4.0 KB SRAM, <=64 GPR32 -> 24 ActSGs/core, 0.25 LDS/MMA):
+        //     large prefill repacked NVFP4/Q8_0 when >= 512 WGs (pp2048 & W_attn_in/LM; halves X reads!)
+        //   - TILE_MODE=0 (64x32, 128T = 4 SGs, 4.0 KB SRAM, <=64 GPR32 -> 24-28 ActSGs/core, 0.25 LDS/MMA):
+        //     exact S24 ci=5 geometry (576 WGs on 2304x2304 M=512!); 64x32 for PREC_F32 / non-repacked.
         uint32_t tile_mode       = (desc.N <= 128u && batch_z <= 2u) ? 2u
                                  : (desc.M <= 48u)                   ? 1u
                                                                      : 0u;
@@ -297,8 +297,8 @@ bool agx_gemm_dispatch(agx_backend_context * ctx,
                                     desc.layout == AGX_WEIGHT_Q8_0_REPACKED);
         static const bool no_t5 = (std::getenv("GGML_AGX_GEMM_NO_T5") != nullptr);
         if (tile_mode == 0u && is_repack_f16 && !no_t5) {
-            const uint32_t wgs_128 = ((desc.N + 127u) / 128u) * ((desc.M + 63u) / 64u) * batch_z;
-            if (wgs_128 >= 80u) {
+            const uint32_t wgs_128 = ((desc.N + 127u) / 128u) * ((desc.M + 31u) / 32u) * batch_z;
+            if (wgs_128 >= 512u) {
                 tile_mode = 5u;
             }
         }
@@ -307,7 +307,7 @@ bool agx_gemm_dispatch(agx_backend_context * ctx,
                                  : (tile_mode == 2u) ? 16u
                                  : (tile_mode == 1u) ? 32u
                                                      : 64u;
-        const uint32_t wg_m      = pf_64x64 ? 64u : ((tile_mode == 0u) ? 32u : 16u);
+        const uint32_t wg_m      = (tile_mode == 0u || tile_mode == 5u) ? 32u : 16u;
 
         const bool mma_a4 = pf_64x64 && ((desc.K & 3u) == 0u) && ((x_stride & 3u) == 0u);
         const agx_kernel * k = get_or_compile_mma_gemm(ctx, desc.layout, tile_mode, desc.prec_f32, mma_a4);

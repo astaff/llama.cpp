@@ -154,7 +154,8 @@ bool agx_moe_dispatch(agx_moe_runner *           runner,
 // Wave 4 (Theorem W4.3): Fused 2-Stage MoE (`gate_up + SiTU -> SLC moe_inter -> down + wsum [+ res_va]`)
 //   - M == 1: strictly 2 dispatches + 1 STRONG_USC barrier (PASS_STAGE=5 -> PASS_STAGE=6),
 //             zero bucketing, zero zero-fill, zero atomics, exact 0-ULP sequential FP32 wsum!
-//   - M >= 2: deduplicated bitonic/histogram bucketing + lean BATCH_CAP=4 vecmat + gemm32 (count >= 5),
+//   - M >= 2: deduplicated bitonic/histogram bucketing + lean BATCH_CAP=4/8 vecmat + gemm32/64 (count >= 5,
+//             with SLC-pinned FP16 hidden_bo and zero-atomic sequential down_reduce on prefill),
 //             using args.moe_inter_va (or internal hidden_bo) and optional args.res_va.
 bool agx_moe_dispatch_fused_situ_down(agx_moe_runner *           runner,
                                       agx_cdm_stream *           stream,

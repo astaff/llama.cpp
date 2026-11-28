@@ -405,11 +405,16 @@ void main() {
 
 // Zero-atomic exact sequential FP32 weighted-sum reduce (+ optional res_va) from
 // down_scratch[M * top_k, n_embd] (pc.vecmat_buckets_va) -> moe_out[M, n_embd] (pc.moe_out_va).
+// Skips negative/OOB expert IDs directly via pc.topk_ids_va -> eliminates k_zero_skipped dispatch!
 void main() {
-    const uint tok   = gl_WorkGroupID.y;
-    const bool has_w = (pc.topk_w_va != 0ul);
-    BufF32R in_w     = BufF32R(pc.topk_w_va);
-    const uint w_off = tok * pc.top_k;
+    const uint tok       = gl_WorkGroupID.y;
+    const bool has_w     = (pc.topk_w_va   != 0ul);
+    const bool has_ids   = (pc.topk_ids_va != 0ul);
+    BufF32R    in_w      = BufF32R(pc.topk_w_va);
+    BufI32R    in_ids    = BufI32R(pc.topk_ids_va);
+    const uint w_off     = tok * pc.top_k;
+    const uint id_stride = (pc.ids_row_stride != 0u) ? pc.ids_row_stride : pc.top_k;
+    const uint id_off    = tok * id_stride;
 
     if ((pc.n_embd & 3u) == 0u) {
         const uint col4 = gl_GlobalInvocationID.x;
@@ -423,6 +428,12 @@ void main() {
         precise float s2 = 0.0f;
         precise float s3 = 0.0f;
         for (uint k = 0u; k < pc.top_k; ++k) {
+            if (has_ids) {
+                const int raw_eid = in_ids.d[id_off + k];
+                if (raw_eid < 0 || uint(raw_eid) >= pc.n_expert) {
+                    continue;
+                }
+            }
             const float wt = (has_w ? in_w.d[w_off + k] : 1.0f) * pc.exp_scale0;
             const vec4  v  = ds4.d[(w_off + k) * N4 + col4];
             s0 = s0 + v.x * wt;
@@ -446,6 +457,12 @@ void main() {
         BufF32R ds = BufF32R(pc.vecmat_buckets_va);
         precise float s = 0.0f;
         for (uint k = 0u; k < pc.top_k; ++k) {
+            if (has_ids) {
+                const int raw_eid = in_ids.d[id_off + k];
+                if (raw_eid < 0 || uint(raw_eid) >= pc.n_expert) {
+                    continue;
+                }
+            }
             const float wt = (has_w ? in_w.d[w_off + k] : 1.0f) * pc.exp_scale0;
             s = s + ds.d[(w_off + k) * pc.n_embd + col] * wt;
         }
