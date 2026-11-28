@@ -1,0 +1,360 @@
+#version 450
+
+// ============================================================================
+// Pillar 3: fused_ctrl_gates_sram.comp
+// Native-FP32 32 KB Threadgroup-SRAM Cross-Pass Rank-64 Controller Gates
+// ============================================================================
+// Target: Apple M4 Max (AGX3B), <= 64 32-bit GPRs, 0:0 spills.
+// Workgroup: (256, 1, 1) = 8 simdgroups of 32 lanes.
+// Grid:      (n_ctrls, n_tokens, 1)
+//
+// Numerical contract:
+//   ALL staging, dot products, tanh(), and residual mixing execute in native FP32
+//   (NEVER BF16) to prevent compounding error across Inkling 2 Mini's 3 loop passes.
+
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#define WTYPE_F32       0u
+#define WTYPE_F16       1u
+#define WTYPE_BF16      2u
+#define WTYPE_Q8_0_RAW  3u
+#define WTYPE_Q8_0_8BLK 4u
+
+#define CTRL_FLAG_WRITE_PRE_NORM 1u
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufF32 {
+    float v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufF32 {
+    float v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 2) readonly buffer ConstBufU16 {
+    uint16_t v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 1) readonly buffer ConstBufI8 {
+    int8_t v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufU32 {
+    uint v[];
+};
+
+struct CtrlGateDesc {
+    uint64_t cur_va;
+    uint64_t msg_va;
+    uint64_t down_va;
+    uint64_t gain_va;
+    uint64_t forget_va;
+    uint64_t norm_w_va;
+    uint64_t out_va;
+    uint64_t out_pre_norm_va;
+    uint     down_wtype;
+    uint     gain_wtype;
+    uint     forget_wtype;
+    uint     down_row_bytes;
+    uint     gain_row_bytes;
+    uint     forget_row_bytes;
+    uint     cur_stride_f32;
+    uint     msg_stride_f32;
+    uint     msg_offset_f32;
+    uint     out_stride_f32;
+    uint     flags;
+    uint     pad0;
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer DescBuf {
+    CtrlGateDesc d[];
+};
+
+layout(push_constant) uniform PushArgs {
+    uint64_t desc_va;
+    uint     n_embd;
+    uint     rank;
+    uint     n_tokens;
+    uint     n_ctrls;
+    float    eps_ctrl;
+    float    eps_norm;
+} pc;
+
+// 32 KB threadgroup SRAM budget (native FP32):
+//   s_cur[3840]  = 15,360 B  (for n_embd=2304 -> 9,216 B used)
+//   s_msg[3840]  = 15,360 B  (for n_embd=2304 -> 9,216 B used)
+//   s_gate[256]  =  1,024 B  (for rank=64     ->   256 B used)
+//   s_red[8]     =     32 B
+// Total = 31,776 B < 32,768 B (100% native FP32!)
+shared float s_cur[3840];
+shared float s_msg[3840];
+shared float s_gate[256];
+shared float s_red[8];
+
+// Workgroup FP32 sum reduction across 256 threads (8 simdgroups)
+float wg_sum(float val, uint sg_id, uint lane_id) {
+    float s = subgroupAdd(val);
+    if (lane_id == 0u) {
+        s_red[sg_id] = s;
+    }
+    barrier();
+    float tot = 0.0;
+    if (sg_id == 0u) {
+        float v = (lane_id < 8u) ? s_red[lane_id] : 0.0;
+        tot = subgroupAdd(v);
+        if (lane_id == 0u) {
+            s_red[0] = tot;
+        }
+    }
+    barrier();
+    float res = s_red[0];
+    barrier();
+    return res;
+}
+
+// Load a single dequantized FP32 weight from a row (supports F32/F16/BF16/Q8_0_RAW/Q8_0_8BLK)
+float load_weight_elem(uint64_t row_va, uint wtype, uint k) {
+    if (wtype == WTYPE_F32) {
+        return ConstBufF32(row_va).v[k];
+    } else if (wtype == WTYPE_F16) {
+        uint16_t h = ConstBufU16(row_va).v[k];
+        return unpackHalf2x16(uint(h)).x;
+    } else if (wtype == WTYPE_BF16) {
+        uint16_t b = ConstBufU16(row_va).v[k];
+        return uintBitsToFloat(uint(b) << 16u);
+    } else if (wtype == WTYPE_Q8_0_RAW) {
+        uint blk = k >> 5u;
+        uint off = k & 31u;
+        uint64_t bva = row_va + uint64_t(blk) * 34ul;
+        float d = unpackHalf2x16(uint(ConstBufU16(bva).v[0])).x;
+        float q = float(ConstBufI8(bva + 2ul).v[off]);
+        return d * q;
+    } else {
+        // WTYPE_Q8_0_8BLK: 272 B per 256 weights -> d[8] (16B) + qs[256] (256B)
+        uint chunk = k >> 8u;
+        uint rem   = k & 255u;
+        uint blk   = rem >> 5u;
+        uint64_t cva = row_va + uint64_t(chunk) * 272ul;
+        float d = unpackHalf2x16(uint(ConstBufU16(cva).v[blk])).x;
+        float q = float(ConstBufI8(cva + 16ul).v[rem]);
+        return d * q;
+    }
+}
+
+// Fast simdgroup dot product of one weight row [2*n_embd] against [s_cur; s_msg] in FP32
+float sg_dot_down_row(uint64_t row_va, uint wtype, uint n_embd, uint lane) {
+    float acc = 0.0;
+    const uint k_total = 2u * n_embd;
+
+    if (wtype == WTYPE_Q8_0_8BLK) {
+        // 32 lanes process 1 chunk (256 weights = 8 Q8_0 blocks) per iteration:
+        // lane l owns block (l >> 2) [0..7], and 8 int8 weights (2 uint loads) inside that block!
+        const uint n_chunks = (k_total + 255u) >> 8u;
+        const uint blk      = lane >> 2u;       // 0..7
+        const uint word_off = (lane & 3u) * 2u; // 0, 2, 4, 6 (of 8 uints per 32B block)
+        for (uint c = 0u; c < n_chunks; ++c) {
+            uint64_t cva = row_va + uint64_t(c) * 272ul;
+            float d = unpackHalf2x16(uint(ConstBufU16(cva).v[blk])).x;
+            uint base_k = c * 256u + blk * 32u + word_off * 4u;
+            uint w0 = ConstBufU32(cva + 16ul).v[blk * 8u + word_off];
+            uint w1 = ConstBufU32(cva + 16ul).v[blk * 8u + word_off + 1u];
+
+            float partial = 0.0;
+            [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+                uint kk = base_k + j;
+                if (kk < k_total) {
+                    float xv = (kk < n_embd) ? s_cur[kk] : s_msg[kk - n_embd];
+                    partial += float(bitfieldExtract(int(w0), int(j * 8u), 8)) * xv;
+                }
+            }
+            [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+                uint kk = base_k + 4u + j;
+                if (kk < k_total) {
+                    float xv = (kk < n_embd) ? s_cur[kk] : s_msg[kk - n_embd];
+                    partial += float(bitfieldExtract(int(w1), int(j * 8u), 8)) * xv;
+                }
+            }
+            acc += d * partial;
+        }
+    } else if (wtype == WTYPE_Q8_0_RAW) {
+        // 32 lanes process 1 Q8_0 block (32 weights) per iteration
+        const uint n_blks = k_total >> 5u;
+        for (uint b = 0u; b < n_blks; ++b) {
+            uint64_t bva = row_va + uint64_t(b) * 34ul;
+            float d = unpackHalf2x16(uint(ConstBufU16(bva).v[0])).x;
+            uint kk = (b << 5u) + lane;
+            float xv = (kk < n_embd) ? s_cur[kk] : s_msg[kk - n_embd];
+            float q  = float(ConstBufI8(bva + 2ul).v[lane]);
+            acc += (d * q) * xv;
+        }
+    } else if (wtype == WTYPE_F32) {
+        for (uint kk = lane; kk < k_total; kk += 32u) {
+            float xv = (kk < n_embd) ? s_cur[kk] : s_msg[kk - n_embd];
+            acc += ConstBufF32(row_va).v[kk] * xv;
+        }
+    } else if (wtype == WTYPE_BF16) {
+        for (uint kk = lane; kk < k_total; kk += 32u) {
+            float xv = (kk < n_embd) ? s_cur[kk] : s_msg[kk - n_embd];
+            float w  = uintBitsToFloat(uint(ConstBufU16(row_va).v[kk]) << 16u);
+            acc += w * xv;
+        }
+    } else {
+        // F16
+        for (uint kk = lane; kk < k_total; kk += 32u) {
+            float xv = (kk < n_embd) ? s_cur[kk] : s_msg[kk - n_embd];
+            float w  = unpackHalf2x16(uint(ConstBufU16(row_va).v[kk])).x;
+            acc += w * xv;
+        }
+    }
+    return subgroupAdd(acc);
+}
+
+// Fast per-thread dot product of one small rank-64 row against s_gate[0..rank-1] in FP32
+float thread_dot_rank(uint64_t row_va, uint wtype, uint rank) {
+    float acc = 0.0;
+    if (wtype == WTYPE_Q8_0_RAW) {
+        const uint n_blks = rank >> 5u;
+        for (uint b = 0u; b < n_blks; ++b) {
+            uint64_t bva = row_va + uint64_t(b) * 34ul;
+            float d = unpackHalf2x16(uint(ConstBufU16(bva).v[0])).x;
+            float p = 0.0;
+            uint base_k = b << 5u;
+            for (uint j = 0u; j < 32u; ++j) {
+                p += float(ConstBufI8(bva + 2ul).v[j]) * s_gate[base_k + j];
+            }
+            acc += d * p;
+        }
+    } else if (wtype == WTYPE_Q8_0_8BLK) {
+        const uint n_chunks = (rank + 255u) >> 8u;
+        for (uint c = 0u; c < n_chunks; ++c) {
+            uint64_t cva = row_va + uint64_t(c) * 272ul;
+            uint blk_end = min(8u, (rank - c * 256u + 31u) >> 5u);
+            for (uint b = 0u; b < blk_end; ++b) {
+                float d = unpackHalf2x16(uint(ConstBufU16(cva).v[b])).x;
+                float p = 0.0;
+                uint base_k = c * 256u + b * 32u;
+                for (uint w = 0u; w < 8u; ++w) {
+                    uint packed = ConstBufU32(cva + 16ul).v[b * 8u + w];
+                    uint kk = base_k + w * 4u;
+                    if (kk < rank) {
+                        p += float(bitfieldExtract(int(packed),  0, 8)) * s_gate[kk + 0u];
+                        p += float(bitfieldExtract(int(packed),  8, 8)) * s_gate[kk + 1u];
+                        p += float(bitfieldExtract(int(packed), 16, 8)) * s_gate[kk + 2u];
+                        p += float(bitfieldExtract(int(packed), 24, 8)) * s_gate[kk + 3u];
+                    }
+                }
+                acc += d * p;
+            }
+        }
+    } else if (wtype == WTYPE_F32) {
+        for (uint r = 0u; r < rank; ++r) {
+            acc += ConstBufF32(row_va).v[r] * s_gate[r];
+        }
+    } else if (wtype == WTYPE_BF16) {
+        for (uint r = 0u; r < rank; ++r) {
+            float w = uintBitsToFloat(uint(ConstBufU16(row_va).v[r]) << 16u);
+            acc += w * s_gate[r];
+        }
+    } else {
+        for (uint r = 0u; r < rank; ++r) {
+            float w = unpackHalf2x16(uint(ConstBufU16(row_va).v[r])).x;
+            acc += w * s_gate[r];
+        }
+    }
+    return acc;
+}
+
+void main() {
+    const uint ctrl_idx = gl_WorkGroupID.x;
+    const uint tok_idx  = gl_WorkGroupID.y;
+    if (ctrl_idx >= pc.n_ctrls || tok_idx >= pc.n_tokens) {
+        return;
+    }
+
+    const uint tid     = gl_LocalInvocationID.x;
+    const uint sg_id   = tid >> 5u;
+    const uint lane_id = tid & 31u;
+    const uint n_embd  = pc.n_embd;
+    const uint rank    = pc.rank;
+
+    CtrlGateDesc d = DescBuf(pc.desc_va).d[ctrl_idx];
+
+    const uint64_t cur_tok_va = d.cur_va + uint64_t(tok_idx) * uint64_t(d.cur_stride_f32) * 4ul;
+    const uint64_t msg_tok_va = d.msg_va + uint64_t(tok_idx * d.msg_stride_f32 + d.msg_offset_f32) * 4ul;
+    const uint64_t out_tok_va = d.out_va + uint64_t(tok_idx) * uint64_t(d.out_stride_f32) * 4ul;
+
+    // 1. Load cur and msg into FP32 SRAM and compute exact per-row RMSNorm (eps = 1e-6)
+    float ss_cur = 0.0;
+    float ss_msg = 0.0;
+    for (uint i = tid; i < n_embd; i += 256u) {
+        float cv = ConstBufF32(cur_tok_va).v[i];
+        float mv = ConstBufF32(msg_tok_va).v[i];
+        s_cur[i] = cv;
+        s_msg[i] = mv;
+        ss_cur += cv * cv;
+        ss_msg += mv * mv;
+    }
+
+    const float inv_n   = 1.0 / float(n_embd);
+    const float rms_cur = inversesqrt(wg_sum(ss_cur, sg_id, lane_id) * inv_n + pc.eps_ctrl);
+    const float rms_msg = inversesqrt(wg_sum(ss_msg, sg_id, lane_id) * inv_n + pc.eps_ctrl);
+
+    for (uint i = tid; i < n_embd; i += 256u) {
+        s_cur[i] *= rms_cur;
+        s_msg[i] *= rms_msg;
+    }
+    barrier();
+
+    // 2. Down projection: [2*n_embd -> rank] in native FP32 SRAM
+    //    8 simdgroups stride over the `rank` rows (e.g. 64 / 8 = 8 rows/simdgroup)
+    for (uint r = sg_id; r < rank; r += 8u) {
+        uint64_t row_va = d.down_va + uint64_t(r) * uint64_t(d.down_row_bytes);
+        float val = sg_dot_down_row(row_va, d.down_wtype, n_embd, lane_id);
+        if (lane_id == 0u) {
+            s_gate[r] = val;
+        }
+    }
+    barrier();
+
+    // 3. Up projections (gain & forget) + tanh + exact Inkling2 residual mix in FP32
+    //    y[i] = (cur[i] - forget[i] * cur[i]) + gain[i] * msg[i]
+    //    Reuse s_cur[] to hold y[i] if trailing RMSNorm is requested (zero extra DRAM traffic!)
+    const bool do_norm     = (d.norm_w_va != 0ul);
+    const bool write_pre   = ((d.flags & CTRL_FLAG_WRITE_PRE_NORM) != 0u) && (d.out_pre_norm_va != 0ul);
+    const uint64_t pre_va  = d.out_pre_norm_va + uint64_t(tok_idx) * uint64_t(d.out_stride_f32) * 4ul;
+
+    float ss_y = 0.0;
+    for (uint i = tid; i < n_embd; i += 256u) {
+        uint64_t g_row_va = d.gain_va   + uint64_t(i) * uint64_t(d.gain_row_bytes);
+        uint64_t f_row_va = d.forget_va + uint64_t(i) * uint64_t(d.forget_row_bytes);
+
+        float gain   = tanh(thread_dot_rank(g_row_va, d.gain_wtype,   rank));
+        float forget = tanh(thread_dot_rank(f_row_va, d.forget_wtype, rank));
+
+        float cv = ConstBufF32(cur_tok_va).v[i];
+        float mv = ConstBufF32(msg_tok_va).v[i];
+        float y  = (cv - forget * cv) + gain * mv;
+
+        if (write_pre) {
+            BufF32(pre_va).v[i] = y;
+        }
+        if (do_norm) {
+            s_cur[i] = y;
+            ss_y += y * y;
+        } else {
+            BufF32(out_tok_va).v[i] = y;
+        }
+    }
+
+    // 4. Optional fused trailing RMSNorm * norm_w (e.g. attn_norm / attn_{q,k,v}_inp_norm / ffn_norm)
+    if (do_norm) {
+        const float rms_y = inversesqrt(wg_sum(ss_y, sg_id, lane_id) * inv_n + pc.eps_norm);
+        for (uint i = tid; i < n_embd; i += 256u) {
+            float nw = ConstBufF32(d.norm_w_va).v[i];
+            BufF32(out_tok_va).v[i] = (s_cur[i] * rms_y) * nw;
+        }
+    }
+}

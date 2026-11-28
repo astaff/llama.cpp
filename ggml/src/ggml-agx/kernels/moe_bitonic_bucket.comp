@@ -1,0 +1,476 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+// ============================================================================
+// Pillar 5a: GPU-Resident Bitonic Token-to-Expert Bucketing & Indirect Grid
+//            Emission (Zero CPU Sync, M=1..8 Bitonic + M>8 SRAM Histogram)
+// ============================================================================
+// Target: Apple Silicon AGX3B (M4 Max, 32-lane simdgroup, <= 48 GPRs, 0:0 spills)
+//
+// Compile-time modes:
+//   BUCKET_MODE = 0 : Single-simdgroup (32 lanes) 64-element bitonic sort for
+//                     M * top_k <= 64 (covers B=1 decode & M=5 DSpark verify = 40!)
+//   BUCKET_MODE = 1 : 128-thread TG-SRAM histogram + prefix scan for prefill
+//                     M * top_k > 64 (up to M = 8192, E <= 256).
+//   BUCKET_MODE = 2 : Fast vec4 zero-fill / residual copy of `moe_out[M * n_embd]` (F32).
+//   BUCKET_MODE = 3 : Sparse zero-fill of ONLY skipped (`eid < 0`) MUL_MAT_ID rows!
+//                     (0 bytes written during real Inkling 2 Mini prefill!)
+//   BUCKET_MODE = 4 : Zero-atomic exact sequential FP32 weighted-sum reduce (+ optional res_va)
+//                     from `down_scratch[M * top_k, n_embd]` -> `moe_out[M, n_embd]`.
+
+#ifndef BUCKET_MODE
+#define BUCKET_MODE 0
+#endif
+
+#if BUCKET_MODE == 0
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+#else
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+#endif
+
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly  buffer BufI32R  { int   d[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly  buffer BufF32R  { float d[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly  buffer BufU32R  { uint  d[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) writeonly buffer BufU32W  { uint  d[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) writeonly buffer BufF32W  { float d[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly  buffer BufVec4R { vec4  d[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) writeonly buffer BufVec4W { vec4  d[]; };
+
+struct AgxIndirectGrid {
+    uint global_x;
+    uint global_y;
+    uint global_z;
+    uint local_x;
+    uint local_y;
+    uint local_z;
+};
+
+struct AgxMoeBucket {
+    uint expert_id;
+    uint token_offset;
+    uint count;
+    uint pad0;
+};
+
+// Exact binary match with agx_moe_bucket_header (128 bytes) + trailing grid_zero_skipped (24B @ +128)
+layout(buffer_reference, scalar, buffer_reference_align = 128) buffer BufBucketHeader {
+    uint            n_active_experts;
+    uint            n_vecmat_buckets;
+    uint            n_gemm_tiles;
+    uint            total_assignments;
+    uint            n_tokens;
+    uint            top_k;
+    uint            n_expert;
+    uint            n_skipped;
+    AgxIndirectGrid grid_gate_up_vecmat; // offset 32
+    AgxIndirectGrid grid_down_vecmat;    // offset 56
+    AgxIndirectGrid grid_gate_up_gemm;   // offset 80
+    AgxIndirectGrid grid_down_gemm;      // offset 104
+    AgxIndirectGrid grid_zero_skipped;   // offset 128
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) writeonly buffer BufBucketArr {
+    AgxMoeBucket b[];
+};
+
+// Push constants: 152 bytes (exact multiple of 8, <= 256B AGX push window)
+layout(push_constant) uniform PushBucket {
+    uint64_t topk_ids_va;        // [M, top_k] int32_t
+    uint64_t topk_w_va;          // [M, top_k] float (optional, 0 -> 1.0f)
+    uint64_t header_va;          // agx_moe_bucket_header (128B) + grid_zero_skipped (24B)
+    uint64_t vecmat_buckets_va;  // agx_moe_bucket[max_vecmat_buckets] (or down_scratch_va in MODE 4)
+    uint64_t gemm_tiles_va;      // agx_moe_bucket[max_gemm_tiles] (or res_va in MODE 4)
+    uint64_t sorted_tok_va;      // uint32_t[M * top_k]
+    uint64_t sorted_kslot_va;    // uint32_t[M * top_k]
+    uint64_t sorted_w_va;        // float[M * top_k]
+    uint64_t moe_out_va;         // [M, n_embd] F32 (for BUCKET_MODE 2/3/4)
+    uint64_t skipped_slots_va;   // uint32_t[M * top_k] (tok * top_k + ksl for skipped IDs)
+    uint     n_tokens;
+    uint     top_k;
+    uint     n_expert;
+    uint     n_ff;
+    uint     n_embd;
+    uint     wg_gate_up_vecmat;  // ceil(n_ff / 32)
+    uint     wg_down_vecmat;     // ceil(n_embd / 64)
+    uint     wg_gate_up_gemm;    // ceil(n_ff / 64)
+    uint     wg_down_gemm;       // ceil(n_embd / 128)
+    uint     max_vecmat_buckets;
+    uint     max_gemm_tiles;
+    uint     max_vecmat_m;       // 1 (BATCH_CAP=1), 4 (BATCH_CAP=4), or 8 (DSpark)
+    uint     gemm_min_m;         // 5 normally; 0xFFFFFFFFu when forcing vec-mat
+    float    exp_scale0;         // hparams.expert_weights_scale (1.0f if already applied)
+    uint     zero_elems;         // M * n_embd (for BUCKET_MODE == 2)
+    uint     ids_row_stride;     // int32 elements between token rows in topk_ids (>= top_k)
+    uint     gemm_tile_m;        // 32u or 64u (0 -> 32u)
+    uint     gemm_local_x;       // 128u (TILE_M=32) or 256u (TILE_M=64) (0 -> 128u)
+} pc;
+
+void write_indirect_grids(uint n_active, uint n_vm, uint n_gt, uint total_valid, uint n_skip) {
+    BufBucketHeader hdr = BufBucketHeader(pc.header_va);
+    hdr.n_active_experts  = n_active;
+    hdr.n_vecmat_buckets  = n_vm;
+    hdr.n_gemm_tiles      = n_gt;
+    hdr.total_assignments = total_valid;
+    hdr.n_tokens          = pc.n_tokens;
+    hdr.top_k             = pc.top_k;
+    hdr.n_expert          = pc.n_expert;
+    hdr.n_skipped         = n_skip;
+
+    const uint safe_vm     = max(n_vm, 1u);
+    const uint safe_gt     = max(n_gt, 1u);
+    const uint safe_skip   = max(n_skip, 1u);
+    const uint wg_zero_row = (pc.n_embd + 127u) / 128u;
+    const uint gt_lx       = (pc.gemm_local_x != 0u) ? pc.gemm_local_x : 128u;
+
+    // When a side has 0 active buckets/tiles (e.g. n_vm==0 on pp2048 or n_gt==0 on M<=4),
+    // shrink global_x to 1 WG instead of launching dummy WGs!
+    const uint vm_gx_gu = (n_vm   > 0u) ? (pc.wg_gate_up_vecmat * 128u)  : 128u;
+    const uint vm_gx_dn = (n_vm   > 0u) ? (pc.wg_down_vecmat    * 128u)  : 128u;
+    const uint gt_gx_gu = (n_gt   > 0u) ? (pc.wg_gate_up_gemm   * gt_lx)  : gt_lx;
+    const uint gt_gx_dn = (n_gt   > 0u) ? (pc.wg_down_gemm      * gt_lx)  : gt_lx;
+    const uint zs_gx    = (n_skip > 0u) ? (max(wg_zero_row, 1u) * 128u)  : 128u;
+
+    hdr.grid_gate_up_vecmat = AgxIndirectGrid(vm_gx_gu, safe_vm,   1u, 128u,  1u, 1u);
+    hdr.grid_down_vecmat    = AgxIndirectGrid(vm_gx_dn, safe_vm,   1u, 128u,  1u, 1u);
+    hdr.grid_gate_up_gemm   = AgxIndirectGrid(gt_gx_gu, safe_gt,   1u, gt_lx, 1u, 1u);
+    hdr.grid_down_gemm      = AgxIndirectGrid(gt_gx_dn, safe_gt,   1u, gt_lx, 1u, 1u);
+    hdr.grid_zero_skipped   = AgxIndirectGrid(zs_gx,    safe_skip, 1u, 128u,  1u, 1u);
+}
+
+#if BUCKET_MODE == 0
+
+shared uint s_keys[64];
+
+void main() {
+    const uint lane  = gl_LocalInvocationID.x;
+    const uint total = pc.n_tokens * pc.top_k;
+
+    BufI32R ids = BufI32R(pc.topk_ids_va);
+
+    uint idx0 = lane;
+    uint idx1 = lane + 32u;
+
+    // Encode valid keys as (eid << 8) | orig_idx; invalid/skipped as (0xFFFFFEu << 8) | orig_idx;
+    // padding >= total as 0xFFFFFFFFu -> sorts valid first, then skipped, then padding!
+    uint k0 = 0xFFFFFFFFu;
+    if (idx0 < total) {
+        uint tok0 = idx0 / pc.top_k;
+        uint ksl0 = idx0 % pc.top_k;
+        int  raw  = ids.d[tok0 * pc.ids_row_stride + ksl0];
+        k0 = (raw >= 0 && uint(raw) < pc.n_expert)
+            ? ((uint(raw) << 8) | idx0)
+            : (0xFFFFFE00u | idx0);
+    }
+    uint k1 = 0xFFFFFFFFu;
+    if (idx1 < total) {
+        uint tok1 = idx1 / pc.top_k;
+        uint ksl1 = idx1 % pc.top_k;
+        int  raw  = ids.d[tok1 * pc.ids_row_stride + ksl1];
+        k1 = (raw >= 0 && uint(raw) < pc.n_expert)
+            ? ((uint(raw) << 8) | idx1)
+            : (0xFFFFFE00u | idx1);
+    }
+
+    s_keys[idx0] = k0;
+    s_keys[idx1] = k1;
+    subgroupMemoryBarrierShared();
+
+    for (uint size = 2u; size <= 64u; size <<= 1) {
+        for (uint stride = size >> 1; stride >= 1u; stride >>= 1) {
+            uint low_mask = stride - 1u;
+            uint i        = ((lane & ~low_mask) << 1) | (lane & low_mask);
+            uint j        = i | stride;
+            bool asc      = ((i & size) == 0u);
+
+            uint a = s_keys[i];
+            uint b = s_keys[j];
+            bool swap_ab = asc ? (a > b) : (a < b);
+            s_keys[i] = swap_ab ? b : a;
+            s_keys[j] = swap_ab ? a : b;
+            subgroupMemoryBarrierShared();
+        }
+    }
+
+    BufU32W out_tok  = BufU32W(pc.sorted_tok_va);
+    BufU32W out_ksl  = BufU32W(pc.sorted_kslot_va);
+    BufF32W out_w    = BufF32W(pc.sorted_w_va);
+    const bool has_w = (pc.topk_w_va != 0ul);
+    BufF32R in_w     = BufF32R(pc.topk_w_va);
+
+    for (uint pass = 0u; pass < 2u; ++pass) {
+        uint pos = lane + pass * 32u;
+        if (pos < total && (s_keys[pos] >> 8) < pc.n_expert) {
+            uint orig = s_keys[pos] & 0xFFu;
+            out_tok.d[pos] = orig / pc.top_k;
+            out_ksl.d[pos] = orig % pc.top_k;
+            float w = has_w ? in_w.d[orig] : 1.0f;
+            out_w.d[pos] = w * pc.exp_scale0;
+        }
+    }
+
+    if (lane == 0u) {
+        BufBucketArr vm_arr   = BufBucketArr(pc.vecmat_buckets_va);
+        BufBucketArr gt_arr   = BufBucketArr(pc.gemm_tiles_va);
+        BufU32W      skip_arr = BufU32W(pc.skipped_slots_va);
+
+        const uint max_vm   = max(pc.max_vecmat_m, 1u);
+        const uint g_tile_m = (pc.gemm_tile_m != 0u) ? pc.gemm_tile_m : 32u;
+        uint n_active = 0u;
+        uint n_vm     = 0u;
+        uint n_gt     = 0u;
+        uint n_valid  = 0u;
+        uint n_skip   = 0u;
+
+        uint p = 0u;
+        while (p < total && (s_keys[p] >> 8) < pc.n_expert) {
+            uint eid = s_keys[p] >> 8;
+            uint end = p + 1u;
+            while (end < total && (s_keys[end] >> 8) == eid) {
+                end++;
+            }
+            uint cnt = end - p;
+            n_active++;
+            n_valid += cnt;
+
+            if (cnt >= pc.gemm_min_m) {
+                for (uint off = 0u; off < cnt; off += g_tile_m) {
+                    uint tlen = min(g_tile_m, cnt - off);
+                    if (n_gt < pc.max_gemm_tiles) {
+                        gt_arr.b[n_gt++] = AgxMoeBucket(eid, p + off, tlen, 0u);
+                    }
+                }
+            } else {
+                for (uint off = 0u; off < cnt; off += max_vm) {
+                    uint tlen = min(max_vm, cnt - off);
+                    if (n_vm < pc.max_vecmat_buckets) {
+                        vm_arr.b[n_vm++] = AgxMoeBucket(eid, p + off, tlen, 0u);
+                    }
+                }
+            }
+            p = end;
+        }
+
+        // Record any skipped slots (0 iterations during real LLM inference!)
+        while (p < total && s_keys[p] != 0xFFFFFFFFu) {
+            skip_arr.d[n_skip++] = s_keys[p] & 0xFFu;
+            p++;
+        }
+
+        write_indirect_grids(n_active, n_vm, n_gt, n_valid, n_skip);
+    }
+}
+
+#elif BUCKET_MODE == 1
+
+shared uint s_counts[256];
+shared uint s_offsets[256];
+shared uint s_cursor[256];
+shared uint s_skip_cnt;
+shared uint s_skip_cur;
+
+void main() {
+    const uint tid   = gl_LocalInvocationID.x;
+    const uint total = pc.n_tokens * pc.top_k;
+    const uint n_exp = min(pc.n_expert, 256u);
+
+    s_counts[tid]        = 0u;
+    s_counts[tid + 128u] = 0u;
+    if (tid == 0u) {
+        s_skip_cnt = 0u;
+        s_skip_cur = 0u;
+    }
+    barrier();
+
+    BufI32R ids = BufI32R(pc.topk_ids_va);
+    const bool pow2_k  = (pc.top_k != 0u) && ((pc.top_k & (pc.top_k - 1u)) == 0u);
+    const uint k_shift = pow2_k ? uint(findLSB(pc.top_k)) : 0u;
+    const uint k_mask  = pc.top_k - 1u;
+
+    for (uint i = tid; i < total; i += 128u) {
+        uint tok = pow2_k ? (i >> k_shift) : (i / pc.top_k);
+        uint ksl = pow2_k ? (i & k_mask)   : (i % pc.top_k);
+        int  raw = ids.d[tok * pc.ids_row_stride + ksl];
+        if (raw >= 0 && uint(raw) < n_exp) {
+            atomicAdd(s_counts[uint(raw)], 1u);
+        } else {
+            atomicAdd(s_skip_cnt, 1u);
+        }
+    }
+    barrier();
+
+    if (tid == 0u) {
+        BufBucketArr vm_arr = BufBucketArr(pc.vecmat_buckets_va);
+        BufBucketArr gt_arr = BufBucketArr(pc.gemm_tiles_va);
+
+        const uint max_vm   = max(pc.max_vecmat_m, 1u);
+        const uint g_tile_m = (pc.gemm_tile_m != 0u) ? pc.gemm_tile_m : 32u;
+        uint sum      = 0u;
+        uint n_active = 0u;
+        uint n_vm     = 0u;
+        uint n_gt     = 0u;
+
+        for (uint e = 0u; e < n_exp; ++e) {
+            uint cnt     = s_counts[e];
+            s_offsets[e] = sum;
+            s_cursor[e]  = sum;
+            if (cnt > 0u) {
+                n_active++;
+                if (cnt >= pc.gemm_min_m) {
+                    for (uint off = 0u; off < cnt; off += g_tile_m) {
+                        uint tlen = min(g_tile_m, cnt - off);
+                        if (n_gt < pc.max_gemm_tiles) {
+                            gt_arr.b[n_gt++] = AgxMoeBucket(e, sum + off, tlen, 0u);
+                        }
+                    }
+                } else {
+                    for (uint off = 0u; off < cnt; off += max_vm) {
+                        uint tlen = min(max_vm, cnt - off);
+                        if (n_vm < pc.max_vecmat_buckets) {
+                            vm_arr.b[n_vm++] = AgxMoeBucket(e, sum + off, tlen, 0u);
+                        }
+                    }
+                }
+            }
+            sum += cnt;
+        }
+
+        write_indirect_grids(n_active, n_vm, n_gt, sum, s_skip_cnt);
+    }
+    barrier();
+
+    BufU32W out_tok  = BufU32W(pc.sorted_tok_va);
+    BufU32W out_ksl  = BufU32W(pc.sorted_kslot_va);
+    BufF32W out_w    = BufF32W(pc.sorted_w_va);
+    BufU32W skip_arr = BufU32W(pc.skipped_slots_va);
+    const bool has_w = (pc.topk_w_va != 0ul);
+    BufF32R in_w     = BufF32R(pc.topk_w_va);
+
+    for (uint i = tid; i < total; i += 128u) {
+        uint tok = pow2_k ? (i >> k_shift) : (i / pc.top_k);
+        uint ksl = pow2_k ? (i & k_mask)   : (i % pc.top_k);
+        int  raw = ids.d[tok * pc.ids_row_stride + ksl];
+        if (raw >= 0 && uint(raw) < n_exp) {
+            uint dst = atomicAdd(s_cursor[uint(raw)], 1u);
+            out_tok.d[dst] = tok;
+            out_ksl.d[dst] = ksl;
+            float w = has_w ? in_w.d[i] : 1.0f;
+            out_w.d[dst] = w * pc.exp_scale0;
+        } else {
+            uint sdst = atomicAdd(s_skip_cur, 1u);
+            skip_arr.d[sdst] = i;
+        }
+    }
+}
+
+#elif BUCKET_MODE == 2
+
+// Fast vec4 zero-fill OR residual copy (`res_va` passed via `pc.topk_w_va` when non-zero) into `moe_out[M * n_embd]`
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    if ((pc.zero_elems & 3u) == 0u) {
+        const uint n4 = pc.zero_elems >> 2;
+        if (idx < n4) {
+            vec4 v = (pc.topk_w_va != 0ul) ? BufVec4R(pc.topk_w_va).d[idx] : vec4(0.0f);
+            BufVec4W(pc.moe_out_va).d[idx] = v;
+        }
+    } else if (idx < pc.zero_elems) {
+        float v = (pc.topk_w_va != 0ul) ? BufF32R(pc.topk_w_va).d[idx] : 0.0f;
+        BufF32W(pc.moe_out_va).d[idx] = v;
+    }
+}
+
+#elif BUCKET_MODE == 3
+
+// Sparse zero-fill: zeroes ONLY skipped MUL_MAT_ID rows (`n_skipped == 0` -> instant 1-WG exit!)
+void main() {
+    const uint sidx = gl_WorkGroupID.y;
+    if (sidx >= BufBucketHeader(pc.header_va).n_skipped) {
+        return;
+    }
+    const uint col = gl_GlobalInvocationID.x;
+    if (col < pc.n_embd) {
+        const uint slot = BufU32R(pc.skipped_slots_va).d[sidx];
+        BufF32W(pc.moe_out_va).d[slot * pc.n_embd + col] = 0.0f;
+    }
+}
+
+#elif BUCKET_MODE == 4
+
+// Zero-atomic exact sequential FP32 weighted-sum reduce (+ optional res_va) from
+// down_scratch[M * top_k, n_embd] (pc.vecmat_buckets_va) -> moe_out[M, n_embd] (pc.moe_out_va).
+// Skips negative/OOB expert IDs directly via pc.topk_ids_va -> eliminates k_zero_skipped dispatch!
+void main() {
+    const uint tok       = gl_WorkGroupID.y;
+    const bool has_w     = (pc.topk_w_va   != 0ul);
+    const bool has_ids   = (pc.topk_ids_va != 0ul);
+    BufF32R    in_w      = BufF32R(pc.topk_w_va);
+    BufI32R    in_ids    = BufI32R(pc.topk_ids_va);
+    const uint w_off     = tok * pc.top_k;
+    const uint id_stride = (pc.ids_row_stride != 0u) ? pc.ids_row_stride : pc.top_k;
+    const uint id_off    = tok * id_stride;
+
+    if ((pc.n_embd & 3u) == 0u) {
+        const uint col4 = gl_GlobalInvocationID.x;
+        const uint N4   = pc.n_embd >> 2;
+        if (col4 >= N4) {
+            return;
+        }
+        BufVec4R ds4 = BufVec4R(pc.vecmat_buckets_va);
+        precise float s0 = 0.0f;
+        precise float s1 = 0.0f;
+        precise float s2 = 0.0f;
+        precise float s3 = 0.0f;
+        for (uint k = 0u; k < pc.top_k; ++k) {
+            if (has_ids) {
+                const int raw_eid = in_ids.d[id_off + k];
+                if (raw_eid < 0 || uint(raw_eid) >= pc.n_expert) {
+                    continue;
+                }
+            }
+            const float wt = (has_w ? in_w.d[w_off + k] : 1.0f) * pc.exp_scale0;
+            const vec4  v  = ds4.d[(w_off + k) * N4 + col4];
+            s0 = s0 + v.x * wt;
+            s1 = s1 + v.y * wt;
+            s2 = s2 + v.z * wt;
+            s3 = s3 + v.w * wt;
+        }
+        if (pc.gemm_tiles_va != 0ul) {
+            const vec4 rv = BufVec4R(pc.gemm_tiles_va).d[tok * N4 + col4];
+            s0 = s0 + rv.x;
+            s1 = s1 + rv.y;
+            s2 = s2 + rv.z;
+            s3 = s3 + rv.w;
+        }
+        BufVec4W(pc.moe_out_va).d[tok * N4 + col4] = vec4(s0, s1, s2, s3);
+    } else {
+        const uint col = gl_GlobalInvocationID.x;
+        if (col >= pc.n_embd) {
+            return;
+        }
+        BufF32R ds = BufF32R(pc.vecmat_buckets_va);
+        precise float s = 0.0f;
+        for (uint k = 0u; k < pc.top_k; ++k) {
+            if (has_ids) {
+                const int raw_eid = in_ids.d[id_off + k];
+                if (raw_eid < 0 || uint(raw_eid) >= pc.n_expert) {
+                    continue;
+                }
+            }
+            const float wt = (has_w ? in_w.d[w_off + k] : 1.0f) * pc.exp_scale0;
+            s = s + ds.d[(w_off + k) * pc.n_embd + col] * wt;
+        }
+        if (pc.gemm_tiles_va != 0ul) {
+            s = s + BufF32R(pc.gemm_tiles_va).d[tok * pc.n_embd + col];
+        }
+        BufF32W(pc.moe_out_va).d[tok * pc.n_embd + col] = s;
+    }
+}
+
+#endif

@@ -1,0 +1,381 @@
+#version 450
+
+// ============================================================================
+// Wave 5 Pillar 3 (Pass-5): agx_inkling2_attn_in_b1.comp
+// Single-Dispatch 517 GB/s Full-Occupancy (0B SRAM, ~44 GPR32, 32 SGs/core)
+// Coalesced Attention Input Projection for B=1 Decode:
+//   Fuses W_attn_in (wq + wqkv_gate + attn_rel + wk + wv in Q8_0_8BLK, with
+//   independent x_q / x_k / x_v pointers!) + BF16/F16/F32 attn_sink_proj (24)
+//   + full-attn k_conv_proj / v_conv_proj (64) into ONE single CDM dispatch!
+//   Collapses 168 attention-input dispatches -> 48 (-120 CDM dispatches/tok)!
+// ============================================================================
+
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : require
+
+#include "dequant_supertile.glsl"
+
+#ifndef BATCH_M
+#define BATCH_M 1
+#endif
+#ifndef X_IS_F16
+#define X_IS_F16 0
+#endif
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+#if BATCH_M > 1 && X_IS_F16 == 1
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer BufF16Vec4R { f16vec4 v[]; };
+#endif
+
+layout(push_constant, scalar) uniform PushArgs {
+    uint64_t w_attn_in_va;
+    uint64_t x_q_va;
+    uint64_t x_k_va;
+    uint64_t x_v_va;
+    uint64_t qkv_buf_va;
+    uint64_t k_raw_va;
+    uint64_t v_raw_va;
+    uint64_t sink_proj_va;
+    uint64_t sinks_va;
+    uint64_t k_conv_proj_va;
+    uint64_t v_conv_proj_va;
+    uint64_t k_dyn_va;
+    uint64_t v_dyn_va;
+    uint     q_prefix_rows;
+    uint     wk_rows;
+    uint     wv_rows;
+    uint     total_coal_rows;
+    uint     sink_wtype;
+    uint     sink_row_B;
+    uint     dyn_k_wtype;
+    uint     dyn_k_row_B;
+    uint     dyn_v_wtype;
+    uint     dyn_v_row_B;
+    uint     n_tokens;
+    uint     x_is_f16;
+    uint64_t x_q_f16_va;
+    uint64_t x_k_f16_va;
+    uint64_t x_v_f16_va;
+} pc;
+
+#if BATCH_M == 1
+
+float dot_small_row_16(uint64_t row_va, uint wtype, uint64_t x_va, uint lane16) {
+    AgxBufVec4R xb = AgxBufVec4R(x_va);
+    const uint K4 = 2304u >> 2u; // 576
+    float acc = 0.0;
+    if (wtype == 2u) {
+        // BF16 (uvec2 = 4 BF16s)
+        AgxBufU32x2R wb = AgxBufU32x2R(row_va);
+        for (uint i4 = lane16; i4 < K4; i4 += 16u) {
+            uvec2 p = wb.v[i4];
+            vec4 w = vec4(
+                uintBitsToFloat((p.x & 0xFFFFu) << 16u),
+                uintBitsToFloat(p.x & 0xFFFF0000u),
+                uintBitsToFloat((p.y & 0xFFFFu) << 16u),
+                uintBitsToFloat(p.y & 0xFFFF0000u));
+            acc += dot(w, xb.v[i4]);
+        }
+    } else if (wtype == 0u) {
+        // F32
+        AgxBufVec4R wb = AgxBufVec4R(row_va);
+        for (uint i4 = lane16; i4 < K4; i4 += 16u) {
+            acc += dot(wb.v[i4], xb.v[i4]);
+        }
+    } else {
+        // F16 (wtype == 1)
+        AgxBufU32x2R wb = AgxBufU32x2R(row_va);
+        for (uint i4 = lane16; i4 < K4; i4 += 16u) {
+            uvec2 p = wb.v[i4];
+            acc += dot(vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y)), xb.v[i4]);
+        }
+    }
+    acc += subgroupShuffleXor(acc, 1u);
+    acc += subgroupShuffleXor(acc, 2u);
+    acc += subgroupShuffleXor(acc, 4u);
+    acc += subgroupShuffleXor(acc, 8u);
+    return acc;
+}
+
+void main() {
+    const uint lane   = gl_SubgroupInvocationID; // 0..31
+    const uint sg_id  = gl_SubgroupID;           // 0..3
+    const uint row    = (gl_WorkGroupID.x * 4u + sg_id) * 2u + (lane >> 4u);
+    const uint lane16 = lane & 15u;
+
+    // 1. Primary 517 GB/s Q8_0_8BLK W_attn_in path (99% of all WGs!)
+    if (row < pc.total_coal_rows) {
+        uint64_t x_va = pc.x_q_va;
+        uint64_t y_va = pc.qkv_buf_va;
+        uint     y_i  = row;
+        if (row >= pc.q_prefix_rows) {
+            const uint rem = row - pc.q_prefix_rows;
+            if (rem < pc.wk_rows) {
+                x_va = pc.x_k_va;
+                y_va = pc.k_raw_va;
+                y_i  = rem;
+            } else {
+                x_va = pc.x_v_va;
+                y_va = pc.v_raw_va;
+                y_i  = rem - pc.wk_rows;
+            }
+        }
+
+        AgxBufQ8_8Blk w_buf  = AgxBufQ8_8Blk(pc.w_attn_in_va);
+        AgxBufVec4R   x_buf4 = AgxBufVec4R(x_va);
+        const uint row_chk0  = row * 9u; // K = 2304 = 9 * 256
+        const uint d_slot    = lane16 >> 1u;
+
+        float acc = 0.0;
+        uvec4 qv = w_buf.blk[row_chk0].qs[lane16];
+        float d  = float(unpackFloat2x16(uint(w_buf.blk[row_chk0].d[d_slot])).x);
+        for (uint c = 0u; c < 8u; ++c) {
+            const uint  chk_n = row_chk0 + c + 1u;
+            const uvec4 qv_n  = w_buf.blk[chk_n].qs[lane16];
+            const float d_n   = float(unpackFloat2x16(uint(w_buf.blk[chk_n].d[d_slot])).x);
+            const uint  c4    = c * 64u + lane16 * 4u;
+            float dp = dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.x)), x_buf4.v[c4 + 0u])
+                     + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.y)), x_buf4.v[c4 + 1u])
+                     + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.z)), x_buf4.v[c4 + 2u])
+                     + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.w)), x_buf4.v[c4 + 3u]);
+            acc = fma(dp, d, acc);
+            qv = qv_n;
+            d  = d_n;
+        }
+        {
+            const uint c4 = 8u * 64u + lane16 * 4u;
+            float dp = dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.x)), x_buf4.v[c4 + 0u])
+                     + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.y)), x_buf4.v[c4 + 1u])
+                     + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.z)), x_buf4.v[c4 + 2u])
+                     + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.w)), x_buf4.v[c4 + 3u]);
+            acc = fma(dp, d, acc);
+        }
+
+        acc += subgroupShuffleXor(acc, 1u);
+        acc += subgroupShuffleXor(acc, 2u);
+        acc += subgroupShuffleXor(acc, 4u);
+        acc += subgroupShuffleXor(acc, 8u);
+        if (lane16 == 0u) {
+            AgxBufF32RW(y_va).v[y_i] = acc;
+        }
+        return;
+    }
+
+    // 2. Tail WGs: BF16/F16/F32 attn_sink_proj (24 rows) + full-attn k_dyn / v_dyn (64 rows)
+    const uint tail    = row - pc.total_coal_rows;
+    const uint n_sinks = (pc.sink_proj_va != 0ul) ? 24u : 0u;
+    if (tail < n_sinks) {
+        float v = dot_small_row_16(pc.sink_proj_va + uint64_t(tail) * uint64_t(pc.sink_row_B),
+                                   pc.sink_wtype, pc.x_q_va, lane16);
+        if (lane16 == 0u) AgxBufF32RW(pc.sinks_va).v[tail] = v;
+        return;
+    }
+    const uint d_idx = tail - n_sinks;
+    if (pc.k_conv_proj_va != 0ul && d_idx < 64u) {
+        if (d_idx < 32u) {
+            float v = dot_small_row_16(pc.k_conv_proj_va + uint64_t(d_idx) * uint64_t(pc.dyn_k_row_B),
+                                       pc.dyn_k_wtype, pc.x_k_va, lane16);
+            if (lane16 == 0u) AgxBufF32RW(pc.k_dyn_va).v[d_idx] = v;
+        } else {
+            const uint vr = d_idx - 32u;
+            float v = dot_small_row_16(pc.v_conv_proj_va + uint64_t(vr) * uint64_t(pc.dyn_v_row_B),
+                                       pc.dyn_v_wtype, pc.x_v_va, lane16);
+            if (lane16 == 0u) AgxBufF32RW(pc.v_dyn_va).v[vr] = v;
+        }
+    }
+}
+
+#else // BATCH_M > 1 (Wave 9: M = 2..8 Coalesced 0-SRAM 0-Barrier W_attn_in, -124 disp/verify!)
+
+void dot_small_row_16_m(uint64_t row_va, uint wtype, uint64_t x_va, uint lane16,
+                        uint n_tok, uint64_t out_va, uint out_row, uint out_stride) {
+    const uint K4 = 2304u >> 2u; // 576
+    AgxBufVec4R xb = AgxBufVec4R(x_va);
+    float acc[BATCH_M];
+    [[unroll]] for (uint m = 0u; m < uint(BATCH_M); ++m) acc[m] = 0.0;
+
+    if (wtype == 2u) {
+        AgxBufU32x2R wb = AgxBufU32x2R(row_va);
+        for (uint i4 = lane16; i4 < K4; i4 += 16u) {
+            uvec2 p = wb.v[i4];
+            vec4 w = vec4(
+                uintBitsToFloat((p.x & 0xFFFFu) << 16u),
+                uintBitsToFloat(p.x & 0xFFFF0000u),
+                uintBitsToFloat((p.y & 0xFFFFu) << 16u),
+                uintBitsToFloat(p.y & 0xFFFF0000u));
+            [[unroll]] for (uint m = 0u; m < uint(BATCH_M); ++m) {
+                const uint mi = min(m, n_tok - 1u);
+                acc[m] += dot(w, xb.v[mi * K4 + i4]);
+            }
+        }
+    } else if (wtype == 0u) {
+        AgxBufVec4R wb = AgxBufVec4R(row_va);
+        for (uint i4 = lane16; i4 < K4; i4 += 16u) {
+            vec4 w = wb.v[i4];
+            [[unroll]] for (uint m = 0u; m < uint(BATCH_M); ++m) {
+                const uint mi = min(m, n_tok - 1u);
+                acc[m] += dot(w, xb.v[mi * K4 + i4]);
+            }
+        }
+    } else {
+        AgxBufU32x2R wb = AgxBufU32x2R(row_va);
+        for (uint i4 = lane16; i4 < K4; i4 += 16u) {
+            uvec2 p = wb.v[i4];
+            vec4 w = vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y));
+            [[unroll]] for (uint m = 0u; m < uint(BATCH_M); ++m) {
+                const uint mi = min(m, n_tok - 1u);
+                acc[m] += dot(w, xb.v[mi * K4 + i4]);
+            }
+        }
+    }
+
+    AgxBufF32RW ob = AgxBufF32RW(out_va);
+    [[unroll]] for (uint m = 0u; m < uint(BATCH_M); ++m) {
+        acc[m] += subgroupShuffleXor(acc[m], 1u);
+        acc[m] += subgroupShuffleXor(acc[m], 2u);
+        acc[m] += subgroupShuffleXor(acc[m], 4u);
+        acc[m] += subgroupShuffleXor(acc[m], 8u);
+        if (lane16 == 0u && m < n_tok) {
+            ob.v[m * out_stride + out_row] = acc[m];
+        }
+    }
+}
+
+void main() {
+    const uint lane   = gl_SubgroupInvocationID; // 0..31
+    const uint sg_id  = gl_SubgroupID;           // 0..3
+    const uint row    = (gl_WorkGroupID.x * 4u + sg_id) * 2u + (lane >> 4u);
+    const uint lane16 = lane & 15u;
+    const uint n_tok  = max(pc.n_tokens, 1u);
+
+    // 1. Primary Q8_0_8BLK W_attn_in path: 0 SRAM, 0 barriers, 1-chunk weight prefetch, f16vec2 FMA!
+    if (row < pc.total_coal_rows) {
+#if X_IS_F16 == 1
+        uint64_t x_va    = pc.x_q_f16_va;
+#else
+        uint64_t x_va    = pc.x_q_va;
+#endif
+        uint64_t y_va    = pc.qkv_buf_va;
+        uint     y_i     = row;
+        uint     y_str   = pc.q_prefix_rows;
+        if (row >= pc.q_prefix_rows) {
+            const uint rem = row - pc.q_prefix_rows;
+            if (rem < pc.wk_rows) {
+#if X_IS_F16 == 1
+                x_va  = pc.x_k_f16_va;
+#else
+                x_va  = pc.x_k_va;
+#endif
+                y_va  = pc.k_raw_va;
+                y_i   = rem;
+                y_str = pc.wk_rows;
+            } else {
+#if X_IS_F16 == 1
+                x_va  = pc.x_v_f16_va;
+#else
+                x_va  = pc.x_v_va;
+#endif
+                y_va  = pc.v_raw_va;
+                y_i   = rem - pc.wk_rows;
+                y_str = pc.wv_rows;
+            }
+        }
+
+        AgxBufQ8_8Blk w_buf  = AgxBufQ8_8Blk(pc.w_attn_in_va);
+#if X_IS_F16 == 1
+        BufF16Vec4R   x_buf4 = BufF16Vec4R(x_va);
+#else
+        AgxBufVec4R   x_buf4 = AgxBufVec4R(x_va);
+#endif
+        const uint K4        = 576u; // 2304 / 4
+        const uint row_chk0  = row * 9u;
+        const uint d_slot    = lane16 >> 1u;
+
+        float acc[BATCH_M];
+        [[unroll]] for (uint m = 0u; m < uint(BATCH_M); ++m) acc[m] = 0.0;
+
+        uvec4 qv = w_buf.blk[row_chk0].qs[lane16];
+        float d  = float(unpackFloat2x16(uint(w_buf.blk[row_chk0].d[d_slot])).x) * 128.0;
+        for (uint c = 0u; c < 9u; ++c) {
+            const f16vec4 w0 = agx_q8_u32_magic_norm_to_f16vec4(qv.x);
+            const f16vec4 w1 = agx_q8_u32_magic_norm_to_f16vec4(qv.y);
+            const f16vec4 w2 = agx_q8_u32_magic_norm_to_f16vec4(qv.z);
+            const f16vec4 w3 = agx_q8_u32_magic_norm_to_f16vec4(qv.w);
+            const float   dc = d;
+            if (c < 8u) {
+                const uint chk_n = row_chk0 + c + 1u;
+                qv = w_buf.blk[chk_n].qs[lane16];
+                d  = float(unpackFloat2x16(uint(w_buf.blk[chk_n].d[d_slot])).x) * 128.0;
+            }
+            const uint c4 = c * 64u + lane16 * 4u;
+            [[unroll]] for (uint m = 0u; m < uint(BATCH_M); ++m) {
+                const uint    mi = min(m, n_tok - 1u);
+                const uint    xb = mi * K4 + c4;
+#if X_IS_F16 == 1
+                const f16vec4 x0 = x_buf4.v[xb + 0u];
+                const f16vec4 x1 = x_buf4.v[xb + 1u];
+                const f16vec4 x2 = x_buf4.v[xb + 2u];
+                const f16vec4 x3 = x_buf4.v[xb + 3u];
+#else
+                const f16vec4 x0 = f16vec4(x_buf4.v[xb + 0u]);
+                const f16vec4 x1 = f16vec4(x_buf4.v[xb + 1u]);
+                const f16vec4 x2 = f16vec4(x_buf4.v[xb + 2u]);
+                const f16vec4 x3 = f16vec4(x_buf4.v[xb + 3u]);
+#endif
+                f16vec2 dp2 = w0.xy * x0.xy;
+                dp2 = fma(w0.zw, x0.zw, dp2);
+                dp2 = fma(w1.xy, x1.xy, dp2);
+                dp2 = fma(w1.zw, x1.zw, dp2);
+                dp2 = fma(w2.xy, x2.xy, dp2);
+                dp2 = fma(w2.zw, x2.zw, dp2);
+                dp2 = fma(w3.xy, x3.xy, dp2);
+                dp2 = fma(w3.zw, x3.zw, dp2);
+                acc[m] = fma(float(dp2.x + dp2.y), dc, acc[m]);
+            }
+        }
+
+        AgxBufF32RW ob = AgxBufF32RW(y_va);
+        [[unroll]] for (uint m = 0u; m < uint(BATCH_M); ++m) {
+            acc[m] += subgroupShuffleXor(acc[m], 1u);
+            acc[m] += subgroupShuffleXor(acc[m], 2u);
+            acc[m] += subgroupShuffleXor(acc[m], 4u);
+            acc[m] += subgroupShuffleXor(acc[m], 8u);
+            if (lane16 == 0u && m < n_tok) {
+                ob.v[m * y_str + y_i] = acc[m];
+            }
+        }
+        return;
+    }
+
+    // 2. Tail WGs: BF16/F16/F32 attn_sink_proj (24 rows) + full-attn k_dyn / v_dyn (64 rows)
+    const uint tail    = row - pc.total_coal_rows;
+    const uint n_sinks = (pc.sink_proj_va != 0ul) ? 24u : 0u;
+    if (tail < n_sinks) {
+        dot_small_row_16_m(pc.sink_proj_va + uint64_t(tail) * uint64_t(pc.sink_row_B),
+                           pc.sink_wtype, pc.x_q_va, lane16, n_tok, pc.sinks_va, tail, 24u);
+        return;
+    }
+    const uint d_idx = tail - n_sinks;
+    if (pc.k_conv_proj_va != 0ul && d_idx < 64u) {
+        if (d_idx < 32u) {
+            dot_small_row_16_m(pc.k_conv_proj_va + uint64_t(d_idx) * uint64_t(pc.dyn_k_row_B),
+                               pc.dyn_k_wtype, pc.x_k_va, lane16, n_tok, pc.k_dyn_va, d_idx, 32u);
+        } else {
+            const uint vr = d_idx - 32u;
+            dot_small_row_16_m(pc.v_conv_proj_va + uint64_t(vr) * uint64_t(pc.dyn_v_row_B),
+                               pc.dyn_v_wtype, pc.x_v_va, lane16, n_tok, pc.v_dyn_va, vr, 32u);
+        }
+    }
+}
+#endif // BATCH_M == 1

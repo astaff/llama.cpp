@@ -1,0 +1,308 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+#include "dequant_supertile.glsl"
+
+// ============================================================================
+// Pillar 4: Fused SWA-1024 Ring Attention + Banded Rel-Pos + Learned Sink
+//           + Optional In-Register FWHT64 + Optional sigmoid(Qgate)
+// ============================================================================
+// Target: Apple Silicon AGX3B (M4 Max, 40 cores, 32-lane simdgroup)
+// Budget: <= 96 32-bit GPRs/lane, 0:0 spills, ~2.1 KB TG SRAM (4 simdgroups/WG)
+//
+// Compile-time specializations (via agx_compile_opts::defines):
+//   KV_DTYPE = 0 (F8_E4M3), 1 (Q8_0_PLANAR), 2 (F16)
+//   HEAD_DIM = 128 (default: 4 elems/lane across 32 lanes)
+//   N_SG     = 4   (128 threads/WG -> 4 simdgroups splitting the 1024-tok ring)
+//
+// Exact Inkling 2 Mini attention math (verified vs src/models/inkling2.cpp &
+// src/llama-graph.cpp:4476-4482):
+//   logit[j] = kq_scale * dot(Q[h], K[h_kv, j]) + rel_bias(h, dist) - sink[h] + mask[j]
+//   with zero_sink = 0.0f in softmax denominator (equivalently unscaled sink
+//   added ONCE in online-softmax normalization).
+//   Epilogue order: kqv_out -> optional FWHT64(kqv_out) -> optional * sigmoid(q_gate).
+
+#ifndef KV_DTYPE
+#define KV_DTYPE 0
+#endif
+
+#ifndef N_SG
+#define N_SG 4
+#endif
+
+layout(local_size_x = 32, local_size_y = N_SG, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer BufF32 { float d[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) writeonly buffer BufF32W { float d[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 2) readonly buffer BufF16 { float16_t d[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 2) writeonly buffer BufF16W { float16_t d[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer BufU32 { uint d[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer BufI32 { int d[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer BufUvec2 { uvec2 d[]; };
+
+// Flags matching agx_attn_flags in agx-kv-hybrid.h
+const uint FLAG_CAUSAL            = 1u << 0;
+const uint FLAG_SWA_WINDOW        = 1u << 1;
+const uint FLAG_HAS_REL_TABLE     = 1u << 2;
+const uint FLAG_REL_TABLE_SINK    = 1u << 3;
+const uint FLAG_SINK_PER_HEAD     = 1u << 4;
+const uint FLAG_SINK_PER_TOK_HEAD = 1u << 5;
+const uint FLAG_HAS_MASK_F16      = 1u << 6;
+const uint FLAG_HAS_MASK_F32      = 1u << 7;
+const uint FLAG_FWHT64            = 1u << 8;
+const uint FLAG_QGATE_F32         = 1u << 9;
+const uint FLAG_QGATE_F16         = 1u << 10;
+const uint FLAG_Q_F16             = 1u << 15;
+const uint FLAG_OUT_F16           = 1u << 16;
+
+// Push constants: 128 bytes (well under 256B AGX limit)
+layout(push_constant) uniform PushArgs {
+    uint64_t q_va;
+    uint64_t k_va;           // SWA ring K data base for this logical slot
+    uint64_t v_va;           // SWA ring V data base for this logical slot
+    uint64_t ks_va;          // Q8_0 planar K scales (0 if not Q8_0)
+    uint64_t vs_va;          // Q8_0 planar V scales (0 if not Q8_0)
+    uint64_t pos_ring_va;    // int32_t pos_ring[swa_window]
+    uint64_t rel_table_va;   // [M, Hq, n_rel_extent+1] F32 (0 if unused)
+    uint64_t sinks_va;       // [Hq] or [M, Hq] F32 (0 if unused)
+    uint64_t q_gate_va;      // [M, Hq, D] F32/F16 (0 if unused)
+    uint64_t pos_q_va;       // [M] int32_t (0 -> pos_q_base + tok)
+    uint64_t out_va;         // [M, Hq, D] F32/F16
+    uint     n_tokens;       // M
+    uint     swa_window;     // 1024 (power of 2)
+    uint     n_kv_scan;      // min(total_seen, swa_window) or swa_window
+    uint     n_head_q;       // 24
+    uint     n_head_kv;      // 8
+    uint     n_rel_extent;   // 1024
+    uint     pos_q_base;
+    uint     flags;
+    float    kq_scale;       // 1/sqrt(128)
+    uint     pad0;
+} pc;
+
+// Tiny TG SRAM reduction buffer: 4*4 + 4*4 + 4*32*16 = 2080 bytes (~6.3% of 32 KB)
+shared float sh_m[N_SG];
+shared float sh_l[N_SG];
+shared vec4  sh_o[N_SG][32];
+
+// Branchless FTZ-safe OCP E4M3FN byte -> FP32 (0 denormals, exact for all 256 values)
+float decode_e4m3_byte(uint b) {
+    uint s = (b & 0x80u) << 24;
+    uint e = (b >> 3) & 0x0Fu;
+    uint m = b & 0x07u;
+    float sub = (s != 0u ? -1.0f : 1.0f) * float(m) * 0.001953125f; // 1/512
+    float nrm = uintBitsToFloat(s | ((e + 120u) << 23) | (m << 20));
+    return (e == 0u) ? sub : nrm;
+}
+
+vec4 decode_e4m3_u32(uint packed) {
+    return vec4(
+        decode_e4m3_byte( packed        & 0xFFu),
+        decode_e4m3_byte((packed >>  8) & 0xFFu),
+        decode_e4m3_byte((packed >> 16) & 0xFFu),
+        decode_e4m3_byte((packed >> 24) & 0xFFu)
+    );
+}
+
+vec4 load_kv_vec4(uint64_t data_va, uint64_t scale_va, uint head_idx, uint lane) {
+#if KV_DTYPE == 0
+    // F8_E4M3: 128 bytes/head = 32 uint32s -> 1 coalesced 128B cache line per simdgroup!
+    uint packed = BufU32(data_va).d[head_idx * 32u + lane];
+    return decode_e4m3_u32(packed);
+#elif KV_DTYPE == 1
+    // Q8_0 planar: 128B int8 qs + 4 FP16 scales per head (magic-bias decode, 0 spills!)
+    uint packed = BufU32(data_va).d[head_idx * 32u + lane];
+    float sc = float(BufF16(scale_va).d[head_idx * 4u + (lane >> 3)]);
+    return vec4(agx_q8_u32_magic_to_f16vec4(packed)) * sc;
+#else
+    // F16: 256 bytes/head = 32 uvec2s -> 2 coalesced 128B cache lines per simdgroup!
+    uvec2 p = BufUvec2(data_va).d[head_idx * 32u + lane];
+    vec2 lo = unpackHalf2x16(p.x);
+    vec2 hi = unpackHalf2x16(p.y);
+    return vec4(lo.x, lo.y, hi.x, hi.y);
+#endif
+}
+
+// Orthonormal 64-point Sylvester Walsh-Hadamard transform (matches ggml_gen_hadamard(64)):
+// Lanes 0..15 hold elements 0..63; lanes 16..31 hold elements 64..127.
+// Pure in-register + 4 subgroupShuffleXor ops, zero TG SRAM!
+vec4 fwht64_in_reg(vec4 v, uint lane) {
+    // 4-point butterfly within lane (bits 0 and 1)
+    float a0 = v.x + v.y;
+    float a1 = v.x - v.y;
+    float a2 = v.z + v.w;
+    float a3 = v.z - v.w;
+    v = vec4(a0 + a2, a1 + a3, a0 - a2, a1 - a3);
+
+    // 16-lane butterfly across bits 2, 3, 4, 5 (lanes 0..15 and 16..31 independently)
+    vec4 p;
+    p = subgroupShuffleXor(v, 1u); v = ((lane & 1u) != 0u) ? (p - v) : (v + p);
+    p = subgroupShuffleXor(v, 2u); v = ((lane & 2u) != 0u) ? (p - v) : (v + p);
+    p = subgroupShuffleXor(v, 4u); v = ((lane & 4u) != 0u) ? (p - v) : (v + p);
+    p = subgroupShuffleXor(v, 8u); v = ((lane & 8u) != 0u) ? (p - v) : (v + p);
+
+    return v * 0.125f; // 1 / sqrt(64)
+}
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x; // 0..31
+    const uint sg   = gl_LocalInvocationID.y; // 0..N_SG-1
+    const uint h_q  = gl_WorkGroupID.x;       // 0..n_head_q-1
+    const uint tok  = gl_WorkGroupID.y;       // 0..n_tokens-1
+
+    if (h_q >= pc.n_head_q || tok >= pc.n_tokens) {
+        return;
+    }
+
+    const uint gqa_ratio = pc.n_head_q / pc.n_head_kv;
+    const uint h_kv      = h_q / gqa_ratio;
+    const uint q_head_off = (tok * pc.n_head_q + h_q) * 128u + lane * 4u;
+
+    // Load Q[tok, h_q, lane*4..+3] and pre-multiply by kq_scale (saves 1 ALU per key!)
+    vec4 q_reg;
+    if ((pc.flags & FLAG_Q_F16) != 0u) {
+        uvec2 qp = BufUvec2(pc.q_va).d[(tok * pc.n_head_q + h_q) * 32u + lane];
+        vec2 lo = unpackHalf2x16(qp.x);
+        vec2 hi = unpackHalf2x16(qp.y);
+        q_reg = vec4(lo.x, lo.y, hi.x, hi.y) * pc.kq_scale;
+    } else {
+        BufF32 qb = BufF32(pc.q_va);
+        q_reg = vec4(qb.d[q_head_off + 0u], qb.d[q_head_off + 1u],
+                     qb.d[q_head_off + 2u], qb.d[q_head_off + 3u]) * pc.kq_scale;
+    }
+
+    const int pos_q = (pc.pos_q_va != 0ul)
+        ? BufI32(pc.pos_q_va).d[tok]
+        : int(pc.pos_q_base + tok);
+
+    const bool has_rel      = (pc.flags & FLAG_HAS_REL_TABLE) != 0u && (pc.rel_table_va != 0ul);
+    const uint rel_stride   = pc.n_rel_extent + 1u;
+    const uint rel_base     = (tok * pc.n_head_q + h_q) * rel_stride;
+    const uint n_scan       = min(pc.n_kv_scan, pc.swa_window);
+    const int  swa_win_i    = int(pc.swa_window);
+
+    float m_i = -3.402823466e+38f * 0.5f; // NEG_FLT_MAX_OVER_2 (NaN-safe)
+    float l_i = 0.0f;
+    vec4  o_i = vec4(0.0f);
+
+    BufI32 pos_ring = BufI32(pc.pos_ring_va);
+
+    for (uint j = sg; j < n_scan; j += N_SG) {
+        int pos_k = pos_ring.d[j];
+        int dist  = pos_q - pos_k;
+
+        // Valid ring entry: non-empty, causal (dist >= 0), inside SWA window (dist < swa_window)
+        if (pos_k < 0 || dist < 0 || dist >= swa_win_i) {
+            continue;
+        }
+
+        const uint kv_head_idx = j * pc.n_head_kv + h_kv;
+        vec4 k_reg = load_kv_vec4(pc.k_va, pc.ks_va, kv_head_idx, lane);
+        float score = subgroupAdd(dot(q_reg, k_reg));
+
+        // Banded relative-position bias (added AFTER kq_scale, exact inkling2.cpp order!)
+        if (has_rel) {
+            uint d_idx = min(uint(dist), pc.n_rel_extent);
+            score += BufF32(pc.rel_table_va).d[rel_base + d_idx];
+        }
+
+        vec4 v_reg = load_kv_vec4(pc.v_va, pc.vs_va, kv_head_idx, lane);
+
+        // Online softmax update
+        float m_new = max(m_i, score);
+        float alpha = exp(m_i - m_new);
+        float p_w   = exp(score - m_new);
+        o_i = o_i * alpha + v_reg * p_w;
+        l_i = l_i * alpha + p_w;
+        m_i = m_new;
+    }
+
+    // Store per-simdgroup partials to TG SRAM
+    if (lane == 0u) {
+        sh_m[sg] = m_i;
+        sh_l[sg] = l_i;
+    }
+    sh_o[sg][lane] = o_i;
+    barrier();
+
+    // Simdgroup 0 performs the final 4-way merge + single sink + optional FWHT64 + sigmoid(Qgate)
+    if (sg == 0u) {
+        // Compute effective sink logit (applied ONCE across all 4 simdgroups!)
+        bool  has_sink = false;
+        float eff_sink = 0.0f;
+        if ((pc.flags & FLAG_REL_TABLE_SINK) != 0u) {
+            // rel_table already subtracted sink -> zero_sink = 0.0f
+            has_sink = true;
+            eff_sink = 0.0f;
+        } else if ((pc.flags & FLAG_SINK_PER_TOK_HEAD) != 0u && pc.sinks_va != 0ul) {
+            has_sink = true;
+            eff_sink = BufF32(pc.sinks_va).d[tok * pc.n_head_q + h_q];
+        } else if ((pc.flags & FLAG_SINK_PER_HEAD) != 0u && pc.sinks_va != 0ul) {
+            has_sink = true;
+            eff_sink = BufF32(pc.sinks_va).d[h_q];
+        }
+
+        float m_tot = has_sink ? eff_sink : (-3.402823466e+38f * 0.5f);
+        for (uint s = 0u; s < N_SG; ++s) {
+            if (sh_l[s] > 0.0f) {
+                m_tot = max(m_tot, sh_m[s]);
+            }
+        }
+
+        float l_tot = has_sink ? exp(eff_sink - m_tot) : 0.0f;
+        vec4  o_tot = vec4(0.0f);
+        for (uint s = 0u; s < N_SG; ++s) {
+            if (sh_l[s] > 0.0f) {
+                float w = exp(sh_m[s] - m_tot);
+                l_tot += sh_l[s] * w;
+                o_tot += sh_o[s][lane] * w;
+            }
+        }
+
+        vec4 out_v = (l_tot > 0.0f) ? (o_tot / l_tot) : vec4(0.0f);
+
+        // Optional orthonormal FWHT64 on kqv_out (applied BEFORE sigmoid(Qgate)!)
+        if ((pc.flags & FLAG_FWHT64) != 0u) {
+            out_v = fwht64_in_reg(out_v, lane);
+        }
+
+        // Optional fused sigmoid(Qgate) output gating
+        if ((pc.flags & FLAG_QGATE_F32) != 0u && pc.q_gate_va != 0ul) {
+            BufF32 gb = BufF32(pc.q_gate_va);
+            vec4 g = vec4(gb.d[q_head_off + 0u], gb.d[q_head_off + 1u],
+                          gb.d[q_head_off + 2u], gb.d[q_head_off + 3u]);
+            out_v *= 1.0f / (1.0f + exp(-g));
+        } else if ((pc.flags & FLAG_QGATE_F16) != 0u && pc.q_gate_va != 0ul) {
+            uvec2 gp = BufUvec2(pc.q_gate_va).d[(tok * pc.n_head_q + h_q) * 32u + lane];
+            vec4 g = vec4(unpackHalf2x16(gp.x), unpackHalf2x16(gp.y));
+            out_v *= 1.0f / (1.0f + exp(-g));
+        }
+
+        // Store final output [M, Hq, D]
+        if ((pc.flags & FLAG_OUT_F16) != 0u) {
+            BufF16W ob = BufF16W(pc.out_va);
+            ob.d[q_head_off + 0u] = float16_t(out_v.x);
+            ob.d[q_head_off + 1u] = float16_t(out_v.y);
+            ob.d[q_head_off + 2u] = float16_t(out_v.z);
+            ob.d[q_head_off + 3u] = float16_t(out_v.w);
+        } else {
+            BufF32W ob = BufF32W(pc.out_va);
+            ob.d[q_head_off + 0u] = out_v.x;
+            ob.d[q_head_off + 1u] = out_v.y;
+            ob.d[q_head_off + 2u] = out_v.z;
+            ob.d[q_head_off + 3u] = out_v.w;
+        }
+    }
+}

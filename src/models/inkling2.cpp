@@ -363,35 +363,62 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         cb(Vcur, "Vcur", il);
         cb(Rcur, "Rcur", il);
 
-        ggml_tensor * rel_pos = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
+        ggml_tensor * rel_pos      = is_swa ? inp->self_rel_pos_swa      : inp->self_rel_pos;
+        ggml_tensor * rel_pos_pack = is_swa ? inp->self_rel_pos_pack_swa : inp->self_rel_pos_pack;
 
-        const int64_t n_stream = (is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw)->ne[3];
-        const int64_t n_kv     = rel_pos->ne[0];
+        const ggml_tensor * raw_mask = is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
+        const int64_t n_stream = raw_mask->ne[3];
+        const int64_t n_kv     = raw_mask->ne[0];
 
         ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
 
-        // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
-        ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
+        if (cparams.flash_attn && rel_pos_pack != nullptr) {
+            const int64_t n_extent = layer.attn_rel_bias->ne[1];
+            const int64_t eff_rows = (is_swa || inp->rel_eff_rows <= 0)
+                ? n_extent
+                : std::min<int64_t>(n_extent, inp->rel_eff_rows);
+            ggml_tensor * rel_bias_v = eff_rows < n_extent
+                ? ggml_view_2d(ctx0, layer.attn_rel_bias, layer.attn_rel_bias->ne[0], eff_rows, layer.attn_rel_bias->nb[1], 0)
+                : layer.attn_rel_bias;
 
-        // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
-        table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
-        table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
+            ggml_tensor * table = nullptr;
+            if (Rcur->ne[2] >= 32 && ggml_is_contiguous(Rcur)) {
+                ggml_tensor * rc2 = ggml_reshape_2d(ctx0, Rcur, Rcur->ne[0], Rcur->ne[1] * Rcur->ne[2]);
+                ggml_tensor * tb2 = ggml_mul_mat(ctx0, rel_bias_v, rc2);
+                table = ggml_reshape_3d(ctx0, tb2, rel_bias_v->ne[1], Rcur->ne[1], Rcur->ne[2]);
+            } else {
+                table = ggml_mul_mat(ctx0, rel_bias_v, Rcur);
+            }
+            cb(table, "rel_table", il);
 
-        ggml_tensor * kq_b = ggml_get_rows(ctx0, table, rel_pos);
-        kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
-        kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
-        cb(kq_b, "kq_b", il);
+            cur = build_attn(inp,
+                    nullptr, nullptr, nullptr,
+                    Qcur, Kcur, Vcur, nullptr, sinks, 1.0f/sqrtf(n_embd_head), il,
+                    table, rel_pos_pack, (int32_t) n_extent);
+        } else {
+            // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
+            ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
 
-        // one zero tensor per head count for the whole graph
-        ggml_tensor *& zero = zero_sinks[n_head];
-        if (!zero) {
-            zero = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+            // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
+            table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
+            table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
+
+            ggml_tensor * kq_b = ggml_get_rows(ctx0, table, rel_pos);
+            kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
+            kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
+            cb(kq_b, "kq_b", il);
+
+            // one zero tensor per head count for the whole graph
+            ggml_tensor *& zero = zero_sinks[n_head];
+            if (!zero) {
+                zero = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+            }
+            sinks = zero;
+
+            cur = build_attn(inp,
+                    nullptr, nullptr, nullptr,
+                    Qcur, Kcur, Vcur, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il);
         }
-        sinks = zero;
-
-        cur = build_attn(inp,
-                nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il);
 
         cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
         cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);

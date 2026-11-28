@@ -817,8 +817,13 @@ public:
     llm_graph_input_rs           * get_recr() const { return inp_rs.get(); }
 
     // distance from the token to the cell, extent for the empty, future and more distant cells
-    ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
-    ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
+    ggml_tensor * self_rel_pos          = nullptr; // I32 [n_kv,     n_batch]
+    ggml_tensor * self_rel_pos_swa      = nullptr; // I32 [n_kv_swa, n_batch]
+    ggml_tensor * self_rel_pos_pack     = nullptr; // I32 [n_stream*n_kv     + n_tokens + n_stream*ceil(n_kv/64)*2]
+    ggml_tensor * self_rel_pos_pack_swa = nullptr; // I32 [n_stream*n_kv_swa + n_tokens + n_stream*ceil(n_kv_swa/64)*2]
+    uint32_t      n_stream_rel          = 1;
+    uint32_t      n_stream_rel_swa      = 1;
+    int64_t       rel_eff_rows          = 0;
 
     const uint32_t extent;
     const uint32_t extent_swa;
@@ -1345,11 +1350,14 @@ struct llm_graph_context {
             ggml_tensor * kq_b,
             ggml_tensor * kq_mask,
             ggml_tensor * kv_rows, // [n_kv, n_stream], k and v are shared by the streams
-            ggml_tensor * sinks,   // [n_head_q]
+            ggml_tensor * sinks,   // [n_head_q] or [n_head_q, n_tokens]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * rel_table    = nullptr,
+            ggml_tensor * rel_pos_pack = nullptr,
+                int32_t   rel_extent   = 0) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
@@ -1547,7 +1555,7 @@ struct llm_graph_context {
             uint32_t extent,
             uint32_t extent_swa) const;
 
-    // kq_b is added to the KQ mask, after the KQ scale
+    // kq_b is added to the KQ mask, after the KQ scale (or banded rel_table + rel_pos_pack when rel_table != nullptr)
     ggml_tensor * build_attn(
             llm_graph_input_mem_hybrid_iswa_rel * inp,
             ggml_tensor * wo,
@@ -1557,9 +1565,12 @@ struct llm_graph_context {
             ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
             ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
             ggml_tensor * kq_b,  // [n_kv, n_tokens/n_stream, n_head_q, n_stream]
-            ggml_tensor * sinks, // [n_head_q]
+            ggml_tensor * sinks, // [n_head_q] or [n_head_q, n_tokens]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * rel_table    = nullptr,
+            ggml_tensor * rel_pos_pack = nullptr,
+                int32_t   rel_extent   = 0) const;
 
     //
     // pooling

@@ -1,0 +1,1481 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+
+#include "dequant_supertile.glsl"
+
+// ============================================================================
+// Pillar 1/2: Wave 7 Reshaped-SLM Subgroup-Fenced 8x8 MMA Dense GEMM (AGX3B)
+// ============================================================================
+// Zero dynamic shuffles, zero gl_NumWorkGroups, <= 72 GPR32, 0:0 spills:
+//
+//   1. `TILE_MODE in {0, 5}, PREC_F32=0, WEIGHT_MODE in {0, 2}` (`M=64..2048` -> 13-14+ TFLOPS):
+//      - Vulkan S24 AGX3B 8x8x8 MMA architecture:
+//        * `TILE_MODE=0`: `64N x 64M` (`128T` = `2x2` SGs of `32N x 32M`, **8,192 B = 4 WGs/core = 16 SGs/core!**)
+//        * `TILE_MODE=5`: `128N x 64M` (`256T` = `4x2` SGs of `32N x 32M`, **12,416 B = 2 WGs/core = 16 SGs/core!**)
+//        * Each SG computes `4x4 = 16` 8x8 accumulators (`2.00` MMAs per `coopMatLoad`, +25% vs `2x8`!).
+//        * Zero-pad 8x8-reshaped `shared f16vec2 sh_w` (`stride=4`) + `subgroupShuffleXor(4)`-transposed
+//          `shared f16vec2 sh_x` (`stride=4`, 0 bank conflicts, 2x-4x fewer SRAM stores!).
+//        * Software-pipelined global loads (`stage -> if(k>0) barrier() -> commit -> barrier()`)
+//          + 3 subgroup scheduling fences per `ks` (keeps `4+4` matA/matB strictly bounded -> `<= 68` GPR32
+//          and emits 16 uninterrupted back-to-back `f32matmad8x8` instructions per `ks`!).
+//   2. `TILE_MODE=3/4` (`M=5..8`, Theorem W5.2) — Coalesced-Load `sh_w`-Staged `8x8` MMA:
+//      - `NVFP4_32x16` `TILE_MODE=4` (`16N x 8M`, 4-way K-split, 7,936 B <= 8 KB SRAM).
+//      - `Q8_0_8BLK` `TILE_MODE=3/4`: Lean 9,088 B SRAM (`3` WGs/core) + `<= 64` GPR32 -> `404+ GB/s`.
+
+#ifndef WEIGHT_MODE
+#define WEIGHT_MODE 0
+#endif
+
+#ifndef TILE_MODE
+#define TILE_MODE 0
+#endif
+
+#ifndef PREC_F32
+#define PREC_F32 0
+#endif
+
+#ifndef X_ALIGNED4
+#define X_ALIGNED4 0
+#endif
+
+#ifndef K_PAIRS
+#define K_PAIRS 2
+#endif
+
+#ifndef SH_X_PAD
+#define SH_X_PAD 2
+#endif
+
+#ifndef X_IS_F16
+#define X_IS_F16 0
+#endif
+
+#ifndef K_ALIGNED128
+#define K_ALIGNED128 0
+#endif
+
+#ifndef BATCH_Z1
+#define BATCH_Z1 1
+#endif
+
+#ifndef UNROLL_KP
+#define UNROLL_KP 0
+#endif
+
+#ifndef SH_X_PAIR_SWIZ
+#define SH_X_PAIR_SWIZ 1
+#endif
+
+#ifndef M8_UNROLL_KP
+#define M8_UNROLL_KP 1
+#endif
+
+#define PF_SHW_64X64 ((TILE_MODE == 0 || TILE_MODE == 5) && PREC_F32 == 0 && (WEIGHT_MODE == 0 || WEIGHT_MODE == 2))
+#define M8_DIRECT    ((TILE_MODE == 3 || TILE_MODE == 4) && PREC_F32 == 0 && (WEIGHT_MODE == 0 || WEIGHT_MODE == 2))
+
+#if M8_DIRECT
+  // Wave 10 Zero-sh_w Direct-Register RT=1 (8M) K_PAIRS=2 8x8 MMA:
+  //   - ZERO sh_w staging, ZERO K-split epilogue barriers, 2,176 B SRAM!
+  //   - TILE_MODE=3: 128T (4 SGs), 64N x 8M -> 48/52 GPR32, 32 ActSGs/core (100% MAX HW occupancy!)
+  //   - TILE_MODE=4:  64T (2 SGs), 32N x 8M -> 48/52 GPR32, 30 ActSGs/core (72 WGs on N=2304!)
+  #define M8_K_PAIRS   2
+  #define TILE_K       (64u * uint(M8_K_PAIRS))
+  #define M8_SH_K4     (16u * uint(M8_K_PAIRS))
+  #define M8_K4_MASK   (M8_SH_K4 - 1u)
+  #define M8_K4_SHIFT  5u
+  #define WG_M         8u
+  #if TILE_MODE == 3
+    #define LOCAL_SIZE_X 128u
+    #define WG_N         64u
+  #else
+    #define LOCAL_SIZE_X 64u
+    #define WG_N         32u
+  #endif
+  #define M8_X_STEP    (LOCAL_SIZE_X >> M8_K4_SHIFT)
+  #define M8_X_LOADS   (8u / M8_X_STEP)
+#elif PF_SHW_64X64
+  // Wave 9 Direct-Register K_PAIRS=2 (TILE_K=128) 8x8 MMA (Vulkan S24 mul_mv_mma USE_SH_B=12 engine!):
+  //   - ZERO sh_w, ZERO coopMatLoad, ZERO subgroupShuffleXor, HALF the barrier()s (K_PAIRS=2)!
+  //   - ONLY shared f16vec4 sh_x[32][16*K_PAIRS + SH_X_PAD] = 8,192 B (4 WGs/core @ 128T & 256T!)
+  //   - PF_NT=2, PF_RT=4 -> ONLY 8 accumulators/SG (16 GPR32 -> <= 64 GPR32, 0:0 spills!)
+  //   - Branchless k_base: pre-clamped hoisted weight bases (parallel row0+row1 load co-issue),
+  //     branchless NVFP4 uvec2/u8 super-tile indexing, unconditional rt=0..3 single basic block!
+  //   - TILE_MODE=0: 64N x 32M  (128T = 4 SGs, 512B coalesced X loads = exact S24 ci=5!)
+  //   - TILE_MODE=5: 128N x 32M (256T = 8 SGs, 512B coalesced X loads, 2x X global reuse!)
+  #define TILE_K       (64u * uint(K_PAIRS))
+  #define PF_SH_K4     (16u * uint(K_PAIRS))
+  #define PF_K4_MASK   (PF_SH_K4 - 1u)
+  #if K_PAIRS == 2
+    #define PF_K4_SHIFT 5u
+  #else
+    #define PF_K4_SHIFT 4u
+  #endif
+  #define WG_M         32u
+  #define PF_RT        4u
+  #define PF_NT        2
+  #if TILE_MODE == 5
+    #define LOCAL_SIZE_X 256u
+    #define WG_N         128u
+  #else
+    #define LOCAL_SIZE_X 128u
+    #define WG_N         64u
+  #endif
+  #define PF_X_STEP    (LOCAL_SIZE_X >> PF_K4_SHIFT)
+  #define PF_X_LOADS   (32u / PF_X_STEP)
+  #define PF_P_STEP    (LOCAL_SIZE_X >> PF_K4_SHIFT)
+  #define PF_P_LOADS   (16u / PF_P_STEP)
+#else
+  #define TILE_K 32u
+  #if TILE_MODE == 0
+    #define LOCAL_SIZE_X 128u
+    #define WG_N         64u
+    #define WG_M         32u
+    #define SG_N_CNT     4u
+    #define SG_M_CNT     1u
+    #define SG_TILES_N   2u  // 2 x 8 = 16 rows/sg
+    #define SG_TILES_M   4u  // 4 x 8 = 32 cols/sg
+  #elif TILE_MODE == 1
+    // Medium batch tile (`M = 9..48`): 32(N) x 16(M) across 4 sgs (4 along N, 1 along M)
+    #define LOCAL_SIZE_X 128u
+    #define WG_N         32u
+    #define WG_M         16u
+    #define SG_N_CNT     4u
+    #define SG_M_CNT     1u
+    #define SG_TILES_N   1u  // 1 x 8 = 8 rows/sg
+    #define SG_TILES_M   2u  // 2 x 8 = 16 cols/sg
+  #else
+    // Narrow-N high-occupancy tile (`N <= 128`): 16(N) x 16(M) across 4 sgs (2x2)
+    #define LOCAL_SIZE_X 128u
+    #define WG_N         16u
+    #define WG_M         16u
+    #define SG_N_CNT     2u
+    #define SG_M_CNT     2u
+    #define SG_TILES_N   1u  // 1 x 8 = 8 rows/sg
+    #define SG_TILES_M   1u  // 1 x 8 = 8 cols/sg
+  #endif
+  #define X_VEC4_PER_T  ((WG_M * TILE_K) / (LOCAL_SIZE_X * 4u))
+  #define X_ROWS_STEP   (LOCAL_SIZE_X / 8u)
+#endif
+
+#if PREC_F32 == 1
+  #define MAT_T       float
+  #define MAT_VEC2    vec2
+  #define MAT_VEC4    vec4
+#else
+  #define MAT_T       float16_t
+  #define MAT_VEC2    f16vec2
+  #define MAT_VEC4    f16vec4
+#endif
+
+layout(local_size_x = LOCAL_SIZE_X, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant, scalar) uniform PushArgs {
+    uint64_t w_va;
+    uint64_t x_va;
+    uint64_t y_va;
+    uint     M;
+    uint     N;
+    uint     K;
+    uint     x_stride;
+    uint     y_stride;
+    uint     w_slice_bytes;
+    uint     x_slice_elems;
+    uint     y_slice_elems;
+    uint     w_bcast_div;
+    uint     _pad;
+} pc;
+
+#if (M8_DIRECT || PF_SHW_64X64)
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer AgxBufUvec4FlatR { uvec4   v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8)  readonly buffer AgxBufUvec2FlatR { uvec2   v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  readonly buffer AgxBufU32FlatR   { uint    v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 1)  readonly buffer AgxBufU8FlatR    { uint8_t v[]; };
+  #if WEIGHT_MODE == 0
+void decode_e2m1_u32_f16x2_scaled(uint w32, float16_t sc, out f16vec4 w0, out f16vec4 w1) {
+    f16vec2 v04 = agx_e2m1_swar2_to_f16vec2(w32) * sc;
+    f16vec2 v15 = agx_e2m1_swar2_to_f16vec2(w32 >> 4) * sc;
+    f16vec2 v26 = agx_e2m1_swar2_to_f16vec2(w32 >> 8) * sc;
+    // w32 >> 12 sign bits already reside at bits 15 & 31 of w32 (saves 1 bfi per u32, bit-exact)
+    f16vec2 raw37 = unpackFloat2x16(0x38003800u + (((w32 >> 12u) & 0x00070007u) << 9u));
+    f16vec2 mag37 = min(raw37, fma(raw37, f16vec2(float16_t(2.0)), f16vec2(float16_t(-1.0))));
+    f16vec2 v37   = unpackFloat2x16(packFloat2x16(mag37) | (w32 & 0x80008000u)) * sc;
+    w0 = f16vec4(v04.x, v15.x, v26.x, v37.x);
+    w1 = f16vec4(v04.y, v15.y, v26.y, v37.y);
+}
+  #endif
+#endif
+
+#if M8_DIRECT
+
+  shared f16vec4 sh_x[8][M8_SH_K4 + 2]; // 2,176 B @ KP=2, zero bank conflicts -> 15 WGs/core!
+
+#elif PF_SHW_64X64
+
+  // ==========================================================================
+  // Wave 11 Pair-Transposed XOR-Swizzled Direct-Register K_PAIRS=2 MMA:
+  //   - SH_X_PAIR_SWIZ=1: shared uvec4 sh_x[16][PF_SH_K4] (exact 8,192 B @ KP=2,
+  //     4,096 B @ KP=1): 0 bank conflicts, 4x 128-bit local_store (vs 8x),
+  //     0 inner-loop mov1 transpose ops, 0 loop cf drains, 159 GPRs (640 threads)!
+  //   - SH_X_PAIR_SWIZ=0: Wave 10 f16vec4 sh_x[32][PF_SH_K4 + SH_X_PAD] A/B path.
+  // ==========================================================================
+#if SH_X_PAIR_SWIZ == 1
+  shared uvec4 sh_x[16][PF_SH_K4];
+
+  uvec4 pack_x_pair_f16(f16vec4 a, f16vec4 b) {
+      return uvec4(
+          packFloat2x16(f16vec2(a.x, b.x)),
+          packFloat2x16(f16vec2(a.y, b.y)),
+          packFloat2x16(f16vec2(a.z, b.z)),
+          packFloat2x16(f16vec2(a.w, b.w)));
+  }
+
+  #if X_IS_F16 == 1
+  uvec4 pack_x_pair_u2(uvec2 a, uvec2 b) {
+      return uvec4(
+          bitfieldInsert(a.x, b.x, 16, 16),
+          bitfieldInsert(b.x, a.x >> 16u, 0, 16),
+          bitfieldInsert(a.y, b.y, 16, 16),
+          bitfieldInsert(b.y, a.y >> 16u, 0, 16));
+  }
+  #endif
+#else
+  shared f16vec4 sh_x[32][PF_SH_K4 + SH_X_PAD];
+
+  #if X_IS_F16 == 1
+  layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer AgxBufF16Vec4R {
+      f16vec4 v[];
+  };
+  #endif
+#endif
+
+#if WEIGHT_MODE == 0
+  // Exact 1152B NVFP4_32x16 super-tile view (retained for reference; inner loop uses flat 32-bit views)
+  struct AgxNvfp4ST_U2 {
+      uint8_t d8[128];
+      uvec2   qs2[128];
+  };
+  layout(buffer_reference, scalar, buffer_reference_align = 128) readonly buffer AgxBufNvfp4ST_U2 {
+      AgxNvfp4ST_U2 st[];
+  };
+#endif
+
+#if X_ALIGNED4 == 0
+  f16vec4 load_x_vec4_scalar(AgxBufF32R x_buf, uint gm, uint k0) {
+      if (gm >= pc.M) {
+          return f16vec4(float16_t(0.0));
+      }
+      const uint base = gm * pc.x_stride + k0;
+      return f16vec4(
+          (k0 + 0u < pc.K) ? float16_t(x_buf.v[base + 0u]) : float16_t(0.0),
+          (k0 + 1u < pc.K) ? float16_t(x_buf.v[base + 1u]) : float16_t(0.0),
+          (k0 + 2u < pc.K) ? float16_t(x_buf.v[base + 2u]) : float16_t(0.0),
+          (k0 + 3u < pc.K) ? float16_t(x_buf.v[base + 3u]) : float16_t(0.0));
+  }
+#endif
+
+#else // TILE_MODE == 1, 2 or TILE_MODE == 0 (PREC_F32 == 1 / non-repacked)
+
+  #define SH_X_STRIDE (WG_M + 8u)
+  #define SH_X_SLAB   (TILE_K * SH_X_STRIDE)
+
+  shared MAT_T sh_x[2u * SH_X_SLAB];
+
+  uint pack_lane_nvfp4_bytes(uvec4 q, uint shift) {
+      return ((q.x >> shift) & 0xFFu)
+           | (((q.y >> shift) & 0xFFu) << 8)
+           | (((q.z >> shift) & 0xFFu) << 16)
+           | (((q.w >> shift) & 0xFFu) << 24);
+  }
+
+  uint pack_lane_q8_u32(uvec4 raw, uint w_sub, uint p_shift) {
+      const uint a = (w_sub == 0u) ? raw.x : raw.y;
+      const uint b = (w_sub == 0u) ? raw.z : raw.w;
+      return ((a >> p_shift) & 0xFFFFu) | (((b >> p_shift) & 0xFFFFu) << 16);
+  }
+
+  void store_x_vec4_to_sh_T(uint sh_off, uint dst_rel, MAT_VEC4 xv) {
+      const uint d = sh_off + dst_rel;
+      sh_x[d + 0u * SH_X_STRIDE] = xv.x;
+      sh_x[d + 1u * SH_X_STRIDE] = xv.y;
+      sh_x[d + 2u * SH_X_STRIDE] = xv.z;
+      sh_x[d + 3u * SH_X_STRIDE] = xv.w;
+  }
+
+  #if WEIGHT_MODE != 0 && WEIGHT_MODE != 2
+  MAT_VEC2 load_w_pair(uint64_t w_base, uint row, uint k0) {
+      if (row >= pc.N || k0 >= pc.K) {
+          return MAT_VEC2(MAT_T(0.0));
+      }
+
+    #if WEIGHT_MODE == 1
+      const uint nb_k   = pc.K >> 6;
+      const uint tk     = k0 >> 6;
+      const uint k_in   = k0 & 63u;
+      const uint sub    = k_in >> 4;
+      const uint k16    = k_in & 15u;
+      const uint j      = k16 & 7u;
+      const uint sh     = (k16 >= 8u) ? 4u : 0u;
+      AgxBufNvfp4Raw raw_buf = AgxBufNvfp4Raw(w_base);
+      const uint blk_idx = row * nb_k + tk;
+      const uint b0 = uint(raw_buf.blk[blk_idx].qs[sub * 8u + j]);
+      const uint b1 = uint(raw_buf.blk[blk_idx].qs[sub * 8u + j + 1u]);
+      #if PREC_F32 == 1
+      return vec2(agx_e2m1_to_f32((b0 >> sh) & 0xFu),
+                  agx_e2m1_to_f32((b1 >> sh) & 0xFu)) * agx_ue4m3_to_f32(uint(raw_buf.blk[blk_idx].d[sub]));
+      #else
+      return f16vec2(agx_e2m1_to_f16((b0 >> sh) & 0xFu),
+                     agx_e2m1_to_f16((b1 >> sh) & 0xFu)) * agx_ue4m3_to_f16(uint(raw_buf.blk[blk_idx].d[sub]));
+      #endif
+
+    #elif WEIGHT_MODE == 3
+      const uint nb_k   = pc.K >> 5;
+      const uint b      = k0 >> 5;
+      const uint k32    = k0 & 31u;
+      AgxBufQ8_0Raw w_buf = AgxBufQ8_0Raw(w_base);
+      const uint blk_idx = row * nb_k + b;
+      const float16_t sc = unpackFloat2x16(uint(w_buf.blk[blk_idx].d)).x;
+      const int q0 = int(w_buf.blk[blk_idx].qs[k32]);
+      const int q1 = int(w_buf.blk[blk_idx].qs[k32 + 1u]);
+      #if PREC_F32 == 1
+      return vec2(float(q0), float(q1)) * float(sc);
+      #else
+      return f16vec2(float16_t(q0), float16_t(q1)) * sc;
+      #endif
+
+    #elif WEIGHT_MODE == 4
+      const uint n_chunks = (pc.K + 511u) >> 9;
+      const uint c        = k0 >> 9;
+      const uint k512     = k0 & 511u;
+      const uint blk_in   = k512 >> 5;
+      const uint vec_idx  = k512 >> 4;
+      const uint word_idx = (k512 >> 2) & 3u;
+      const uint pair_idx = (k512 >> 1) & 1u;
+
+      AgxBufMxfp8_16Blk w_buf = AgxBufMxfp8_16Blk(w_base);
+      const uint chk_idx = row * n_chunks + c;
+      const float sc     = agx_ue8m0_to_f32(uint(w_buf.blk[chk_idx].e[blk_in]));
+      const uint word    = w_buf.blk[chk_idx].qs[vec_idx][word_idx];
+      const f16vec4 v4   = agx_e4m3_u32_to_f16vec4(word);
+      const vec2 pair    = ((pair_idx == 0u) ? vec2(v4.xy) : vec2(v4.zw)) * sc;
+      return MAT_VEC2(pair);
+
+    #elif WEIGHT_MODE == 5
+      AgxBufU8R w_buf = AgxBufU8R(w_base + uint64_t(row) * uint64_t(pc.K));
+      const float16_t v0 = agx_e4m3_to_f16(uint(w_buf.v[k0]));
+      const float16_t v1 = (k0 + 1u < pc.K) ? agx_e4m3_to_f16(uint(w_buf.v[k0 + 1u])) : float16_t(0.0);
+      return MAT_VEC2(MAT_T(v0), MAT_T(v1));
+
+    #elif WEIGHT_MODE == 6
+      AgxBufU16R w_buf = AgxBufU16R(w_base + uint64_t(row) * uint64_t(pc.K) * 2ul);
+      const float v0 = agx_bf16_to_f32(w_buf.v[k0]);
+      const float v1 = (k0 + 1u < pc.K) ? agx_bf16_to_f32(w_buf.v[k0 + 1u]) : 0.0;
+      return MAT_VEC2(MAT_T(v0), MAT_T(v1));
+
+    #elif WEIGHT_MODE == 7
+      AgxBufF16R w_buf = AgxBufF16R(w_base + uint64_t(row) * uint64_t(pc.K) * 2ul);
+      const float16_t v0 = w_buf.v[k0];
+      const float16_t v1 = (k0 + 1u < pc.K) ? w_buf.v[k0 + 1u] : float16_t(0.0);
+      return MAT_VEC2(MAT_T(v0), MAT_T(v1));
+
+    #else
+      AgxBufF32R w_buf = AgxBufF32R(w_base + uint64_t(row) * uint64_t(pc.K) * 4ul);
+      const float v0 = w_buf.v[k0];
+      const float v1 = (k0 + 1u < pc.K) ? w_buf.v[k0 + 1u] : 0.0;
+      return MAT_VEC2(MAT_T(v0), MAT_T(v1));
+    #endif
+  }
+  #endif
+
+  void load_sh_x_scalar_T(AgxBufF32R x_buf, uint tid, uint wg_m0, uint sh_off, uint k_base) {
+      const uint total_x = WG_M * TILE_K;
+      for (uint idx = tid * 2u; idx < total_x; idx += LOCAL_SIZE_X * 2u) {
+          const uint lm = idx >> 5;
+          const uint lk = idx & 31u;
+          const uint gm = wg_m0 + lm;
+          const uint gk = k_base + lk;
+          MAT_T v0 = (gm < pc.M && gk      < pc.K) ? MAT_T(x_buf.v[gm * pc.x_stride + gk])      : MAT_T(0.0);
+          MAT_T v1 = (gm < pc.M && gk + 1u < pc.K) ? MAT_T(x_buf.v[gm * pc.x_stride + gk + 1u]) : MAT_T(0.0);
+          sh_x[sh_off + lk        * SH_X_STRIDE + lm] = v0;
+          sh_x[sh_off + (lk + 1u) * SH_X_STRIDE + lm] = v1;
+      }
+  }
+
+#endif
+
+void main() {
+    const uint tid   = gl_LocalInvocationIndex;
+    const uint lane  = gl_SubgroupInvocationID; // 0..31
+    const uint sg_id = gl_SubgroupID;
+    const uint x_stride4 = pc.x_stride >> 2;
+
+#if M8_DIRECT || PF_SHW_64X64
+  #if BATCH_Z1 == 1
+    const uint64_t w_va_u = pc.w_va;
+    const uint64_t x_va_u = pc.x_va;
+    const uint64_t y_va_u = pc.y_va;
+  #else
+    const uint slice      = gl_WorkGroupID.z;
+    const uint w_slice    = slice / max(1u, pc.w_bcast_div);
+    const uint64_t w_va_u = pc.w_va + uint64_t(w_slice) * uint64_t(pc.w_slice_bytes);
+    #if PF_SHW_64X64 && X_IS_F16 == 1
+    const uint64_t x_va_u = pc.x_va + uint64_t(slice)   * uint64_t(pc.x_slice_elems) * 2ul;
+    #else
+    const uint64_t x_va_u = pc.x_va + uint64_t(slice)   * uint64_t(pc.x_slice_elems) * 4ul;
+    #endif
+    const uint64_t y_va_u = pc.y_va + uint64_t(slice)   * uint64_t(pc.y_slice_elems) * 4ul;
+  #endif
+#endif
+
+#if M8_DIRECT
+    // ========================================================================
+    // Wave 10 Zero-sh_w Direct-Register RT=1 (8M) K_PAIRS=2 8x8 MMA
+    //   - TILE_MODE=3 (128T, 64N x 8M): 48/52 GPR32, 2,176 B SRAM -> 32 ActSGs/core!
+    //   - TILE_MODE=4 ( 64T, 32N x 8M): 48/52 GPR32, 2,176 B SRAM -> 30 ActSGs/core!
+    //   - Flat 32-bit uniform-base uXX:uYY loads, ZERO sh_w, ZERO K-split barriers!
+    // ========================================================================
+    coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> acc0 =
+        coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> acc1 =
+        coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0.0);
+
+    {
+        AgxBufVec4R x_buf4     = AgxBufVec4R(x_va_u);
+        const uint  sg_n0      = gl_WorkGroupID.x * WG_N + sg_id * 16u;
+        const uint  K4         = pc.K >> 2u;
+        const bool  full_x_m8  = (pc.M >= 8u) && ((pc.K & (TILE_K - 1u)) == 0u);
+#if WEIGHT_MODE == 0
+        AgxBufUvec2FlatR w_q2 = AgxBufUvec2FlatR(w_va_u);
+        AgxBufU8FlatR    w_d8 = AgxBufU8FlatR(w_va_u);
+#else
+        AgxBufUvec4FlatR w_q4 = AgxBufUvec4FlatR(w_va_u);
+        AgxBufU32FlatR   w_d4 = AgxBufU32FlatR(w_va_u);
+#endif
+
+        for (uint k_base = 0u; k_base < pc.K; k_base += TILE_K) {
+            f16vec4 tmp_x[M8_X_LOADS];
+            {
+                const uint x_col0 = tid >> M8_K4_SHIFT;
+                const uint x_k4   = tid & M8_K4_MASK;
+                const uint kb4    = (k_base >> 2u) + x_k4;
+                if (full_x_m8) {
+                    [[unroll]] for (uint li = 0u; li < M8_X_LOADS; ++li) {
+                        const uint col = x_col0 + li * M8_X_STEP;
+                        tmp_x[li] = f16vec4(x_buf4.v[col * x_stride4 + kb4]);
+                    }
+                } else {
+                    [[unroll]] for (uint li = 0u; li < M8_X_LOADS; ++li) {
+                        const uint col = x_col0 + li * M8_X_STEP;
+                        tmp_x[li] = (col < pc.M && kb4 < K4)
+                            ? f16vec4(x_buf4.v[col * x_stride4 + kb4])
+                            : f16vec4(float16_t(0.0));
+                    }
+                }
+            }
+
+            if (k_base > 0u) {
+                barrier();
+            }
+            {
+                const uint x_col0 = tid >> M8_K4_SHIFT;
+                const uint x_k4   = tid & M8_K4_MASK;
+                [[unroll]] for (uint li = 0u; li < M8_X_LOADS; ++li) {
+                    sh_x[x_col0 + li * M8_X_STEP][x_k4] = tmp_x[li];
+                }
+            }
+            barrier();
+
+#if M8_UNROLL_KP == 1
+            [[unroll]] for (uint s_kp = 0u; s_kp < uint(M8_K_PAIRS); ++s_kp) {
+#else
+            [[dont_unroll]] for (uint s_kp = 0u; s_kp < uint(M8_K_PAIRS); ++s_kp) {
+#endif
+                const uint fm      = agx_cmat8_row(lane);
+                const uint fn      = agx_cmat8_col0(lane);
+                const uint fn2     = fn >> 1u;
+                const uint sub_off = (s_kp << 4u) + (fm << 1u);
+                f16vec4 wa0, wa1, wa2, wa3;
+                f16vec4 wb0, wb1, wb2, wb3;
+#if WEIGHT_MODE == 0
+                const uint nb_k   = pc.K >> 6u;
+                const uint tn     = min(sg_n0 >> 5u, (pc.N - 1u) >> 5u);
+                const uint st_idx = tn * nb_k + min((k_base >> 6u) + s_kp, nb_k - 1u);
+                const uint q2_0   = (((sg_n0 >> 4u) & 1u) << 6u) + (fm << 2u) + fn2;
+                const uint q2_1   = q2_0 + 32u;
+                const uint q_base = st_idx * 144u + 16u;
+                const uint d_base = st_idx * 1152u;
+                const uvec2 q0    = w_q2.v[q_base + q2_0];
+                const uint  d0b   = uint(w_d8.v[d_base + q2_0]);
+                const uvec2 q1    = w_q2.v[q_base + q2_1];
+                const uint  d1b   = uint(w_d8.v[d_base + q2_1]);
+                const float16_t sc0 = agx_ue4m3_to_f16(d0b);
+                const float16_t sc1 = agx_ue4m3_to_f16(d1b);
+                decode_e2m1_u32_f16x2_scaled(q0.x, sc0, wa0, wa1);
+                decode_e2m1_u32_f16x2_scaled(q0.y, sc0, wa2, wa3);
+                decode_e2m1_u32_f16x2_scaled(q1.x, sc1, wb0, wb1);
+                decode_e2m1_u32_f16x2_scaled(q1.y, sc1, wb2, wb3);
+#else
+                const uint n_chunks = (pc.K + 255u) >> 8u;
+                const uint row0     = min(sg_n0 + fm,      pc.N - 1u);
+                const uint row1     = min(sg_n0 + 8u + fm, pc.N - 1u);
+                const uint k_chk    = k_base >> 8u;
+                const uint sb0_u4   = (row0 * n_chunks + k_chk) * 17u;
+                const uint sb1_u4   = (row1 * n_chunks + k_chk) * 17u;
+                const uint blk      = (((k_base >> 5u) & 7u) + (s_kp << 1u)) | (fn >> 2u);
+                const uint q_off    = 1u + (blk << 1u) + (fn2 & 1u);
+                const uvec4 qv0     = w_q4.v[sb0_u4 + q_off];
+                const uint  d0w     = w_d4.v[(sb0_u4 << 2u) + (blk >> 1u)];
+                const uvec4 qv1     = w_q4.v[sb1_u4 + q_off];
+                const uint  d1w     = w_d4.v[(sb1_u4 << 2u) + (blk >> 1u)];
+                const f16vec2 d0p   = unpackFloat2x16(d0w);
+                const f16vec2 d1p   = unpackFloat2x16(d1w);
+                const float16_t d0  = ((blk & 1u) != 0u) ? d0p.y : d0p.x;
+                const float16_t d1  = ((blk & 1u) != 0u) ? d1p.y : d1p.x;
+                wa0 = agx_q8_u32_magic_to_f16vec4(qv0.x) * d0;
+                wa1 = agx_q8_u32_magic_to_f16vec4(qv0.y) * d0;
+                wa2 = agx_q8_u32_magic_to_f16vec4(qv0.z) * d0;
+                wa3 = agx_q8_u32_magic_to_f16vec4(qv0.w) * d0;
+                wb0 = agx_q8_u32_magic_to_f16vec4(qv1.x) * d1;
+                wb1 = agx_q8_u32_magic_to_f16vec4(qv1.y) * d1;
+                wb2 = agx_q8_u32_magic_to_f16vec4(qv1.z) * d1;
+                wb3 = agx_q8_u32_magic_to_f16vec4(qv1.w) * d1;
+#endif
+                const f16vec4 ba0 = sh_x[fn + 0u][sub_off + 0u];
+                const f16vec4 ba1 = sh_x[fn + 0u][sub_off + 1u];
+                const f16vec4 bb0 = sh_x[fn + 1u][sub_off + 0u];
+                const f16vec4 bb1 = sh_x[fn + 1u][sub_off + 1u];
+                [[unroll]] for (uint s = 0u; s < 4u; ++s) {
+                    coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> ma0_0, ma1_0, ma0_1, ma1_1;
+                    coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> mb0, mb1;
+                    ma0_0[0] = wa0[s]; ma0_0[1] = wa2[s];
+                    ma1_0[0] = wa1[s]; ma1_0[1] = wa3[s];
+                    ma0_1[0] = wb0[s]; ma0_1[1] = wb2[s];
+                    ma1_1[0] = wb1[s]; ma1_1[1] = wb3[s];
+                    mb0[0]   = ba0[s]; mb0[1]   = bb0[s];
+                    mb1[0]   = ba1[s]; mb1[1]   = bb1[s];
+                    acc0 = coopMatMulAdd(ma0_0, mb0, acc0);
+                    acc1 = coopMatMulAdd(ma0_1, mb0, acc1);
+                    acc0 = coopMatMulAdd(ma1_0, mb1, acc0);
+                    acc1 = coopMatMulAdd(ma1_1, mb1, acc1);
+                }
+            }
+        }
+    }
+
+    {
+        const uint ep_sg_n0 = gl_WorkGroupID.x * WG_N + sg_id * 16u;
+        const uint ep_fm    = agx_cmat8_row(lane);
+        const uint ep_fn    = agx_cmat8_col0(lane);
+        AgxBufF32RW y_buf   = AgxBufF32RW(y_va_u);
+        const uint gn0      = ep_sg_n0 + ep_fm;
+        const uint gn1      = gn0 + 8u;
+        if (ep_fn < pc.M) {
+            const uint y_row0 = ep_fn * pc.y_stride;
+            if (gn0 < pc.N) y_buf.v[y_row0 + gn0] = acc0[0];
+            if (gn1 < pc.N) y_buf.v[y_row0 + gn1] = acc1[0];
+        }
+        if (ep_fn + 1u < pc.M) {
+            const uint y_row1 = (ep_fn + 1u) * pc.y_stride;
+            if (gn0 < pc.N) y_buf.v[y_row1 + gn0] = acc0[1];
+            if (gn1 < pc.N) y_buf.v[y_row1 + gn1] = acc1[1];
+        }
+    }
+
+#elif PF_SHW_64X64
+#if SH_X_PAIR_SWIZ == 1
+    // ========================================================================
+    // Wave 11 Pair-Transposed XOR-Swizzled Direct-Register MMA:
+    //   - Exact 8,192 B SRAM @ KP=2 (4 WGs/core = 16 ActSGs) with 0 bank conflicts!
+    //   - Half the local_stores (4x 128-bit), ZERO inner-loop mov1 transpose ops,
+    //     ZERO loop control-flow drains, 2x 64-bit Q8_0 scale loads, 159 GPRs (640T)!
+    //   - Optional 2D WG L2/SLC tile swizzle driven by pc._pad (0/1 = off).
+    // ========================================================================
+    uint wg_x = gl_WorkGroupID.x;
+    uint wg_y = gl_WorkGroupID.y;
+    {
+        const uint swiz_m = pc._pad;
+        if (swiz_m > 1u) {
+            const uint gx      = (pc.N + WG_N - 1u) / WG_N;
+            const uint gy      = (pc.M + 31u) >> 5u;
+            const uint lin     = wg_y * gx + wg_x;
+            const uint grp_sz  = swiz_m * gx;
+            const uint grp_id  = lin / grp_sz;
+            const uint grp_rem = lin - grp_id * grp_sz;
+            const uint m_grp0  = grp_id * swiz_m;
+            const uint cur_m   = min(swiz_m, gy - m_grp0);
+            wg_x = grp_rem / cur_m;
+            wg_y = m_grp0 + (grp_rem - wg_x * cur_m);
+        }
+    }
+
+    coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> acc[PF_NT][PF_RT];
+    [[unroll]] for (uint t = 0u; t < uint(PF_NT); ++t) {
+        [[unroll]] for (uint rt = 0u; rt < PF_RT; ++rt) {
+            acc[t][rt] = coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0.0);
+        }
+    }
+
+    {
+#if X_IS_F16 == 1
+        AgxBufUvec2FlatR x_buf4_u = AgxBufUvec2FlatR(x_va_u);
+#else
+        AgxBufVec4R x_buf4        = AgxBufVec4R(x_va_u);
+  #if X_ALIGNED4 == 0
+        const bool x_vec4_ok      = ((pc.K & 3u) == 0u) && ((pc.x_stride & 3u) == 0u);
+        AgxBufF32R x_buf          = AgxBufF32R(x_va_u);
+  #endif
+#endif
+#if WEIGHT_MODE == 0
+        AgxBufUvec2FlatR w_q2     = AgxBufUvec2FlatR(w_va_u);
+        AgxBufU8FlatR    w_d8     = AgxBufU8FlatR(w_va_u);
+#else
+        AgxBufUvec4FlatR w_q4     = AgxBufUvec4FlatR(w_va_u);
+  #if K_PAIRS == 2
+        AgxBufUvec2FlatR w_d2     = AgxBufUvec2FlatR(w_va_u);
+  #else
+        AgxBufU32FlatR   w_d4     = AgxBufU32FlatR(w_va_u);
+  #endif
+#endif
+        const uint wg_m0   = wg_y * 32u;
+        const uint n_valid = (wg_m0 < pc.M) ? min(32u, pc.M - wg_m0) : 0u;
+        const uint sg_n0   = wg_x * WG_N + sg_id * 16u;
+        const uint fm      = agx_cmat8_row(lane);
+        const uint fn      = agx_cmat8_col0(lane);
+        const uint fn2     = fn >> 1u;
+        const uint k0_sw   = (fm << 1u) ^ fn2;
+        const uint k1_sw   = k0_sw ^ 1u;
+
+        const uint x_p0    = tid >> PF_K4_SHIFT;
+        const uint x_k4    = tid & PF_K4_MASK;
+        const uint x_ksw   = x_k4 ^ (x_p0 & 3u);
+#if K_ALIGNED128 == 1
+  #if X_IS_F16 == 0 && X_ALIGNED4 == 0
+        const bool full_x_tile = x_vec4_ok && (n_valid == 32u);
+  #else
+        const bool full_x_tile = (n_valid == 32u);
+  #endif
+#else
+  #if X_IS_F16 == 0 && X_ALIGNED4 == 0
+        const bool full_x_tile = x_vec4_ok && (n_valid == 32u) && ((pc.K & (TILE_K - 1u)) == 0u);
+  #else
+        const bool full_x_tile = (n_valid == 32u) && ((pc.K & (TILE_K - 1u)) == 0u);
+  #endif
+#endif
+
+#if WEIGHT_MODE == 0
+        const uint nb_k    = pc.K >> 6u;
+        const uint tn      = min(sg_n0 >> 5u, (pc.N - 1u) >> 5u);
+        const uint q2_0    = (((sg_n0 >> 4u) & 1u) << 6u) + (fm << 2u) + fn2;
+  #if K_PAIRS == 1 || K_ALIGNED128 == 1
+        uint st_q_idx      = (tn * nb_k) * 144u + 16u + q2_0;
+        uint st_d_idx      = (tn * nb_k) * 1152u + q2_0;
+  #else
+        const uint st_row0 = tn * nb_k;
+  #endif
+#else
+        const uint n_chunks = (pc.K + 255u) >> 8u;
+        const uint row0     = min(sg_n0 + fm,      pc.N - 1u);
+        const uint row1     = min(sg_n0 + 8u + fm, pc.N - 1u);
+        const uint sb0_row  = row0 * n_chunks;
+        const uint sb1_row  = row1 * n_chunks;
+        const uint fn_hi    = fn >> 2u;
+        const uint q_lane   = 1u + (fn_hi << 1u) + (fn2 & 1u);
+#endif
+
+        for (uint k_base = 0u; k_base < pc.K; k_base += TILE_K) {
+            const uint kb4 = (k_base >> 2u) + x_k4;
+            // 1. Zero-drain pair-transposed XOR-swizzled X load & store (store inside branch -> 0 cf drains!)
+            if (full_x_tile) {
+                uvec4 tmp_p[PF_P_LOADS];
+                const uint x_row0_base = (wg_m0 + (x_p0 << 1u)) * x_stride4 + kb4;
+                const uint x_step_s4   = (PF_P_STEP << 1u) * x_stride4;
+                [[unroll]] for (uint pi = 0u; pi < PF_P_LOADS; ++pi) {
+                    const uint r0_off = x_row0_base + pi * x_step_s4;
+#if X_IS_F16 == 1
+                    tmp_p[pi] = pack_x_pair_u2(x_buf4_u.v[r0_off], x_buf4_u.v[r0_off + x_stride4]);
+#else
+                    tmp_p[pi] = pack_x_pair_f16(f16vec4(x_buf4.v[r0_off]), f16vec4(x_buf4.v[r0_off + x_stride4]));
+#endif
+                }
+                if (k_base > 0u) {
+                    barrier();
+                }
+                [[unroll]] for (uint pi = 0u; pi < PF_P_LOADS; ++pi) {
+                    sh_x[x_p0 + pi * PF_P_STEP][x_ksw] = tmp_p[pi];
+                }
+            } else {
+                uvec4 tmp_p[PF_P_LOADS];
+#if K_ALIGNED128 == 0
+                const uint K4    = pc.K >> 2u;
+                const bool k_ok  = (kb4 < K4);
+#else
+                const bool k_ok  = true;
+#endif
+                [[unroll]] for (uint pi = 0u; pi < PF_P_LOADS; ++pi) {
+                    const uint p  = x_p0 + pi * PF_P_STEP;
+                    const uint c0 = p << 1u;
+                    const uint c1 = c0 + 1u;
+#if X_IS_F16 == 1
+                    const uvec2 v0 = (c0 < n_valid && k_ok) ? x_buf4_u.v[(wg_m0 + c0) * x_stride4 + kb4] : uvec2(0u);
+                    const uvec2 v1 = (c1 < n_valid && k_ok) ? x_buf4_u.v[(wg_m0 + c1) * x_stride4 + kb4] : uvec2(0u);
+                    tmp_p[pi] = pack_x_pair_u2(v0, v1);
+#else
+  #if X_ALIGNED4 == 0
+                    if (x_vec4_ok) {
+  #endif
+                        const f16vec4 v0 = (c0 < n_valid && k_ok)
+                            ? f16vec4(x_buf4.v[(wg_m0 + c0) * x_stride4 + kb4])
+                            : f16vec4(float16_t(0.0));
+                        const f16vec4 v1 = (c1 < n_valid && k_ok)
+                            ? f16vec4(x_buf4.v[(wg_m0 + c1) * x_stride4 + kb4])
+                            : f16vec4(float16_t(0.0));
+                        tmp_p[pi] = pack_x_pair_f16(v0, v1);
+  #if X_ALIGNED4 == 0
+                    } else {
+                        const uint gk = k_base + (x_k4 << 2u);
+                        const f16vec4 v0 = (c0 < n_valid) ? load_x_vec4_scalar(x_buf, wg_m0 + c0, gk)
+                                                          : f16vec4(float16_t(0.0));
+                        const f16vec4 v1 = (c1 < n_valid) ? load_x_vec4_scalar(x_buf, wg_m0 + c1, gk)
+                                                          : f16vec4(float16_t(0.0));
+                        tmp_p[pi] = pack_x_pair_f16(v0, v1);
+                    }
+  #endif
+#endif
+                }
+                if (k_base > 0u) {
+                    barrier();
+                }
+                [[unroll]] for (uint pi = 0u; pi < PF_P_LOADS; ++pi) {
+                    sh_x[x_p0 + pi * PF_P_STEP][x_ksw] = tmp_p[pi];
+                }
+            }
+            barrier();
+
+            // 2. Hoisted flat-32 weight decode + zero-bank-conflict zero-mov1 64-MMA compute
+#if WEIGHT_MODE == 2 && K_PAIRS == 2
+            const uint k_chk    = k_base >> 8u;
+            const uint sb0_u4   = (sb0_row + k_chk) * 17u;
+            const uint sb1_u4   = (sb1_row + k_chk) * 17u;
+            const uint d_half   = (k_base >> 7u) & 1u;
+            const uvec2 d0_w    = w_d2.v[(sb0_u4 << 1u) + d_half];
+            const uvec2 d1_w    = w_d2.v[(sb1_u4 << 1u) + d_half];
+            const uint q_base_k = q_lane + (d_half << 3u);
+  #if UNROLL_KP == 1
+            const uvec4 qv0_0   = w_q4.v[sb0_u4 + q_base_k];
+            const uvec4 qv1_0   = w_q4.v[sb1_u4 + q_base_k];
+            [[unroll]] for (uint s_kp = 0u; s_kp < 2u; ++s_kp) {
+                const uvec4 qv0     = (s_kp == 0u) ? qv0_0 : w_q4.v[sb0_u4 + q_base_k + 4u];
+                const uvec4 qv1     = (s_kp == 0u) ? qv1_0 : w_q4.v[sb1_u4 + q_base_k + 4u];
+  #else
+            [[dont_unroll]] for (uint s_kp = 0u; s_kp < 2u; ++s_kp) {
+                const uvec4 qv0     = w_q4.v[sb0_u4 + q_base_k + (s_kp << 2u)];
+                const uvec4 qv1     = w_q4.v[sb1_u4 + q_base_k + (s_kp << 2u)];
+  #endif
+                const f16vec2 d0p   = unpackFloat2x16((s_kp == 0u) ? d0_w.x : d0_w.y);
+                const f16vec2 d1p   = unpackFloat2x16((s_kp == 0u) ? d1_w.x : d1_w.y);
+                const float16_t d0  = (fn_hi != 0u) ? d0p.y : d0p.x;
+                const float16_t d1  = (fn_hi != 0u) ? d1p.y : d1p.x;
+                const f16vec4 wa0   = agx_q8_u32_magic_to_f16vec4(qv0.x) * d0;
+                const f16vec4 wa1   = agx_q8_u32_magic_to_f16vec4(qv0.y) * d0;
+                const f16vec4 wa2   = agx_q8_u32_magic_to_f16vec4(qv0.z) * d0;
+                const f16vec4 wa3   = agx_q8_u32_magic_to_f16vec4(qv0.w) * d0;
+                const f16vec4 wb0   = agx_q8_u32_magic_to_f16vec4(qv1.x) * d1;
+                const f16vec4 wb1   = agx_q8_u32_magic_to_f16vec4(qv1.y) * d1;
+                const f16vec4 wb2   = agx_q8_u32_magic_to_f16vec4(qv1.z) * d1;
+                const f16vec4 wb3   = agx_q8_u32_magic_to_f16vec4(qv1.w) * d1;
+                const uint sk0      = (s_kp << 4u) + k0_sw;
+                const uint sk1      = (s_kp << 4u) + k1_sw;
+                [[unroll]] for (uint rtp = 0u; rtp < PF_RT; rtp += 2u) {
+                    const uint p0    = (rtp << 2u) + fn2;
+                    const uint p1    = p0 + 4u;
+                    const uvec4 b0_0 = sh_x[p0][sk0];
+                    const uvec4 b1_0 = sh_x[p0][sk1];
+                    const uvec4 b0_1 = sh_x[p1][sk0];
+                    const uvec4 b1_1 = sh_x[p1][sk1];
+                    [[unroll]] for (uint s = 0u; s < 4u; ++s) {
+                        coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> ma0_0, ma1_0, ma0_1, ma1_1;
+                        coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> mb0_0, mb1_0, mb0_1, mb1_1;
+                        ma0_0[0] = wa0[s]; ma0_0[1] = wa2[s];
+                        ma1_0[0] = wa1[s]; ma1_0[1] = wa3[s];
+                        ma0_1[0] = wb0[s]; ma0_1[1] = wb2[s];
+                        ma1_1[0] = wb1[s]; ma1_1[1] = wb3[s];
+                        const f16vec2 bp0_0 = unpackFloat2x16(b0_0[s]);
+                        const f16vec2 bp1_0 = unpackFloat2x16(b1_0[s]);
+                        const f16vec2 bp0_1 = unpackFloat2x16(b0_1[s]);
+                        const f16vec2 bp1_1 = unpackFloat2x16(b1_1[s]);
+                        mb0_0[0] = bp0_0.x; mb0_0[1] = bp0_0.y;
+                        mb0_1[0] = bp0_1.x; mb0_1[1] = bp0_1.y;
+                        mb1_0[0] = bp1_0.x; mb1_0[1] = bp1_0.y;
+                        mb1_1[0] = bp1_1.x; mb1_1[1] = bp1_1.y;
+                        acc[0][rtp]      = coopMatMulAdd(ma0_0, mb0_0, acc[0][rtp]);
+                        acc[1][rtp]      = coopMatMulAdd(ma0_1, mb0_0, acc[1][rtp]);
+                        acc[0][rtp + 1u] = coopMatMulAdd(ma0_0, mb0_1, acc[0][rtp + 1u]);
+                        acc[1][rtp + 1u] = coopMatMulAdd(ma0_1, mb0_1, acc[1][rtp + 1u]);
+                        acc[0][rtp]      = coopMatMulAdd(ma1_0, mb1_0, acc[0][rtp]);
+                        acc[1][rtp]      = coopMatMulAdd(ma1_1, mb1_0, acc[1][rtp]);
+                        acc[0][rtp + 1u] = coopMatMulAdd(ma1_0, mb1_1, acc[0][rtp + 1u]);
+                        acc[1][rtp + 1u] = coopMatMulAdd(ma1_1, mb1_1, acc[1][rtp + 1u]);
+                    }
+                }
+            }
+#else
+  #if UNROLL_KP == 1
+            [[unroll]] for (uint s_kp = 0u; s_kp < uint(K_PAIRS); ++s_kp) {
+  #elif K_PAIRS > 1
+            [[dont_unroll]] for (uint s_kp = 0u; s_kp < uint(K_PAIRS); ++s_kp) {
+  #else
+            [[unroll]] for (uint s_kp = 0u; s_kp < 1u; ++s_kp) {
+  #endif
+                f16vec4 wa0, wa1, wa2, wa3;
+                f16vec4 wb0, wb1, wb2, wb3;
+  #if WEIGHT_MODE == 0
+    #if K_PAIRS == 1 || K_ALIGNED128 == 1
+                const uint qb = st_q_idx + s_kp * 144u;
+                const uint db = st_d_idx + s_kp * 1152u;
+    #else
+                const uint st_idx = st_row0 + min((k_base >> 6u) + s_kp, nb_k - 1u);
+                const uint qb     = st_idx * 144u + 16u + q2_0;
+                const uint db     = st_idx * 1152u + q2_0;
+    #endif
+                const uvec2 q0  = w_q2.v[qb];
+                const uint  d0b = uint(w_d8.v[db]);
+                const uvec2 q1  = w_q2.v[qb + 32u];
+                const uint  d1b = uint(w_d8.v[db + 32u]);
+                const float16_t sc0 = agx_ue4m3_to_f16(d0b);
+                const float16_t sc1 = agx_ue4m3_to_f16(d1b);
+                decode_e2m1_u32_f16x2_scaled(q0.x, sc0, wa0, wa1);
+                decode_e2m1_u32_f16x2_scaled(q0.y, sc0, wa2, wa3);
+                decode_e2m1_u32_f16x2_scaled(q1.x, sc1, wb0, wb1);
+                decode_e2m1_u32_f16x2_scaled(q1.y, sc1, wb2, wb3);
+  #else
+                // K_PAIRS == 1 Q8_0
+                const uint k_chk  = k_base >> 8u;
+                const uint sb0_u4 = (sb0_row + k_chk) * 17u;
+                const uint sb1_u4 = (sb1_row + k_chk) * 17u;
+                const uint k_64   = (k_base >> 6u) & 3u;
+                const uint q_off  = q_lane + (k_64 << 2u);
+                const uvec4 qv0   = w_q4.v[sb0_u4 + q_off];
+                const uint  d0w   = w_d4.v[(sb0_u4 << 2u) + k_64];
+                const uvec4 qv1   = w_q4.v[sb1_u4 + q_off];
+                const uint  d1w   = w_d4.v[(sb1_u4 << 2u) + k_64];
+                const f16vec2 d0p = unpackFloat2x16(d0w);
+                const f16vec2 d1p = unpackFloat2x16(d1w);
+                const float16_t d0 = (fn_hi != 0u) ? d0p.y : d0p.x;
+                const float16_t d1 = (fn_hi != 0u) ? d1p.y : d1p.x;
+                wa0 = agx_q8_u32_magic_to_f16vec4(qv0.x) * d0;
+                wa1 = agx_q8_u32_magic_to_f16vec4(qv0.y) * d0;
+                wa2 = agx_q8_u32_magic_to_f16vec4(qv0.z) * d0;
+                wa3 = agx_q8_u32_magic_to_f16vec4(qv0.w) * d0;
+                wb0 = agx_q8_u32_magic_to_f16vec4(qv1.x) * d1;
+                wb1 = agx_q8_u32_magic_to_f16vec4(qv1.y) * d1;
+                wb2 = agx_q8_u32_magic_to_f16vec4(qv1.z) * d1;
+                wb3 = agx_q8_u32_magic_to_f16vec4(qv1.w) * d1;
+  #endif
+                const uint sk0 = (s_kp << 4u) + k0_sw;
+                const uint sk1 = (s_kp << 4u) + k1_sw;
+                [[unroll]] for (uint rt = 0u; rt < PF_RT; ++rt) {
+                    const uint p   = (rt << 2u) + fn2;
+                    const uvec4 b0 = sh_x[p][sk0];
+                    const uvec4 b1 = sh_x[p][sk1];
+                    [[unroll]] for (uint s = 0u; s < 4u; ++s) {
+                        coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> ma0_0, ma1_0, ma0_1, ma1_1;
+                        coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> mb0, mb1;
+                        ma0_0[0] = wa0[s]; ma0_0[1] = wa2[s];
+                        ma1_0[0] = wa1[s]; ma1_0[1] = wa3[s];
+                        ma0_1[0] = wb0[s]; ma0_1[1] = wb2[s];
+                        ma1_1[0] = wb1[s]; ma1_1[1] = wb3[s];
+                        const f16vec2 bp0 = unpackFloat2x16(b0[s]);
+                        const f16vec2 bp1 = unpackFloat2x16(b1[s]);
+                        mb0[0] = bp0.x; mb0[1] = bp0.y;
+                        mb1[0] = bp1.x; mb1[1] = bp1.y;
+                        acc[0][rt] = coopMatMulAdd(ma0_0, mb0, acc[0][rt]);
+                        acc[1][rt] = coopMatMulAdd(ma0_1, mb0, acc[1][rt]);
+                        acc[0][rt] = coopMatMulAdd(ma1_0, mb1, acc[0][rt]);
+                        acc[1][rt] = coopMatMulAdd(ma1_1, mb1, acc[1][rt]);
+                    }
+                }
+            }
+  #if WEIGHT_MODE == 0 && (K_PAIRS == 1 || K_ALIGNED128 == 1)
+            st_q_idx += uint(K_PAIRS) * 144u;
+            st_d_idx += uint(K_PAIRS) * 1152u;
+  #endif
+#endif
+        }
+    }
+
+    // Direct epilogue store using swizzled (wg_x, wg_y)
+    {
+        const uint ep_sg_n0 = wg_x * WG_N + sg_id * 16u;
+        const uint ep_wg_m0 = wg_y * 32u;
+        const uint ep_fm    = agx_cmat8_row(lane);
+        const uint ep_fn    = agx_cmat8_col0(lane);
+        AgxBufF32RW y_buf   = AgxBufF32RW(y_va_u);
+        [[unroll]] for (uint rt = 0u; rt < PF_RT; ++rt) {
+            const uint gm0_out = ep_wg_m0 + rt * 8u + ep_fn;
+            const bool m0_ok   = (gm0_out      < pc.M);
+            const bool m1_ok   = (gm0_out + 1u < pc.M);
+            if (m0_ok || m1_ok) {
+                const uint y_row0 = gm0_out * pc.y_stride;
+                const uint y_row1 = y_row0 + pc.y_stride;
+                [[unroll]] for (uint t = 0u; t < uint(PF_NT); ++t) {
+                    const uint gn = ep_sg_n0 + t * 8u + ep_fm;
+                    if (gn < pc.N) {
+                        if (m0_ok) y_buf.v[y_row0 + gn] = acc[t][rt][0];
+                        if (m1_ok) y_buf.v[y_row1 + gn] = acc[t][rt][1];
+                    }
+                }
+            }
+        }
+    }
+#else // SH_X_PAIR_SWIZ == 0 (Wave 10 baseline A/B path)
+    // ========================================================================
+    // Wave 10 Flat-32 Uniform-Base K_PAIRS=2 (TILE_K=128) 8x8 MMA
+    //   - BATCH_Z1=1 + flat 32-bit indexing -> ZERO 64-bit pointer arithmetic,
+    //     ALL weight device_loads off uniform uXX:uYY!
+    //   - TILE_MODE=5 (256T, 128x32, PAD=2): 68 GPR32 -> 24 ActSGs/core (+50%!), 0:0 spills!
+    //   - UNROLL_KP=1 A/B mode: unrolled s_kp with ov=4 overlapped weight prefetch!
+    // ========================================================================
+    coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> acc[PF_NT][PF_RT];
+    [[unroll]] for (uint t = 0u; t < uint(PF_NT); ++t) {
+        [[unroll]] for (uint rt = 0u; rt < PF_RT; ++rt) {
+            acc[t][rt] = coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0.0);
+        }
+    }
+
+    {
+#if X_IS_F16 == 1
+        AgxBufF16Vec4R x_buf4_h = AgxBufF16Vec4R(x_va_u);
+#else
+        AgxBufVec4R x_buf4      = AgxBufVec4R(x_va_u);
+  #if X_ALIGNED4 == 0
+        const bool x_vec4_ok    = ((pc.K & 3u) == 0u) && ((pc.x_stride & 3u) == 0u);
+        AgxBufF32R x_buf        = AgxBufF32R(x_va_u);
+  #endif
+#endif
+#if WEIGHT_MODE == 0
+        AgxBufUvec2FlatR w_q2   = AgxBufUvec2FlatR(w_va_u);
+        AgxBufU8FlatR    w_d8   = AgxBufU8FlatR(w_va_u);
+#else
+        AgxBufUvec4FlatR w_q4   = AgxBufUvec4FlatR(w_va_u);
+        AgxBufU32FlatR   w_d4   = AgxBufU32FlatR(w_va_u);
+#endif
+        const uint wg_m0       = gl_WorkGroupID.y * 32u;
+        const uint n_valid     = (wg_m0 < pc.M) ? min(32u, pc.M - wg_m0) : 0u;
+        const uint sg_n0       = gl_WorkGroupID.x * WG_N + sg_id * 16u;
+#if X_IS_F16 == 0 && X_ALIGNED4 == 0
+        const bool full_x_tile = x_vec4_ok && (n_valid == 32u) && ((pc.K & (TILE_K - 1u)) == 0u);
+#else
+        const bool full_x_tile = (n_valid == 32u) && ((pc.K & (TILE_K - 1u)) == 0u);
+#endif
+
+        for (uint k_base = 0u; k_base < pc.K; k_base += TILE_K) {
+            // 1. Software-pipelined cooperative X load into regs BEFORE barrier()
+            f16vec4 tmp_x[PF_X_LOADS];
+            {
+                const uint x_col0 = tid >> PF_K4_SHIFT;
+                const uint x_k4   = tid & PF_K4_MASK;
+                const uint kb4    = (k_base >> 2u) + x_k4;
+                if (full_x_tile) {
+                    [[unroll]] for (uint li = 0u; li < PF_X_LOADS; ++li) {
+                        const uint gm = wg_m0 + x_col0 + li * PF_X_STEP;
+#if X_IS_F16 == 1
+                        tmp_x[li] = x_buf4_h.v[gm * x_stride4 + kb4];
+#else
+                        tmp_x[li] = f16vec4(x_buf4.v[gm * x_stride4 + kb4]);
+#endif
+                    }
+                } else {
+                    const uint K4 = pc.K >> 2u;
+                    [[unroll]] for (uint li = 0u; li < PF_X_LOADS; ++li) {
+                        const uint col = x_col0 + li * PF_X_STEP;
+                        const uint gm  = wg_m0 + col;
+#if X_IS_F16 == 1
+                        tmp_x[li] = (col < n_valid && kb4 < K4)
+                            ? x_buf4_h.v[gm * x_stride4 + kb4]
+                            : f16vec4(float16_t(0.0));
+#else
+  #if X_ALIGNED4 == 0
+                        if (x_vec4_ok) {
+  #endif
+                            tmp_x[li] = (col < n_valid && kb4 < K4)
+                                ? f16vec4(x_buf4.v[gm * x_stride4 + kb4])
+                                : f16vec4(float16_t(0.0));
+  #if X_ALIGNED4 == 0
+                        } else {
+                            tmp_x[li] = (col < n_valid) ? load_x_vec4_scalar(x_buf, gm, k_base + (x_k4 << 2u))
+                                                        : f16vec4(float16_t(0.0));
+                        }
+  #endif
+#endif
+                    }
+                }
+            }
+
+            if (k_base > 0u) {
+                barrier();
+            }
+            {
+                const uint x_col0 = tid >> PF_K4_SHIFT;
+                const uint x_k4   = tid & PF_K4_MASK;
+                [[unroll]] for (uint li = 0u; li < PF_X_LOADS; ++li) {
+                    sh_x[x_col0 + li * PF_X_STEP][x_k4] = tmp_x[li];
+                }
+            }
+            barrier();
+
+            // 2. Flat 32-bit uniform-base co-issued dual-tile weight decode + 64-MMA compute
+#if UNROLL_KP == 1
+            [[unroll]] for (uint s_kp = 0u; s_kp < uint(K_PAIRS); ++s_kp) {
+#elif K_PAIRS > 1
+            [[dont_unroll]] for (uint s_kp = 0u; s_kp < uint(K_PAIRS); ++s_kp) {
+#else
+            [[unroll]] for (uint s_kp = 0u; s_kp < 1u; ++s_kp) {
+#endif
+                const uint fm      = agx_cmat8_row(lane);
+                const uint fn      = agx_cmat8_col0(lane);
+                const uint fn2     = fn >> 1u;
+                const uint sub_off = (s_kp << 4u) + (fm << 1u);
+                f16vec4 wa0, wa1, wa2, wa3;
+                f16vec4 wb0, wb1, wb2, wb3;
+#if WEIGHT_MODE == 0
+                const uint nb_k   = pc.K >> 6u;
+                const uint tn     = min(sg_n0 >> 5u, (pc.N - 1u) >> 5u);
+  #if K_PAIRS == 1 || K_ALIGNED128 == 1
+                const uint st_idx = tn * nb_k + ((k_base >> 6u) + s_kp);
+  #else
+                const uint st_idx = tn * nb_k + min((k_base >> 6u) + s_kp, nb_k - 1u);
+  #endif
+                const uint q2_0   = (((sg_n0 >> 4u) & 1u) << 6u) + (fm << 2u) + fn2;
+                const uint q2_1   = q2_0 + 32u;
+                const uint q_base = st_idx * 144u + 16u;
+                const uint d_base = st_idx * 1152u;
+                const uvec2 q0    = w_q2.v[q_base + q2_0];
+                const uint  d0b   = uint(w_d8.v[d_base + q2_0]);
+                const uvec2 q1    = w_q2.v[q_base + q2_1];
+                const uint  d1b   = uint(w_d8.v[d_base + q2_1]);
+                const float16_t sc0 = agx_ue4m3_to_f16(d0b);
+                const float16_t sc1 = agx_ue4m3_to_f16(d1b);
+                decode_e2m1_u32_f16x2_scaled(q0.x, sc0, wa0, wa1);
+                decode_e2m1_u32_f16x2_scaled(q0.y, sc0, wa2, wa3);
+                decode_e2m1_u32_f16x2_scaled(q1.x, sc1, wb0, wb1);
+                decode_e2m1_u32_f16x2_scaled(q1.y, sc1, wb2, wb3);
+#else
+                const uint n_chunks = (pc.K + 255u) >> 8u;
+                const uint row0     = min(sg_n0 + fm,      pc.N - 1u);
+                const uint row1     = min(sg_n0 + 8u + fm, pc.N - 1u);
+                const uint k_chk    = k_base >> 8u;
+                const uint sb0_u4   = (row0 * n_chunks + k_chk) * 17u;
+                const uint sb1_u4   = (row1 * n_chunks + k_chk) * 17u;
+                const uint blk      = (((k_base >> 5u) & 7u) + (s_kp << 1u)) | (fn >> 2u);
+                const uint q_off    = 1u + (blk << 1u) + (fn2 & 1u);
+                const uvec4 qv0     = w_q4.v[sb0_u4 + q_off];
+                const uint  d0w     = w_d4.v[(sb0_u4 << 2u) + (blk >> 1u)];
+                const uvec4 qv1     = w_q4.v[sb1_u4 + q_off];
+                const uint  d1w     = w_d4.v[(sb1_u4 << 2u) + (blk >> 1u)];
+                const f16vec2 d0p   = unpackFloat2x16(d0w);
+                const f16vec2 d1p   = unpackFloat2x16(d1w);
+                const float16_t d0  = ((blk & 1u) != 0u) ? d0p.y : d0p.x;
+                const float16_t d1  = ((blk & 1u) != 0u) ? d1p.y : d1p.x;
+                wa0 = agx_q8_u32_magic_to_f16vec4(qv0.x) * d0;
+                wa1 = agx_q8_u32_magic_to_f16vec4(qv0.y) * d0;
+                wa2 = agx_q8_u32_magic_to_f16vec4(qv0.z) * d0;
+                wa3 = agx_q8_u32_magic_to_f16vec4(qv0.w) * d0;
+                wb0 = agx_q8_u32_magic_to_f16vec4(qv1.x) * d1;
+                wb1 = agx_q8_u32_magic_to_f16vec4(qv1.y) * d1;
+                wb2 = agx_q8_u32_magic_to_f16vec4(qv1.z) * d1;
+                wb3 = agx_q8_u32_magic_to_f16vec4(qv1.w) * d1;
+#endif
+                // Pair-interleaved rtp=0,2: doubles same-acc matmad-gap (2 -> 4) & shares ma regs @ 68 GPR32!
+                [[unroll]] for (uint rtp = 0u; rtp < PF_RT; rtp += 2u) {
+                    const uint c0 = 8u * rtp + fn;
+                    const uint c1 = c0 + 8u;
+                    const f16vec4 ba0_0 = sh_x[c0 + 0u][sub_off + 0u];
+                    const f16vec4 ba1_0 = sh_x[c0 + 0u][sub_off + 1u];
+                    const f16vec4 bb0_0 = sh_x[c0 + 1u][sub_off + 0u];
+                    const f16vec4 bb1_0 = sh_x[c0 + 1u][sub_off + 1u];
+                    const f16vec4 ba0_1 = sh_x[c1 + 0u][sub_off + 0u];
+                    const f16vec4 ba1_1 = sh_x[c1 + 0u][sub_off + 1u];
+                    const f16vec4 bb0_1 = sh_x[c1 + 1u][sub_off + 0u];
+                    const f16vec4 bb1_1 = sh_x[c1 + 1u][sub_off + 1u];
+                    [[unroll]] for (uint s = 0u; s < 4u; ++s) {
+                        coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> ma0_0, ma1_0, ma0_1, ma1_1;
+                        coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> mb0_0, mb1_0, mb0_1, mb1_1;
+                        ma0_0[0] = wa0[s]; ma0_0[1] = wa2[s];
+                        ma1_0[0] = wa1[s]; ma1_0[1] = wa3[s];
+                        ma0_1[0] = wb0[s]; ma0_1[1] = wb2[s];
+                        ma1_1[0] = wb1[s]; ma1_1[1] = wb3[s];
+                        mb0_0[0] = ba0_0[s]; mb0_0[1] = bb0_0[s];
+                        mb0_1[0] = ba0_1[s]; mb0_1[1] = bb0_1[s];
+                        mb1_0[0] = ba1_0[s]; mb1_0[1] = bb1_0[s];
+                        mb1_1[0] = ba1_1[s]; mb1_1[1] = bb1_1[s];
+                        acc[0][rtp]      = coopMatMulAdd(ma0_0, mb0_0, acc[0][rtp]);
+                        acc[1][rtp]      = coopMatMulAdd(ma0_1, mb0_0, acc[1][rtp]);
+                        acc[0][rtp + 1u] = coopMatMulAdd(ma0_0, mb0_1, acc[0][rtp + 1u]);
+                        acc[1][rtp + 1u] = coopMatMulAdd(ma0_1, mb0_1, acc[1][rtp + 1u]);
+                        acc[0][rtp]      = coopMatMulAdd(ma1_0, mb1_0, acc[0][rtp]);
+                        acc[1][rtp]      = coopMatMulAdd(ma1_1, mb1_0, acc[1][rtp]);
+                        acc[0][rtp + 1u] = coopMatMulAdd(ma1_0, mb1_1, acc[0][rtp + 1u]);
+                        acc[1][rtp + 1u] = coopMatMulAdd(ma1_1, mb1_1, acc[1][rtp + 1u]);
+                    }
+                }
+            }
+        }
+    }
+
+    // Direct epilogue store (recompute indices post-loop -> ZERO epilogue regs live across K-loop!)
+    {
+        const uint ep_sg_n0 = gl_WorkGroupID.x * WG_N + sg_id * 16u;
+        const uint ep_wg_m0 = gl_WorkGroupID.y * 32u;
+        const uint ep_fm    = agx_cmat8_row(lane);
+        const uint ep_fn    = agx_cmat8_col0(lane);
+        AgxBufF32RW y_buf   = AgxBufF32RW(y_va_u);
+        [[unroll]] for (uint rt = 0u; rt < PF_RT; ++rt) {
+            const uint gm0_out = ep_wg_m0 + rt * 8u + ep_fn;
+            const bool m0_ok   = (gm0_out      < pc.M);
+            const bool m1_ok   = (gm0_out + 1u < pc.M);
+            if (m0_ok || m1_ok) {
+                const uint y_row0 = gm0_out * pc.y_stride;
+                const uint y_row1 = y_row0 + pc.y_stride;
+                [[unroll]] for (uint t = 0u; t < uint(PF_NT); ++t) {
+                    const uint gn = ep_sg_n0 + t * 8u + ep_fm;
+                    if (gn < pc.N) {
+                        if (m0_ok) y_buf.v[y_row0 + gn] = acc[t][rt][0];
+                        if (m1_ok) y_buf.v[y_row1 + gn] = acc[t][rt][1];
+                    }
+                }
+            }
+        }
+    }
+#endif // SH_X_PAIR_SWIZ
+
+#else // TILE_MODE == 1, 2 or TILE_MODE == 0 (PREC_F32 == 1 / non-repacked)
+    const uint slice      = gl_WorkGroupID.z;
+    const uint w_slice    = slice / max(1u, pc.w_bcast_div);
+    const uint64_t w_base = pc.w_va + uint64_t(w_slice) * uint64_t(pc.w_slice_bytes);
+    const uint64_t x_base = pc.x_va + uint64_t(slice)   * uint64_t(pc.x_slice_elems) * 4ul;
+    AgxBufVec4R x_buf4    = AgxBufVec4R(x_base);
+    const uint lr         = agx_cmat8_row(lane);
+    const uint lc0        = agx_cmat8_col0(lane);
+
+    const uint wg_n0 = gl_WorkGroupID.x * WG_N;
+    const uint wg_m0 = gl_WorkGroupID.y * WG_M;
+
+    const uint sg_n_idx = sg_id % SG_N_CNT;
+    const uint sg_m_idx = sg_id / SG_N_CNT;
+    const uint sg_n0    = wg_n0 + sg_n_idx * (SG_TILES_N * 8u);
+    const uint sg_m_off = sg_m_idx * (SG_TILES_M * 8u);
+
+    const bool x_vec4_ok = ((pc.K & 3u) == 0u) && ((pc.x_stride & 3u) == 0u);
+
+    const uint lm0       = tid >> 3;
+    const uint lk4       = tid & 7u;
+    const uint gm0       = wg_m0 + lm0;
+    const uint x_off0    = gm0 * x_stride4 + lk4;
+    const uint x_step_s  = X_ROWS_STEP * x_stride4;
+    const uint sh_dst0   = (lk4 << 2) * SH_X_STRIDE + lm0;
+
+    coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> acc[SG_TILES_N][SG_TILES_M];
+    for (uint in_t = 0u; in_t < SG_TILES_N; ++in_t) {
+        for (uint im_t = 0u; im_t < SG_TILES_M; ++im_t) {
+            acc[in_t][im_t] = coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0.0);
+        }
+    }
+
+  #if WEIGHT_MODE == 0
+    {
+        AgxBufNvfp4ST st_buf = AgxBufNvfp4ST(w_base);
+        const uint nb_k      = pc.K >> 6;
+        const uint shift     = lc0 << 2;
+        const uint gn_base   = sg_n0 + lr;
+        const uint w_st_base = (gn_base >> 5) * nb_k;
+        const uint w_l_base0 = ((gn_base >> 4) & 1u) * 32u + ((gn_base & 15u) << 1);
+
+        if (x_vec4_ok) {
+            uint buf_idx = 0u;
+            for (uint k_base = 0u; k_base < pc.K; k_base += TILE_K) {
+                const uint sh_off = buf_idx * SH_X_SLAB;
+                const uint kb4    = k_base >> 2;
+
+                for (uint s = 0u; s < X_VEC4_PER_T; ++s) {
+                    const MAT_VEC4 xv = (gm0 + s * X_ROWS_STEP < pc.M)
+                        ? MAT_VEC4(x_buf4.v[x_off0 + s * x_step_s + kb4])
+                        : MAT_VEC4(MAT_T(0.0));
+                    store_x_vec4_to_sh_T(sh_off, sh_dst0 + s * X_ROWS_STEP, xv);
+                }
+
+                const uint st_idx = w_st_base + (k_base >> 6);
+                const uint kh     = (k_base >> 5) & 1u;
+                uint     w_cur[SG_TILES_N];
+                uint16_t d_cur[SG_TILES_N];
+                for (uint in_t = 0u; in_t < SG_TILES_N; ++in_t) {
+                    if (gn_base + in_t * 8u < pc.N) {
+                        const uint l_idx = (w_l_base0 + in_t * 16u) | kh;
+                        w_cur[in_t] = pack_lane_nvfp4_bytes(st_buf.st[st_idx].qs[l_idx], shift);
+                        d_cur[in_t] = st_buf.st[st_idx].d[l_idx];
+                    } else {
+                        w_cur[in_t] = 0u;
+                        d_cur[in_t] = uint16_t(0u);
+                    }
+                }
+                barrier();
+
+                for (uint h = 0u; h < 2u; ++h) {
+                    MAT_T sc[SG_TILES_N];
+                    for (uint in_t = 0u; in_t < SG_TILES_N; ++in_t) {
+    #if PREC_F32 == 1
+                        sc[in_t] = agx_ue4m3_to_f32((h == 0u) ? (uint(d_cur[in_t]) & 0xFFu) : (uint(d_cur[in_t]) >> 8));
+    #else
+                        sc[in_t] = agx_ue4m3_to_f16((h == 0u) ? (uint(d_cur[in_t]) & 0xFFu) : (uint(d_cur[in_t]) >> 8));
+    #endif
+                    }
+                    for (uint ks_sub = 0u; ks_sub < 2u; ++ks_sub) {
+                        const uint ks = h * 2u + ks_sub;
+                        coopmat<MAT_T, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> matA[SG_TILES_N];
+                        for (uint in_t = 0u; in_t < SG_TILES_N; ++in_t) {
+                            const uint b2 = (w_cur[in_t] >> (ks * 8u)) & 0xFFu;
+    #if PREC_F32 == 1
+                            const vec2 wp    = agx_e2m1_byte_to_vec2(b2) * sc[in_t];
+    #else
+                            const f16vec2 wp = agx_e2m1_byte_to_f16vec2(b2) * sc[in_t];
+    #endif
+                            matA[in_t] = coopmat<MAT_T, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA>(MAT_T(0.0));
+                            matA[in_t][0] = wp.x;
+                            matA[in_t][1] = wp.y;
+                        }
+                        const uint ks_row_off = sh_off + (ks * 8u) * SH_X_STRIDE + sg_m_off;
+                        for (uint im_t = 0u; im_t < SG_TILES_M; ++im_t) {
+                            coopmat<MAT_T, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> matB;
+                            coopMatLoad(matB, sh_x, ks_row_off + im_t * 8u, SH_X_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+                            for (uint in_t = 0u; in_t < SG_TILES_N; ++in_t) {
+                                acc[in_t][im_t] = coopMatMulAdd(matA[in_t], matB, acc[in_t][im_t]);
+                            }
+                        }
+                    }
+                }
+                buf_idx ^= 1u;
+            }
+        } else {
+            AgxBufF32R x_buf = AgxBufF32R(x_base);
+            uint buf_idx = 0u;
+            for (uint k_base = 0u; k_base < pc.K; k_base += TILE_K) {
+                const uint sh_off = buf_idx * SH_X_SLAB;
+                load_sh_x_scalar_T(x_buf, tid, wg_m0, sh_off, k_base);
+                barrier();
+                const uint st_idx = w_st_base + (k_base >> 6);
+                const uint kh     = (k_base >> 5) & 1u;
+                for (uint ks = 0u; ks < 4u; ++ks) {
+                    coopmat<MAT_T, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> matA[SG_TILES_N];
+                    for (uint in_t = 0u; in_t < SG_TILES_N; ++in_t) {
+                        MAT_VEC2 wp = MAT_VEC2(MAT_T(0.0));
+                        if (gn_base + in_t * 8u < pc.N) {
+                            const uint l_idx  = (w_l_base0 + in_t * 16u) | kh;
+                            const uint w_word = st_buf.st[st_idx].qs[l_idx][ks];
+                            const uint dp     = uint(st_buf.st[st_idx].d[l_idx]);
+                            const uint b2     = (w_word >> shift) & 0xFFu;
+    #if PREC_F32 == 1
+                            wp = agx_e2m1_byte_to_vec2(b2) * agx_ue4m3_to_f32((ks < 2u) ? (dp & 0xFFu) : (dp >> 8));
+    #else
+                            wp = agx_e2m1_byte_to_f16vec2(b2) * agx_ue4m3_to_f16((ks < 2u) ? (dp & 0xFFu) : (dp >> 8));
+    #endif
+                        }
+                        matA[in_t] = coopmat<MAT_T, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA>(MAT_T(0.0));
+                        matA[in_t][0] = wp.x;
+                        matA[in_t][1] = wp.y;
+                    }
+                    const uint ks_row_off = sh_off + (ks * 8u) * SH_X_STRIDE + sg_m_off;
+                    for (uint im_t = 0u; im_t < SG_TILES_M; ++im_t) {
+                        coopmat<MAT_T, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> matB;
+                        coopMatLoad(matB, sh_x, ks_row_off + im_t * 8u, SH_X_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+                        for (uint in_t = 0u; in_t < SG_TILES_N; ++in_t) {
+                            acc[in_t][im_t] = coopMatMulAdd(matA[in_t], matB, acc[in_t][im_t]);
+                        }
+                    }
+                }
+                buf_idx ^= 1u;
+            }
+        }
+    }
+
+  #elif WEIGHT_MODE == 2
+    {
+        AgxBufQ8_8Blk w_buf = AgxBufQ8_8Blk(w_base);
+        const uint n_chunks  = (pc.K + 255u) >> 8;
+        const uint w_sub     = lc0 >> 2;
+        const uint p_shift   = ((lc0 >> 1) & 1u) << 4;
+        const uint gn_base   = sg_n0 + lr;
+        const uint w_row0    = gn_base * n_chunks;
+        const uint w_row_inc = 8u * n_chunks;
+
+        if (x_vec4_ok) {
+            uint buf_idx = 0u;
+            for (uint k_base = 0u; k_base < pc.K; k_base += TILE_K) {
+                const uint sh_off = buf_idx * SH_X_SLAB;
+                const uint kb4    = k_base >> 2;
+
+                for (uint s = 0u; s < X_VEC4_PER_T; ++s) {
+                    const MAT_VEC4 xv = (gm0 + s * X_ROWS_STEP < pc.M)
+                        ? MAT_VEC4(x_buf4.v[x_off0 + s * x_step_s + kb4])
+                        : MAT_VEC4(MAT_T(0.0));
+                    store_x_vec4_to_sh_T(sh_off, sh_dst0 + s * X_ROWS_STEP, xv);
+                }
+
+                const uint c   = k_base >> 8;
+                const uint blk = (k_base >> 5) & 7u;
+                const uint vi0 = blk * 2u;
+                uvec2     w_cur[SG_TILES_N];
+                float16_t sc_cur[SG_TILES_N];
+                for (uint in_t = 0u; in_t < SG_TILES_N; ++in_t) {
+                    if (gn_base + in_t * 8u < pc.N) {
+                        const uint chk_idx = w_row0 + in_t * w_row_inc + c;
+                        sc_cur[in_t] = unpackFloat2x16(uint(w_buf.blk[chk_idx].d[blk])).x;
+                        w_cur[in_t]  = uvec2(pack_lane_q8_u32(w_buf.blk[chk_idx].qs[vi0],      w_sub, p_shift),
+                                             pack_lane_q8_u32(w_buf.blk[chk_idx].qs[vi0 + 1u], w_sub, p_shift));
+                    } else {
+                        sc_cur[in_t] = float16_t(0.0);
+                        w_cur[in_t]  = uvec2(0u);
+                    }
+                }
+                barrier();
+
+                for (uint ks = 0u; ks < 4u; ++ks) {
+                    coopmat<MAT_T, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> matA[SG_TILES_N];
+                    for (uint in_t = 0u; in_t < SG_TILES_N; ++in_t) {
+                        const uint w_word = (ks < 2u) ? w_cur[in_t].x : w_cur[in_t].y;
+                        const uint w16    = ((ks & 1u) == 0u) ? (w_word & 0xFFFFu) : (w_word >> 16);
+                        const f16vec2 q2  = agx_q8_u16_magic_to_f16vec2(w16);
+    #if PREC_F32 == 1
+                        const vec2 wp     = vec2(q2) * float(sc_cur[in_t]);
+    #else
+                        const f16vec2 wp  = q2 * sc_cur[in_t];
+    #endif
+                        matA[in_t] = coopmat<MAT_T, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA>(MAT_T(0.0));
+                        matA[in_t][0] = wp.x;
+                        matA[in_t][1] = wp.y;
+                    }
+                    const uint ks_row_off = sh_off + (ks * 8u) * SH_X_STRIDE + sg_m_off;
+                    for (uint im_t = 0u; im_t < SG_TILES_M; ++im_t) {
+                        coopmat<MAT_T, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> matB;
+                        coopMatLoad(matB, sh_x, ks_row_off + im_t * 8u, SH_X_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+                        for (uint in_t = 0u; in_t < SG_TILES_N; ++in_t) {
+                            acc[in_t][im_t] = coopMatMulAdd(matA[in_t], matB, acc[in_t][im_t]);
+                        }
+                    }
+                }
+                buf_idx ^= 1u;
+            }
+        } else {
+            AgxBufF32R x_buf = AgxBufF32R(x_base);
+            uint buf_idx = 0u;
+            for (uint k_base = 0u; k_base < pc.K; k_base += TILE_K) {
+                const uint sh_off = buf_idx * SH_X_SLAB;
+                load_sh_x_scalar_T(x_buf, tid, wg_m0, sh_off, k_base);
+                barrier();
+                const uint c   = k_base >> 8;
+                const uint blk = (k_base >> 5) & 7u;
+                for (uint ks = 0u; ks < 4u; ++ks) {
+                    const uint vi = blk * 2u + (ks >> 1);
+                    const uint wi = w_sub + ((ks & 1u) << 1);
+                    coopmat<MAT_T, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> matA[SG_TILES_N];
+                    for (uint in_t = 0u; in_t < SG_TILES_N; ++in_t) {
+                        MAT_VEC2 wp = MAT_VEC2(MAT_T(0.0));
+                        if (gn_base + in_t * 8u < pc.N) {
+                            const uint chk_idx = w_row0 + in_t * w_row_inc + c;
+                            const float16_t sc = unpackFloat2x16(uint(w_buf.blk[chk_idx].d[blk])).x;
+                            const uint w_word  = w_buf.blk[chk_idx].qs[vi][wi];
+                            const f16vec2 q2   = agx_q8_u16_magic_to_f16vec2((w_word >> p_shift) & 0xFFFFu);
+    #if PREC_F32 == 1
+                            wp = vec2(q2) * float(sc);
+    #else
+                            wp = q2 * sc;
+    #endif
+                        }
+                        matA[in_t] = coopmat<MAT_T, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA>(MAT_T(0.0));
+                        matA[in_t][0] = wp.x;
+                        matA[in_t][1] = wp.y;
+                    }
+                    const uint ks_row_off = sh_off + (ks * 8u) * SH_X_STRIDE + sg_m_off;
+                    for (uint im_t = 0u; im_t < SG_TILES_M; ++im_t) {
+                        coopmat<MAT_T, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> matB;
+                        coopMatLoad(matB, sh_x, ks_row_off + im_t * 8u, SH_X_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+                        for (uint in_t = 0u; in_t < SG_TILES_N; ++in_t) {
+                            acc[in_t][im_t] = coopMatMulAdd(matA[in_t], matB, acc[in_t][im_t]);
+                        }
+                    }
+                }
+                buf_idx ^= 1u;
+            }
+        }
+    }
+
+  #else
+    uint buf_idx = 0u;
+    for (uint k_base = 0u; k_base < pc.K; k_base += TILE_K) {
+        const uint sh_off = buf_idx * SH_X_SLAB;
+        if (x_vec4_ok && (k_base + TILE_K <= pc.K)) {
+            const uint kb4 = k_base >> 2;
+            for (uint s = 0u; s < X_VEC4_PER_T; ++s) {
+                MAT_VEC4 xv = (gm0 + s * X_ROWS_STEP < pc.M)
+                    ? MAT_VEC4(x_buf4.v[x_off0 + s * x_step_s + kb4])
+                    : MAT_VEC4(MAT_T(0.0));
+                store_x_vec4_to_sh_T(sh_off, sh_dst0 + s * X_ROWS_STEP, xv);
+            }
+        } else {
+            load_sh_x_scalar_T(AgxBufF32R(x_base), tid, wg_m0, sh_off, k_base);
+        }
+        barrier();
+
+        for (uint ks = 0u; ks < TILE_K; ks += 8u) {
+            coopmat<MAT_T, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> matA[SG_TILES_N];
+            for (uint in_t = 0u; in_t < SG_TILES_N; ++in_t) {
+                const uint gn = sg_n0 + in_t * 8u + lr;
+                const uint gk = k_base + ks + lc0;
+                const MAT_VEC2 wp = load_w_pair(w_base, gn, gk);
+                matA[in_t] = coopmat<MAT_T, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA>(MAT_T(0.0));
+                matA[in_t][0] = wp.x;
+                matA[in_t][1] = wp.y;
+            }
+            const uint ks_row_off = sh_off + ks * SH_X_STRIDE + sg_m_off;
+            for (uint im_t = 0u; im_t < SG_TILES_M; ++im_t) {
+                coopmat<MAT_T, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> matB;
+                coopMatLoad(matB, sh_x, ks_row_off + im_t * 8u, SH_X_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+                for (uint in_t = 0u; in_t < SG_TILES_N; ++in_t) {
+                    acc[in_t][im_t] = coopMatMulAdd(matA[in_t], matB, acc[in_t][im_t]);
+                }
+            }
+        }
+        buf_idx ^= 1u;
+    }
+  #endif
+
+    // Direct epilogue store from acc[in_t][im_t] (zero sh_y SRAM, zero barriers!)
+    AgxBufF32RW y_buf = AgxBufF32RW(pc.y_va + uint64_t(slice) * uint64_t(pc.y_slice_elems) * 4ul);
+    for (uint im_t = 0u; im_t < SG_TILES_M; ++im_t) {
+        const uint gm0_out = wg_m0 + sg_m_off + im_t * 8u + lc0;
+        const bool m0_ok   = (gm0_out      < pc.M);
+        const bool m1_ok   = (gm0_out + 1u < pc.M);
+        if (m0_ok || m1_ok) {
+            const uint y_row0 = gm0_out * pc.y_stride;
+            const uint y_row1 = y_row0 + pc.y_stride;
+            for (uint in_t = 0u; in_t < SG_TILES_N; ++in_t) {
+                const uint gn = sg_n0 + in_t * 8u + lr;
+                if (gn < pc.N) {
+                    if (m0_ok) y_buf.v[y_row0 + gn] = acc[in_t][im_t][0];
+                    if (m1_ok) y_buf.v[y_row1 + gn] = acc[in_t][im_t][1];
+                }
+            }
+        }
+    }
+#endif
+}

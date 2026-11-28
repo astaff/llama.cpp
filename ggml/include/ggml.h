@@ -2301,6 +2301,19 @@ extern "C" {
             struct ggml_tensor * table,
             struct ggml_tensor * indices);
 
+    GGML_API bool ggml_flash_attn_ext_has_banded_rel_bias(const struct ggml_tensor * a);
+
+    // Banded relative-position bias with O(n_kv) packed positions instead of O(n_kv * n_tokens * n_head) kq_b:
+    //   table    : F32 [eff_rows, n_head, n_tokens * n_stream]
+    //   pos_info : I32 [n_stream * n_kv + n_tokens * n_stream + n_stream * ceil(n_kv / 64) * 2]
+    //              layout: [cell_pos | q_pos | tile64_minmax]
+    //   extent   : maximum valid relative distance (d in [0, min(extent, eff_rows)) adds table[d], else 0)
+    GGML_API void ggml_flash_attn_ext_add_banded_rel_bias(
+            struct ggml_tensor * a,
+            struct ggml_tensor * table,
+            struct ggml_tensor * pos_info,
+            int32_t              extent);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
             struct ggml_context * ctx,

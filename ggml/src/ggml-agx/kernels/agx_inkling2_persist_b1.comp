@@ -1,0 +1,1911 @@
+#version 450
+
+// ============================================================================
+// Wave 5 Pillar 3: agx_inkling2_persist_b1.comp
+// Persistent 40-WG SENSE_BARRIER B=1 Megakernel for Apple M4 Max (AGX3B)
+// ============================================================================
+// Formally verified in:
+//   - formal/AgxPersistentW5.tla (128B USC L1 coherency, deadlock-free 40-WG
+//     sense barrier, bounded phase skew <= 1, watchdog-bounded chunked epochs)
+//   - Wave5Roofline.lean (Theorem W5.1 128B disjoint arena, Theorem W5.4
+//     700 STRONG_USC -> persistent SENSE_BARRIER recovery)
+//
+// Compile-time specializations:
+//   PERSIST_MODE == 0 : Persistent Attention Super-Stage (Loop QKV ctrl + W_attn_in
+//                       + qkv_prep_store/RelBias + FlashAttn + Wo + post_attn)
+//   PERSIST_MODE == 1 : Persistent FFN/MoE Super-Stage (Loop FFN ctrl + Router
+//                       + MoE gate_up/SiTU + MoE down/wsum + post_ffn)
+//   PERSIST_MODE == 2 : Chunked Multi-Pass Full-Pass Persistent Megakernel
+//                       (loops p = 0..n_passes-1 running Attn + MoE back-to-back!)
+//   HAS_LOOP     == 0 | 1 (non-looped vs looped core passes 18..41)
+//   KV_Q8        == 0 (F16 external KV) | 1 (Q8_0_GGML external KV)
+//   MOE_MODE     == 0 (AGX_NVFP4_32x16) | 2 (AGX_Q8_0_8BLK)
+//
+// Launch geometry: Grid = (40, 1, 1), Local = (256, 1, 1) [8 simdgroups/WG = 320 sgs]
+// Coherency model:
+//   - Static read-only model weights & pass descriptors: non-coherent readonly (L1D+SLC)
+//   - Dynamic activations, KV store/load, mask, shortconv, router, barrier: coherent (SLC)
+//   - Hot input vectors cached once per phase in unified 12 KB TG SRAM `sh_buf[3072]`
+// Target: <= 96 GPR32, 0:0 spills, ~13.7 KB TG SRAM (< 16 KB -> 100% 40-core co-resident)
+// ============================================================================
+
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_control_flow_attributes : require
+#pragma use_vulkan_memory_model
+
+#include "dequant_supertile.glsl"
+
+#ifndef PERSIST_MODE
+#define PERSIST_MODE 0
+#endif
+
+#ifndef HAS_LOOP
+#define HAS_LOOP 0
+#endif
+
+#ifndef KV_Q8
+#define KV_Q8 0
+#endif
+
+#ifndef MOE_MODE
+#define MOE_MODE 0
+#endif
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================================================
+// Buffer References: Non-Coherent Readonly (Static Weights/Descs) & Coherent (SLC)
+// ============================================================================
+
+layout(buffer_reference, std430, buffer_reference_align = 4)  readonly buffer ConstBufF32   { float     v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer ConstBufVec4  { vec4      v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  readonly buffer ConstBufI32   { int       v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8)  readonly buffer ConstBufI64   { int64_t   v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  readonly buffer ConstBufU32   { uint      v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8)  readonly buffer ConstBufUvec2 { uvec2     v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8)  readonly buffer ConstBufU64   { uint64_t  v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2)  readonly buffer ConstBufF16   { float16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2)  readonly buffer ConstBufU16   { uint16_t  v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 1)  readonly buffer ConstBufI8    { int8_t    v[]; };
+
+// Coherent SLC-direct buffer references for all cross-WG inter-phase arena / KV / conv data
+layout(buffer_reference, scalar, buffer_reference_align = 4)  coherent buffer CohBufF32     { float     v[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 16) coherent buffer CohBufVec4    { vec4      v[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4)  coherent buffer CohBufI32     { int       v[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 2)  coherent buffer CohBufF16     { float16_t v[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 2)  coherent buffer CohBufU16     { uint16_t  v[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 8)  coherent buffer CohBufUvec2   { uvec2     v[]; };
+
+layout(buffer_reference, std430, buffer_reference_align = 4) coherent buffer SenseBarrierBuf {
+    uint arrived;
+    uint sense;
+    uint epoch;
+    uint n_workgroups;
+    uint stage;
+    uint pass;
+};
+
+// ============================================================================
+// Pass Descriptor (1024 B = 8 x 128B cache lines; exact match to agx_w5_pass_desc)
+// ============================================================================
+
+#define PFLAG_IS_SWA            (1u << 0)
+#define PFLAG_SAME_QKV_INP      (1u << 1)
+#define PFLAG_NEED_QKV_MIX      (1u << 2)
+#define PFLAG_HAS_K_ROT         (1u << 3)
+#define PFLAG_HAS_V_ROT         (1u << 4)
+#define PFLAG_K_IDS_I64         (1u << 5)
+#define PFLAG_V_IDS_I64         (1u << 6)
+#define PFLAG_BMASK_F16         (1u << 7)
+#define PFLAG_POST_ATTN_ADD_RES (1u << 8)
+#define PFLAG_POST_ATTN_DO_NORM (1u << 9)
+#define PFLAG_POST_FFN_DO_MIX   (1u << 10)
+#define PFLAG_POST_FFN_DO_NORM  (1u << 11)
+#define PFLAG_NEXT_IS_SWA       (1u << 12)
+
+struct W5PassDesc {
+    // 1. SLC Arena / Activation VAs (30 x u64)
+    uint64_t x_q_va;
+    uint64_t x_k_va;
+    uint64_t x_v_va;
+    uint64_t qkv_in_va[3];
+    uint64_t qkv_buf_va;
+    uint64_t k_raw_va;
+    uint64_t v_raw_va;
+    uint64_t q_out_va;
+    uint64_t attn_out_va;
+    uint64_t wo_out_va;
+    uint64_t ffn_inp_va;
+    uint64_t k_dyn_va;
+    uint64_t v_dyn_va;
+    uint64_t router_logits_va;
+    uint64_t router_topk_va;
+    uint64_t router_topk_w_va;
+    uint64_t moe_inter_va;
+    uint64_t moe_out_va;
+    uint64_t h_msg_va;
+    uint64_t ctrl_cat_va[3];
+    uint64_t ctrl_gate_va[3];
+    uint64_t ctrl_gain_va[3];
+
+    // 2. Loop Controller Weights & Mix Inputs (22 x u64)
+    uint64_t msg_state_va[2];
+    uint64_t msg_query_va;
+    uint64_t qkv_mix_cur_va;
+    uint64_t qkv_mix_bptrs_va;
+    uint64_t qkv_mix_query_va;
+    uint64_t ctrl_down_w_va[4];
+    uint64_t ctrl_gain_w_va[4];
+    uint64_t ctrl_forget_w_va[4];
+    uint64_t attn_norm_w_va[3];
+    uint64_t ffn_norm_w_va;
+
+    // 3. Attention Weights, KV Cache & Mask (29 x u64)
+    uint64_t w_attn_in_va;
+    uint64_t wk_byte_off;
+    uint64_t wv_byte_off;
+    uint64_t sink_proj_va;
+    uint64_t sinks_va;
+    uint64_t k_conv_proj_va;
+    uint64_t v_conv_proj_va;
+    uint64_t q_clip_va;
+    uint64_t r_clip_va;
+    uint64_t k_conv_w_va;
+    uint64_t v_conv_w_va;
+    uint64_t rel_bias_va;
+    uint64_t inp_pos_va;
+    uint64_t r_l_va;
+    uint64_t s_copy_va;
+    uint64_t cell_va[4];
+    uint64_t k_va;
+    uint64_t v_va;
+    uint64_t k_store_va;
+    uint64_t v_store_va;
+    uint64_t k_idxs_va;
+    uint64_t v_idxs_va;
+    uint64_t rel_pos_va;
+    uint64_t base_mask_va;
+    uint64_t kq_mask_va;
+    uint64_t wo_va;
+
+    // 4. Post-Attn Stage Prep (5 x u64)
+    uint64_t attn_post_conv_w_va;
+    uint64_t attn_res_va;
+    uint64_t attn_bptrs_va;
+    uint64_t ffn_res_query_va;
+    uint64_t post_attn_mix_out_va;
+
+    // 5. Router & MoE Weights (8 x u64)
+    uint64_t router_w_va;
+    uint64_t exp_probs_b_va;
+    uint64_t gu_exps_va;
+    uint64_t dn_exps_va;
+    uint64_t gu_slice_B;
+    uint64_t dn_slice_B;
+    uint64_t gu_scale_va;
+    uint64_t dn_scale_va;
+
+    // 6. Post-FFN Stage Prep (12 x u64)
+    uint64_t ffn_post_conv_w_va;
+    uint64_t next_cur_va;
+    uint64_t export_l_out_va;
+    uint64_t ffn_bptrs_va;
+    uint64_t next_attn_query_va;
+    uint64_t next_norm_w_va[3];
+    uint64_t next_mix_out_va[3];
+    uint64_t next_mix_export_va;
+
+    // 7. Scalar 32-bit Parameters (48 x u32/f32)
+    uint     flags;
+    uint     total_coal_rows;
+    uint     q_prefix_rows;
+    uint     wk_rows;
+    uint     wv_rows;
+    uint     q_row_off;
+    uint     qgate_row_off;
+    uint     r_row_off;
+    uint     sink_proj_wtype;
+    uint     qkv_mix_n_blocks;
+    uint     k_proj_wtype;
+    uint     k_proj_row_B;
+    uint     v_proj_wtype;
+    uint     v_proj_row_B;
+    uint     r_nb1_f32;
+    uint     k_nb1;
+    uint     k_nb2;
+    uint     v_nb1;
+    uint     v_nb2;
+    uint     k_store_nb1;
+    uint     v_store_nb1;
+    uint     k_ids_nb0;
+    uint     v_ids_nb0;
+    uint     n_rel;
+    uint     n_extent;
+    uint     n_kv;
+    uint     kq_mask_stride;
+    uint     bias_wtype;
+    uint     bias_nb1_B;
+    uint     post_attn_n_blocks;
+    uint     post_ffn_n_blocks;
+    uint     post_ffn_n_queries;
+    uint     router_wtype;
+    uint     router_row_B;
+    uint     n_expert;
+    uint     n_ff_exp;
+    float    kv_conv_res_scale;
+    float    post_conv_res_scale;
+    float    qk_clip;
+    float    rel_clip;
+    float    rms_eps;
+    float    log_scale_alpha;
+    float    inv_log_floor;
+    float    router_norm_eps;
+    float    router_w_scale;
+    float    situ_beta;
+    float    situ_linear_beta;
+    uint     sink_proj_row_B;
+    uint     n_tokens;
+    uint     rollback_slots;
+    uint     rollback_stride_f32;
+    uint     reserved[25];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer W5PassDescBuf {
+    W5PassDesc d;
+};
+
+layout(push_constant) uniform PushArgs {
+    uint64_t descs_va;
+    uint64_t barrier_va;
+    uint     n_passes;
+    uint     n_wg;
+} pc;
+
+#define P_FLD(f) (W5PassDescBuf(desc_va).d.f)
+
+// ============================================================================
+// Unified TG SRAM (~13.7 KB < 16 KB -> 100% 40-core co-resident on M4 Max!)
+// ============================================================================
+
+shared float    sh_buf[3072];       // 12,288 B: cached X / s_cur / sh_o / sh_exp / sh_gate / s_r / router
+shared float    sh_red[5][8];       //    160 B: 8-sg reduction scratch (up to 5 channels)
+shared float    sh_inv_rms[16];     //     64 B: depth-mix inv_rms
+shared float    sh_prob[4][16];     //    256 B: depth-mix softmax weights
+shared uint64_t sh_bva[8];          //     64 B: hoisted block VAs
+shared int      sh_idx[256];        //  1,024 B: router bitonic top-8 indices
+shared uint     sh_init_sense;      //      4 B: initial sense read at entry
+
+// ============================================================================
+// TLA+-Verified Device-Scope Sense-Reversing Atomic Barrier (AgxPersistentW5.tla)
+// ============================================================================
+
+void agx_sense_barrier(uint64_t bar_va, uint n_wg, inout uint local_sense) {
+    memoryBarrier(gl_ScopeDevice, gl_StorageSemanticsBuffer,
+                  gl_SemanticsRelease | gl_SemanticsMakeAvailable);
+    barrier();
+    if (gl_LocalInvocationID.x == 0u) {
+        SenseBarrierBuf bar = SenseBarrierBuf(bar_va);
+        uint next_sense = local_sense ^ 1u;
+        uint prev = atomicAdd(bar.arrived, 1u, gl_ScopeDevice,
+                              gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease);
+        if (prev + 1u == n_wg) {
+            atomicStore(bar.arrived, 0u, gl_ScopeDevice,
+                        gl_StorageSemanticsNone, gl_SemanticsRelaxed);
+            atomicAdd(bar.epoch, 1u, gl_ScopeDevice,
+                      gl_StorageSemanticsNone, gl_SemanticsRelaxed);
+            atomicStore(bar.sense, next_sense, gl_ScopeDevice,
+                        gl_StorageSemanticsBuffer, gl_SemanticsRelease | gl_SemanticsMakeAvailable);
+        } else {
+            while (atomicLoad(bar.sense, gl_ScopeDevice,
+                              gl_StorageSemanticsBuffer, gl_SemanticsAcquire | gl_SemanticsMakeVisible) != next_sense) {
+            }
+        }
+        local_sense = next_sense;
+    } else {
+        local_sense ^= 1u;
+    }
+    barrier();
+    memoryBarrier(gl_ScopeDevice, gl_StorageSemanticsBuffer,
+                  gl_SemanticsAcquire | gl_SemanticsMakeVisible);
+}
+
+// ============================================================================
+// Common Workgroup Reduction & Vector-Load Helpers
+// ============================================================================
+
+float wg_sum1(float val, uint sg, uint ln) {
+    float s = subgroupAdd(val);
+    if (ln == 0u) sh_red[0][sg] = s;
+    barrier();
+    if (sg == 0u) {
+        float t = subgroupAdd((ln < 8u) ? sh_red[0][ln] : 0.0);
+        if (ln == 0u) sh_red[0][0] = t;
+    }
+    barrier();
+    float res = sh_red[0][0];
+    barrier();
+    return res;
+}
+
+vec4 wg_sum4(vec4 v, uint sg, uint ln) {
+    vec4 s = vec4(subgroupAdd(v.x), subgroupAdd(v.y), subgroupAdd(v.z), subgroupAdd(v.w));
+    if (ln == 0u) {
+        sh_red[0][sg] = s.x;
+        sh_red[1][sg] = s.y;
+        sh_red[2][sg] = s.z;
+        sh_red[3][sg] = s.w;
+    }
+    barrier();
+    if (sg < 4u) {
+        float t = subgroupAdd((ln < 8u) ? sh_red[sg][ln] : 0.0);
+        if (ln == 0u) sh_red[sg][0] = t;
+    }
+    barrier();
+    vec4 res = vec4(sh_red[0][0], sh_red[1][0], sh_red[2][0], sh_red[3][0]);
+    barrier();
+    return res;
+}
+
+void cache_vec_to_sh(uint64_t src_va, uint n_elems, uint tid) {
+    const uint n4 = n_elems >> 2u;
+    CohBufVec4 sb = CohBufVec4(src_va);
+    for (uint i4 = tid; i4 < n4; i4 += 256u) {
+        vec4 v = sb.v[i4];
+        uint b = i4 << 2u;
+        sh_buf[b + 0u] = v.x;
+        sh_buf[b + 1u] = v.y;
+        sh_buf[b + 2u] = v.z;
+        sh_buf[b + 3u] = v.w;
+    }
+    barrier();
+}
+
+// Generic dot(row, sh_buf[0..K-1]) distributed across all 256 threads in WG (F32/F16/BF16/Q8_0_8BLK/Q8_0_RAW)
+float dot_row_sh_256(uint64_t row_va, uint wtype, uint K, uint tid, uint sg, uint ln) {
+    float acc = 0.0;
+    if (wtype == 0u) {
+        // F32 (vec4 coalesced)
+        const uint K4 = K >> 2u;
+        ConstBufVec4 wb = ConstBufVec4(row_va);
+        for (uint i4 = tid; i4 < K4; i4 += 256u) {
+            uint b = i4 << 2u;
+            vec4 xv = vec4(sh_buf[b], sh_buf[b + 1u], sh_buf[b + 2u], sh_buf[b + 3u]);
+            acc += dot(wb.v[i4], xv);
+        }
+    } else if (wtype == 2u) {
+        // BF16 (uvec2 = 4 BF16s/load)
+        const uint K4 = K >> 2u;
+        ConstBufUvec2 wb = ConstBufUvec2(row_va);
+        for (uint i4 = tid; i4 < K4; i4 += 256u) {
+            uvec2 p = wb.v[i4];
+            vec4 w = vec4(
+                uintBitsToFloat((p.x & 0xFFFFu) << 16u),
+                uintBitsToFloat(p.x & 0xFFFF0000u),
+                uintBitsToFloat((p.y & 0xFFFFu) << 16u),
+                uintBitsToFloat(p.y & 0xFFFF0000u));
+            uint b = i4 << 2u;
+            acc += dot(w, vec4(sh_buf[b], sh_buf[b + 1u], sh_buf[b + 2u], sh_buf[b + 3u]));
+        }
+    } else if (wtype == 1u) {
+        // F16 (uvec2 = 4 F16s/load)
+        const uint K4 = K >> 2u;
+        ConstBufUvec2 wb = ConstBufUvec2(row_va);
+        for (uint i4 = tid; i4 < K4; i4 += 256u) {
+            uvec2 p = wb.v[i4];
+            vec4 w = vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y));
+            uint b = i4 << 2u;
+            acc += dot(w, vec4(sh_buf[b], sh_buf[b + 1u], sh_buf[b + 2u], sh_buf[b + 3u]));
+        }
+    } else if (wtype == 4u) {
+        // AGX_Q8_0_8BLK (272B/256 weights): 16 lanes per chunk
+        const uint n_chunks = (K + 255u) >> 8u;
+        const uint cg       = tid >> 4u; // 0..15
+        const uint l16      = tid & 15u;
+        AgxBufQ8_8Blk wb    = AgxBufQ8_8Blk(row_va);
+        for (uint c = cg; c < n_chunks; c += 16u) {
+            const uint k0 = c * 256u + l16 * 16u;
+            if (k0 < K) {
+                const uvec4 qv = wb.blk[c].qs[l16];
+                const float d  = float(unpackFloat2x16(uint(wb.blk[c].d[l16 >> 1u])).x);
+                vec4 x0 = vec4(sh_buf[k0 + 0u],  sh_buf[k0 + 1u],  sh_buf[k0 + 2u],  sh_buf[k0 + 3u]);
+                vec4 x1 = vec4(sh_buf[k0 + 4u],  sh_buf[k0 + 5u],  sh_buf[k0 + 6u],  sh_buf[k0 + 7u]);
+                vec4 x2 = vec4(sh_buf[k0 + 8u],  sh_buf[k0 + 9u],  sh_buf[k0 + 10u], sh_buf[k0 + 11u]);
+                vec4 x3 = vec4(sh_buf[k0 + 12u], sh_buf[k0 + 13u], sh_buf[k0 + 14u], sh_buf[k0 + 15u]);
+                float dp = dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.x)), x0)
+                         + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.y)), x1)
+                         + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.z)), x2)
+                         + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.w)), x3);
+                acc = fma(dp, d, acc);
+            }
+        }
+    } else {
+        // Raw block_q8_0 (34B/32 weights)
+        const uint nb = K >> 5u;
+        AgxBufQ8_0Raw wb = AgxBufQ8_0Raw(row_va);
+        for (uint b = tid; b < nb; b += 256u) {
+            const float d = float(unpackFloat2x16(uint(wb.blk[b].d)).x);
+            const uint k0 = b * 32u;
+            float dp = 0.0;
+            for (uint o = 0u; o < 32u; ++o) {
+                dp = fma(float(int(wb.blk[b].qs[o])), sh_buf[k0 + o], dp);
+            }
+            acc = fma(dp, d, acc);
+        }
+    }
+    return wg_sum1(acc, sg, ln);
+}
+
+#if HAS_LOOP == 1
+// Fused RMSNorm(src, eps) -> dst (unweighted, for ctrl_cat halves)
+void wg_rmsnorm_unweighted(uint64_t src_va, uint64_t dst_va, float eps, uint tid, uint sg, uint ln) {
+    const uint D4 = 2304u >> 2u;
+    CohBufVec4 sb = CohBufVec4(src_va);
+    CohBufVec4 db = CohBufVec4(dst_va);
+    float ss = 0.0;
+    for (uint i4 = tid; i4 < D4; i4 += 256u) {
+        vec4 v = sb.v[i4];
+        ss += dot(v, v);
+    }
+    float rms = inversesqrt(wg_sum1(ss, sg, ln) * (1.0 / 2304.0) + eps);
+    for (uint i4 = tid; i4 < D4; i4 += 256u) {
+        db.v[i4] = sb.v[i4] * rms;
+    }
+}
+
+// Weighted RMSNorm(src, eps) * norm_w -> dst
+void wg_rmsnorm_weighted(uint64_t src_va, uint64_t norm_w_va, uint64_t dst_va, float eps, uint tid, uint sg, uint ln) {
+    const uint D4 = 2304u >> 2u;
+    CohBufVec4   sb = CohBufVec4(src_va);
+    ConstBufVec4 nw = ConstBufVec4(norm_w_va);
+    CohBufVec4   db = CohBufVec4(dst_va);
+    float ss = 0.0;
+    for (uint i4 = tid; i4 < D4; i4 += 256u) {
+        vec4 v = sb.v[i4];
+        ss += dot(v, v);
+    }
+    float rms = inversesqrt(wg_sum1(ss, sg, ln) * (1.0 / 2304.0) + eps);
+    for (uint i4 = tid; i4 < D4; i4 += 256u) {
+        db.v[i4] = (sb.v[i4] * rms) * nw.v[i4];
+    }
+}
+
+// Shared ctrl_up_mix helper for 1 controller (K=64, N=2304, 72 x 32-row 128B tiles across 40 WGs)
+void phase_ctrl_up_mix_one(
+        uint64_t cur_va, uint64_t msg_va, uint64_t gate_va,
+        uint64_t gain_w_va, uint64_t forget_w_va, uint64_t out_va,
+        uint wg, uint tid, uint sg, uint ln) {
+    if (tid < 64u) {
+        sh_buf[tid] = CohBufF32(gate_va).v[tid];
+    }
+    barrier();
+
+    const uint r_sg = ln >> 3u; // 0..3 (4 rows/sg -> 32 rows/WG = exact 128B line!)
+    const uint l8   = ln & 7u;  // 0..7 (8 lanes/row x 8 floats = 64)
+    const uint k0   = l8 * 4u;
+    const uint k1   = (l8 + 8u) * 4u;
+    const vec4 x0   = vec4(sh_buf[k0], sh_buf[k0 + 1u], sh_buf[k0 + 2u], sh_buf[k0 + 3u]);
+    const vec4 x1   = vec4(sh_buf[k1], sh_buf[k1 + 1u], sh_buf[k1 + 2u], sh_buf[k1 + 3u]);
+
+    CohBufF32 cb = CohBufF32(cur_va);
+    CohBufF32 mb = CohBufF32(msg_va);
+    CohBufF32 ob = CohBufF32(out_va);
+
+    for (uint tile = wg; tile < 72u; tile += 40u) {
+        const uint row = tile * 32u + sg * 4u + r_sg;
+        const uint64_t row_off = uint64_t(row) * 256ul;
+        ConstBufVec4 gw = ConstBufVec4(gain_w_va + row_off);
+        ConstBufVec4 fw = ConstBufVec4(forget_w_va + row_off);
+
+        float dg = dot(gw.v[l8], x0) + dot(gw.v[l8 + 8u], x1);
+        float df = dot(fw.v[l8], x0) + dot(fw.v[l8 + 8u], x1);
+        dg += subgroupShuffleXor(dg, 1u);
+        dg += subgroupShuffleXor(dg, 2u);
+        dg += subgroupShuffleXor(dg, 4u);
+        df += subgroupShuffleXor(df, 1u);
+        df += subgroupShuffleXor(df, 2u);
+        df += subgroupShuffleXor(df, 4u);
+
+        if (l8 == 0u) {
+            float cv = cb.v[row];
+            float mv = mb.v[row];
+            ob.v[row] = (cv - tanh(df) * cv) + tanh(dg) * mv;
+        }
+    }
+    barrier();
+}
+#endif // HAS_LOOP == 1
+
+// ============================================================================
+// ATTENTION SUPER-STAGE PHASES (PERSIST_MODE == 0 || PERSIST_MODE == 2)
+// ============================================================================
+#if PERSIST_MODE == 0 || PERSIST_MODE == 2
+
+// Reusable Q8_0_8BLK GEMV across 40 WGs (x ALREADY cached in sh_buf[0..K-1]!)
+// Writes exact 32-row (128B) tiles per WG -> zero USC L1 false sharing.
+void gemv_q8_8blk_sh_40wg(
+        uint64_t w_va, uint64_t y_va, uint N, uint K,
+        uint wg, uint sg, uint ln) {
+    const uint n_chunks = (K + 255u) >> 8u;
+    const uint lane16   = ln & 15u;
+    const uint d_slot   = lane16 >> 1u;
+    const uint r_in_sg  = ln >> 4u; // 0..1
+    const uint n_tiles  = (N + 31u) >> 5u;
+
+    AgxBufQ8_8Blk wb = AgxBufQ8_8Blk(w_va);
+    CohBufF32     yb = CohBufF32(y_va);
+
+    for (uint tile = wg; tile < n_tiles; tile += 40u) {
+        const uint row_base = tile * 32u;
+        [[unroll]] for (uint sub = 0u; sub < 2u; ++sub) {
+            const uint row = row_base + sub * 16u + sg * 2u + r_in_sg;
+            float acc = 0.0;
+            if (row < N) {
+                const uint row_chk0 = row * n_chunks;
+                for (uint c = 0u; c < n_chunks; ++c) {
+                    const uint k0 = c * 256u + lane16 * 16u;
+                    if (k0 < K) {
+                        const uint  chk = row_chk0 + c;
+                        const uvec4 qv  = wb.blk[chk].qs[lane16];
+                        const float d   = float(unpackFloat2x16(uint(wb.blk[chk].d[d_slot])).x);
+                        const vec4  x0  = vec4(sh_buf[k0 + 0u],  sh_buf[k0 + 1u],  sh_buf[k0 + 2u],  sh_buf[k0 + 3u]);
+                        const vec4  x1  = vec4(sh_buf[k0 + 4u],  sh_buf[k0 + 5u],  sh_buf[k0 + 6u],  sh_buf[k0 + 7u]);
+                        const vec4  x2  = vec4(sh_buf[k0 + 8u],  sh_buf[k0 + 9u],  sh_buf[k0 + 10u], sh_buf[k0 + 11u]);
+                        const vec4  x3  = vec4(sh_buf[k0 + 12u], sh_buf[k0 + 13u], sh_buf[k0 + 14u], sh_buf[k0 + 15u]);
+                        float dp = dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.x)), x0)
+                                 + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.y)), x1)
+                                 + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.z)), x2)
+                                 + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.w)), x3);
+                        acc = fma(dp, d, acc);
+                    }
+                }
+            }
+            acc += subgroupShuffleXor(acc, 1u);
+            acc += subgroupShuffleXor(acc, 2u);
+            acc += subgroupShuffleXor(acc, 4u);
+            acc += subgroupShuffleXor(acc, 8u);
+            if (lane16 == 0u && row < N) {
+                yb.v[row] = acc;
+            }
+        }
+    }
+}
+
+void fwht128_in_reg(inout float reg[4], uint lane) {
+    const float sc = 0.08838834764831845;
+    [[unroll]] for (uint k = 0u; k < 4u; ++k) reg[k] *= sc;
+    [[unroll]] for (uint h = 1u; h < 32u; h <<= 1u) {
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+            float a = reg[k];
+            float b = subgroupShuffleXor(a, h);
+            reg[k] = ((lane & h) == 0u) ? (a + b) : (b - a);
+        }
+    }
+    float a0 = reg[0], a1 = reg[1], a2 = reg[2], a3 = reg[3];
+    float b0 = a0 + a1, b1 = a0 - a1, b2 = a2 + a3, b3 = a2 - a3;
+    reg[0] = b0 + b2; reg[1] = b1 + b3;
+    reg[2] = b0 - b2; reg[3] = b1 - b3;
+}
+
+void store_kv_head_coh(uint64_t row_va, uint head, float reg[4], uint lane) {
+#if KV_Q8 == 0
+    uint64_t h_va = row_va + uint64_t(head * 128u) * 2ul;
+    CohBufF16 hb = CohBufF16(h_va);
+    [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+        hb.v[k * 32u + lane] = float16_t(reg[k]);
+    }
+#else
+    uint64_t h_va = row_va + uint64_t(head * 4u) * 34ul;
+    [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+        float val  = reg[k];
+        float amax = subgroupMax(abs(val));
+        float d    = amax * (1.0 / 127.0);
+        float id   = (d != 0.0) ? (1.0 / d) : 0.0;
+        int   q    = clamp(int(round(val * id)), -127, 127);
+        uint64_t bva = h_va + uint64_t(k) * 34ul;
+        if (lane == 0u) CohBufF16(bva).v[0] = float16_t(d);
+        int q_hi = subgroupShuffleXor(q, 1u);
+        if ((lane & 1u) == 0u) {
+            CohBufU16(bva + 2ul).v[lane >> 1u] =
+                uint16_t((uint(q) & 0xFFu) | ((uint(q_hi) & 0xFFu) << 8u));
+        }
+    }
+#endif
+}
+
+// Vectorized 32-element RelBias dot product (reads s_r from sh_buf[0..31])
+float dot_rel_bias_row_sh(uint64_t b_va, uint wtype, uint n_rel) {
+    float acc = 0.0;
+    if (wtype == 2u) {
+        const uint n4 = n_rel >> 2u;
+        ConstBufUvec2 bb = ConstBufUvec2(b_va);
+        for (uint g = 0u; g < n4; ++g) {
+            uvec2 p = bb.v[g];
+            uint k = g << 2u;
+            vec4 w = vec4(
+                uintBitsToFloat((p.x & 0xFFFFu) << 16u),
+                uintBitsToFloat(p.x & 0xFFFF0000u),
+                uintBitsToFloat((p.y & 0xFFFFu) << 16u),
+                uintBitsToFloat(p.y & 0xFFFF0000u));
+            acc += dot(w, vec4(sh_buf[k], sh_buf[k + 1u], sh_buf[k + 2u], sh_buf[k + 3u]));
+        }
+    } else if (wtype == 1u) {
+        const uint n4 = n_rel >> 2u;
+        ConstBufUvec2 bb = ConstBufUvec2(b_va);
+        for (uint g = 0u; g < n4; ++g) {
+            uvec2 p = bb.v[g];
+            uint k = g << 2u;
+            vec4 w = vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y));
+            acc += dot(w, vec4(sh_buf[k], sh_buf[k + 1u], sh_buf[k + 2u], sh_buf[k + 3u]));
+        }
+    } else if (wtype == 0u) {
+        const uint n4 = n_rel >> 2u;
+        ConstBufVec4 bb = ConstBufVec4(b_va);
+        for (uint g = 0u; g < n4; ++g) {
+            uint k = g << 2u;
+            acc += dot(bb.v[g], vec4(sh_buf[k], sh_buf[k + 1u], sh_buf[k + 2u], sh_buf[k + 3u]));
+        }
+    } else if (wtype == 4u) {
+        const uint n_chunks = (n_rel + 255u) >> 8u;
+        for (uint c = 0u; c < n_chunks; ++c) {
+            uint64_t cva = b_va + uint64_t(c) * 272ul;
+            uint blk_end = min(8u, (n_rel - c * 256u + 31u) >> 5u);
+            for (uint b = 0u; b < blk_end; ++b) {
+                float ds = unpackHalf2x16(uint(ConstBufU16(cva).v[b])).x;
+                float p = 0.0;
+                uint base_k = c * 256u + b * 32u;
+                for (uint w = 0u; w < 8u; ++w) {
+                    uint pk = ConstBufU32(cva + 16ul).v[b * 8u + w];
+                    uint kk = base_k + w * 4u;
+                    if (kk < n_rel) {
+                        p += float(bitfieldExtract(int(pk),  0, 8)) * sh_buf[kk + 0u]
+                           + float(bitfieldExtract(int(pk),  8, 8)) * sh_buf[kk + 1u]
+                           + float(bitfieldExtract(int(pk), 16, 8)) * sh_buf[kk + 2u]
+                           + float(bitfieldExtract(int(pk), 24, 8)) * sh_buf[kk + 3u];
+                    }
+                }
+                acc += ds * p;
+            }
+        }
+    } else {
+        for (uint k = 0u; k < n_rel; k += 32u) {
+            uint64_t blk_va = b_va + uint64_t(k >> 5u) * 34ul;
+            float ds = unpackHalf2x16(uint(ConstBufU16(blk_va).v[0])).x;
+            float p = 0.0;
+            for (uint o = 0u; o < 32u && (k + o) < n_rel; ++o) {
+                p += float(ConstBufI8(blk_va + 2ul).v[o]) * sh_buf[k + o];
+            }
+            acc += ds * p;
+        }
+    }
+    return acc;
+}
+
+vec4 load_ext_kv_coh(uint64_t base_va, uint nb1, uint nb2, uint kv_idx, uint h_kv, uint lane) {
+    const uint64_t row_va = base_va + uint64_t(kv_idx) * uint64_t(nb1) + uint64_t(h_kv) * uint64_t(nb2);
+#if KV_Q8 == 0
+    uvec2 p = CohBufUvec2(row_va).v[lane];
+    return vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y));
+#else
+    uint blk = lane >> 3u;
+    uint sub16 = (lane & 7u) * 2u;
+    uint64_t blk_va = row_va + uint64_t(blk) * 34ul;
+    float sc = float(CohBufF16(blk_va).v[0]);
+    CohBufU16 qb = CohBufU16(blk_va + 2ul);
+    f16vec2 lo = agx_q8_u16_magic_to_f16vec2(uint(qb.v[sub16 + 0u]));
+    f16vec2 hi = agx_q8_u16_magic_to_f16vec2(uint(qb.v[sub16 + 1u]));
+    return vec4(lo, hi) * sc;
+#endif
+}
+
+#if HAS_LOOP == 1
+// Phase L0..L3: Fused Looped QKV Controller (msg_mix + norm_cat -> 3x ctrl_down -> ctrl_up_mix -> batch_rmsnorm)
+void run_loop_qkv_ctrl(uint64_t desc_va, uint64_t bar_va, uint n_wg, inout uint local_sense,
+                       uint wg, uint tid, uint sg, uint ln) {
+    const uint flags  = P_FLD(flags);
+    const bool is_swa = (flags & PFLAG_IS_SWA) != 0u;
+    const bool need_mix = (flags & PFLAG_NEED_QKV_MIX) != 0u;
+    const uint D      = 2304u;
+    const uint D4     = D >> 2u;
+    const float inv_D = 1.0 / 2304.0;
+    const float inv_sqrt_D = 0.020833333333333332; // 1 / sqrt(2304) = 1 / 48 EXACT!
+
+    // Phase L0: WG 0 computes msg = depth_mix(bank, va_bank_out, msg_query, Q=4) -> h_msg[0..3]
+    //           AND writes RMSNorm(msg[0..2]) -> ctrl_cat[0..2][D..2D-1]!
+    //           Concurrently: if need_mix (v==18,30), WG 1 computes qkv_in_0 + RMSNorm -> ctrl_cat[0..2][0..D-1];
+    //           else WGs 1..3 compute RMSNorm(cur_vas[0..2]) -> ctrl_cat[0..2][0..D-1]!
+    if (wg == 0u) {
+        const uint64_t q_va = P_FLD(msg_query_va);
+        for (uint s = 0u; s < 2u; ++s) {
+            uint64_t x_va = P_FLD(msg_state_va)[s];
+            float ss = 0.0, d0 = 0.0, d1 = 0.0, d2 = 0.0, d3 = 0.0;
+            CohBufVec4   xb = CohBufVec4(x_va);
+            ConstBufVec4 qb = ConstBufVec4(q_va);
+            for (uint i4 = tid; i4 < D4; i4 += 256u) {
+                vec4 xv = xb.v[i4];
+                ss += dot(xv, xv);
+                d0 += dot(xv, qb.v[0u * D4 + i4]);
+                d1 += dot(xv, qb.v[1u * D4 + i4]);
+                d2 += dot(xv, qb.v[2u * D4 + i4]);
+                d3 += dot(xv, qb.v[3u * D4 + i4]);
+            }
+            float r0 = subgroupAdd(ss), r1 = subgroupAdd(d0), r2 = subgroupAdd(d1),
+                  r3 = subgroupAdd(d2), r4 = subgroupAdd(d3);
+            if (ln == 0u) {
+                sh_red[0][sg] = r0; sh_red[1][sg] = r1; sh_red[2][sg] = r2;
+                sh_red[3][sg] = r3; sh_red[4][sg] = r4;
+            }
+            barrier();
+            if (sg < 5u) {
+                float t = subgroupAdd((ln < 8u) ? sh_red[sg][ln] : 0.0);
+                if (ln == 0u) sh_red[sg][0] = t;
+            }
+            barrier();
+            if (tid == 0u) {
+                float ir = inversesqrt(sh_red[0][0] * inv_D + 1e-6);
+                sh_inv_rms[s] = ir;
+                float sc = ir * inv_sqrt_D;
+                sh_prob[0][s] = sh_red[1][0] * sc;
+                sh_prob[1][s] = sh_red[2][0] * sc;
+                sh_prob[2][s] = sh_red[3][0] * sc;
+                sh_prob[3][s] = sh_red[4][0] * sc;
+            }
+            barrier();
+        }
+        if (tid < 4u) {
+            float m = max(sh_prob[tid][0], sh_prob[tid][1]);
+            float e0 = exp(sh_prob[tid][0] - m);
+            float e1 = exp(sh_prob[tid][1] - m);
+            float is = 1.0 / (e0 + e1);
+            sh_prob[tid][0] = (e0 * is) * sh_inv_rms[0];
+            sh_prob[tid][1] = (e1 * is) * sh_inv_rms[1];
+        }
+        barrier();
+
+        CohBufVec4 x0b = CohBufVec4(P_FLD(msg_state_va)[0]);
+        CohBufVec4 x1b = CohBufVec4(P_FLD(msg_state_va)[1]);
+        const uint64_t h_msg_va = P_FLD(h_msg_va);
+        vec4 ss_m = vec4(0.0);
+        for (uint i4 = tid; i4 < D4; i4 += 256u) {
+            vec4 xv0 = x0b.v[i4];
+            vec4 xv1 = x1b.v[i4];
+            vec4 y0 = sh_prob[0][0] * xv0 + sh_prob[0][1] * xv1;
+            vec4 y1 = sh_prob[1][0] * xv0 + sh_prob[1][1] * xv1;
+            vec4 y2 = sh_prob[2][0] * xv0 + sh_prob[2][1] * xv1;
+            vec4 y3 = sh_prob[3][0] * xv0 + sh_prob[3][1] * xv1;
+            CohBufVec4(h_msg_va + uint64_t(0u * D) * 4ul).v[i4] = y0;
+            CohBufVec4(h_msg_va + uint64_t(1u * D) * 4ul).v[i4] = y1;
+            CohBufVec4(h_msg_va + uint64_t(2u * D) * 4ul).v[i4] = y2;
+            CohBufVec4(h_msg_va + uint64_t(3u * D) * 4ul).v[i4] = y3;
+            ss_m.x += dot(y0, y0);
+            ss_m.y += dot(y1, y1);
+            ss_m.z += dot(y2, y2);
+        }
+        vec4 tot_m = wg_sum4(ss_m, sg, ln);
+        float rms0 = inversesqrt(tot_m.x * inv_D + 1e-6);
+        float rms1 = inversesqrt(tot_m.y * inv_D + 1e-6);
+        float rms2 = inversesqrt(tot_m.z * inv_D + 1e-6);
+        CohBufVec4 c0 = CohBufVec4(P_FLD(ctrl_cat_va)[0] + uint64_t(D) * 4ul);
+        CohBufVec4 c1 = CohBufVec4(P_FLD(ctrl_cat_va)[1] + uint64_t(D) * 4ul);
+        CohBufVec4 c2 = CohBufVec4(P_FLD(ctrl_cat_va)[2] + uint64_t(D) * 4ul);
+        for (uint i4 = tid; i4 < D4; i4 += 256u) {
+            c0.v[i4] = CohBufVec4(h_msg_va + uint64_t(0u * D) * 4ul).v[i4] * rms0;
+            c1.v[i4] = CohBufVec4(h_msg_va + uint64_t(1u * D) * 4ul).v[i4] * rms1;
+            c2.v[i4] = CohBufVec4(h_msg_va + uint64_t(2u * D) * 4ul).v[i4] * rms2;
+        }
+    } else if (need_mix && wg == 1u) {
+        // v == 18 or v == 30 (always SWA, Q=1, B=1): depth_mix(blocks, cur, attn_res_query) -> qkv_in_0 & ctrl_cat[0..2][0..D-1]
+        const uint B = P_FLD(qkv_mix_n_blocks);
+        const uint S = B + 1u;
+        const uint64_t bptrs_va = P_FLD(qkv_mix_bptrs_va);
+        const uint64_t q_va     = P_FLD(qkv_mix_query_va);
+        if (tid < B && tid < 8u) sh_bva[tid] = ConstBufU64(bptrs_va).v[tid];
+        barrier();
+        for (uint s = 0u; s < B; ++s) {
+            uint64_t x_va = (s < 8u) ? sh_bva[s] : ConstBufU64(bptrs_va).v[s];
+            vec4 acc = vec4(0.0);
+            CohBufVec4 xb = CohBufVec4(x_va);
+            ConstBufVec4 qb = ConstBufVec4(q_va);
+            for (uint i4 = tid; i4 < D4; i4 += 256u) {
+                vec4 xv = xb.v[i4];
+                acc.x += dot(xv, xv);
+                acc.y += dot(xv, qb.v[i4]);
+            }
+            vec4 tot = wg_sum4(acc, sg, ln);
+            if (tid == 0u) {
+                float ir = inversesqrt(tot.x * inv_D + 1e-6);
+                sh_inv_rms[s] = ir;
+                sh_prob[0][s] = tot.y * ir * inv_sqrt_D;
+            }
+        }
+        {
+            vec4 acc = vec4(0.0);
+            CohBufVec4 cb = CohBufVec4(P_FLD(qkv_mix_cur_va));
+            ConstBufVec4 qb = ConstBufVec4(q_va);
+            for (uint i4 = tid; i4 < D4; i4 += 256u) {
+                vec4 xv = cb.v[i4];
+                acc.x += dot(xv, xv);
+                acc.y += dot(xv, qb.v[i4]);
+            }
+            vec4 tot = wg_sum4(acc, sg, ln);
+            if (tid == 0u) {
+                float ir = inversesqrt(tot.x * inv_D + 1e-6);
+                sh_inv_rms[B] = ir;
+                sh_prob[0][B] = tot.y * ir * inv_sqrt_D;
+            }
+        }
+        barrier();
+        if (tid == 0u) {
+            float m = sh_prob[0][0];
+            for (uint s = 1u; s < S; ++s) m = max(m, sh_prob[0][s]);
+            float sum_e = 0.0;
+            for (uint s = 0u; s < S; ++s) { float e = exp(sh_prob[0][s] - m); sh_prob[0][s] = e; sum_e += e; }
+            float is = 1.0 / sum_e;
+            for (uint s = 0u; s < S; ++s) sh_prob[0][s] = (sh_prob[0][s] * is) * sh_inv_rms[s];
+        }
+        barrier();
+        const float wb = sh_prob[0][B];
+        CohBufVec4 cur_b = CohBufVec4(P_FLD(qkv_mix_cur_va));
+        CohBufVec4 out_b = CohBufVec4(P_FLD(qkv_in_va)[0]);
+        float ss_y = 0.0;
+        for (uint i4 = tid; i4 < D4; i4 += 256u) {
+            vec4 yv = wb * cur_b.v[i4];
+            for (uint s = 0u; s < B; ++s) {
+                uint64_t x_va = (s < 8u) ? sh_bva[s] : ConstBufU64(bptrs_va).v[s];
+                yv += sh_prob[0][s] * CohBufVec4(x_va).v[i4];
+            }
+            out_b.v[i4] = yv;
+            ss_y += dot(yv, yv);
+        }
+        float rms = inversesqrt(wg_sum1(ss_y, sg, ln) * inv_D + 1e-6);
+        CohBufVec4 c0 = CohBufVec4(P_FLD(ctrl_cat_va)[0]);
+        CohBufVec4 c1 = CohBufVec4(P_FLD(ctrl_cat_va)[1]);
+        CohBufVec4 c2 = CohBufVec4(P_FLD(ctrl_cat_va)[2]);
+        for (uint i4 = tid; i4 < D4; i4 += 256u) {
+            vec4 nv = out_b.v[i4] * rms;
+            c0.v[i4] = nv;
+            c1.v[i4] = nv;
+            c2.v[i4] = nv;
+        }
+    } else if (!need_mix && wg >= 1u && wg <= 3u) {
+        const uint c = wg - 1u;
+        const uint64_t src_va = is_swa ? P_FLD(qkv_in_va)[0] : P_FLD(qkv_in_va)[c];
+        wg_rmsnorm_unweighted(src_va, P_FLD(ctrl_cat_va)[c], 1e-6, tid, sg, ln);
+    }
+    agx_sense_barrier(bar_va, n_wg, local_sense);
+
+    // Phase L1: 3x ctrl_down (K=4608, N=64, F32 -> 192 total rows across 40 WGs, 256T/row!)
+    for (uint r = wg; r < 192u; r += 40u) {
+        const uint c   = r >> 6u;  // 0..2
+        const uint row = r & 63u;  // 0..63
+        const uint64_t w_row = P_FLD(ctrl_down_w_va)[c] + uint64_t(row) * 4608ul * 4ul;
+        ConstBufVec4 wb = ConstBufVec4(w_row);
+        CohBufVec4   xb = CohBufVec4(P_FLD(ctrl_cat_va)[c]);
+        float acc = 0.0;
+        for (uint i4 = tid; i4 < (4608u >> 2u); i4 += 256u) {
+            acc += dot(wb.v[i4], xb.v[i4]);
+        }
+        float tot = wg_sum1(acc, sg, ln);
+        if (tid == 0u) {
+            CohBufF32(P_FLD(ctrl_gate_va)[c]).v[row] = tot;
+        }
+    }
+    agx_sense_barrier(bar_va, n_wg, local_sense);
+
+    // Phase L2: 3x ctrl_up_mix (K=64, N=2304, F32 gain+forget+tanh+mix -> ctrl_gain[0..2])
+    const uint64_t h_msg_va = P_FLD(h_msg_va);
+    for (uint c = 0u; c < 3u; ++c) {
+        const uint64_t cur_va = is_swa ? P_FLD(qkv_in_va)[0] : P_FLD(qkv_in_va)[c];
+        const uint64_t msg_va = h_msg_va + uint64_t(c * D) * 4ul;
+        phase_ctrl_up_mix_one(cur_va, msg_va, P_FLD(ctrl_gate_va)[c],
+                              P_FLD(ctrl_gain_w_va)[c], P_FLD(ctrl_forget_w_va)[c],
+                              P_FLD(ctrl_gain_va)[c], wg, tid, sg, ln);
+    }
+    agx_sense_barrier(bar_va, n_wg, local_sense);
+
+    // Phase L3: batch_rmsnorm (WGs 0..2 -> x_q, x_k, x_v)
+    if (wg < 3u) {
+        const uint64_t dst_va = (wg == 0u) ? P_FLD(x_q_va) : ((wg == 1u) ? P_FLD(x_k_va) : P_FLD(x_v_va));
+        wg_rmsnorm_weighted(P_FLD(ctrl_gain_va)[wg], P_FLD(attn_norm_w_va)[wg], dst_va,
+                            P_FLD(rms_eps), tid, sg, ln);
+    }
+    agx_sense_barrier(bar_va, n_wg, local_sense);
+}
+#endif // HAS_LOOP == 1
+
+// Phase A0..A4: Complete Attention Super-Stage
+void run_attn_superstage(uint64_t desc_va, uint64_t bar_va, uint n_wg, inout uint local_sense,
+                         uint wg, uint tid, uint sg, uint ln) {
+#if HAS_LOOP == 1
+    run_loop_qkv_ctrl(desc_va, bar_va, n_wg, local_sense, wg, tid, sg, ln);
+#endif
+
+    const uint flags        = P_FLD(flags);
+    const bool is_swa       = (flags & PFLAG_IS_SWA) != 0u;
+    const bool same_qkv_inp = (flags & PFLAG_SAME_QKV_INP) != 0u;
+    const bool fwht_k       = (flags & PFLAG_HAS_K_ROT) != 0u;
+    const bool fwht_v       = (flags & PFLAG_HAS_V_ROT) != 0u;
+
+    // ---- Phase A0: Coalesced W_attn_in (Q8_0_8BLK) [+ BF16 attn_sink_proj + full-attn k_dyn / v_dyn] ----
+    cache_vec_to_sh(P_FLD(x_q_va), 2304u, tid);
+    gemv_q8_8blk_sh_40wg(P_FLD(w_attn_in_va), P_FLD(qkv_buf_va),
+                         same_qkv_inp ? P_FLD(total_coal_rows) : P_FLD(q_prefix_rows),
+                         2304u, wg, sg, ln);
+    if (wg < 24u && P_FLD(sink_proj_va) != 0ul) {
+        float sv = dot_row_sh_256(P_FLD(sink_proj_va) + uint64_t(wg) * uint64_t(P_FLD(sink_proj_row_B)),
+                                  P_FLD(sink_proj_wtype), 2304u, tid, sg, ln);
+        if (tid == 0u) CohBufF32(P_FLD(sinks_va)).v[wg] = sv;
+    }
+    if (!same_qkv_inp) {
+        for (uint kv_i = 0u; kv_i < 2u; ++kv_i) {
+            barrier();
+            cache_vec_to_sh((kv_i == 0u) ? P_FLD(x_k_va) : P_FLD(x_v_va), 2304u, tid);
+            if (wg < 32u) {
+                gemv_q8_8blk_sh_40wg(
+                    P_FLD(w_attn_in_va) + ((kv_i == 0u) ? P_FLD(wk_byte_off) : P_FLD(wv_byte_off)),
+                    (kv_i == 0u) ? P_FLD(k_raw_va) : P_FLD(v_raw_va),
+                    (kv_i == 0u) ? P_FLD(wk_rows)  : P_FLD(wv_rows),
+                    2304u, wg, sg, ln);
+            } else if (!is_swa) {
+                const uint     wt   = (kv_i == 0u) ? P_FLD(k_proj_wtype)   : P_FLD(v_proj_wtype);
+                const uint     rb   = (kv_i == 0u) ? P_FLD(k_proj_row_B)   : P_FLD(v_proj_row_B);
+                const uint64_t p_va = (kv_i == 0u) ? P_FLD(k_conv_proj_va) : P_FLD(v_conv_proj_va);
+                CohBufF32      db   = CohBufF32((kv_i == 0u) ? P_FLD(k_dyn_va) : P_FLD(v_dyn_va));
+                for (uint r = wg - 32u; r < 32u; r += 8u) {
+                    float v = dot_row_sh_256(p_va + uint64_t(r) * uint64_t(rb), wt, 2304u, tid, sg, ln);
+                    if (tid == 0u) db.v[r] = v;
+                }
+            }
+        }
+    }
+    agx_sense_barrier(bar_va, n_wg, local_sense);
+
+    // ---- Phase A1: 40-WG Fused qkv_prep_store + Inline RelBias -> kq_mask_f16 ----
+    if (wg < 24u) {
+        const uint head = wg;
+        const uint64_t qkv_buf_va = P_FLD(qkv_buf_va);
+        // sg 0: Q head prep (q_clip + L2 clip + full-attn tau + optional FWHT128 -> q_out)
+        if (sg == 0u) {
+            const uint64_t q_raw_va  = qkv_buf_va + uint64_t(P_FLD(q_row_off)) * 4ul;
+            const uint64_t q_clip_va = P_FLD(q_clip_va);
+            float reg[4];
+            float ss = 0.0;
+            [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+                const uint ch = head * 128u + k * 32u + ln;
+                float x = CohBufF32(q_raw_va).v[ch] * ConstBufF32(q_clip_va).v[ch];
+                reg[k] = x;
+                ss += x * x;
+            }
+            const float qk_clip = P_FLD(qk_clip);
+            float sc = qk_clip / max(sqrt(subgroupAdd(ss)), qk_clip);
+            if (!is_swa) {
+                float pos_p1 = float(ConstBufI32(P_FLD(inp_pos_va)).v[0]) + 1.0;
+                sc *= 1.0 + P_FLD(log_scale_alpha) * log(max(1.0, pos_p1 * P_FLD(inv_log_floor)));
+            }
+            [[unroll]] for (uint k = 0u; k < 4u; ++k) reg[k] *= sc;
+            if (fwht_k) fwht128_in_reg(reg, ln);
+            CohBufF32 qo = CohBufF32(P_FLD(q_out_va));
+            const uint q_base = head * 128u;
+            [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+                qo.v[q_base + k * 32u + ln] = reg[k];
+            }
+        }
+        // sg 1: R head prep (r_clip + L2 clip + full-attn tau -> sh_buf[0..31])
+        if (sg == 1u) {
+            const uint n_rel = P_FLD(n_rel);
+            const uint64_t r_raw_va = qkv_buf_va + uint64_t(P_FLD(r_row_off)) * 4ul;
+            float rv = 0.0;
+            if (ln < n_rel) {
+                const uint ch = head * n_rel + ln;
+                rv = CohBufF32(r_raw_va).v[ch] * ConstBufF32(P_FLD(r_clip_va)).v[ch];
+            }
+            const float rel_clip = P_FLD(rel_clip);
+            float sc = rel_clip / max(sqrt(subgroupAdd(rv * rv)), rel_clip);
+            if (!is_swa) {
+                float pos_p1 = float(ConstBufI32(P_FLD(inp_pos_va)).v[0]) + 1.0;
+                sc *= 1.0 + P_FLD(log_scale_alpha) * log(max(1.0, pos_p1 * P_FLD(inv_log_floor)));
+            }
+            if (ln < 32u) sh_buf[ln] = rv * sc;
+        }
+        barrier();
+
+        // All 256 threads of WG `head` compute RelBias - Sink + BaseMask -> kq_mask_f16
+        const float    sink       = CohBufF32(P_FLD(sinks_va)).v[head];
+        const uint64_t rpos_va    = P_FLD(rel_pos_va);
+        const uint64_t bmask_va   = P_FLD(base_mask_va);
+        const uint64_t dst_row_va = P_FLD(kq_mask_va) + uint64_t(head * P_FLD(kq_mask_stride)) * 2ul;
+        const bool     bmask_f16  = (flags & PFLAG_BMASK_F16) != 0u;
+        const uint     n_kv       = P_FLD(n_kv);
+        const uint     n_extent   = P_FLD(n_extent);
+        const uint     n_rel      = P_FLD(n_rel);
+        const uint64_t rb_va      = P_FLD(rel_bias_va);
+        const uint     bias_wt    = P_FLD(bias_wtype);
+        const uint     bias_nb1   = P_FLD(bias_nb1_B);
+
+        CohBufF16 dst_m = CohBufF16(dst_row_va);
+        for (uint j = tid; j < n_kv; j += 256u) {
+            float bm = bmask_f16 ? float(ConstBufF16(bmask_va).v[j]) : ConstBufF32(bmask_va).v[j];
+            if (!(bm > -1.0e20)) {
+                dst_m.v[j] = float16_t(bm);
+                continue;
+            }
+            int d_idx = ConstBufI32(rpos_va).v[j];
+            float acc = 0.0;
+            if (d_idx >= 0 && uint(d_idx) < n_extent) {
+                acc = dot_rel_bias_row_sh(rb_va + uint64_t(d_idx) * uint64_t(bias_nb1), bias_wt, n_rel);
+            }
+            dst_m.v[j] = float16_t((acc - sink) + bm);
+        }
+    } else if (sg == 0u) {
+        // WGs 24..31: K heads 0..7; WGs 32..39: V heads 0..7 (M=1, WAR-free state update!)
+        const bool is_v     = (wg >= 32u);
+        const uint head     = is_v ? (wg - 32u) : (wg - 24u);
+        const uint ch_off   = is_v ? 1024u : 0u;
+        const uint64_t raw_va    = is_v ? P_FLD(v_raw_va)    : P_FLD(k_raw_va);
+        const uint64_t conv_w_va = is_v ? P_FLD(v_conv_w_va) : P_FLD(k_conv_w_va);
+        const uint64_t dyn_va    = is_v ? P_FLD(v_dyn_va)    : P_FLD(k_dyn_va);
+        const uint64_t cell_va   = is_v ? P_FLD(cell_va)[1]  : P_FLD(cell_va)[0];
+        const uint64_t store_va  = is_v ? P_FLD(v_store_va)  : P_FLD(k_store_va);
+        const uint64_t idxs_va   = is_v ? P_FLD(v_idxs_va)   : P_FLD(k_idxs_va);
+        const uint     store_nb1 = is_v ? P_FLD(v_store_nb1) : P_FLD(k_store_nb1);
+        const bool     ids_i64   = is_v ? ((flags & PFLAG_V_IDS_I64) != 0u) : ((flags & PFLAG_K_IDS_I64) != 0u);
+        const bool     do_fwht   = is_v ? fwht_v : fwht_k;
+        const float    res_sc    = P_FLD(kv_conv_res_scale);
+
+        const int src_cell = max(ConstBufI32(P_FLD(s_copy_va)).v[0], 0);
+        const uint64_t hist_cell_va = P_FLD(r_l_va) + uint64_t(src_cell) * uint64_t(P_FLD(r_nb1_f32)) * 4ul;
+
+        vec4 dw = (!is_swa && dyn_va != 0ul) ? CohBufVec4(dyn_va).v[head] : vec4(0.0);
+        float reg[4];
+        float ss = 0.0;
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+            const uint ch = head * 128u + k * 32u + ln;
+            const uint64_t past_va = hist_cell_va + uint64_t((ch_off + ch) * 3u) * 4ul;
+            CohBufF32 pb = CohBufF32(past_va);
+            float p0 = pb.v[0];
+            float p1 = pb.v[1];
+            float p2 = pb.v[2];
+            float x0 = CohBufF32(raw_va).v[ch];
+
+            vec4 cw = ConstBufVec4(conv_w_va).v[ch];
+            float csum = p0 * cw.x + p1 * cw.y + p2 * cw.z + x0 * cw.w;
+            if (!is_swa && dyn_va != 0ul) {
+                csum += x0 * dw.x + p2 * dw.y + p1 * dw.z + p0 * dw.w;
+            }
+            float v = (x0 + csum) * res_sc;
+            reg[k] = v;
+            ss += v * v;
+
+            // WAR-free state update (p0,p1,p2 already in registers before writing cell_va!)
+            if (cell_va != 0ul) {
+                CohBufF32 cb = CohBufF32(cell_va + uint64_t(ch * 3u) * 4ul);
+                cb.v[0] = p1;
+                cb.v[1] = p2;
+                cb.v[2] = x0;
+            }
+        }
+
+        float sum_sq = subgroupAdd(ss);
+        float sc = (!is_v)
+            ? (P_FLD(qk_clip) / max(sqrt(sum_sq), P_FLD(qk_clip)))
+            : inversesqrt(sum_sq * (1.0 / 128.0) + P_FLD(rms_eps));
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) reg[k] *= sc;
+        if (do_fwht) fwht128_in_reg(reg, ln);
+
+        int64_t dst_row = ids_i64 ? ConstBufI64(idxs_va).v[0] : int64_t(ConstBufI32(idxs_va).v[0]);
+        if (dst_row >= 0l) {
+            store_kv_head_coh(store_va + uint64_t(dst_row) * uint64_t(store_nb1), head, reg, ln);
+        }
+    }
+    agx_sense_barrier(bar_va, n_wg, local_sense);
+
+    // ---- Phase A2: 24-WG (8 sgs/head) FlashAttention Decode + Optional FWHT128 + Qgate ----
+    if (wg < 24u) {
+        const uint h_q  = wg;
+        const uint h_kv = h_q / 3u;
+        const uint n_kv = P_FLD(n_kv);
+        const vec4 q_reg = CohBufVec4(P_FLD(q_out_va)).v[h_q * 32u + ln] * 0.08838834764831845;
+
+        const uint64_t mask_row_va = P_FLD(kq_mask_va) + uint64_t(h_q * P_FLD(kq_mask_stride)) * 2ul;
+        const uint64_t k_va  = P_FLD(k_va);
+        const uint64_t v_va  = P_FLD(v_va);
+        const uint     k_nb1 = P_FLD(k_nb1);
+        const uint     k_nb2 = P_FLD(k_nb2);
+        const uint     v_nb1 = P_FLD(v_nb1);
+        const uint     v_nb2 = P_FLD(v_nb2);
+
+        float m_i = -3.402823466e+38 * 0.5;
+        float l_i = 0.0;
+        vec4  o_i = vec4(0.0);
+
+        CohBufF16 mb = CohBufF16(mask_row_va);
+        for (uint kv = sg; kv < n_kv; kv += 8u) {
+            float mv = float(mb.v[kv]);
+            if (!(mv > -1.0e30)) continue;
+            vec4 k_reg = load_ext_kv_coh(k_va, k_nb1, k_nb2, kv, h_kv, ln);
+            vec4 v_reg = load_ext_kv_coh(v_va, v_nb1, v_nb2, kv, h_kv, ln);
+            float score = subgroupAdd(dot(q_reg, k_reg)) + mv;
+            float m_new = max(m_i, score);
+            float alpha = exp(m_i - m_new);
+            float p_w   = exp(score - m_new);
+            o_i = o_i * alpha + v_reg * p_w;
+            l_i = l_i * alpha + p_w;
+            m_i = m_new;
+        }
+
+        if (ln == 0u) {
+            sh_red[0][sg] = m_i;
+            sh_red[1][sg] = l_i;
+        }
+        const uint o_off = (sg * 32u + ln) * 4u;
+        sh_buf[o_off + 0u] = o_i.x;
+        sh_buf[o_off + 1u] = o_i.y;
+        sh_buf[o_off + 2u] = o_i.z;
+        sh_buf[o_off + 3u] = o_i.w;
+        barrier();
+
+        if (sg == 0u) {
+            float m_wg = -3.402823466e+38 * 0.5;
+            for (uint s = 0u; s < 8u; ++s) {
+                if (sh_red[1][s] > 0.0) m_wg = max(m_wg, sh_red[0][s]);
+            }
+            float l_wg = 0.0;
+            vec4  o_wg = vec4(0.0);
+            for (uint s = 0u; s < 8u; ++s) {
+                if (sh_red[1][s] > 0.0) {
+                    float w = exp(sh_red[0][s] - m_wg);
+                    l_wg += sh_red[1][s] * w;
+                    uint so = (s * 32u + ln) * 4u;
+                    o_wg += vec4(sh_buf[so], sh_buf[so + 1u], sh_buf[so + 2u], sh_buf[so + 3u]) * w;
+                }
+            }
+            // FLAG_REL_TABLE_SINK: single-application sink (eff_sink = 0.0)
+            float m_fin = (l_wg > 0.0) ? max(m_wg, 0.0) : 0.0;
+            float w_o   = (l_wg > 0.0) ? exp(m_wg - m_fin) : 0.0;
+            float w_s   = exp(-m_fin);
+            o_wg = o_wg * w_o;
+            l_wg = l_wg * w_o + w_s;
+            vec4 out_v = (l_wg > 0.0) ? (o_wg / l_wg) : vec4(0.0);
+
+            const uint64_t qgate_va = P_FLD(qkv_buf_va) + uint64_t(P_FLD(qgate_row_off)) * 4ul;
+            if (fwht_v) {
+                // Transpose contiguous vec4 -> striped reg[4] in sh_buf[0..127] (single simdgroup!)
+                uint lo4 = ln * 4u;
+                sh_buf[lo4 + 0u] = out_v.x;
+                sh_buf[lo4 + 1u] = out_v.y;
+                sh_buf[lo4 + 2u] = out_v.z;
+                sh_buf[lo4 + 3u] = out_v.w;
+                subgroupMemoryBarrierShared();
+                float reg[4];
+                [[unroll]] for (uint k = 0u; k < 4u; ++k) reg[k] = sh_buf[k * 32u + ln];
+                fwht128_in_reg(reg, ln);
+                CohBufF32 ao = CohBufF32(P_FLD(attn_out_va));
+                CohBufF32 qg = CohBufF32(qgate_va);
+                const uint base = h_q * 128u;
+                [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+                    const uint idx = base + k * 32u + ln;
+                    ao.v[idx] = reg[k] / (1.0 + exp(-qg.v[idx]));
+                }
+            } else {
+                vec4 g = CohBufVec4(qgate_va).v[h_q * 32u + ln];
+                CohBufVec4(P_FLD(attn_out_va)).v[h_q * 32u + ln] = out_v * (1.0 / (1.0 + exp(-g)));
+            }
+        }
+    }
+    agx_sense_barrier(bar_va, n_wg, local_sense);
+
+    // ---- Phase A3: 40-WG W_o (Q8_0_8BLK, N=2304, K=3072 -> wo_out_va) ----
+    cache_vec_to_sh(P_FLD(attn_out_va), 3072u, tid);
+    gemv_q8_8blk_sh_40wg(P_FLD(wo_va), P_FLD(wo_out_va), 2304u, 3072u, wg, sg, ln);
+    agx_sense_barrier(bar_va, n_wg, local_sense);
+
+    // ---- Phase A4: WG 0 stage_post_attn (attn_post_conv + state-store + res + ffn_depth_mix + optional ffn_norm) ----
+    if (wg == 0u) {
+        const uint D     = 2304u;
+        const uint D4    = D >> 2u;
+        const float inv_D = 1.0 / 2304.0;
+        const float inv_sqrt_D = 0.020833333333333332;
+        const bool add_res = ((flags & PFLAG_POST_ATTN_ADD_RES) != 0u) && (P_FLD(attn_res_va) != 0ul);
+        const bool do_norm = (flags & PFLAG_POST_ATTN_DO_NORM) != 0u;
+
+        const int src_cell = max(ConstBufI32(P_FLD(s_copy_va)).v[0], 0);
+        const uint64_t hist_cell_va = P_FLD(r_l_va) + uint64_t(src_cell) * uint64_t(P_FLD(r_nb1_f32)) * 4ul;
+        const uint64_t conv_src_va  = P_FLD(wo_out_va);
+        const uint64_t conv_w_va    = P_FLD(attn_post_conv_w_va);
+        const uint64_t res_va       = P_FLD(attn_res_va);
+        const uint64_t cur_out_va   = P_FLD(ffn_inp_va);
+        const uint64_t cell_va      = P_FLD(cell_va)[2];
+        const float    res_sc       = P_FLD(post_conv_res_scale);
+
+        float ss_cur = 0.0;
+        for (uint ch = tid; ch < D; ch += 256u) {
+            const uint64_t past_va = hist_cell_va + uint64_t((2048u + ch) * 3u) * 4ul;
+            CohBufF32 pb = CohBufF32(past_va);
+            float p0 = pb.v[0], p1 = pb.v[1], p2 = pb.v[2];
+            float x0 = CohBufF32(conv_src_va).v[ch];
+            vec4  cw = ConstBufVec4(conv_w_va).v[ch];
+            float out_v = (x0 + (p0 * cw.x + p1 * cw.y + p2 * cw.z + x0 * cw.w)) * res_sc;
+            if (add_res) out_v += CohBufF32(res_va).v[ch];
+            sh_buf[ch] = out_v;
+            ss_cur += out_v * out_v;
+            CohBufF32(cur_out_va).v[ch] = out_v;
+            if (cell_va != 0ul) {
+                CohBufF32 cb = CohBufF32(cell_va + uint64_t(ch * 3u) * 4ul);
+                cb.v[0] = p1; cb.v[1] = p2; cb.v[2] = x0;
+            }
+        }
+
+        const uint B = P_FLD(post_attn_n_blocks);
+        const uint S = B + 1u;
+        const uint64_t bptrs_va = P_FLD(attn_bptrs_va);
+        const uint64_t q_va     = P_FLD(ffn_res_query_va);
+        if (tid < B && tid < 8u) sh_bva[tid] = ConstBufU64(bptrs_va).v[tid];
+        barrier();
+
+        for (uint s = 0u; s < B; ++s) {
+            uint64_t x_va = (s < 8u) ? sh_bva[s] : ConstBufU64(bptrs_va).v[s];
+            vec4 acc = vec4(0.0);
+            CohBufVec4 xb = CohBufVec4(x_va);
+            ConstBufVec4 qb = ConstBufVec4(q_va);
+            for (uint i4 = tid; i4 < D4; i4 += 256u) {
+                vec4 xv = xb.v[i4];
+                acc.x += dot(xv, xv);
+                acc.y += dot(xv, qb.v[i4]);
+            }
+            vec4 tot = wg_sum4(acc, sg, ln);
+            if (tid == 0u) {
+                float ir = inversesqrt(tot.x * inv_D + 1e-6);
+                sh_inv_rms[s] = ir;
+                sh_prob[0][s] = tot.y * ir * inv_sqrt_D;
+            }
+        }
+        {
+            vec4 acc = vec4(ss_cur, 0.0, 0.0, 0.0);
+            ConstBufVec4 qb = ConstBufVec4(q_va);
+            for (uint i4 = tid; i4 < D4; i4 += 256u) {
+                uint b = i4 << 2u;
+                vec4 xv = vec4(sh_buf[b], sh_buf[b + 1u], sh_buf[b + 2u], sh_buf[b + 3u]);
+                acc.y += dot(xv, qb.v[i4]);
+            }
+            vec4 tot = wg_sum4(acc, sg, ln);
+            if (tid == 0u) {
+                float ir = inversesqrt(tot.x * inv_D + 1e-6);
+                sh_inv_rms[B] = ir;
+                sh_prob[0][B] = tot.y * ir * inv_sqrt_D;
+            }
+        }
+        barrier();
+
+        if (tid == 0u) {
+            float m = sh_prob[0][0];
+            for (uint s = 1u; s < S; ++s) m = max(m, sh_prob[0][s]);
+            float sum_e = 0.0;
+            for (uint s = 0u; s < S; ++s) { float e = exp(sh_prob[0][s] - m); sh_prob[0][s] = e; sum_e += e; }
+            float is = 1.0 / sum_e;
+            for (uint s = 0u; s < S; ++s) sh_prob[0][s] = (sh_prob[0][s] * is) * sh_inv_rms[s];
+        }
+        barrier();
+
+        const uint64_t dst_va = P_FLD(post_attn_mix_out_va);
+        const float wb = sh_prob[0][B];
+        CohBufVec4 db = CohBufVec4(dst_va);
+        float ss_y = 0.0;
+        for (uint i4 = tid; i4 < D4; i4 += 256u) {
+            uint b = i4 << 2u;
+            vec4 yv = wb * vec4(sh_buf[b], sh_buf[b + 1u], sh_buf[b + 2u], sh_buf[b + 3u]);
+            for (uint s = 0u; s < B; ++s) {
+                uint64_t x_va = (s < 8u) ? sh_bva[s] : ConstBufU64(bptrs_va).v[s];
+                yv += sh_prob[0][s] * CohBufVec4(x_va).v[i4];
+            }
+            db.v[i4] = yv;
+            if (do_norm) ss_y += dot(yv, yv);
+        }
+        if (do_norm) {
+            float rms = inversesqrt(wg_sum1(ss_y, sg, ln) * inv_D + P_FLD(rms_eps));
+            ConstBufVec4 nw = ConstBufVec4(P_FLD(ffn_norm_w_va));
+            for (uint i4 = tid; i4 < D4; i4 += 256u) {
+                db.v[i4] = (db.v[i4] * rms) * nw.v[i4];
+            }
+        }
+    }
+}
+#endif // PERSIST_MODE == 0 || PERSIST_MODE == 2
+
+// ============================================================================
+// FFN / MoE SUPER-STAGE PHASES (PERSIST_MODE == 1 || PERSIST_MODE == 2)
+// ============================================================================
+#if PERSIST_MODE == 1 || PERSIST_MODE == 2
+
+float eval_situ_exact(float g, float u, float beta, float lb) {
+    float g_s   = g * (1.0 / beta);
+    float act_t = tanh(g_s) * beta;
+    float sig_g = 1.0 / (1.0 + exp(-g));
+    float act   = act_t * sig_g;
+    float u_a   = (lb > 0.0) ? (tanh(u * (1.0 / lb)) * lb) : u;
+    return act * u_a;
+}
+
+float moe_scale_weight_exact(float acc_val, float s2, float wt) {
+    float scaled = acc_val * s2;
+    return scaled * wt;
+}
+
+float moe_sum8_exact(uint base_off, uint stride) {
+    float total = sh_buf[base_off];
+    for (uint k = 1u; k < 8u; ++k) {
+        total = total + sh_buf[base_off + k * stride];
+    }
+    return total;
+}
+
+#if MOE_MODE == 0
+float16_t moe_dot_e2m1_u32_f16x2(uint w32, f16vec4 hx0, f16vec4 hx1) {
+    f16vec2 v04 = agx_e2m1_swar2_to_f16vec2(w32);
+    f16vec2 v15 = agx_e2m1_swar2_to_f16vec2(w32 >> 4u);
+    f16vec2 v26 = agx_e2m1_swar2_to_f16vec2(w32 >> 8u);
+    f16vec2 v37 = agx_e2m1_swar2_to_f16vec2(w32 >> 12u);
+    return dot(f16vec4(v04.x, v15.x, v26.x, v37.x), hx0)
+         + dot(f16vec4(v04.y, v15.y, v26.y, v37.y), hx1);
+}
+#endif
+
+#if HAS_LOOP == 1
+// Phase M0..M3: Fused Looped FFN Controller
+void run_loop_ffn_ctrl(uint64_t desc_va, uint64_t bar_va, uint n_wg, inout uint local_sense,
+                       uint wg, uint tid, uint sg, uint ln) {
+    const uint D = 2304u;
+    // Phase M0: WG 0 norms qkv_in_0 -> ctrl_cat[0][0..D-1], WG 1 norms h_msg[3] -> ctrl_cat[0][D..2D-1]
+    if (wg == 0u) {
+        wg_rmsnorm_unweighted(P_FLD(qkv_in_va)[0], P_FLD(ctrl_cat_va)[0], 1e-6, tid, sg, ln);
+    } else if (wg == 1u) {
+        wg_rmsnorm_unweighted(P_FLD(h_msg_va) + uint64_t(3u * D) * 4ul,
+                              P_FLD(ctrl_cat_va)[0] + uint64_t(D) * 4ul, 1e-6, tid, sg, ln);
+    }
+    agx_sense_barrier(bar_va, n_wg, local_sense);
+
+    // Phase M1: ctrl_down[3] (K=4608, N=64, F32 -> ctrl_gate[0])
+    const uint64_t w_base = P_FLD(ctrl_down_w_va)[3];
+    CohBufVec4 xb = CohBufVec4(P_FLD(ctrl_cat_va)[0]);
+    for (uint row = wg; row < 64u; row += 40u) {
+        ConstBufVec4 wb = ConstBufVec4(w_base + uint64_t(row) * 4608ul * 4ul);
+        float acc = 0.0;
+        for (uint i4 = tid; i4 < (4608u >> 2u); i4 += 256u) {
+            acc += dot(wb.v[i4], xb.v[i4]);
+        }
+        float tot = wg_sum1(acc, sg, ln);
+        if (tid == 0u) {
+            CohBufF32(P_FLD(ctrl_gate_va)[0]).v[row] = tot;
+        }
+    }
+    agx_sense_barrier(bar_va, n_wg, local_sense);
+
+    // Phase M2: ctrl_up_mix (K=64, N=2304, F32 -> ctrl_gain[0])
+    phase_ctrl_up_mix_one(P_FLD(qkv_in_va)[0], P_FLD(h_msg_va) + uint64_t(3u * D) * 4ul,
+                          P_FLD(ctrl_gate_va)[0], P_FLD(ctrl_gain_w_va)[3], P_FLD(ctrl_forget_w_va)[3],
+                          P_FLD(ctrl_gain_va)[0], wg, tid, sg, ln);
+    agx_sense_barrier(bar_va, n_wg, local_sense);
+
+    // Phase M3: WG 0 RMSNorm(ctrl_gain[0]) * ffn_norm -> x_q
+    if (wg == 0u) {
+        wg_rmsnorm_weighted(P_FLD(ctrl_gain_va)[0], P_FLD(ffn_norm_w_va), P_FLD(x_q_va),
+                            P_FLD(rms_eps), tid, sg, ln);
+    }
+    agx_sense_barrier(bar_va, n_wg, local_sense);
+}
+#endif // HAS_LOOP == 1
+
+// Phase M4..M8: Complete FFN/MoE Super-Stage
+void run_moe_superstage(uint64_t desc_va, uint64_t bar_va, uint n_wg, inout uint local_sense,
+                        uint wg, uint tid, uint sg, uint ln) {
+#if HAS_LOOP == 1
+    run_loop_ffn_ctrl(desc_va, bar_va, n_wg, local_sense, wg, tid, sg, ln);
+#endif
+
+    const uint n_exp  = P_FLD(n_expert);
+    const uint n_ff   = P_FLD(n_ff_exp);
+    const uint flags  = P_FLD(flags);
+
+    // ---- Phase M4: 40-WG Router GEMM (x_q cached in sh_buf[0..2303] -> router_logits) ----
+    cache_vec_to_sh(P_FLD(x_q_va), 2304u, tid);
+    {
+        const uint64_t rw_va = P_FLD(router_w_va);
+        const uint     rw_wt = P_FLD(router_wtype);
+        const uint     rw_rb = P_FLD(router_row_B);
+        CohBufF32 lb = CohBufF32(P_FLD(router_logits_va));
+        for (uint row = wg; row < n_exp; row += 40u) {
+            float v = dot_row_sh_256(rw_va + uint64_t(row) * uint64_t(rw_rb), rw_wt, 2304u, tid, sg, ln);
+            if (tid == 0u) lb.v[row] = v;
+        }
+    }
+    agx_sense_barrier(bar_va, n_wg, local_sense);
+
+    // ---- Phase M5: WG 0 Bitonic Top-8 + Sigmoid + exp_probs_b + Norm -> router_topk / router_topk_w ----
+    if (wg == 0u) {
+        uint n_pad = 1u;
+        while (n_pad < n_exp) n_pad <<= 1u;
+        const uint64_t logits_va = P_FLD(router_logits_va);
+        const uint64_t bias_va   = P_FLD(exp_probs_b_va);
+        // Use sh_buf[0..255] = s_sel, sh_buf[256..511] = s_prob, sh_idx[0..255] = s_idx
+        if (tid < n_pad) {
+            if (tid < n_exp) {
+                float x = CohBufF32(logits_va).v[tid];
+                float p = 1.0 / (1.0 + exp(-x));
+                float s = (bias_va != 0ul) ? (p + ConstBufF32(bias_va).v[tid]) : p;
+                sh_buf[256u + tid] = p;
+                sh_buf[tid]        = s;
+                sh_idx[tid]        = int(tid);
+            } else {
+                sh_buf[256u + tid] = 0.0;
+                sh_buf[tid]        = uintBitsToFloat(0xFF800000u);
+                sh_idx[tid]        = 0x7FFFFFFF;
+            }
+        }
+        barrier();
+
+        const uint half_n = n_pad >> 1u;
+        for (uint k = 2u; k <= n_pad; k <<= 1u) {
+            for (uint j = k >> 1u; j > 0u; j >>= 1u) {
+                if (tid < half_n) {
+                    uint low_mask = j - 1u;
+                    uint lo = ((tid & ~low_mask) << 1u) | (tid & low_mask);
+                    uint hi = lo | j;
+                    bool asc_dir = ((lo & k) == 0u);
+                    float va = sh_buf[lo]; int ia = sh_idx[lo];
+                    float vb = sh_buf[hi]; int ib = sh_idx[hi];
+                    bool a_before = (va > vb) || (va == vb && ia < ib);
+                    if (asc_dir ? (!a_before) : a_before) {
+                        sh_buf[lo] = vb; sh_idx[lo] = ib;
+                        sh_buf[hi] = va; sh_idx[hi] = ia;
+                    }
+                }
+                barrier();
+            }
+        }
+
+        if (tid == 0u) {
+            float sum_p = 0.0;
+            for (uint k = 0u; k < 8u; ++k) sum_p += sh_buf[256u + uint(sh_idx[k])];
+            float inv_s = 1.0 / (sum_p + P_FLD(router_norm_eps));
+            float w_sc  = P_FLD(router_w_scale);
+            CohBufI32 idb = CohBufI32(P_FLD(router_topk_va));
+            CohBufF32 wb  = CohBufF32(P_FLD(router_topk_w_va));
+            for (uint k = 0u; k < 8u; ++k) {
+                int eid = sh_idx[k];
+                idb.v[k] = eid;
+                wb.v[k]  = (sh_buf[256u + uint(eid)] * inv_s) * w_sc;
+            }
+        }
+    }
+    agx_sense_barrier(bar_va, n_wg, local_sense);
+
+    // ---- Phase M6: 40-WG Fused MoE gate_up + scale2 + SiTU -> moe_inter ----
+    cache_vec_to_sh(P_FLD(x_q_va), 2304u, tid);
+    {
+        const uint64_t gu_va      = P_FLD(gu_exps_va);
+        const uint64_t gu_slice_B = P_FLD(gu_slice_B);
+        const uint64_t gu_sc_va   = P_FLD(gu_scale_va);
+        const uint64_t inter_va   = P_FLD(moe_inter_va);
+        const float    beta       = P_FLD(situ_beta);
+        const float    lb         = P_FLD(situ_linear_beta);
+        CohBufI32      idb        = CohBufI32(P_FLD(router_topk_va));
+
+#if MOE_MODE == 0
+        // AGX_NVFP4_32x16: 8 experts x (n_ff/16) half-tiles distributed across 320 simdgroups!
+        const uint halves_per_exp = n_ff >> 4u; // 72 for n_ff=1152
+        const uint total_jobs     = 8u * halves_per_exp;
+        const uint row_in_h       = ln >> 1u;
+        const uint kh             = ln & 1u;
+        const uint kh_col4        = kh * 8u;
+        const uint nb_k           = 2304u >> 6u; // 36
+
+        for (uint job = wg * 8u + sg; job < total_jobs; job += 320u) {
+            const uint k_slot  = job / halves_per_exp;
+            const uint half_g  = job - k_slot * halves_per_exp;
+            const uint row     = half_g * 16u + row_in_h;
+            const int  raw_eid = idb.v[k_slot];
+            const uint64_t y_row_va = inter_va + uint64_t(k_slot * n_ff) * 4ul;
+
+            if (raw_eid < 0 || uint(raw_eid) >= n_exp) {
+                if (kh == 0u && row < n_ff) CohBufF32(y_row_va).v[row] = 0.0;
+                continue;
+            }
+
+            const uint64_t w_base = gu_va + uint64_t(raw_eid) * gu_slice_B;
+            const uint half_u     = half_g + halves_per_exp;
+            AgxBufNvfp4ST st_g    = AgxBufNvfp4ST(w_base);
+            const uint st_g_base  = (half_g >> 1u) * nb_k;
+            const uint st_u_base  = (half_u >> 1u) * nb_k;
+            const uint l_g        = (half_g & 1u) * 32u + ln;
+            const uint l_u        = (half_u & 1u) * 32u + ln;
+
+            float acc_g = 0.0;
+            float acc_u = 0.0;
+            for (uint tk = 0u; tk < nb_k; ++tk) {
+                const uint     sg_idx = st_g_base + tk;
+                const uint     su_idx = st_u_base + tk;
+                const uint16_t dg     = st_g.st[sg_idx].d[l_g];
+                const uvec4    qg     = st_g.st[sg_idx].qs[l_g];
+                const uint16_t du     = st_g.st[su_idx].d[l_u];
+                const uvec4    qu     = st_g.st[su_idx].qs[l_u];
+                const vec2     scg    = agx_ue4m3_pair_to_vec2(dg);
+                const vec2     scu    = agx_ue4m3_pair_to_vec2(du);
+                const uint     b0     = (tk * 16u + kh_col4) * 4u;
+
+                f16vec4 hx0 = f16vec4(sh_buf[b0 + 0u],  sh_buf[b0 + 1u],  sh_buf[b0 + 2u],  sh_buf[b0 + 3u]);
+                f16vec4 hx1 = f16vec4(sh_buf[b0 + 4u],  sh_buf[b0 + 5u],  sh_buf[b0 + 6u],  sh_buf[b0 + 7u]);
+                float16_t dg0 = moe_dot_e2m1_u32_f16x2(qg.x, hx0, hx1);
+                float16_t du0 = moe_dot_e2m1_u32_f16x2(qu.x, hx0, hx1);
+
+                hx0 = f16vec4(sh_buf[b0 + 8u],  sh_buf[b0 + 9u],  sh_buf[b0 + 10u], sh_buf[b0 + 11u]);
+                hx1 = f16vec4(sh_buf[b0 + 12u], sh_buf[b0 + 13u], sh_buf[b0 + 14u], sh_buf[b0 + 15u]);
+                dg0 += moe_dot_e2m1_u32_f16x2(qg.y, hx0, hx1);
+                du0 += moe_dot_e2m1_u32_f16x2(qu.y, hx0, hx1);
+                acc_g = fma(float(dg0), scg.x, acc_g);
+                acc_u = fma(float(du0), scu.x, acc_u);
+
+                hx0 = f16vec4(sh_buf[b0 + 16u], sh_buf[b0 + 17u], sh_buf[b0 + 18u], sh_buf[b0 + 19u]);
+                hx1 = f16vec4(sh_buf[b0 + 20u], sh_buf[b0 + 21u], sh_buf[b0 + 22u], sh_buf[b0 + 23u]);
+                float16_t dg1 = moe_dot_e2m1_u32_f16x2(qg.z, hx0, hx1);
+                float16_t du1 = moe_dot_e2m1_u32_f16x2(qu.z, hx0, hx1);
+
+                hx0 = f16vec4(sh_buf[b0 + 24u], sh_buf[b0 + 25u], sh_buf[b0 + 26u], sh_buf[b0 + 27u]);
+                hx1 = f16vec4(sh_buf[b0 + 28u], sh_buf[b0 + 29u], sh_buf[b0 + 30u], sh_buf[b0 + 31u]);
+                dg1 += moe_dot_e2m1_u32_f16x2(qg.w, hx0, hx1);
+                du1 += moe_dot_e2m1_u32_f16x2(qu.w, hx0, hx1);
+                acc_g = fma(float(dg1), scg.y, acc_g);
+                acc_u = fma(float(du1), scu.y, acc_u);
+            }
+
+            acc_g += subgroupShuffleXor(acc_g, 1u);
+            acc_u += subgroupShuffleXor(acc_u, 1u);
+            if (kh == 0u && row < n_ff) {
+                const float s2 = (gu_sc_va != 0ul) ? ConstBufF32(gu_sc_va).v[uint(raw_eid)] : 1.0;
+                CohBufF32(y_row_va).v[row] = eval_situ_exact(acc_g * s2, acc_u * s2, beta, lb);
+            }
+        }
+#else
+        // AGX_Q8_0_8BLK (Coda layers 20..23): 8 experts x (n_ff/2) row-pairs across 320 simdgroups!
+        const uint pairs_per_exp = (n_ff + 1u) >> 1u; // 576
+        const uint total_jobs    = 8u * pairs_per_exp;
+        const uint lane16        = ln & 15u;
+        const uint d_slot        = lane16 >> 1u;
+        const uint r_in_sg       = ln >> 4u;
+        const uint n_chunks      = 9u; // 2304 / 256
+
+        for (uint job = wg * 8u + sg; job < total_jobs; job += 320u) {
+            const uint k_slot  = job / pairs_per_exp;
+            const uint pair_i  = job - k_slot * pairs_per_exp;
+            const uint row     = pair_i * 2u + r_in_sg;
+            const int  raw_eid = idb.v[k_slot];
+            const uint64_t y_row_va = inter_va + uint64_t(k_slot * n_ff) * 4ul;
+
+            if (raw_eid < 0 || uint(raw_eid) >= n_exp) {
+                if (lane16 == 0u && row < n_ff) CohBufF32(y_row_va).v[row] = 0.0;
+                continue;
+            }
+
+            float acc_g = 0.0;
+            float acc_u = 0.0;
+            if (row < n_ff) {
+                AgxBufQ8_8Blk wb = AgxBufQ8_8Blk(gu_va + uint64_t(raw_eid) * gu_slice_B);
+                const uint row_g0 = row * n_chunks;
+                const uint row_u0 = (n_ff + row) * n_chunks;
+                for (uint c = 0u; c < n_chunks; ++c) {
+                    const uint k0  = c * 256u + lane16 * 16u;
+                    const uint cg  = row_g0 + c;
+                    const uint cu  = row_u0 + c;
+                    const uvec4 qvg = wb.blk[cg].qs[lane16];
+                    const float dg  = float(unpackFloat2x16(uint(wb.blk[cg].d[d_slot])).x);
+                    const uvec4 qvu = wb.blk[cu].qs[lane16];
+                    const float du  = float(unpackFloat2x16(uint(wb.blk[cu].d[d_slot])).x);
+                    const vec4 x0 = vec4(sh_buf[k0 + 0u],  sh_buf[k0 + 1u],  sh_buf[k0 + 2u],  sh_buf[k0 + 3u]);
+                    const vec4 x1 = vec4(sh_buf[k0 + 4u],  sh_buf[k0 + 5u],  sh_buf[k0 + 6u],  sh_buf[k0 + 7u]);
+                    const vec4 x2 = vec4(sh_buf[k0 + 8u],  sh_buf[k0 + 9u],  sh_buf[k0 + 10u], sh_buf[k0 + 11u]);
+                    const vec4 x3 = vec4(sh_buf[k0 + 12u], sh_buf[k0 + 13u], sh_buf[k0 + 14u], sh_buf[k0 + 15u]);
+                    float dpg = dot(vec4(agx_q8_u32_magic_to_f16vec4(qvg.x)), x0)
+                              + dot(vec4(agx_q8_u32_magic_to_f16vec4(qvg.y)), x1)
+                              + dot(vec4(agx_q8_u32_magic_to_f16vec4(qvg.z)), x2)
+                              + dot(vec4(agx_q8_u32_magic_to_f16vec4(qvg.w)), x3);
+                    acc_g = fma(dpg, dg, acc_g);
+                    float dpu = dot(vec4(agx_q8_u32_magic_to_f16vec4(qvu.x)), x0)
+                              + dot(vec4(agx_q8_u32_magic_to_f16vec4(qvu.y)), x1)
+                              + dot(vec4(agx_q8_u32_magic_to_f16vec4(qvu.z)), x2)
+                              + dot(vec4(agx_q8_u32_magic_to_f16vec4(qvu.w)), x3);
+                    acc_u = fma(dpu, du, acc_u);
+                }
+            }
+            acc_g += subgroupShuffleXor(acc_g, 1u); acc_u += subgroupShuffleXor(acc_u, 1u);
+            acc_g += subgroupShuffleXor(acc_g, 2u); acc_u += subgroupShuffleXor(acc_u, 2u);
+            acc_g += subgroupShuffleXor(acc_g, 4u); acc_u += subgroupShuffleXor(acc_u, 4u);
+            acc_g += subgroupShuffleXor(acc_g, 8u); acc_u += subgroupShuffleXor(acc_u, 8u);
+            if (lane16 == 0u && row < n_ff) {
+                const float s2 = (gu_sc_va != 0ul) ? ConstBufF32(gu_sc_va).v[uint(raw_eid)] : 1.0;
+                CohBufF32(y_row_va).v[row] = eval_situ_exact(acc_g * s2, acc_u * s2, beta, lb);
+            }
+        }
+#endif
+    }
+    agx_sense_barrier(bar_va, n_wg, local_sense);
+
+    // ---- Phase M7: 40-WG Fused MoE down + scale2 + Exact Sequential precise-float wsum -> moe_out ----
+    // 8 simdgroups per WG handle the 8 active experts (k_slot = sg = 0..7) IN PARALLEL!
+    {
+        const int      raw_eid    = CohBufI32(P_FLD(router_topk_va)).v[sg];
+        const bool     valid_eid  = (raw_eid >= 0) && (uint(raw_eid) < n_exp);
+        const float    wt         = CohBufF32(P_FLD(router_topk_w_va)).v[sg];
+        const uint64_t dn_sc_va   = P_FLD(dn_scale_va);
+        const float    s2         = (valid_eid && dn_sc_va != 0ul) ? ConstBufF32(dn_sc_va).v[uint(raw_eid)] : 1.0;
+        const uint64_t x_row_va   = P_FLD(moe_inter_va) + uint64_t(sg * n_ff) * 4ul;
+        const uint64_t w_base     = P_FLD(dn_exps_va) + (valid_eid ? uint64_t(raw_eid) * P_FLD(dn_slice_B) : 0ul);
+        CohBufVec4     x_buf4     = CohBufVec4(x_row_va);
+        CohBufF32      out_b      = CohBufF32(P_FLD(moe_out_va));
+
+#if MOE_MODE == 0
+        // AGX_NVFP4_32x16: 72 full 32-row (128B) supertiles across 40 WGs (exact 128B WG ownership!)
+        const uint nb_k     = n_ff >> 6u; // 18 for n_ff=1152
+        const uint row_in_h = ln >> 1u;
+        const uint kh       = ln & 1u;
+        const uint kh_col4  = kh * 8u;
+        AgxBufNvfp4ST st_buf = AgxBufNvfp4ST(w_base);
+
+        for (uint tile = wg; tile < 72u; tile += 40u) {
+            const uint st_base = tile * nb_k;
+            [[unroll]] for (uint sub = 0u; sub < 2u; ++sub) {
+                const uint l_idx = sub * 32u + ln;
+                float acc = 0.0;
+                if (valid_eid) {
+                    for (uint tk = 0u; tk < nb_k; ++tk) {
+                        const uint     st0 = st_base + tk;
+                        const uint16_t dp0 = st_buf.st[st0].d[l_idx];
+                        const uvec4    qs0 = st_buf.st[st0].qs[l_idx];
+                        const vec2     sc  = agx_ue4m3_pair_to_vec2(dp0);
+                        const uint     c4  = tk * 16u + kh_col4;
+                        float16_t d0 = moe_dot_e2m1_u32_f16x2(qs0.x, f16vec4(x_buf4.v[c4 + 0u]), f16vec4(x_buf4.v[c4 + 1u]))
+                                     + moe_dot_e2m1_u32_f16x2(qs0.y, f16vec4(x_buf4.v[c4 + 2u]), f16vec4(x_buf4.v[c4 + 3u]));
+                        acc = fma(float(d0), sc.x, acc);
+                        float16_t d1 = moe_dot_e2m1_u32_f16x2(qs0.z, f16vec4(x_buf4.v[c4 + 4u]), f16vec4(x_buf4.v[c4 + 5u]))
+                                     + moe_dot_e2m1_u32_f16x2(qs0.w, f16vec4(x_buf4.v[c4 + 6u]), f16vec4(x_buf4.v[c4 + 7u]));
+                        acc = fma(float(d1), sc.y, acc);
+                    }
+                }
+                acc += subgroupShuffleXor(acc, 1u);
+                float prod = moe_scale_weight_exact(acc, s2, wt);
+                if (kh == 0u) sh_buf[sg * 16u + row_in_h] = prod;
+                barrier();
+                if (sg == 0u && kh == 0u) {
+                    const uint row = tile * 32u + sub * 16u + row_in_h;
+                    out_b.v[row] = moe_sum8_exact(row_in_h, 16u);
+                }
+                barrier();
+            }
+        }
+#else
+        // AGX_Q8_0_8BLK (Coda layers 20..23): 72 x 32-row (128B) tiles (16 pairs/tile) across 40 WGs
+        const uint n_chunks = (n_ff + 255u) >> 8u; // 5 for n_ff=1152
+        const uint r_half   = ln >> 4u;
+        const uint lane16   = ln & 15u;
+        const uint d_slot   = lane16 >> 1u;
+        AgxBufQ8_8Blk wb    = AgxBufQ8_8Blk(w_base);
+
+        for (uint tile = wg; tile < 72u; tile += 40u) {
+            for (uint p = 0u; p < 16u; ++p) {
+                const uint row = tile * 32u + p * 2u + r_half;
+                float acc = 0.0;
+                if (valid_eid) {
+                    const uint row_c0 = row * n_chunks;
+                    for (uint c = 0u; c < n_chunks; ++c) {
+                        const uint k0 = c * 256u + lane16 * 16u;
+                        if (k0 < n_ff) {
+                            const uint  chk = row_c0 + c;
+                            const uvec4 qv  = wb.blk[chk].qs[lane16];
+                            const float d   = float(unpackFloat2x16(uint(wb.blk[chk].d[d_slot])).x);
+                            const uint  c4  = k0 >> 2u;
+                            float dp = dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.x)), x_buf4.v[c4 + 0u])
+                                     + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.y)), x_buf4.v[c4 + 1u])
+                                     + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.z)), x_buf4.v[c4 + 2u])
+                                     + dot(vec4(agx_q8_u32_magic_to_f16vec4(qv.w)), x_buf4.v[c4 + 3u]);
+                            acc = fma(dp, d, acc);
+                        }
+                    }
+                }
+                acc += subgroupShuffleXor(acc, 1u);
+                acc += subgroupShuffleXor(acc, 2u);
+                acc += subgroupShuffleXor(acc, 4u);
+                acc += subgroupShuffleXor(acc, 8u);
+                float prod = moe_scale_weight_exact(acc, s2, wt);
+                if (lane16 == 0u) sh_buf[sg * 2u + r_half] = prod;
+                barrier();
+                if (sg == 0u && lane16 == 0u) {
+                    out_b.v[row] = moe_sum8_exact(r_half, 2u);
+                }
+                barrier();
+            }
+        }
+#endif
+    }
+    agx_sense_barrier(bar_va, n_wg, local_sense);
+
+    // ---- Phase M8: WG 0 stage_post_ffn (ffn_post_conv + state-store + res + next depth_mix + optional 1x/3x norm) ----
+    if (wg == 0u) {
+        const uint D     = 2304u;
+        const uint D4    = D >> 2u;
+        const float inv_D = 1.0 / 2304.0;
+        const float inv_sqrt_D = 0.020833333333333332;
+        const bool do_mix  = (flags & PFLAG_POST_FFN_DO_MIX) != 0u;
+        const bool do_norm = (flags & PFLAG_POST_FFN_DO_NORM) != 0u;
+
+        const int src_cell = max(ConstBufI32(P_FLD(s_copy_va)).v[0], 0);
+        const uint64_t hist_cell_va = P_FLD(r_l_va) + uint64_t(src_cell) * uint64_t(P_FLD(r_nb1_f32)) * 4ul;
+        const uint64_t conv_src_va  = P_FLD(moe_out_va);
+        const uint64_t res_va       = P_FLD(ffn_inp_va);
+        const uint64_t conv_w_va    = P_FLD(ffn_post_conv_w_va);
+        const uint64_t cur_out_va   = P_FLD(next_cur_va);
+        const uint64_t export_va    = P_FLD(export_l_out_va);
+        const uint64_t cell_va      = P_FLD(cell_va)[3];
+        const float    res_sc       = P_FLD(post_conv_res_scale);
+
+        float ss_cur = 0.0;
+        for (uint ch = tid; ch < D; ch += 256u) {
+            const uint64_t past_va = hist_cell_va + uint64_t((4352u + ch) * 3u) * 4ul;
+            CohBufF32 pb = CohBufF32(past_va);
+            float p0 = pb.v[0], p1 = pb.v[1], p2 = pb.v[2];
+            float x0 = CohBufF32(conv_src_va).v[ch];
+            vec4  cw = ConstBufVec4(conv_w_va).v[ch];
+            float out_v = (x0 + (p0 * cw.x + p1 * cw.y + p2 * cw.z + x0 * cw.w)) * res_sc
+                        + CohBufF32(res_va).v[ch];
+            sh_buf[ch] = out_v;
+            ss_cur += out_v * out_v;
+            CohBufF32(cur_out_va).v[ch] = out_v;
+            if (export_va != 0ul) CohBufF32(export_va).v[ch] = out_v;
+            if (cell_va != 0ul) {
+                CohBufF32 cb = CohBufF32(cell_va + uint64_t(ch * 3u) * 4ul);
+                cb.v[0] = p1; cb.v[1] = p2; cb.v[2] = x0;
+            }
+        }
+
+        if (do_mix) {
+            const uint B = P_FLD(post_ffn_n_blocks);
+            const uint S = B + 1u;
+            const uint Q = P_FLD(post_ffn_n_queries);
+            const uint64_t bptrs_va = P_FLD(ffn_bptrs_va);
+            const uint64_t q_va     = P_FLD(next_attn_query_va);
+
+            if (tid < B && tid < 8u) sh_bva[tid] = ConstBufU64(bptrs_va).v[tid];
+            barrier();
+
+            for (uint s = 0u; s < B; ++s) {
+                uint64_t x_va = (s < 8u) ? sh_bva[s] : ConstBufU64(bptrs_va).v[s];
+                vec4 acc = vec4(0.0);
+                CohBufVec4 xb = CohBufVec4(x_va);
+                ConstBufVec4 qb = ConstBufVec4(q_va);
+                for (uint i4 = tid; i4 < D4; i4 += 256u) {
+                    vec4 xv = xb.v[i4];
+                    acc.x += dot(xv, xv);
+                    acc.y += dot(xv, qb.v[i4]);
+                    if (Q >= 2u) acc.z += dot(xv, qb.v[D4 + i4]);
+                    if (Q >= 3u) acc.w += dot(xv, qb.v[2u * D4 + i4]);
+                }
+                vec4 tot = wg_sum4(acc, sg, ln);
+                if (tid == 0u) {
+                    float ir = inversesqrt(tot.x * inv_D + 1e-6);
+                    sh_inv_rms[s] = ir;
+                    float sc = ir * inv_sqrt_D;
+                    sh_prob[0][s] = tot.y * sc;
+                    if (Q >= 2u) sh_prob[1][s] = tot.z * sc;
+                    if (Q >= 3u) sh_prob[2][s] = tot.w * sc;
+                }
+            }
+            {
+                vec4 acc = vec4(ss_cur, 0.0, 0.0, 0.0);
+                ConstBufVec4 qb = ConstBufVec4(q_va);
+                for (uint i4 = tid; i4 < D4; i4 += 256u) {
+                    uint b = i4 << 2u;
+                    vec4 xv = vec4(sh_buf[b], sh_buf[b + 1u], sh_buf[b + 2u], sh_buf[b + 3u]);
+                    acc.y += dot(xv, qb.v[i4]);
+                    if (Q >= 2u) acc.z += dot(xv, qb.v[D4 + i4]);
+                    if (Q >= 3u) acc.w += dot(xv, qb.v[2u * D4 + i4]);
+                }
+                vec4 tot = wg_sum4(acc, sg, ln);
+                if (tid == 0u) {
+                    float ir = inversesqrt(tot.x * inv_D + 1e-6);
+                    sh_inv_rms[B] = ir;
+                    float sc = ir * inv_sqrt_D;
+                    sh_prob[0][B] = tot.y * sc;
+                    if (Q >= 2u) sh_prob[1][B] = tot.z * sc;
+                    if (Q >= 3u) sh_prob[2][B] = tot.w * sc;
+                }
+            }
+            barrier();
+
+            if (tid < Q) {
+                float m = sh_prob[tid][0];
+                for (uint s = 1u; s < S; ++s) m = max(m, sh_prob[tid][s]);
+                float sum_e = 0.0;
+                for (uint s = 0u; s < S; ++s) { float e = exp(sh_prob[tid][s] - m); sh_prob[tid][s] = e; sum_e += e; }
+                float is = 1.0 / sum_e;
+                for (uint s = 0u; s < S; ++s) sh_prob[tid][s] = (sh_prob[tid][s] * is) * sh_inv_rms[s];
+            }
+            barrier();
+
+            const float eps_norm = P_FLD(rms_eps);
+            const uint64_t exp_va = P_FLD(next_mix_export_va);
+            for (uint q = 0u; q < Q; ++q) {
+                const uint64_t dst_va = P_FLD(next_mix_out_va)[q];
+                const float wb = sh_prob[q][B];
+                CohBufVec4 db = CohBufVec4(dst_va);
+                float ss_y = 0.0;
+                for (uint i4 = tid; i4 < D4; i4 += 256u) {
+                    uint b = i4 << 2u;
+                    vec4 yv = wb * vec4(sh_buf[b], sh_buf[b + 1u], sh_buf[b + 2u], sh_buf[b + 3u]);
+                    for (uint s = 0u; s < B; ++s) {
+                        uint64_t x_va = (s < 8u) ? sh_bva[s] : ConstBufU64(bptrs_va).v[s];
+                        yv += sh_prob[q][s] * CohBufVec4(x_va).v[i4];
+                    }
+                    db.v[i4] = yv;
+                    if (do_norm) ss_y += dot(yv, yv);
+                }
+                if (do_norm) {
+                    float rms = inversesqrt(wg_sum1(ss_y, sg, ln) * inv_D + eps_norm);
+                    ConstBufVec4 nw = ConstBufVec4(P_FLD(next_norm_w_va)[q]);
+                    for (uint i4 = tid; i4 < D4; i4 += 256u) {
+                        vec4 vo = (db.v[i4] * rms) * nw.v[i4];
+                        db.v[i4] = vo;
+                        if (q == 0u && exp_va != 0ul) {
+                            CohBufVec4(exp_va).v[i4] = vo;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+#endif // PERSIST_MODE == 1 || PERSIST_MODE == 2
+
+// ============================================================================
+// Persistent 40-WG Entrypoint
+// ============================================================================
+
+void main() {
+    const uint wg  = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint sg  = tid >> 5u;
+    const uint ln  = tid & 31u;
+    if (wg >= pc.n_wg) return;
+
+    // Read quiescent global sense ONCE before Phase 0 (works for even OR odd barrier counts & replays!)
+    if (tid == 0u) {
+        SenseBarrierBuf bar = SenseBarrierBuf(pc.barrier_va);
+        sh_init_sense = atomicLoad(bar.sense, gl_ScopeDevice,
+                                   gl_StorageSemanticsBuffer, gl_SemanticsAcquire | gl_SemanticsMakeVisible);
+    }
+    barrier();
+    uint local_sense = sh_init_sense;
+
+#if PERSIST_MODE == 0
+    run_attn_superstage(pc.descs_va, pc.barrier_va, pc.n_wg, local_sense, wg, tid, sg, ln);
+#elif PERSIST_MODE == 1
+    run_moe_superstage(pc.descs_va, pc.barrier_va, pc.n_wg, local_sense, wg, tid, sg, ln);
+#else
+    for (uint p = 0u; p < pc.n_passes; ++p) {
+        const uint64_t desc_va = pc.descs_va + uint64_t(p) * 1152ul;
+        run_attn_superstage(desc_va, pc.barrier_va, pc.n_wg, local_sense, wg, tid, sg, ln);
+        agx_sense_barrier(pc.barrier_va, pc.n_wg, local_sense);
+        run_moe_superstage(desc_va, pc.barrier_va, pc.n_wg, local_sense, wg, tid, sg, ln);
+        if (p + 1u < pc.n_passes) {
+            agx_sense_barrier(pc.barrier_va, pc.n_wg, local_sense);
+        }
+    }
+#endif
+}
+#undef P_FLD
