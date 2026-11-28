@@ -43,14 +43,17 @@
 #define AGX_MOE_DIRECT_MAX_M     1u  // M=1 direct fastpath (M>=2 deduplicates shared experts via bitonic bucket!)
 #define AGX_MOE_VECMAT_MAX_M     4u  // Lean 4-scalar BATCH_CAP=4 for M>=9 tail buckets & M<=4 (<=52 GPR32, 0:0 spills)
 #define AGX_MOE_VECMAT_DSPARK_M  8u  // Wave 5: 8-way sh_x BATCH_CAP=8 for M=5..8 DSpark (1x W load, 0 GEMM dispatches!)
-#define AGX_MOE_GEMM_MIN_M       5u  // M >= 9 prefill: M_bucket >= 5 -> 128N x 32M/64M reshaped-SLM 8x8 MMA GEMM
+#define AGX_MOE_GEMM_MIN_M       5u  // M >= 9 prefill: M_bucket >= 5 -> 128N x 32M/64M 8x8 MMA GEMM
+#define AGX_MOE_GEMM_TILE_M_SML  8u  // Wave 10 M=5..8 direct-register 128T (4 SG) 8M MMA (32 ActSGs/core!)
 #define AGX_MOE_GEMM_TILE_M      32u
 #define AGX_MOE_GEMM_TILE_M_MID  48u
 #define AGX_MOE_GEMM_TILE_M_BIG  64u
 #define AGX_MOE_VECMAT_WG_PAIRS  32u // 32 (gate,up) pairs/WG for gate_up vec-mat (Q8_0_8BLK uses 4 pairs/WG)
 #define AGX_MOE_VECMAT_WG_OUT    64u // 64 output rows/WG for down vec-mat (Q8_0_8BLK uses 8 rows/WG)
-#define AGX_MOE_GEMM_WG_PAIRS    64u // 64 (gate,up) pairs/WG (= 128N) for gate_up 8x8 MMA GEMM
-#define AGX_MOE_GEMM_WG_OUT      128u // 128 output rows/WG (= 128N) for down 8x8 MMA GEMM
+#define AGX_MOE_GEMM_WG_PAIRS    64u // 64 (gate,up) pairs/WG (= 128N, 256T) for gate_up 8x8 MMA GEMM
+#define AGX_MOE_GEMM_WG_OUT      128u // 128 output rows/WG (= 128N, 256T) for down 8x8 MMA GEMM
+#define AGX_MOE_GEMM_WG_PAIRS_M8 32u // 32 (gate,up) pairs/WG (= 64N, 128T) for M=5..8 gate_up 8M MMA
+#define AGX_MOE_GEMM_WG_OUT_M8   64u // 64 output rows/WG (= 64N, 128T) for M=5..8 down 8M MMA
 
 enum agx_moe_act_op : uint32_t {
     AGX_MOE_ACT_SITU  = 0, // Inkling 2: beta*tanh(g/beta)*sigmoid(g) * (lb>0 ? lb*tanh(u/lb) : u)

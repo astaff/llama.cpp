@@ -71,8 +71,32 @@
 #define INTER_F16 0
 #endif
 
+#ifndef MOE_X_F16
+#define MOE_X_F16 0
+#endif
+
+#ifndef MERGED_GU
+#define MERGED_GU 0
+#endif
+
+#ifndef MOE_GEMM_SGS
+  #if GEMM_TILE_M == 8
+    #define MOE_GEMM_SGS 4
+  #else
+    #define MOE_GEMM_SGS 8
+  #endif
+#endif
+
+#ifndef MOE_UNROLL_KP
+  #if GEMM_TILE_M == 8
+    #define MOE_UNROLL_KP 1
+  #else
+    #define MOE_UNROLL_KP 0
+  #endif
+#endif
+
 #if PASS_STAGE == 2 || PASS_STAGE == 3
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = MOE_GEMM_SGS * 32, local_size_y = 1, local_size_z = 1) in;
 #elif PASS_STAGE == 5 && WEIGHT_MODE == 0
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 #elif PASS_STAGE == 6 && WEIGHT_MODE == 0
@@ -1904,22 +1928,33 @@ void main() {
 #define MOE_K4_MASK   (MOE_SH_K4 - 1u)
 #if MOE_K_PAIRS == 2
   #define MOE_K4_SHIFT 5u
-  #define MOE_X_STEP   8u
 #else
   #define MOE_K4_SHIFT 4u
-  #define MOE_X_STEP   16u
 #endif
-#define WG_N          128u
+#define MOE_LOCAL_X   (uint(MOE_GEMM_SGS) * 32u)
+#define MOE_X_STEP    (MOE_LOCAL_X >> MOE_K4_SHIFT)
+#define MOE_WG_PAIRS  (uint(MOE_GEMM_SGS) * 8u)
+#define MOE_WG_OUT    (uint(MOE_GEMM_SGS) * 16u)
 #define WG_M          uint(GEMM_TILE_M)
-#define MOE_RT        (WG_M >> 3u)              // 4 (32M), 6 (48M), or 8 (64M)
-#define X_LOADS       (WG_M / MOE_X_STEP)       // 4 (32M/KP2), 6 (48M/KP2), 4 (64M/KP1), 2 (32M/KP1)
+#define MOE_RT        (WG_M >> 3u)              // 1 (8M), 4 (32M), 6 (48M), or 8 (64M)
+#define X_LOADS       (WG_M / MOE_X_STEP)       // 2 (8M/128T/KP2), 4 (32M/256T/KP2), 6 (48M/KP2), 4 (64M/KP1)
+
+#define MOE_SRAM_MINIMAL (MOE_GEMM_SGS == 4 && GEMM_TILE_M == 32 && MOE_SH_X_PAD == 0)
 
 shared f16vec4 sh_x[WG_M][MOE_SH_K4 + MOE_SH_X_PAD];
+#if !MOE_SRAM_MINIMAL
 shared uint    sh_row_x[WG_M];
-#if PASS_STAGE == 3
+shared uint    sh_eid;
+  #if PASS_STAGE == 3
 shared uint    sh_y_row[WG_M];
 shared float   sh_tok_w[WG_M];
+  #endif
 #endif
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer AgxBufMoeUvec4FlatR { uvec4   v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8)  readonly buffer AgxBufMoeUvec2FlatR { uvec2   v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  readonly buffer AgxBufMoeU32FlatR   { uint    v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 1)  readonly buffer AgxBufMoeU8FlatR    { uint8_t v[]; };
 
 #if WEIGHT_MODE == 0
 // Exact 1152B NVFP4_32x16 super-tile view for branchless coalesced u8/uvec2 loads!
@@ -2023,13 +2058,18 @@ void main() {
 
     const uint m_len = min(BufBucketArrR(pc.buckets_va).b[tile_idx].count, WG_M);
 
+#if !MOE_SRAM_MINIMAL
     // Pre-load per-row X/Y indices & weights ONCE into SRAM (scoped so ZERO epilogue regs stay live!)
     {
-        const uint tok_off = BufBucketArrR(pc.buckets_va).b[tile_idx].token_offset;
+        const AgxMoeBucket bkt = BufBucketArrR(pc.buckets_va).b[tile_idx];
+        const uint tok_off = bkt.token_offset;
+        if (tid == 0u) {
+            sh_eid = bkt.expert_id;
+        }
         if (tid < WG_M) {
             if (tid < m_len) {
                 const uint t_id = BufU32R(pc.sorted_tok_va).d[tok_off + tid];
-#if PASS_STAGE == 3
+  #if PASS_STAGE == 3
                 const bool raw_mmid = (pc.flags & MOE_FLAG_RAW_MMID) != 0u;
                 const bool per_slot = (pc.flags & MOE_FLAG_RAW_MMID_PERSLOT) != 0u;
                 const bool direct_y = raw_mmid || ((pc.flags & MOE_FLAG_DOWN_NOSCATTER) != 0u);
@@ -2037,19 +2077,20 @@ void main() {
                 sh_row_x[tid] = (!raw_mmid) ? (tok_off + tid) : (per_slot ? (t_id * pc.top_k + ksl) : t_id);
                 sh_y_row[tid] = direct_y ? (t_id * pc.top_k + ksl) : t_id;
                 sh_tok_w[tid] = direct_y ? 1.0f : AgxBufF32R(pc.sorted_w_va).v[tok_off + tid];
-#else
+  #else
                 sh_row_x[tid] = t_id;
-#endif
+  #endif
             } else {
                 sh_row_x[tid] = 0u;
-#if PASS_STAGE == 3
+  #if PASS_STAGE == 3
                 sh_y_row[tid] = 0u;
                 sh_tok_w[tid] = 0.0f;
-#endif
+  #endif
             }
         }
     }
     barrier();
+#endif
 
     coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> acc[2][MOE_RT];
     [[unroll]] for (uint t = 0u; t < 2u; ++t) {
@@ -2059,21 +2100,29 @@ void main() {
     }
 
     {
-        const uint expert_id   = BufBucketArrR(pc.buckets_va).b[tile_idx].expert_id;
         const uint K4          = pc.K >> 2u;
         const bool full_x_tile = (m_len == WG_M) && ((pc.K & (TILE_K - 1u)) == 0u);
-#if PASS_STAGE == 3 && INTER_F16 != 0
+#if (PASS_STAGE == 3 && INTER_F16 != 0) || (PASS_STAGE == 2 && MOE_X_F16 != 0)
         BufF16Vec4R x_buf4_h   = BufF16Vec4R(pc.x_va);
 #else
-        const bool  x_f16      = (pc.flags & MOE_FLAG_X_F16) != 0u;
         AgxBufVec4R x_buf4     = AgxBufVec4R(pc.x_va);
-        BufF16Vec4R x_buf4_h   = BufF16Vec4R(pc.x_va);
 #endif
 
-        const uint64_t wg_va   = pc.w_gate_va + uint64_t(expert_id) * pc.w_slice_B;
-#if PASS_STAGE == 2
+#if MOE_SRAM_MINIMAL
+        const AgxMoeBucket bkt_m = BufBucketArrR(pc.buckets_va).b[tile_idx];
+        const uint tok_off_m     = bkt_m.token_offset;
+        const uint64_t w_eoff    = uint64_t(bkt_m.expert_id) * pc.w_slice_B;
+  #if PASS_STAGE == 3
+        const bool raw_mmid_m    = (pc.flags & MOE_FLAG_RAW_MMID) != 0u;
+        const bool per_slot_m    = (pc.flags & MOE_FLAG_RAW_MMID_PERSLOT) != 0u;
+  #endif
+#else
+        const uint64_t w_eoff  = uint64_t(sh_eid) * pc.w_slice_B;
+#endif
+        const uint64_t wg_va   = pc.w_gate_va + w_eoff;
+#if PASS_STAGE == 2 && MERGED_GU == 0
         const bool     sep_gu   = (pc.flags & MOE_FLAG_SEPARATE_GU) != 0u;
-        const uint64_t wu_va    = (sep_gu ? pc.w_up_va : pc.w_gate_va) + uint64_t(expert_id) * pc.w_slice_B;
+        const uint64_t wu_va    = (sep_gu ? pc.w_up_va : pc.w_gate_va) + w_eoff;
 #endif
 
         for (uint k_base = 0u; k_base < pc.K; k_base += TILE_K) {
@@ -2084,43 +2133,74 @@ void main() {
                 const uint x_col0 = tid >> MOE_K4_SHIFT;
                 const uint x_k4   = tid & MOE_K4_MASK;
                 const uint kb4    = (k_base >> 2u) + x_k4;
-#if PASS_STAGE == 3 && INTER_F16 != 0
+#if (PASS_STAGE == 3 && INTER_F16 != 0) || (PASS_STAGE == 2 && MOE_X_F16 != 0)
                 if (full_x_tile) {
                     [[unroll]] for (uint li = 0u; li < X_LOADS; ++li) {
                         const uint col = x_col0 + li * MOE_X_STEP;
-                        tmp_x[li] = x_buf4_h.v[sh_row_x[col] * K4 + kb4];
+  #if MOE_SRAM_MINIMAL && PASS_STAGE == 3
+                        const uint rx  = (!raw_mmid_m) ? (tok_off_m + col)
+                            : (per_slot_m ? (BufU32R(pc.sorted_tok_va).d[tok_off_m + col] * pc.top_k + BufU32R(pc.sorted_kslot_va).d[tok_off_m + col])
+                                          : BufU32R(pc.sorted_tok_va).d[tok_off_m + col]);
+  #elif MOE_SRAM_MINIMAL
+                        const uint rx  = BufU32R(pc.sorted_tok_va).d[tok_off_m + col];
+  #else
+                        const uint rx  = sh_row_x[col];
+  #endif
+                        tmp_x[li] = x_buf4_h.v[rx * K4 + kb4];
                     }
                 } else {
                     [[unroll]] for (uint li = 0u; li < X_LOADS; ++li) {
                         const uint col = x_col0 + li * MOE_X_STEP;
-                        tmp_x[li] = (col < m_len && kb4 < K4)
-                            ? x_buf4_h.v[sh_row_x[col] * K4 + kb4]
-                            : f16vec4(float16_t(0.0));
+                        if (col < m_len && kb4 < K4) {
+  #if MOE_SRAM_MINIMAL && PASS_STAGE == 3
+                            const uint rx = (!raw_mmid_m) ? (tok_off_m + col)
+                                : (per_slot_m ? (BufU32R(pc.sorted_tok_va).d[tok_off_m + col] * pc.top_k + BufU32R(pc.sorted_kslot_va).d[tok_off_m + col])
+                                              : BufU32R(pc.sorted_tok_va).d[tok_off_m + col]);
+  #elif MOE_SRAM_MINIMAL
+                            const uint rx = BufU32R(pc.sorted_tok_va).d[tok_off_m + col];
+  #else
+                            const uint rx = sh_row_x[col];
+  #endif
+                            tmp_x[li] = x_buf4_h.v[rx * K4 + kb4];
+                        } else {
+                            tmp_x[li] = f16vec4(float16_t(0.0));
+                        }
                     }
                 }
 #else
-                if (!x_f16 && full_x_tile) {
+                if (full_x_tile) {
                     [[unroll]] for (uint li = 0u; li < X_LOADS; ++li) {
                         const uint col = x_col0 + li * MOE_X_STEP;
-                        const uint xo  = sh_row_x[col] * K4 + kb4;
+  #if MOE_SRAM_MINIMAL && PASS_STAGE == 3
+                        const uint rx  = (!raw_mmid_m) ? (tok_off_m + col)
+                            : (per_slot_m ? (BufU32R(pc.sorted_tok_va).d[tok_off_m + col] * pc.top_k + BufU32R(pc.sorted_kslot_va).d[tok_off_m + col])
+                                          : BufU32R(pc.sorted_tok_va).d[tok_off_m + col]);
+  #elif MOE_SRAM_MINIMAL
+                        const uint rx  = BufU32R(pc.sorted_tok_va).d[tok_off_m + col];
+  #else
+                        const uint rx  = sh_row_x[col];
+  #endif
+                        const uint xo  = rx * K4 + kb4;
   #if WEIGHT_MODE == 0 || WEIGHT_MODE == 2
                         tmp_x[li] = f16vec4(x_buf4.v[xo]);
   #else
                         tmp_x[li] = f16vec4(clamp(x_buf4.v[xo], vec4(-65504.0f), vec4(65504.0f)));
   #endif
                     }
-                } else if (x_f16) {
-                    [[unroll]] for (uint li = 0u; li < X_LOADS; ++li) {
-                        const uint col = x_col0 + li * MOE_X_STEP;
-                        tmp_x[li] = (col < m_len && kb4 < K4)
-                            ? x_buf4_h.v[sh_row_x[col] * K4 + kb4]
-                            : f16vec4(float16_t(0.0));
-                    }
                 } else {
                     [[unroll]] for (uint li = 0u; li < X_LOADS; ++li) {
                         const uint col = x_col0 + li * MOE_X_STEP;
                         if (col < m_len && kb4 < K4) {
-                            const uint xo = sh_row_x[col] * K4 + kb4;
+  #if MOE_SRAM_MINIMAL && PASS_STAGE == 3
+                            const uint rx = (!raw_mmid_m) ? (tok_off_m + col)
+                                : (per_slot_m ? (BufU32R(pc.sorted_tok_va).d[tok_off_m + col] * pc.top_k + BufU32R(pc.sorted_kslot_va).d[tok_off_m + col])
+                                              : BufU32R(pc.sorted_tok_va).d[tok_off_m + col]);
+  #elif MOE_SRAM_MINIMAL
+                            const uint rx = BufU32R(pc.sorted_tok_va).d[tok_off_m + col];
+  #else
+                            const uint rx = sh_row_x[col];
+  #endif
+                            const uint xo = rx * K4 + kb4;
   #if WEIGHT_MODE == 0 || WEIGHT_MODE == 2
                             tmp_x[li] = f16vec4(x_buf4.v[xo]);
   #else
@@ -2146,8 +2226,10 @@ void main() {
             }
             barrier();
 
-            // 2. Branchless co-issued dual-tile weight decode + single sh_x LDS read (0.25 LDS/MMA!)
-#if MOE_K_PAIRS > 1
+            // 2. Flat 32-bit co-issued dual-tile weight decode + single sh_x LDS read (0.25 LDS/MMA!)
+#if MOE_UNROLL_KP == 1
+            [[unroll]] for (uint s_kp = 0u; s_kp < uint(MOE_K_PAIRS); ++s_kp) {
+#elif MOE_K_PAIRS > 1
             [[dont_unroll]] for (uint s_kp = 0u; s_kp < uint(MOE_K_PAIRS); ++s_kp) {
 #else
             [[unroll]] for (uint s_kp = 0u; s_kp < 1u; ++s_kp) {
@@ -2164,31 +2246,46 @@ void main() {
                 const uint nb_k = pc.K >> 6u;
                 const uint tk   = min((k_base >> 6u) + s_kp, nb_k - 1u);
   #if PASS_STAGE == 2
-                const uint row_g = min(gl_WorkGroupID.x * 64u + sg_id * 8u + fm, pc.n_ff - 1u);
-                const uint row_u = min(sep_gu ? (gl_WorkGroupID.x * 64u + sg_id * 8u + fm)
-                                              : (gl_WorkGroupID.x * 64u + sg_id * 8u + fm + pc.n_ff),
+                const uint row_g = min(gl_WorkGroupID.x * MOE_WG_PAIRS + sg_id * 8u + fm, pc.n_ff - 1u);
+    #if MERGED_GU != 0
+                const uint row_u = min(gl_WorkGroupID.x * MOE_WG_PAIRS + sg_id * 8u + fm + pc.n_ff, 2u * pc.n_ff - 1u);
+                const uint stg_i = (row_g >> 5u) * nb_k + tk;
+                const uint stu_i = (row_u >> 5u) * nb_k + tk;
+                const uint qg_i  = ((row_g & 31u) << 2u) + fn2;
+                const uint qu_i  = ((row_u & 31u) << 2u) + fn2;
+                AgxBufMoeUvec2FlatR w_q2 = AgxBufMoeUvec2FlatR(wg_va);
+                AgxBufMoeU8FlatR    w_d8 = AgxBufMoeU8FlatR(wg_va);
+                const uvec2 q0  = w_q2.v[stg_i * 144u + 16u + qg_i];
+                const uint  d0b = uint(w_d8.v[stg_i * 1152u + qg_i]);
+                const uvec2 q1  = w_q2.v[stu_i * 144u + 16u + qu_i];
+                const uint  d1b = uint(w_d8.v[stu_i * 1152u + qu_i]);
+    #else
+                const uint row_u = min(sep_gu ? (gl_WorkGroupID.x * MOE_WG_PAIRS + sg_id * 8u + fm)
+                                              : (gl_WorkGroupID.x * MOE_WG_PAIRS + sg_id * 8u + fm + pc.n_ff),
                                        (sep_gu ? pc.N : 2u * pc.n_ff) - 1u);
                 const uint stg_i = (row_g >> 5u) * nb_k + tk;
                 const uint stu_i = (row_u >> 5u) * nb_k + tk;
                 const uint qg_i  = ((row_g & 31u) << 2u) + fn2;
                 const uint qu_i  = ((row_u & 31u) << 2u) + fn2;
-                AgxBufMoeNvfp4ST_U2 st_g = AgxBufMoeNvfp4ST_U2(wg_va);
-                AgxBufMoeNvfp4ST_U2 st_u = AgxBufMoeNvfp4ST_U2(wu_va);
-                const uvec2 q0  = st_g.st[stg_i].qs2[qg_i];
-                const uint  d0b = uint(st_g.st[stg_i].d8[qg_i]);
-                const uvec2 q1  = st_u.st[stu_i].qs2[qu_i];
-                const uint  d1b = uint(st_u.st[stu_i].d8[qu_i]);
+                const uvec2 q0  = AgxBufMoeUvec2FlatR(wg_va).v[stg_i * 144u + 16u + qg_i];
+                const uint  d0b = uint(AgxBufMoeU8FlatR(wg_va).v[stg_i * 1152u + qg_i]);
+                const uvec2 q1  = AgxBufMoeUvec2FlatR(wu_va).v[stu_i * 144u + 16u + qu_i];
+                const uint  d1b = uint(AgxBufMoeU8FlatR(wu_va).v[stu_i * 1152u + qu_i]);
+    #endif
   #else
-                const uint sg_n0 = gl_WorkGroupID.x * 128u + sg_id * 16u;
+                const uint sg_n0 = gl_WorkGroupID.x * MOE_WG_OUT + sg_id * 16u;
                 const uint tn    = min(sg_n0 >> 5u, (pc.N - 1u) >> 5u);
                 const uint st_i  = tn * nb_k + tk;
                 const uint q0_i  = (((sg_n0 >> 4u) & 1u) << 6u) + (fm << 2u) + fn2;
                 const uint q1_i  = q0_i + 32u;
-                AgxBufMoeNvfp4ST_U2 st_w = AgxBufMoeNvfp4ST_U2(wg_va);
-                const uvec2 q0  = st_w.st[st_i].qs2[q0_i];
-                const uint  d0b = uint(st_w.st[st_i].d8[q0_i]);
-                const uvec2 q1  = st_w.st[st_i].qs2[q1_i];
-                const uint  d1b = uint(st_w.st[st_i].d8[q1_i]);
+                AgxBufMoeUvec2FlatR w_q2 = AgxBufMoeUvec2FlatR(wg_va);
+                AgxBufMoeU8FlatR    w_d8 = AgxBufMoeU8FlatR(wg_va);
+                const uint qb    = st_i * 144u + 16u;
+                const uint db    = st_i * 1152u;
+                const uvec2 q0  = w_q2.v[qb + q0_i];
+                const uint  d0b = uint(w_d8.v[db + q0_i]);
+                const uvec2 q1  = w_q2.v[qb + q1_i];
+                const uint  d1b = uint(w_d8.v[db + q1_i]);
   #endif
                 const float16_t sc0 = agx_ue4m3_to_f16(d0b);
                 const float16_t sc1 = agx_ue4m3_to_f16(d1b);
@@ -2200,34 +2297,47 @@ void main() {
                 const uint n_chunks = (pc.K + 255u) >> 8u;
                 const uint k_chk    = k_base >> 8u;
                 const uint blk      = (((k_base >> 5u) & 7u) + (s_kp << 1u)) | (fn >> 2u);
-                const uint q_idx    = (blk << 1u) + (fn2 & 1u);
+                const uint q_off    = 1u + (blk << 1u) + (fn2 & 1u);
   #if PASS_STAGE == 2
-                const uint row_g = min(gl_WorkGroupID.x * 64u + sg_id * 8u + fm, pc.n_ff - 1u);
-                const uint row_u = min(sep_gu ? (gl_WorkGroupID.x * 64u + sg_id * 8u + fm)
-                                              : (gl_WorkGroupID.x * 64u + sg_id * 8u + fm + pc.n_ff),
+                const uint row_g = min(gl_WorkGroupID.x * MOE_WG_PAIRS + sg_id * 8u + fm, pc.n_ff - 1u);
+    #if MERGED_GU != 0
+                const uint row_u = min(gl_WorkGroupID.x * MOE_WG_PAIRS + sg_id * 8u + fm + pc.n_ff, 2u * pc.n_ff - 1u);
+                const uint sb0   = (row_g * n_chunks + k_chk) * 17u;
+                const uint sb1   = (row_u * n_chunks + k_chk) * 17u;
+                AgxBufMoeUvec4FlatR w_q4 = AgxBufMoeUvec4FlatR(wg_va);
+                AgxBufMoeU32FlatR   w_d4 = AgxBufMoeU32FlatR(wg_va);
+                const uvec4 qv0  = w_q4.v[sb0 + q_off];
+                const uint  d0w  = w_d4.v[(sb0 << 2u) + (blk >> 1u)];
+                const uvec4 qv1  = w_q4.v[sb1 + q_off];
+                const uint  d1w  = w_d4.v[(sb1 << 2u) + (blk >> 1u)];
+    #else
+                const uint row_u = min(sep_gu ? (gl_WorkGroupID.x * MOE_WG_PAIRS + sg_id * 8u + fm)
+                                              : (gl_WorkGroupID.x * MOE_WG_PAIRS + sg_id * 8u + fm + pc.n_ff),
                                        (sep_gu ? pc.N : 2u * pc.n_ff) - 1u);
-                const uint chk0  = row_g * n_chunks + k_chk;
-                const uint chk1  = row_u * n_chunks + k_chk;
-                AgxBufQ8_8Blk q_g = AgxBufQ8_8Blk(wg_va);
-                AgxBufQ8_8Blk q_u = AgxBufQ8_8Blk(wu_va);
-                const uvec4    qv0 = q_g.blk[chk0].qs[q_idx];
-                const uint16_t d0u = q_g.blk[chk0].d[blk];
-                const uvec4    qv1 = q_u.blk[chk1].qs[q_idx];
-                const uint16_t d1u = q_u.blk[chk1].d[blk];
+                const uint sb0   = (row_g * n_chunks + k_chk) * 17u;
+                const uint sb1   = (row_u * n_chunks + k_chk) * 17u;
+                const uvec4 qv0  = AgxBufMoeUvec4FlatR(wg_va).v[sb0 + q_off];
+                const uint  d0w  = AgxBufMoeU32FlatR(wg_va).v[(sb0 << 2u) + (blk >> 1u)];
+                const uvec4 qv1  = AgxBufMoeUvec4FlatR(wu_va).v[sb1 + q_off];
+                const uint  d1w  = AgxBufMoeU32FlatR(wu_va).v[(sb1 << 2u) + (blk >> 1u)];
+    #endif
   #else
-                const uint sg_n0 = gl_WorkGroupID.x * 128u + sg_id * 16u;
+                const uint sg_n0 = gl_WorkGroupID.x * MOE_WG_OUT + sg_id * 16u;
                 const uint row0  = min(sg_n0 + fm,      pc.N - 1u);
                 const uint row1  = min(sg_n0 + 8u + fm, pc.N - 1u);
-                const uint chk0  = row0 * n_chunks + k_chk;
-                const uint chk1  = row1 * n_chunks + k_chk;
-                AgxBufQ8_8Blk q_w = AgxBufQ8_8Blk(wg_va);
-                const uvec4    qv0 = q_w.blk[chk0].qs[q_idx];
-                const uint16_t d0u = q_w.blk[chk0].d[blk];
-                const uvec4    qv1 = q_w.blk[chk1].qs[q_idx];
-                const uint16_t d1u = q_w.blk[chk1].d[blk];
+                const uint sb0   = (row0 * n_chunks + k_chk) * 17u;
+                const uint sb1   = (row1 * n_chunks + k_chk) * 17u;
+                AgxBufMoeUvec4FlatR w_q4 = AgxBufMoeUvec4FlatR(wg_va);
+                AgxBufMoeU32FlatR   w_d4 = AgxBufMoeU32FlatR(wg_va);
+                const uvec4 qv0  = w_q4.v[sb0 + q_off];
+                const uint  d0w  = w_d4.v[(sb0 << 2u) + (blk >> 1u)];
+                const uvec4 qv1  = w_q4.v[sb1 + q_off];
+                const uint  d1w  = w_d4.v[(sb1 << 2u) + (blk >> 1u)];
   #endif
-                const float16_t d0 = unpackFloat2x16(uint(d0u)).x;
-                const float16_t d1 = unpackFloat2x16(uint(d1u)).x;
+                const f16vec2 d0p  = unpackFloat2x16(d0w);
+                const f16vec2 d1p  = unpackFloat2x16(d1w);
+                const float16_t d0 = ((blk & 1u) != 0u) ? d0p.y : d0p.x;
+                const float16_t d1 = ((blk & 1u) != 0u) ? d1p.y : d1p.x;
                 wa0 = agx_q8_u32_magic_to_f16vec4(qv0.x) * d0;
                 wa1 = agx_q8_u32_magic_to_f16vec4(qv0.y) * d0;
                 wa2 = agx_q8_u32_magic_to_f16vec4(qv0.z) * d0;
@@ -2239,20 +2349,60 @@ void main() {
 #else
                 const uint k_off = k_base + (s_kp << 6u) + (fn2 << 4u);
   #if PASS_STAGE == 2
-                const uint row_g = gl_WorkGroupID.x * 64u + sg_id * 8u + fm;
+                const uint row_g = gl_WorkGroupID.x * MOE_WG_PAIRS + sg_id * 8u + fm;
+    #if MERGED_GU != 0
+                const uint row_u = row_g + pc.n_ff;
+                moe_load_w16_generic(wg_va, row_g, pc.n_ff,      k_off, wa0, wa1, wa2, wa3);
+                moe_load_w16_generic(wg_va, row_u, 2u * pc.n_ff, k_off, wb0, wb1, wb2, wb3);
+    #else
                 const uint row_u = sep_gu ? row_g : (row_g + pc.n_ff);
                 moe_load_w16_generic(wg_va, row_g, pc.n_ff, k_off, wa0, wa1, wa2, wa3);
                 moe_load_w16_generic(wu_va, row_u, sep_gu ? pc.N : 2u * pc.n_ff, k_off, wb0, wb1, wb2, wb3);
+    #endif
   #else
-                const uint row_0 = gl_WorkGroupID.x * 128u + sg_id * 16u + fm;
+                const uint row_0 = gl_WorkGroupID.x * MOE_WG_OUT + sg_id * 16u + fm;
                 moe_load_w16_generic(wg_va, row_0,      pc.N, k_off, wa0, wa1, wa2, wa3);
                 moe_load_w16_generic(wg_va, row_0 + 8u, pc.N, k_off, wb0, wb1, wb2, wb3);
   #endif
 #endif
 
-                // Single sh_x LDS read across wa & wb + unconditional rt + interleaved acc[0]/acc[1]!
-                [[unroll]] for (uint rt = 0u; rt < MOE_RT; ++rt) {
-                    const uint c0 = 8u * rt + fn;
+                // Single sh_x LDS read across wa & wb + pair-interleaved rtp=0,2 (matmad-gap 2 -> 4)!
+#if GEMM_TILE_M >= 16
+                [[unroll]] for (uint rtp = 0u; rtp < MOE_RT; rtp += 2u) {
+                    const uint c0 = 8u * rtp + fn;
+                    const uint c1 = c0 + 8u;
+                    const f16vec4 ba0_0 = sh_x[c0 + 0u][sub_off + 0u];
+                    const f16vec4 ba1_0 = sh_x[c0 + 0u][sub_off + 1u];
+                    const f16vec4 bb0_0 = sh_x[c0 + 1u][sub_off + 0u];
+                    const f16vec4 bb1_0 = sh_x[c0 + 1u][sub_off + 1u];
+                    const f16vec4 ba0_1 = sh_x[c1 + 0u][sub_off + 0u];
+                    const f16vec4 ba1_1 = sh_x[c1 + 0u][sub_off + 1u];
+                    const f16vec4 bb0_1 = sh_x[c1 + 1u][sub_off + 0u];
+                    const f16vec4 bb1_1 = sh_x[c1 + 1u][sub_off + 1u];
+                    [[unroll]] for (uint s = 0u; s < 4u; ++s) {
+                        coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA> ma0_0, ma1_0, ma0_1, ma1_1;
+                        coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB> mb0_0, mb1_0, mb0_1, mb1_1;
+                        ma0_0[0] = wa0[s]; ma0_0[1] = wa2[s];
+                        ma1_0[0] = wa1[s]; ma1_0[1] = wa3[s];
+                        ma0_1[0] = wb0[s]; ma0_1[1] = wb2[s];
+                        ma1_1[0] = wb1[s]; ma1_1[1] = wb3[s];
+                        mb0_0[0] = ba0_0[s]; mb0_0[1] = bb0_0[s];
+                        mb0_1[0] = ba0_1[s]; mb0_1[1] = bb0_1[s];
+                        mb1_0[0] = ba1_0[s]; mb1_0[1] = bb1_0[s];
+                        mb1_1[0] = ba1_1[s]; mb1_1[1] = bb1_1[s];
+                        acc[0][rtp]      = coopMatMulAdd(ma0_0, mb0_0, acc[0][rtp]);
+                        acc[1][rtp]      = coopMatMulAdd(ma0_1, mb0_0, acc[1][rtp]);
+                        acc[0][rtp + 1u] = coopMatMulAdd(ma0_0, mb0_1, acc[0][rtp + 1u]);
+                        acc[1][rtp + 1u] = coopMatMulAdd(ma0_1, mb0_1, acc[1][rtp + 1u]);
+                        acc[0][rtp]      = coopMatMulAdd(ma1_0, mb1_0, acc[0][rtp]);
+                        acc[1][rtp]      = coopMatMulAdd(ma1_1, mb1_0, acc[1][rtp]);
+                        acc[0][rtp + 1u] = coopMatMulAdd(ma1_0, mb1_1, acc[0][rtp + 1u]);
+                        acc[1][rtp + 1u] = coopMatMulAdd(ma1_1, mb1_1, acc[1][rtp + 1u]);
+                    }
+                }
+#else
+                {
+                    const uint c0 = fn;
                     const f16vec4 ba0 = sh_x[c0 + 0u][sub_off + 0u];
                     const f16vec4 ba1 = sh_x[c0 + 0u][sub_off + 1u];
                     const f16vec4 bb0 = sh_x[c0 + 1u][sub_off + 0u];
@@ -2266,12 +2416,13 @@ void main() {
                         ma1_1[0] = wb1[s]; ma1_1[1] = wb3[s];
                         mb0[0]   = ba0[s]; mb0[1]   = bb0[s];
                         mb1[0]   = ba1[s]; mb1[1]   = bb1[s];
-                        acc[0][rt] = coopMatMulAdd(ma0_0, mb0, acc[0][rt]);
-                        acc[1][rt] = coopMatMulAdd(ma0_1, mb0, acc[1][rt]);
-                        acc[0][rt] = coopMatMulAdd(ma1_0, mb1, acc[0][rt]);
-                        acc[1][rt] = coopMatMulAdd(ma1_1, mb1, acc[1][rt]);
+                        acc[0][0] = coopMatMulAdd(ma0_0, mb0, acc[0][0]);
+                        acc[1][0] = coopMatMulAdd(ma0_1, mb0, acc[1][0]);
+                        acc[0][0] = coopMatMulAdd(ma1_0, mb1, acc[0][0]);
+                        acc[1][0] = coopMatMulAdd(ma1_1, mb1, acc[1][0]);
                     }
                 }
+#endif
             }
         }
     }
@@ -2283,26 +2434,31 @@ void main() {
         const uint ep_tok_off = ep_tile.token_offset;
         const uint ep_fm      = agx_cmat8_row(lane);
         const uint ep_fn      = agx_cmat8_col0(lane);
-        const uint n_row      = gl_WorkGroupID.x * 64u + sg_id * 8u + ep_fm;
+        const uint n_row      = gl_WorkGroupID.x * MOE_WG_PAIRS + sg_id * 8u + ep_fm;
         if (n_row < pc.N) {
             const float s2 = (pc.w_scale_va != 0ul)
                 ? AgxBufF32R(pc.w_scale_va).v[ep_tile.expert_id]
                 : 1.0f;
-            const bool y_f16 = (pc.flags & MOE_FLAG_INTER_F16) != 0u;
             [[dont_unroll]] for (uint rt = 0u; rt < MOE_RT; ++rt) {
                 const uint gm0 = rt * 8u + ep_fn;
                 const uint gm1 = gm0 + 1u;
                 if (gm0 < m_len) {
                     const float v0  = eval_moe_act(acc[0][rt][0] * s2, acc[1][rt][0] * s2);
                     const uint  di0 = (ep_tok_off + gm0) * pc.N + n_row;
-                    if (y_f16) BufF16W(pc.y_va).v[di0]    = float16_t(v0);
-                    else       AgxBufF32RW(pc.y_va).v[di0] = v0;
+#if INTER_F16 != 0
+                    BufF16W(pc.y_va).v[di0]     = float16_t(v0);
+#else
+                    AgxBufF32RW(pc.y_va).v[di0] = v0;
+#endif
                 }
                 if (gm1 < m_len) {
                     const float v1  = eval_moe_act(acc[0][rt][1] * s2, acc[1][rt][1] * s2);
                     const uint  di1 = (ep_tok_off + gm1) * pc.N + n_row;
-                    if (y_f16) BufF16W(pc.y_va).v[di1]    = float16_t(v1);
-                    else       AgxBufF32RW(pc.y_va).v[di1] = v1;
+#if INTER_F16 != 0
+                    BufF16W(pc.y_va).v[di1]     = float16_t(v1);
+#else
+                    AgxBufF32RW(pc.y_va).v[di1] = v1;
+#endif
                 }
             }
         }
@@ -2316,7 +2472,7 @@ void main() {
         const bool ep_direct = ep_raw || ((pc.flags & MOE_FLAG_DOWN_NOSCATTER) != 0u);
         const uint ep_fm     = agx_cmat8_row(lane);
         const uint ep_fn     = agx_cmat8_col0(lane);
-        const uint ep_sg_n0  = gl_WorkGroupID.x * 128u + sg_id * 16u;
+        const uint ep_sg_n0  = gl_WorkGroupID.x * MOE_WG_OUT + sg_id * 16u;
         const float s2 = (!ep_raw && pc.w_scale_va != 0ul)
             ? AgxBufF32R(pc.w_scale_va).v[ep_tile.expert_id]
             : 1.0f;
@@ -2329,8 +2485,13 @@ void main() {
                 const bool m0_ok = (gm0 < m_len);
                 const bool m1_ok = (gm1 < m_len);
                 if (m0_ok || m1_ok) {
+#if MOE_SRAM_MINIMAL
+                    const uint yr0 = m0_ok ? ((BufU32R(pc.sorted_tok_va).d[ep_tile.token_offset + gm0] * pc.top_k + BufU32R(pc.sorted_kslot_va).d[ep_tile.token_offset + gm0]) * pc.N) : 0u;
+                    const uint yr1 = m1_ok ? ((BufU32R(pc.sorted_tok_va).d[ep_tile.token_offset + gm1] * pc.top_k + BufU32R(pc.sorted_kslot_va).d[ep_tile.token_offset + gm1]) * pc.N) : 0u;
+#else
                     const uint yr0 = m0_ok ? (sh_y_row[gm0] * pc.N) : 0u;
                     const uint yr1 = m1_ok ? (sh_y_row[gm1] * pc.N) : 0u;
+#endif
                     [[unroll]] for (uint t = 0u; t < 2u; ++t) {
                         const uint gn = ep_sg_n0 + t * 8u + ep_fm;
                         if (gn < pc.N) {
@@ -2347,18 +2508,27 @@ void main() {
                 const bool m0_ok = (gm0 < m_len);
                 const bool m1_ok = (gm1 < m_len);
                 if (m0_ok || m1_ok) {
-                    const uint yr0 = m0_ok ? (sh_y_row[gm0] * pc.N) : 0u;
-                    const uint yr1 = m1_ok ? (sh_y_row[gm1] * pc.N) : 0u;
+#if MOE_SRAM_MINIMAL
+                    const uint  yr0 = m0_ok ? (BufU32R(pc.sorted_tok_va).d[ep_tile.token_offset + gm0] * pc.N) : 0u;
+                    const uint  yr1 = m1_ok ? (BufU32R(pc.sorted_tok_va).d[ep_tile.token_offset + gm1] * pc.N) : 0u;
+                    const float tw0 = m0_ok ? AgxBufF32R(pc.sorted_w_va).v[ep_tile.token_offset + gm0] : 0.0f;
+                    const float tw1 = m1_ok ? AgxBufF32R(pc.sorted_w_va).v[ep_tile.token_offset + gm1] : 0.0f;
+#else
+                    const uint  yr0 = m0_ok ? (sh_y_row[gm0] * pc.N) : 0u;
+                    const uint  yr1 = m1_ok ? (sh_y_row[gm1] * pc.N) : 0u;
+                    const float tw0 = m0_ok ? sh_tok_w[gm0] : 0.0f;
+                    const float tw1 = m1_ok ? sh_tok_w[gm1] : 0.0f;
+#endif
                     for (uint t = 0u; t < 2u; ++t) {
                         const uint gn = ep_sg_n0 + t * 8u + ep_fm;
                         if (gn < pc.N) {
                             if (m0_ok) {
                                 precise float scaled = acc[t][rt][0] * s2;
-                                atomicAddF32(pc.y_va, yr0 + gn, scaled * sh_tok_w[gm0]);
+                                atomicAddF32(pc.y_va, yr0 + gn, scaled * tw0);
                             }
                             if (m1_ok) {
                                 precise float scaled = acc[t][rt][1] * s2;
-                                atomicAddF32(pc.y_va, yr1 + gn, scaled * sh_tok_w[gm1]);
+                                atomicAddF32(pc.y_va, yr1 + gn, scaled * tw1);
                             }
                         }
                     }

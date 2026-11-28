@@ -89,6 +89,14 @@ enum agx_moe_shader_flags : uint32_t {
     AGX_MOE_FLAG_SWAP_XZ          = 1u << 8,
 };
 
+struct agx_push_moe_cvt_f16 {
+    uint64_t src_va;
+    uint64_t dst_va;
+    uint32_t n_vec4;
+    uint32_t _pad;
+};
+static_assert(sizeof(agx_push_moe_cvt_f16) == 24, "agx_push_moe_cvt_f16 size check");
+
 // ============================================================================
 // MoE Runner State (SLC-pinned bucket table + hidden scratch + kernel cache)
 // ============================================================================
@@ -111,8 +119,8 @@ struct agx_moe_runner {
     size_t   off_sorted_w       = 0;
     size_t   off_skipped_slots  = 0;
 
-    // SLC-pinned intermediate hidden activations: [M * top_k, n_ff] F32
-    // (B=1 -> 36 KB, DSpark M=5 -> 184 KB, 100% SLC-resident!)
+    // SLC-pinned intermediate hidden activations: [M * top_k, n_ff] F32 or F16
+    // (B=1 -> 36 KB, DSpark M=5 -> 184 KB, pp2048 FP16 -> 36 MiB SLC-resident!)
     agx_bo * hidden_bo        = nullptr;
     size_t   hidden_cap_bytes = 0;
 
@@ -120,6 +128,11 @@ struct agx_moe_runner {
     // Eliminates atomicAddF32 CAS contention in PASS_STAGE=1/3 & eliminates moe_zero_out!
     agx_bo * down_bo          = nullptr;
     size_t   down_cap_bytes   = 0;
+
+    // Wave 10 prefill F32->F16 X pre-conversion scratch (SLC-pinned <= 24 MiB, overlaps bucket!)
+    agx_bo *           x_f16_bo        = nullptr;
+    size_t             x_f16_cap_bytes = 0;
+    const agx_kernel * k_cvt_f16       = nullptr;
 
     // Stream hazard tracking: avoids redundant entry STRONG_USC barrier when a barrier
     // has already occurred since the last MoE op, while protecting back-to-back MoE calls!
@@ -138,9 +151,9 @@ struct agx_moe_runner {
     const agx_kernel * k_gu_vecmat[AGX_MOE_WEIGHT_MODES][3][2]       = {};
     const agx_kernel * k_down_vecmat[AGX_MOE_WEIGHT_MODES][3][2]     = {};
     const agx_kernel * k_down_vecmat_f32[AGX_MOE_WEIGHT_MODES][3][2] = {};
-    // Indexed by [weight_mode][tile_slot: 0=(32M), 1=(48M), 2=(64M)][inter_f16: 0|1]
-    const agx_kernel * k_gu_gemm[AGX_MOE_WEIGHT_MODES][3][2]         = {};
-    const agx_kernel * k_down_gemm[AGX_MOE_WEIGHT_MODES][3][2]       = {};
+    // Indexed by [weight_mode][tile_slot: 0=(32M), 1=(48M), 2=(64M), 3=(8M)][inter_f16][x_f16][merged_gu]
+    const agx_kernel * k_gu_gemm[AGX_MOE_WEIGHT_MODES][4][2][2][2]   = {};
+    const agx_kernel * k_down_gemm[AGX_MOE_WEIGHT_MODES][4][2]       = {};
     const agx_kernel * k_direct_m1[AGX_MOE_WEIGHT_MODES]             = {};
     const agx_kernel * k_direct_m1_f32[AGX_MOE_WEIGHT_MODES]         = {};
     const agx_kernel * k_direct_gu_situ[AGX_MOE_WEIGHT_MODES]        = {};
@@ -158,7 +171,7 @@ static bool ensure_meta_bo(agx_moe_runner * r, size_t req_assigns) {
     }
 
     const uint32_t max_vm    = static_cast<uint32_t>(cap + AGX_MOE_MAX_EXPERTS + 16u);
-    const uint32_t max_tiles = static_cast<uint32_t>(cap / AGX_MOE_GEMM_TILE_M + AGX_MOE_MAX_EXPERTS + 16u);
+    const uint32_t max_tiles = static_cast<uint32_t>(cap / AGX_MOE_GEMM_TILE_M_SML + AGX_MOE_MAX_EXPERTS + 16u);
     // Offset 0..127 = agx_moe_bucket_header; offset 128..151 = grid_zero_skipped (24B)
     size_t off = sizeof(agx_moe_bucket_header) + sizeof(agx_cdm_indirect_grid);
     const size_t off_vm   = agx_align_up(off, 128u); off = off_vm   + max_vm    * sizeof(agx_moe_bucket);
@@ -240,6 +253,63 @@ static bool ensure_down_bo(agx_moe_runner * r, size_t req_assigns, uint32_t n_em
     return true;
 }
 
+static bool ensure_x_f16_bo(agx_moe_runner * r, size_t req_bytes) {
+    if (!r || !r->dev || req_bytes == 0 || req_bytes > 24u * 1024u * 1024u) {
+        return false;
+    }
+    if (r->x_f16_bo && req_bytes <= r->x_f16_cap_bytes) {
+        return true;
+    }
+    if (r->x_f16_bo) {
+        agx_bo_free(r->dev, r->x_f16_bo);
+        r->x_f16_bo = nullptr;
+        r->x_f16_cap_bytes = 0;
+    }
+    const size_t alloc_B = agx_align_up(std::max<size_t>(req_bytes, 256u * 1024u), AGX_PAGE_SIZE);
+    r->x_f16_bo = agx_bo_alloc(r->dev, alloc_B, AGX_BO_SLC_PIN | AGX_BO_WRITEBACK, "moe-x-f16-slc");
+    if (!r->x_f16_bo) {
+        return false;
+    }
+    r->x_f16_cap_bytes = alloc_B;
+    return true;
+}
+
+static const agx_kernel * get_moe_cvt_f16_kernel(agx_moe_runner * r) {
+    if (!r || !r->compiler) {
+        return nullptr;
+    }
+    if (!r->k_cvt_f16) {
+        static const char * k_src = R"GLSL(
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly  buffer BufV4R { vec4    v[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 8)  writeonly buffer BufH4W { f16vec4 v[]; };
+layout(push_constant, scalar) uniform PushCvt {
+    uint64_t src_va;
+    uint64_t dst_va;
+    uint     n_vec4;
+    uint     _pad;
+} pc;
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i < pc.n_vec4) {
+        BufH4W(pc.dst_va).v[i] = f16vec4(BufV4R(pc.src_va).v[i]);
+    }
+}
+)GLSL";
+        agx_compile_opts opts;
+        opts.push_constant_bytes = sizeof(agx_push_moe_cvt_f16);
+        opts.is_hot_kernel       = true;
+        opts.strict_zero_spill   = true;
+        r->k_cvt_f16 = agx_compiler_compile_glsl(r->compiler, "agx_moe_cvt_f32_to_f16_v4", k_src, opts);
+    }
+    return r->k_cvt_f16;
+}
+
 static void moe_entry_barrier(agx_moe_runner * r, agx_cdm_stream * stream) {
     if (!agx_cdm_is_empty(stream)) {
         agx_cdm_stats st{};
@@ -284,13 +354,33 @@ static const agx_kernel * get_bucket_kernel(agx_moe_runner * r, uint32_t mode) {
     return *slot;
 }
 
+static uint32_t moe_prefill_gemm_sgs(uint32_t gemm_tile_m) {
+    if (gemm_tile_m == AGX_MOE_GEMM_TILE_M_SML) {
+        return 4u;
+    }
+    static const uint32_t env_sgs = []() -> uint32_t {
+        const char * v = std::getenv("GGML_AGX_MOE_SGS");
+        if (v && v[0]) {
+            const int parsed = std::atoi(v);
+            return (parsed == 8) ? 8u : 4u;
+        }
+        // Wave 10 M4 Max silicon winner (task-8148: pp512 1,049 / pp1024 1,121 / pp2048 1,145 t/s!):
+        // 128T (4-SG, 64N x 32M, exact 8,192 B SRAM -> 4 WGs/core, 2x WG parallelism, u0 = 68-72 GPR32).
+        // Set GGML_AGX_MOE_SGS=8 to A/B 256T (8-SG).
+        return 4u;
+    }();
+    return (gemm_tile_m == AGX_MOE_GEMM_TILE_M) ? env_sgs : 8u;
+}
+
 static const agx_kernel * get_moe_exec_kernel(agx_moe_runner *  r,
                                               uint32_t          stage,
                                               agx_weight_layout layout,
                                               uint32_t          batch_cap,
                                               bool              prec_f32    = false,
                                               uint32_t          gemm_tile_m = AGX_MOE_GEMM_TILE_M,
-                                              bool              inter_f16   = false) {
+                                              bool              inter_f16   = false,
+                                              bool              x_f16       = false,
+                                              bool              merged_gu   = false) {
     if (!r->compiler) return nullptr;
     const uint32_t wm = static_cast<uint32_t>(layout);
     if (wm >= AGX_MOE_WEIGHT_MODES) return nullptr;
@@ -302,19 +392,25 @@ static const agx_kernel * get_moe_exec_kernel(agx_moe_runner *  r,
                          : (bslot == 1u) ? AGX_MOE_VECMAT_MAX_M : AGX_MOE_VECMAT_DSPARK_M;
     const bool use_f32   = prec_f32 && is_repacked && (stage == 1u || stage == 4u);
     const uint32_t eff_tile_m = (stage == 2u || stage == 3u)
-        ? ((gemm_tile_m == AGX_MOE_GEMM_TILE_M_BIG && is_repacked) ? AGX_MOE_GEMM_TILE_M_BIG
+        ? ((gemm_tile_m == AGX_MOE_GEMM_TILE_M_SML && is_repacked) ? AGX_MOE_GEMM_TILE_M_SML
+         : (gemm_tile_m == AGX_MOE_GEMM_TILE_M_BIG && is_repacked) ? AGX_MOE_GEMM_TILE_M_BIG
          : (gemm_tile_m == AGX_MOE_GEMM_TILE_M_MID && is_repacked) ? AGX_MOE_GEMM_TILE_M_MID
                                                                    : AGX_MOE_GEMM_TILE_M)
         : AGX_MOE_GEMM_TILE_M;
-    const uint32_t tslot = (eff_tile_m == AGX_MOE_GEMM_TILE_M_BIG) ? 2u
+    const uint32_t tslot = (eff_tile_m == AGX_MOE_GEMM_TILE_M_SML) ? 3u
+                         : (eff_tile_m == AGX_MOE_GEMM_TILE_M_BIG) ? 2u
                          : (eff_tile_m == AGX_MOE_GEMM_TILE_M_MID) ? 1u : 0u;
     const bool use_if16  = inter_f16 && is_repacked && (stage <= 3u);
+    const bool use_xf16  = x_f16     && (stage == 2u);
+    const bool use_mrg   = merged_gu && is_repacked && (stage == 2u);
     const uint32_t if16  = use_if16 ? 1u : 0u;
+    const uint32_t xf16  = use_xf16 ? 1u : 0u;
+    const uint32_t mrg   = use_mrg  ? 1u : 0u;
 
     const agx_kernel ** slot = nullptr;
     if      (stage == 0u) slot = &r->k_gu_vecmat[wm][bslot][if16];
     else if (stage == 1u) slot = use_f32 ? &r->k_down_vecmat_f32[wm][bslot][if16] : &r->k_down_vecmat[wm][bslot][if16];
-    else if (stage == 2u) slot = &r->k_gu_gemm[wm][tslot][if16];
+    else if (stage == 2u) slot = &r->k_gu_gemm[wm][tslot][if16][xf16][mrg];
     else if (stage == 3u) slot = &r->k_down_gemm[wm][tslot][if16];
     else if (stage == 4u) slot = use_f32 ? &r->k_direct_m1_f32[wm] : &r->k_direct_m1[wm];
     else if (stage == 5u) slot = &r->k_direct_gu_situ[wm];
@@ -326,12 +422,23 @@ static const agx_kernel * get_moe_exec_kernel(agx_moe_runner *  r,
             const char * v = std::getenv("GGML_AGX_MOE_NO_K128");
             return v && v[0] && v[0] != '0';
         }();
-        static const int shx_pad = []() {
+        static const int env_shx_pad = []() -> int {
             const char * v = std::getenv("GGML_AGX_MOE_SHX_PAD");
             if (v && v[0]) {
                 return std::atoi(v);
             }
-            return 2;
+            return -1;
+        }();
+        static const int env_unroll_kp = []() -> int {
+            const char * v = std::getenv("GGML_AGX_MOE_UNROLL_KP");
+            if (v && v[0]) {
+                return (v[0] != '0') ? 1 : 0;
+            }
+            return -1;
+        }();
+        static const bool m8_no_unroll_kp = []() {
+            const char * v = std::getenv("GGML_AGX_MOE_M8_NO_UNROLL_KP");
+            return v && v[0] && v[0] != '0';
         }();
         agx_compile_opts opts;
         opts.defines.push_back("PASS_STAGE=" + std::to_string(stage));
@@ -339,15 +446,34 @@ static const agx_kernel * get_moe_exec_kernel(agx_moe_runner *  r,
         if (stage <= 1u) {
             opts.defines.push_back("BATCH_CAP=" + std::to_string(bcap));
         }
+        bool eff_unroll_kp = false;
+        uint32_t eff_sgs = 8u;
         if (stage == 2u || stage == 3u) {
+            eff_sgs = moe_prefill_gemm_sgs(eff_tile_m);
+            const bool is_4sg_m32 = (eff_sgs == 4u && eff_tile_m == AGX_MOE_GEMM_TILE_M);
+            const int eff_pad = (env_shx_pad >= 0) ? env_shx_pad : (is_4sg_m32 ? 0 : 2);
             if (eff_tile_m != AGX_MOE_GEMM_TILE_M) {
                 opts.defines.push_back("GEMM_TILE_M=" + std::to_string(eff_tile_m));
+            }
+            if (eff_sgs != 8u) {
+                opts.defines.push_back("MOE_GEMM_SGS=" + std::to_string(eff_sgs));
+            }
+            if (eff_tile_m == AGX_MOE_GEMM_TILE_M_SML) {
+                eff_unroll_kp = !m8_no_unroll_kp;
+                if (!eff_unroll_kp) {
+                    opts.defines.push_back("MOE_UNROLL_KP=0");
+                }
+            } else {
+                eff_unroll_kp = (env_unroll_kp > 0);
+                if (eff_unroll_kp) {
+                    opts.defines.push_back("MOE_UNROLL_KP=1");
+                }
             }
             if (no_k128) {
                 opts.defines.push_back("MOE_K_PAIRS=1");
             }
-            if (shx_pad != 2) {
-                opts.defines.push_back("MOE_SH_X_PAD=" + std::to_string(shx_pad));
+            if (eff_pad != 2) {
+                opts.defines.push_back("MOE_SH_X_PAD=" + std::to_string(eff_pad));
             }
         }
         if (use_f32) {
@@ -356,14 +482,25 @@ static const agx_kernel * get_moe_exec_kernel(agx_moe_runner *  r,
         if (use_if16) {
             opts.defines.push_back("INTER_F16=1");
         }
+        if (use_xf16) {
+            opts.defines.push_back("MOE_X_F16=1");
+        }
+        if (use_mrg) {
+            opts.defines.push_back("MERGED_GU=1");
+        }
         opts.is_hot_kernel     = true;
         opts.strict_zero_spill = true;
-        const std::string kname = "fused_moe_s" + std::to_string(stage)
+        const std::string prefix = (stage == 2u || stage == 3u) ? "fused_moe_w10_s" : "fused_moe_s";
+        const std::string kname = prefix + std::to_string(stage)
                                 + "_w" + std::to_string(wm)
                                 + (stage <= 1u ? ("_b" + std::to_string(bcap)) : "")
-                                + (tslot == 1u ? "_m48" : (tslot == 2u ? "_m64" : ""))
+                                + (tslot == 3u ? "_m8" : (tslot == 1u ? "_m48" : (tslot == 2u ? "_m64" : "")))
+                                + ((stage == 2u || stage == 3u) && eff_sgs == 4u && tslot == 0u ? "_sg4" : "")
                                 + (use_f32 ? "_f32" : "")
-                                + (use_if16 ? "_if16" : "");
+                                + (use_if16 ? "_if16" : "")
+                                + (use_xf16 ? "_xf16" : "")
+                                + (use_mrg ? "_mrg" : "")
+                                + (eff_unroll_kp ? "_unr" : "");
         *slot = agx_compiler_compile_file(
             r->compiler, kname.c_str(), "fused_moe_gate_up_situ_down.comp", opts);
     }
@@ -389,6 +526,7 @@ void agx_moe_destroy(agx_moe_runner * r) {
     if (r->meta_bo)   agx_bo_free(r->dev, r->meta_bo);
     if (r->hidden_bo) agx_bo_free(r->dev, r->hidden_bo);
     if (r->down_bo)   agx_bo_free(r->dev, r->down_bo);
+    if (r->x_f16_bo)  agx_bo_free(r->dev, r->x_f16_bo);
     delete r;
 }
 
@@ -400,40 +538,28 @@ bool agx_moe_precompile_inkling2(agx_moe_runner * r) {
     ok &= (get_bucket_kernel(r, 2u) != nullptr);
     ok &= (get_bucket_kernel(r, 3u) != nullptr);
     ok &= (get_bucket_kernel(r, 4u) != nullptr);
+    ok &= (get_moe_cvt_f16_kernel(r) != nullptr);
 
-    // Inkling 2 Mini MoE weight types: NVFP4 (blk 0..19) + Q8_0 (blk 20..23), repacked & raw
+    // Lean Wave 10 Inkling 2 Mini hot kernel set (NVFP4 blk 0..19 + Q8_0 blk 20..23, repacked):
+    // covers B=1/M<=4 direct (s5/s6), M=5..8 direct-reg 8M MMA (s2_m8/s3_m8), and prefill 32M MMA
+    // (s0/s1 tail + s2_m32 xf16/xf32 mrg + s3_m32 if16 + s4 MUL_MAT_ID).
     const agx_weight_layout layouts[] = {
         AGX_WEIGHT_NVFP4_REPACKED,
         AGX_WEIGHT_Q8_0_REPACKED,
-        AGX_WEIGHT_NVFP4_RAW,
-        AGX_WEIGHT_Q8_0_RAW,
     };
     for (agx_weight_layout wm : layouts) {
-        ok &= (get_moe_exec_kernel(r, 0u, wm, 1u) != nullptr);
-        ok &= (get_moe_exec_kernel(r, 0u, wm, AGX_MOE_VECMAT_MAX_M) != nullptr);
-        ok &= (get_moe_exec_kernel(r, 1u, wm, 1u) != nullptr);
-        ok &= (get_moe_exec_kernel(r, 1u, wm, AGX_MOE_VECMAT_MAX_M) != nullptr);
-        if (wm == AGX_WEIGHT_NVFP4_REPACKED || wm == AGX_WEIGHT_Q8_0_REPACKED) {
-            ok &= (get_moe_exec_kernel(r, 0u, wm, AGX_MOE_VECMAT_DSPARK_M) != nullptr);
-            ok &= (get_moe_exec_kernel(r, 1u, wm, AGX_MOE_VECMAT_DSPARK_M) != nullptr);
-            ok &= (get_moe_exec_kernel(r, 0u, wm, AGX_MOE_VECMAT_MAX_M, false, AGX_MOE_GEMM_TILE_M, true) != nullptr);
-            ok &= (get_moe_exec_kernel(r, 1u, wm, AGX_MOE_VECMAT_MAX_M, false, AGX_MOE_GEMM_TILE_M, true) != nullptr);
-            ok &= (get_moe_exec_kernel(r, 2u, wm, AGX_MOE_VECMAT_MAX_M, false, AGX_MOE_GEMM_TILE_M, true) != nullptr);
-            ok &= (get_moe_exec_kernel(r, 3u, wm, AGX_MOE_VECMAT_MAX_M, false, AGX_MOE_GEMM_TILE_M, true) != nullptr);
-            ok &= (get_moe_exec_kernel(r, 2u, wm, AGX_MOE_VECMAT_MAX_M, false, AGX_MOE_GEMM_TILE_M_MID) != nullptr);
-            ok &= (get_moe_exec_kernel(r, 3u, wm, AGX_MOE_VECMAT_MAX_M, false, AGX_MOE_GEMM_TILE_M_MID) != nullptr);
-            ok &= (get_moe_exec_kernel(r, 2u, wm, AGX_MOE_VECMAT_MAX_M, false, AGX_MOE_GEMM_TILE_M_MID, true) != nullptr);
-            ok &= (get_moe_exec_kernel(r, 3u, wm, AGX_MOE_VECMAT_MAX_M, false, AGX_MOE_GEMM_TILE_M_MID, true) != nullptr);
-            ok &= (get_moe_exec_kernel(r, 2u, wm, AGX_MOE_VECMAT_MAX_M, false, AGX_MOE_GEMM_TILE_M_BIG) != nullptr);
-            ok &= (get_moe_exec_kernel(r, 3u, wm, AGX_MOE_VECMAT_MAX_M, false, AGX_MOE_GEMM_TILE_M_BIG) != nullptr);
-            ok &= (get_moe_exec_kernel(r, 2u, wm, AGX_MOE_VECMAT_MAX_M, false, AGX_MOE_GEMM_TILE_M_BIG, true) != nullptr);
-            ok &= (get_moe_exec_kernel(r, 3u, wm, AGX_MOE_VECMAT_MAX_M, false, AGX_MOE_GEMM_TILE_M_BIG, true) != nullptr);
-        }
-        ok &= (get_moe_exec_kernel(r, 2u, wm, AGX_MOE_VECMAT_MAX_M) != nullptr);
-        ok &= (get_moe_exec_kernel(r, 3u, wm, AGX_MOE_VECMAT_MAX_M) != nullptr);
-        ok &= (get_moe_exec_kernel(r, 4u, wm, 1u) != nullptr);
         ok &= (get_moe_exec_kernel(r, 5u, wm, 1u) != nullptr);
         ok &= (get_moe_exec_kernel(r, 6u, wm, 1u) != nullptr);
+        ok &= (get_moe_exec_kernel(r, 4u, wm, 1u) != nullptr);
+        ok &= (get_moe_exec_kernel(r, 0u, wm, AGX_MOE_VECMAT_MAX_M, false, AGX_MOE_GEMM_TILE_M, true) != nullptr);
+        ok &= (get_moe_exec_kernel(r, 1u, wm, AGX_MOE_VECMAT_MAX_M, false, AGX_MOE_GEMM_TILE_M, true) != nullptr);
+        // M=5..8 direct-register 8M MMA (128T, 32 ActSGs/core)
+        ok &= (get_moe_exec_kernel(r, 2u, wm, AGX_MOE_VECMAT_MAX_M, false, AGX_MOE_GEMM_TILE_M_SML, true, false, true) != nullptr);
+        ok &= (get_moe_exec_kernel(r, 3u, wm, AGX_MOE_VECMAT_MAX_M, false, AGX_MOE_GEMM_TILE_M_SML, true) != nullptr);
+        // Prefill 32M MMA (default 128T 4-SG, exact 8,192 B SRAM, 68-72 GPR32, u0): xf16 + xf32 fallback, merged gate_up
+        ok &= (get_moe_exec_kernel(r, 2u, wm, AGX_MOE_VECMAT_MAX_M, false, AGX_MOE_GEMM_TILE_M, true, true,  true) != nullptr);
+        ok &= (get_moe_exec_kernel(r, 2u, wm, AGX_MOE_VECMAT_MAX_M, false, AGX_MOE_GEMM_TILE_M, true, false, true) != nullptr);
+        ok &= (get_moe_exec_kernel(r, 3u, wm, AGX_MOE_VECMAT_MAX_M, false, AGX_MOE_GEMM_TILE_M, true) != nullptr);
     }
     return ok;
 }
@@ -452,6 +578,7 @@ static uint32_t moe_select_gemm_tile_m(uint32_t n_tokens, agx_weight_layout lay0
         const char * v = std::getenv("GGML_AGX_MOE_TILE_M");
         return (v && v[0]) ? std::atoi(v) : 0;
     }();
+    if (env_tile_m == 8)  return AGX_MOE_GEMM_TILE_M_SML;
     if (env_tile_m == 32) return AGX_MOE_GEMM_TILE_M;
     if (env_tile_m == 48) return AGX_MOE_GEMM_TILE_M_MID;
     if (env_tile_m == 64) return AGX_MOE_GEMM_TILE_M_BIG;
@@ -462,12 +589,21 @@ static uint32_t moe_select_gemm_tile_m(uint32_t n_tokens, agx_weight_layout lay0
             const int parsed = std::atoi(v);
             return parsed > 0 ? static_cast<uint32_t>(parsed) : 0xFFFFFFFFu;
         }
-        return 0xFFFFFFFFu; // Wave 9 default: 48M (K_PAIRS=2, S24 RT=6!) for M >= 2048; set =2048 to A/B 64M!
+        return 0xFFFFFFFFu;
+    }();
+    static const uint32_t m48_min = []() -> uint32_t {
+        const char * v = std::getenv("GGML_AGX_MOE_TILE_M48_MIN");
+        if (v && v[0]) {
+            const int parsed = std::atoi(v);
+            return parsed > 0 ? static_cast<uint32_t>(parsed) : 0xFFFFFFFFu;
+        }
+        // Wave 10 default: 32M (68 GPR32, 24 ActSGs/core -> +32/+62 t/s over 48M/64M on M=1024/2048!)
+        return 0xFFFFFFFFu;
     }();
     if (n_tokens >= m64_min) {
         return AGX_MOE_GEMM_TILE_M_BIG;
     }
-    if (n_tokens >= 2048u) {
+    if (n_tokens >= m48_min) {
         return AGX_MOE_GEMM_TILE_M_MID;
     }
     return AGX_MOE_GEMM_TILE_M;
@@ -516,10 +652,14 @@ static bool dispatch_bucket_internal(agx_moe_runner *           r,
     pb.n_embd             = args.n_embd;
     const uint32_t gu_vm_rows = (args.gate_up_layout == AGX_WEIGHT_Q8_0_REPACKED) ? 4u : AGX_MOE_VECMAT_WG_PAIRS;
     const uint32_t dn_vm_rows = (args.down_layout    == AGX_WEIGHT_Q8_0_REPACKED) ? 8u : AGX_MOE_VECMAT_WG_OUT;
+    const uint32_t gm_sgs     = moe_prefill_gemm_sgs(gemm_tile_m);
+    const bool     is_4sg     = (gm_sgs == 4u);
+    const uint32_t gu_gm_rows = is_4sg ? AGX_MOE_GEMM_WG_PAIRS_M8 : AGX_MOE_GEMM_WG_PAIRS;
+    const uint32_t dn_gm_rows = is_4sg ? AGX_MOE_GEMM_WG_OUT_M8   : AGX_MOE_GEMM_WG_OUT;
     pb.wg_gate_up_vecmat  = (args.n_ff   + gu_vm_rows - 1u) / gu_vm_rows;
     pb.wg_down_vecmat     = (args.n_embd + dn_vm_rows - 1u) / dn_vm_rows;
-    pb.wg_gate_up_gemm    = (args.n_ff   + AGX_MOE_GEMM_WG_PAIRS - 1u) / AGX_MOE_GEMM_WG_PAIRS;
-    pb.wg_down_gemm       = (args.n_embd + AGX_MOE_GEMM_WG_OUT   - 1u) / AGX_MOE_GEMM_WG_OUT;
+    pb.wg_gate_up_gemm    = (args.n_ff   + gu_gm_rows - 1u) / gu_gm_rows;
+    pb.wg_down_gemm       = (args.n_embd + dn_gm_rows - 1u) / dn_gm_rows;
     pb.max_vecmat_buckets = r->max_vecmat_buckets;
     pb.max_gemm_tiles     = r->max_gemm_tiles;
     pb.max_vecmat_m       = max_vecmat_m;
@@ -528,7 +668,7 @@ static bool dispatch_bucket_internal(agx_moe_runner *           r,
     pb.zero_elems         = args.n_tokens * args.n_embd;
     pb.ids_row_stride     = args.ids_row_stride ? args.ids_row_stride : args.top_k;
     pb.gemm_tile_m        = gemm_tile_m;
-    pb.gemm_local_x       = 256u;
+    pb.gemm_local_x       = gm_sgs * 32u;
 
     if (!agx_cdm_dispatch(stream, k_bkt, 1u, 1u, 1u, &pb, sizeof(pb), post_barrier)) {
         return false;
@@ -587,7 +727,10 @@ static bool try_dispatch_direct_s56(agx_moe_runner *           r,
             const int parsed = std::atoi(v);
             return parsed > 0 ? static_cast<uint32_t>(std::min(parsed, 8)) : 0u;
         }
-        return 8u; // Wave 9 default: M=1..8 (covers B=1, M=4 verify, dspark n=7, batch 8x!)
+        // Wave 10 default: M=1..4 on direct s5/s6 (B=1 tg128 100% untouched!); M=5..8 routes to
+        // deduplicated 8M direct-register 128T MMA (32 ActSGs/core, -19.4% DRAM weight BW!).
+        // Set GGML_AGX_MOE_S56_MAX_M=8 to A/B s5/s6 on M=5..8, or =1 to test 8M MMA on M=4!
+        return 4u;
     }();
     static const bool no_swap_xz = []() {
         const char * v = std::getenv("GGML_AGX_MOE_S56_NO_SWAP_XZ");
@@ -719,26 +862,49 @@ bool agx_moe_dispatch(agx_moe_runner *           r,
         return false;
     }
 
-    const bool     use_b8         = moe_use_dspark_bcap8(args.n_tokens, args.gate_up_layout, args.down_layout);
-    const uint32_t bcap           = (args.n_tokens == 1u) ? 1u
-                                  : use_b8 ? AGX_MOE_VECMAT_DSPARK_M : AGX_MOE_VECMAT_MAX_M;
-    const bool     may_have_gemm  = (!use_b8 && args.n_tokens >= AGX_MOE_GEMM_MIN_M);
-    const uint32_t gemm_tile_m    = may_have_gemm
-        ? moe_select_gemm_tile_m(args.n_tokens, args.gate_up_layout, args.down_layout)
-        : AGX_MOE_GEMM_TILE_M;
-
     const bool is_repacked_gu = (args.gate_up_layout == AGX_WEIGHT_NVFP4_REPACKED ||
                                  args.gate_up_layout == AGX_WEIGHT_Q8_0_REPACKED);
     const bool is_repacked_dn = (args.down_layout == AGX_WEIGHT_NVFP4_REPACKED ||
                                  args.down_layout == AGX_WEIGHT_Q8_0_REPACKED);
 
     static const bool no_inter_f16 = (std::getenv("GGML_AGX_MOE_NO_INTER_F16") != nullptr);
-    static const bool b8_noscat    = []() {
+    static const bool no_x_f16 = []() {
+        const char * v = std::getenv("GGML_AGX_MOE_NO_X_F16");
+        return v && v[0] && v[0] != '0';
+    }();
+    static const bool no_m8_mma = []() {
+        const char * v = std::getenv("GGML_AGX_MOE_NO_M8_MMA");
+        return v && v[0] && v[0] != '0';
+    }();
+    static const bool b8_noscat = []() {
         const char * v = std::getenv("GGML_AGX_MOE_B8_NOSCAT");
         return v && v[0] && v[0] != '0';
     }();
 
-    // Store internal hidden_bo as SLC-pinned FP16 on prefill (36 MiB <= 40 MiB on pp2048 -> 100% SLC hit!)
+    // Wave 10 M=2..8 deduplicated 8M direct-register 128T MMA fastpath (used for M=5..8 by default,
+    // or M=2..4 when GGML_AGX_MOE_S56_MAX_M=1): 32 ActSGs/core, -19.4% DRAM weight BW vs s5/s6,
+    // skips s0/s1 vecmat, zero atomics via DOWN_NOSCATTER + moe_down_reduce!
+    const bool use_m8_mma = !no_m8_mma &&
+                            (args.n_tokens >= 2u && args.n_tokens <= 8u) &&
+                            is_repacked_gu && is_repacked_dn &&
+                            ((args.n_embd & 3u) == 0u) && ((args.n_ff & 3u) == 0u) &&
+                            (args.gate_up_layout != AGX_WEIGHT_NVFP4_REPACKED ||
+                             (args.n_embd >= 64u && (args.n_embd & 63u) == 0u)) &&
+                            (args.down_layout != AGX_WEIGHT_NVFP4_REPACKED ||
+                             (args.n_ff >= 64u && (args.n_ff & 63u) == 0u));
+
+    const bool     use_b8         = !use_m8_mma && moe_use_dspark_bcap8(args.n_tokens, args.gate_up_layout, args.down_layout);
+    const uint32_t bcap           = (args.n_tokens == 1u) ? 1u
+                                  : use_b8 ? AGX_MOE_VECMAT_DSPARK_M : AGX_MOE_VECMAT_MAX_M;
+    const bool     may_have_gemm  = use_m8_mma || (!use_b8 && args.n_tokens >= AGX_MOE_GEMM_MIN_M);
+    const uint32_t gemm_min_m     = use_m8_mma ? 1u : (may_have_gemm ? AGX_MOE_GEMM_MIN_M : 0xFFFFFFFFu);
+    const uint32_t gemm_tile_m    = use_m8_mma ? AGX_MOE_GEMM_TILE_M_SML
+                                  : may_have_gemm
+                                      ? moe_select_gemm_tile_m(args.n_tokens, args.gate_up_layout, args.down_layout)
+                                      : AGX_MOE_GEMM_TILE_M;
+    const bool     skip_vecmat    = use_m8_mma;
+
+    // Store internal hidden_bo as SLC-pinned FP16 on prefill & 8M MMA (36 MiB <= 40 MiB on pp2048 -> 100% SLC hit!)
     const bool inter_f16 = (args.moe_inter_va == 0) && may_have_gemm &&
                            is_repacked_gu && is_repacked_dn && !no_inter_f16;
 
@@ -750,21 +916,48 @@ bool agx_moe_dispatch(agx_moe_runner *           r,
         hidden_va = r->hidden_bo->gpu_va;
     }
 
-    // For prefill (may_have_gemm) or opt-in M=5..8 (GGML_AGX_MOE_B8_NOSCAT=1), eliminate
-    // atomicAddF32 CAS contention by writing directly into down_bo + deterministic reduce!
+    // Eliminate atomicAddF32 CAS contention & moe_zero_out on prefill & 8M MMA!
     const bool use_down_noscat = (may_have_gemm || (use_b8 && b8_noscat)) &&
                                  ensure_down_bo(r, total_assigns, args.n_embd);
 
+    // Wave 10 prefill X F32->F16 pre-conversion for PASS_STAGE=2 (overlaps with bucket histogram!):
+    // halves scattered X gather BW & eliminates F32->F16 ALU inside s2 while keeping s0 tail on F32.
+    const bool want_cvt_x_f16 = !no_x_f16 && !args.x_is_f16 &&
+                                may_have_gemm && (gemm_tile_m >= AGX_MOE_GEMM_TILE_M) &&
+                                (args.n_tokens >= 64u) && is_repacked_gu && ((args.n_embd & 3u) == 0u);
+    bool cvt_x_f16 = false;
+    if (want_cvt_x_f16) {
+        const size_t x_f16_B = static_cast<size_t>(args.n_tokens) * args.n_embd * sizeof(uint16_t);
+        if (get_moe_cvt_f16_kernel(r) && ensure_x_f16_bo(r, x_f16_B)) {
+            cvt_x_f16 = true;
+        }
+    }
+    const bool s2_x_f16 = args.x_is_f16 || cvt_x_f16;
+
     // 1. GPU-resident bucketing (bitonic for M<=8, histogram for M>8)
-    //    Can overlap with moe_out zero-fill / res_va copy via AGX_BARRIER_NONE!
+    //    Overlaps with optional X F32->F16 conversion and/or moe_out zero-fill via AGX_BARRIER_NONE!
     const bool need_init_out = !use_down_noscat && !args.accumulate_out &&
                                (args.res_va == 0 || args.res_va != args.moe_out_va);
-    if (!agx_moe_dispatch_bucket(r, stream, args,
-                                 need_init_out ? AGX_BARRIER_NONE : AGX_BARRIER_STRONG_USC)) {
+    const agx_barrier_mode bkt_bar = (cvt_x_f16 || need_init_out) ? AGX_BARRIER_NONE : AGX_BARRIER_STRONG_USC;
+    if (!dispatch_bucket_internal(r, stream, args, bcap, gemm_min_m, gemm_tile_m, bkt_bar)) {
         return false;
     }
 
     const uint64_t base_va = r->meta_bo->gpu_va;
+
+    if (cvt_x_f16) {
+        const agx_kernel * k_cvt = get_moe_cvt_f16_kernel(r);
+        if (!k_cvt) return false;
+        agx_push_moe_cvt_f16 pcvt = {};
+        pcvt.src_va = args.ffn_x_va;
+        pcvt.dst_va = r->x_f16_bo->gpu_va;
+        pcvt.n_vec4 = (args.n_tokens * args.n_embd) >> 2u;
+        const uint32_t cvt_gx = (pcvt.n_vec4 + 127u) / 128u;
+        if (!agx_cdm_dispatch(stream, k_cvt, cvt_gx, 1u, 1u, &pcvt, sizeof(pcvt),
+                              need_init_out ? AGX_BARRIER_NONE : AGX_BARRIER_STRONG_USC)) {
+            return false;
+        }
+    }
 
     if (need_init_out) {
         const agx_kernel * k_zero = get_bucket_kernel(r, 2u);
@@ -781,20 +974,18 @@ bool agx_moe_dispatch(agx_moe_runner *           r,
         }
     }
 
+    const bool merged_gu = (args.gate_up_va != 0);
     uint32_t act_flags = 0u;
     if (args.act_op == AGX_MOE_ACT_SILU) act_flags |= AGX_MOE_FLAG_ACT_SILU;
     if (args.act_op == AGX_MOE_ACT_GELU) act_flags |= AGX_MOE_FLAG_ACT_GELU;
-    if (args.gate_up_va == 0)            act_flags |= AGX_MOE_FLAG_SEPARATE_GU;
+    if (!merged_gu)                      act_flags |= AGX_MOE_FLAG_SEPARATE_GU;
     if (args.x_is_f16)                   act_flags |= AGX_MOE_FLAG_X_F16;
     if (inter_f16)                       act_flags |= AGX_MOE_FLAG_INTER_F16;
 
     // 2. Stage A: Fused Gate+Up + Exact SiTU (writes SLC-resident moe_inter / hidden_bo)
-    //    - Vec-mat indirect dispatch for all buckets with M_bucket <= 4 (or <= 8 on DSpark verify)
-    //    - 8x8 MMA GEMM indirect dispatch for all buckets with M_bucket >= 5 (when M >= 5)
+    //    - Vec-mat indirect dispatch for buckets with M_bucket < gemm_min_m (skipped on 8M MMA!)
+    //    - 8x8 MMA GEMM indirect dispatch for buckets with M_bucket >= gemm_min_m
     {
-        const agx_kernel * k_gu_vm = get_moe_exec_kernel(r, 0u, args.gate_up_layout, bcap, false, AGX_MOE_GEMM_TILE_M, inter_f16);
-        if (!k_gu_vm) return false;
-
         agx_push_moe_exec p_gu = {};
         p_gu.header_va        = base_va;
         p_gu.buckets_va       = base_va + r->off_vecmat_buckets;
@@ -802,8 +993,8 @@ bool agx_moe_dispatch(agx_moe_runner *           r,
         p_gu.sorted_kslot_va  = base_va + r->off_sorted_kslot;
         p_gu.sorted_w_va      = base_va + r->off_sorted_w;
         p_gu.x_va             = args.ffn_x_va;
-        p_gu.w_gate_va        = (args.gate_up_va != 0) ? args.gate_up_va : args.gate_va;
-        p_gu.w_up_va          = (args.gate_up_va != 0) ? args.gate_up_va : args.up_va;
+        p_gu.w_gate_va        = merged_gu ? args.gate_up_va : args.gate_va;
+        p_gu.w_up_va          = merged_gu ? args.gate_up_va : args.up_va;
         p_gu.y_va             = hidden_va;
         p_gu.w_slice_B        = args.gate_up_slice_B;
         p_gu.K                = args.n_embd;
@@ -815,19 +1006,28 @@ bool agx_moe_dispatch(agx_moe_runner *           r,
         p_gu.situ_linear_beta = args.situ_linear_beta;
         p_gu.w_scale_va       = args.gate_up_scale_va;
 
-        // If GEMM path will also run on disjoint expert buckets, elide barrier between vecmat & GEMM!
-        const agx_barrier_mode gu_vm_bar = may_have_gemm ? AGX_BARRIER_NONE : AGX_BARRIER_STRONG_USC;
-        if (!agx_cdm_dispatch_indirect(
-                stream, k_gu_vm,
-                base_va + offsetof(agx_moe_bucket_header, grid_gate_up_vecmat),
-                &p_gu, sizeof(p_gu), gu_vm_bar)) {
-            return false;
+        if (!skip_vecmat) {
+            const agx_kernel * k_gu_vm = get_moe_exec_kernel(r, 0u, args.gate_up_layout, bcap, false, AGX_MOE_GEMM_TILE_M, inter_f16);
+            if (!k_gu_vm) return false;
+            // If GEMM path will also run on disjoint expert buckets, elide barrier between vecmat & GEMM!
+            const agx_barrier_mode gu_vm_bar = may_have_gemm ? AGX_BARRIER_NONE : AGX_BARRIER_STRONG_USC;
+            if (!agx_cdm_dispatch_indirect(
+                    stream, k_gu_vm,
+                    base_va + offsetof(agx_moe_bucket_header, grid_gate_up_vecmat),
+                    &p_gu, sizeof(p_gu), gu_vm_bar)) {
+                return false;
+            }
         }
 
         if (may_have_gemm) {
-            const agx_kernel * k_gu_gm = get_moe_exec_kernel(r, 2u, args.gate_up_layout, bcap, false, gemm_tile_m, inter_f16);
+            const agx_kernel * k_gu_gm = get_moe_exec_kernel(
+                r, 2u, args.gate_up_layout, bcap, false, gemm_tile_m, inter_f16, s2_x_f16, merged_gu);
             if (!k_gu_gm) return false;
             p_gu.buckets_va = base_va + r->off_gemm_tiles;
+            if (cvt_x_f16) {
+                p_gu.x_va   = r->x_f16_bo->gpu_va;
+                p_gu.flags |= AGX_MOE_FLAG_X_F16;
+            }
             if (!agx_cdm_dispatch_indirect(
                     stream, k_gu_gm,
                     base_va + offsetof(agx_moe_bucket_header, grid_gate_up_gemm),
@@ -837,11 +1037,8 @@ bool agx_moe_dispatch(agx_moe_runner *           r,
         }
     }
 
-    // 3. Stage B: Down Projection + Weighted Sum (zero-atomic reduce on prefill, atomic scatter on M<=8)
+    // 3. Stage B: Down Projection + Weighted Sum (zero-atomic reduce on prefill & 8M MMA)
     {
-        const agx_kernel * k_dn_vm = get_moe_exec_kernel(r, 1u, args.down_layout, bcap, false, AGX_MOE_GEMM_TILE_M, inter_f16);
-        if (!k_dn_vm) return false;
-
         const uint32_t dn_base_flags =
             (use_down_noscat ? AGX_MOE_FLAG_DOWN_NOSCATTER : 0u) |
             (inter_f16       ? AGX_MOE_FLAG_X_F16          : 0u);
@@ -866,12 +1063,16 @@ bool agx_moe_dispatch(agx_moe_runner *           r,
 
         // Vecmat and GEMM write disjoint slots (noscat) or scatter atomically -> overlap with AGX_BARRIER_NONE!
         const agx_barrier_mode dn_end_bar = use_down_noscat ? AGX_BARRIER_STRONG_USC : post_barrier;
-        const agx_barrier_mode dn_vm_bar  = may_have_gemm ? AGX_BARRIER_NONE : dn_end_bar;
-        if (!agx_cdm_dispatch_indirect(
-                stream, k_dn_vm,
-                base_va + offsetof(agx_moe_bucket_header, grid_down_vecmat),
-                &p_dn, sizeof(p_dn), dn_vm_bar)) {
-            return false;
+        if (!skip_vecmat) {
+            const agx_kernel * k_dn_vm = get_moe_exec_kernel(r, 1u, args.down_layout, bcap, false, AGX_MOE_GEMM_TILE_M, inter_f16);
+            if (!k_dn_vm) return false;
+            const agx_barrier_mode dn_vm_bar = may_have_gemm ? AGX_BARRIER_NONE : dn_end_bar;
+            if (!agx_cdm_dispatch_indirect(
+                    stream, k_dn_vm,
+                    base_va + offsetof(agx_moe_bucket_header, grid_down_vecmat),
+                    &p_dn, sizeof(p_dn), dn_vm_bar)) {
+                return false;
+            }
         }
 
         if (may_have_gemm) {

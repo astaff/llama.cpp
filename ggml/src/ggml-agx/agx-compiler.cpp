@@ -424,6 +424,25 @@ static bool agx_want_robust_access() {
     return robust;
 }
 
+static bool agx_want_glslc_opt() {
+    // Wave 10: glslc -O (spirv-opt -O) hoists loop invariants and blows coopmat shaders from
+    // 68 GPR32 (24 ActSGs/core) to 80-87 GPR32 (16 ActSGs/core, -33% occupancy!).
+    // Default to -O0 (matching glslangValidator); set GGML_AGX_GLSLC_OPT=1 to A/B -O.
+    static const bool opt = []() {
+        const char * v = std::getenv("GGML_AGX_GLSLC_OPT");
+        return v && v[0] && v[0] != '0';
+    }();
+    return opt;
+}
+
+static bool agx_want_glsl_prefork_cache() {
+    static const bool enabled = []() {
+        const char * v = std::getenv("GGML_AGX_NO_GLSL_CACHE");
+        return !(v && v[0] && v[0] != '0');
+    }();
+    return enabled;
+}
+
 static std::string compute_cache_key(const uint32_t * spv, size_t word_count,
                                      const agx_compile_opts & opts,
                                      const agx_drm_device_info & info) {
@@ -437,7 +456,7 @@ static std::string compute_cache_key(const uint32_t * spv, size_t word_count,
         info.chip_id,
         info.gpu_hal_generation,
         flags_bits,
-        0x41475832u, // cache schema v2 (Wave 9 norobust / checked_offsets=false)
+        0x41475833u, // cache schema v3 (Wave 10 norobust + -O0 default)
     };
     h1 = fnv1a_64(meta, sizeof(meta), h1);
     h2 = fnv1a_64(meta, sizeof(meta), h2);
@@ -445,6 +464,90 @@ static std::string compute_cache_key(const uint32_t * spv, size_t word_count,
     char buf[48];
     std::snprintf(buf, sizeof(buf), "%016" PRIx64 "%016" PRIx64, h1, h2);
     return std::string(buf);
+}
+
+static bool hash_glsl_includes_recursive(const std::string & src,
+                                         const std::vector<std::string> & inc_dirs,
+                                         uint64_t & h1,
+                                         uint64_t & h2,
+                                         std::unordered_map<std::string, bool> & visited,
+                                         int depth) {
+    if (depth > 8) {
+        return false;
+    }
+    size_t pos = 0;
+    while (pos < src.size()) {
+        size_t eol = src.find('\n', pos);
+        if (eol == std::string::npos) {
+            eol = src.size();
+        }
+        size_t i = pos;
+        while (i < eol && (src[i] == ' ' || src[i] == '\t')) {
+            ++i;
+        }
+        if (i < eol && src[i] == '#') {
+            ++i;
+            while (i < eol && (src[i] == ' ' || src[i] == '\t')) {
+                ++i;
+            }
+            if (i + 7 <= eol && src.compare(i, 7, "include") == 0 &&
+                (i + 7 == eol || src[i + 7] == ' ' || src[i + 7] == '\t' || src[i + 7] == '"' || src[i + 7] == '<')) {
+                size_t q0 = src.find('"', i + 7);
+                if (q0 == std::string::npos || q0 >= eol) {
+                    return false; // angle-bracket or macro include -> fall back to SPIR-V hash
+                }
+                size_t q1 = src.find('"', q0 + 1);
+                if (q1 == std::string::npos || q1 >= eol || q1 <= q0 + 1) {
+                    return false;
+                }
+                const std::string inc_rel = src.substr(q0 + 1, q1 - (q0 + 1));
+                std::string resolved;
+                for (const auto & dir : inc_dirs) {
+                    if (dir.empty()) continue;
+                    fs::path cand = fs::path(dir) / inc_rel;
+                    std::error_code ec;
+                    if (fs::is_regular_file(cand, ec)) {
+                        fs::path canon = fs::weakly_canonical(cand, ec);
+                        resolved = ec ? cand.string() : canon.string();
+                        break;
+                    }
+                }
+                if (resolved.empty()) {
+                    return false;
+                }
+                if (visited.find(resolved) == visited.end()) {
+                    visited.emplace(resolved, true);
+                    std::ifstream ifs(resolved, std::ios::binary);
+                    if (!ifs) {
+                        return false;
+                    }
+                    std::stringstream ss;
+                    ss << ifs.rdbuf();
+                    const std::string inc_src = ss.str();
+                    const char sep = 0;
+                    h1 = fnv1a_64(inc_rel.data(), inc_rel.size(), h1);
+                    h1 = fnv1a_64(&sep, 1, h1);
+                    h1 = fnv1a_64(inc_src.data(), inc_src.size(), h1);
+                    h2 = fnv1a_64(inc_rel.data(), inc_rel.size(), h2);
+                    h2 = fnv1a_64(&sep, 1, h2);
+                    h2 = fnv1a_64(inc_src.data(), inc_src.size(), h2);
+                    std::vector<std::string> child_dirs;
+                    fs::path rp(resolved);
+                    if (rp.has_parent_path()) {
+                        child_dirs.push_back(rp.parent_path().string());
+                    }
+                    for (const auto & d : inc_dirs) {
+                        child_dirs.push_back(d);
+                    }
+                    if (!hash_glsl_includes_recursive(inc_src, child_dirs, h1, h2, visited, depth + 1)) {
+                        return false;
+                    }
+                }
+            }
+        }
+        pos = (eol < src.size()) ? (eol + 1) : eol;
+    }
+    return true;
 }
 
 static void parse_spirv_local_size(const uint32_t * words, size_t count, uint32_t out_local[3]) {
@@ -534,7 +637,7 @@ static bool run_glsl_to_spirv(const std::string & glsl_source,
     argv_str.push_back(tool);
     if (is_glslc) {
         argv_str.push_back("--target-env=vulkan1.3");
-        argv_str.push_back("-O");
+        argv_str.push_back(agx_want_glslc_opt() ? "-O" : "-O0");
         argv_str.push_back("-fshader-stage=compute");
         if (opts.entry_point && opts.entry_point[0] && std::strcmp(opts.entry_point, "main") != 0) {
             argv_str.push_back(std::string("-fentry-point=") + opts.entry_point);
@@ -1274,7 +1377,10 @@ static bool save_agxbin(const std::string & path,
                         const agx_kernel & k,
                         const void * code_ptr, size_t code_sz,
                         const void * data_ptr, size_t data_sz) {
-    std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
+    static std::atomic<uint64_t> tmp_seq{0};
+    const std::string tmp_path = path + "." + std::to_string(::getpid()) + "." +
+                                 std::to_string(tmp_seq.fetch_add(1, std::memory_order_relaxed)) + ".tmp";
+    std::ofstream ofs(tmp_path, std::ios::binary | std::ios::trunc);
     if (!ofs) return false;
 
     agxbin_header hdr{};
@@ -1311,7 +1417,16 @@ static bool save_agxbin(const std::string & path,
     if (data_sz > 0) {
         ofs.write(reinterpret_cast<const char *>(data_ptr), static_cast<std::streamsize>(data_sz));
     }
-    return ofs.good();
+    ofs.close();
+    if (!ofs.good()) {
+        std::remove(tmp_path.c_str());
+        return false;
+    }
+    if (std::rename(tmp_path.c_str(), path.c_str()) != 0) {
+        std::remove(tmp_path.c_str());
+        return false;
+    }
+    return true;
 }
 
 static bool load_agxbin(const std::string & path,
@@ -1596,11 +1711,106 @@ const agx_kernel * agx_compiler_get(const agx_compiler * c, const char * name) {
     return (it != mc->kernels.end()) ? it->second.get() : nullptr;
 }
 
-const agx_kernel * agx_compiler_compile_spirv(agx_compiler *           c,
-                                              const char *             name,
-                                              const uint32_t *         spirv_words,
-                                              size_t                   word_count,
-                                              const agx_compile_opts & opts) {
+static bool compute_glsl_cache_key(const std::string & glsl_source,
+                                   const std::string & default_kernel_dir,
+                                   const agx_compile_opts & opts,
+                                   const agx_drm_device_info & info,
+                                   std::string & out_key) {
+    bool is_glslc = false;
+    const std::string tool = find_glsl_compiler(&is_glslc);
+    uint64_t h1 = fnv1a_64(glsl_source.data(), glsl_source.size(), 0xcbf29ce484222325ULL);
+    uint64_t h2 = fnv1a_64(glsl_source.data(), glsl_source.size(), 0x84222325cbf29ce4ULL);
+
+    std::vector<std::string> inc_dirs;
+    for (const auto & inc : opts.include_dirs) {
+        if (!inc.empty()) inc_dirs.push_back(inc);
+    }
+    if (!default_kernel_dir.empty()) {
+        inc_dirs.push_back(default_kernel_dir);
+    }
+    std::unordered_map<std::string, bool> visited;
+    if (!hash_glsl_includes_recursive(glsl_source, inc_dirs, h1, h2, visited, 0)) {
+        return false;
+    }
+
+    const char sep = 0;
+    for (const auto & def : opts.defines) {
+        h1 = fnv1a_64(def.data(), def.size(), h1);
+        h1 = fnv1a_64(&sep, 1, h1);
+        h2 = fnv1a_64(def.data(), def.size(), h2);
+        h2 = fnv1a_64(&sep, 1, h2);
+    }
+    const char * ep = opts.entry_point ? opts.entry_point : "main";
+    h1 = fnv1a_64(ep, std::strlen(ep), h1);
+    h1 = fnv1a_64(tool.data(), tool.size(), h1);
+    h2 = fnv1a_64(&opts.push_constant_bytes, sizeof(opts.push_constant_bytes), h2);
+    h2 = fnv1a_64(tool.data(), tool.size(), h2);
+    const uint32_t flags_bits = (opts.allow_preamble ? 1u : 0u)
+                              | (agx_want_robust_access() ? 2u : 0u)
+                              | (agx_want_glslc_opt() ? 4u : 0u)
+                              | (is_glslc ? 8u : 0u);
+    uint32_t meta[4] = {
+        info.chip_id,
+        info.gpu_hal_generation,
+        flags_bits,
+        0x41475847u, // GLSL pre-fork cache schema v1 ("AGXG")
+    };
+    h1 = fnv1a_64(meta, sizeof(meta), h1);
+    h2 = fnv1a_64(meta, sizeof(meta), h2);
+
+    char buf[52];
+    std::snprintf(buf, sizeof(buf), "g_%016" PRIx64 "%016" PRIx64, h1, h2);
+    out_key = buf;
+    return true;
+}
+
+static const agx_kernel * finalize_loaded_kernel(agx_compiler *           c,
+                                                 const char *             name,
+                                                 std::unique_ptr<agx_kernel> k,
+                                                 const std::vector<uint8_t> & code_bytes,
+                                                 const std::vector<uint8_t> & const_bytes,
+                                                 const agx_compile_opts & opts,
+                                                 bool                     loaded_from_cache) {
+    // Pillar 1 & 2 strict shaderdb enforcement (`0:0` spills, `<= 96` 32-bit GPRs on hot kernels)
+    const bool allow_spills = (std::getenv("GGML_AGX_ALLOW_SPILLS") != nullptr);
+    if (k->stats.stats_valid) {
+        if ((k->stats.spills > 0 || k->stats.fills > 0) && opts.strict_zero_spill && !allow_spills) {
+            AGX_LOG_ERROR("Kernel '%s' FAILED strict 0:0 spill check (%u:%u spills:fills, %u GPR32, %u B scratch)",
+                          name, k->stats.spills, k->stats.fills, k->stats.nr_gprs_32, k->stats.scratch_bytes);
+            return nullptr;
+        }
+        if (opts.is_hot_kernel && k->stats.nr_gprs_32 > AGX_HOT_GPR32_BUDGET) {
+            AGX_LOG_WARN("Hot kernel '%s' exceeds %u GPR32 budget (%u GPR32 / %u GPR16, %u:%u spills:fills)",
+                         name, AGX_HOT_GPR32_BUDGET, k->stats.nr_gprs_32, k->stats.nr_gprs_16,
+                         k->stats.spills, k->stats.fills);
+        }
+    }
+
+    if (!upload_kernel_to_usc(c->dev, *k, code_bytes.data(), code_bytes.size(),
+                              const_bytes.data(), const_bytes.size())) {
+        return nullptr;
+    }
+
+    if (std::getenv("GGML_AGX_DEBUG") != nullptr || std::getenv("GGML_AGX_SHADERDB") != nullptr) {
+        AGX_LOG_INFO("compiled %-32s | %3u GPR32 (%3u h) | %u:%u sp:fi | %4u inst | %5u B | tg=%5u B | dma=%zu%s",
+                     name, k->stats.nr_gprs_32, k->stats.nr_gprs_16,
+                     k->stats.spills, k->stats.fills, k->stats.instructions,
+                     k->binary_size, k->threadgroup_bytes, k->uniform_dma.size(),
+                     loaded_from_cache ? " [cached]" : "");
+    }
+
+    const agx_kernel * ptr = k.get();
+    c->kernels.emplace(name, std::move(k));
+    c->order.push_back(name);
+    return ptr;
+}
+
+static const agx_kernel * compile_spirv_internal(agx_compiler *           c,
+                                                 const char *             name,
+                                                 const uint32_t *         spirv_words,
+                                                 size_t                   word_count,
+                                                 const agx_compile_opts & opts,
+                                                 const std::string &      extra_cache_path) {
     if (!c || !name || !spirv_words || word_count < 5) {
         return nullptr;
     }
@@ -1803,38 +2013,20 @@ const agx_kernel * agx_compiler_compile_spirv(agx_compiler *           c,
         }
     }
 
-    // Pillar 1 & 2 strict shaderdb enforcement (`0:0` spills, `<= 96` 32-bit GPRs on hot kernels)
-    const bool allow_spills = (std::getenv("GGML_AGX_ALLOW_SPILLS") != nullptr);
-    if (k->stats.stats_valid) {
-        if ((k->stats.spills > 0 || k->stats.fills > 0) && opts.strict_zero_spill && !allow_spills) {
-            AGX_LOG_ERROR("Kernel '%s' FAILED strict 0:0 spill check (%u:%u spills:fills, %u GPR32, %u B scratch)",
-                          name, k->stats.spills, k->stats.fills, k->stats.nr_gprs_32, k->stats.scratch_bytes);
-            return nullptr;
-        }
-        if (opts.is_hot_kernel && k->stats.nr_gprs_32 > AGX_HOT_GPR32_BUDGET) {
-            AGX_LOG_WARN("Hot kernel '%s' exceeds %u GPR32 budget (%u GPR32 / %u GPR16, %u:%u spills:fills)",
-                         name, AGX_HOT_GPR32_BUDGET, k->stats.nr_gprs_32, k->stats.nr_gprs_16,
-                         k->stats.spills, k->stats.fills);
-        }
+    if (!extra_cache_path.empty()) {
+        save_agxbin(extra_cache_path, *k, code_bytes.data(), code_bytes.size(),
+                    const_bytes.data(), const_bytes.size());
     }
 
-    if (!upload_kernel_to_usc(c->dev, *k, code_bytes.data(), code_bytes.size(),
-                              const_bytes.data(), const_bytes.size())) {
-        return nullptr;
-    }
+    return finalize_loaded_kernel(c, name, std::move(k), code_bytes, const_bytes, opts, loaded_from_cache);
+}
 
-    if (std::getenv("GGML_AGX_DEBUG") != nullptr || std::getenv("GGML_AGX_SHADERDB") != nullptr) {
-        AGX_LOG_INFO("compiled %-32s | %3u GPR32 (%3u h) | %u:%u sp:fi | %4u inst | %5u B | tg=%5u B | dma=%zu%s",
-                     name, k->stats.nr_gprs_32, k->stats.nr_gprs_16,
-                     k->stats.spills, k->stats.fills, k->stats.instructions,
-                     k->binary_size, k->threadgroup_bytes, k->uniform_dma.size(),
-                     loaded_from_cache ? " [cached]" : "");
-    }
-
-    const agx_kernel * ptr = k.get();
-    c->kernels.emplace(name, std::move(k));
-    c->order.push_back(name);
-    return ptr;
+const agx_kernel * agx_compiler_compile_spirv(agx_compiler *           c,
+                                              const char *             name,
+                                              const uint32_t *         spirv_words,
+                                              size_t                   word_count,
+                                              const agx_compile_opts & opts) {
+    return compile_spirv_internal(c, name, spirv_words, word_count, opts, std::string());
 }
 
 const agx_kernel * agx_compiler_compile_glsl(agx_compiler *           c,
@@ -1848,13 +2040,35 @@ const agx_kernel * agx_compiler_compile_glsl(agx_compiler *           c,
         return existing;
     }
 
+    // Wave 10 pre-fork GLSL+includes+defines disk cache lookup: 0 ms fork(glslang/glslc) on warm hit!
+    std::string glsl_cache_path;
+    if (c->use_cache && agx_want_glsl_prefork_cache()) {
+        const agx_drm_device_info & dinfo = agx_drm_get_info(c->dev);
+        std::string gkey;
+        if (compute_glsl_cache_key(glsl_source, c->kernel_dir, opts, dinfo, gkey)) {
+            glsl_cache_path = c->cache_dir + "/" + gkey + ".agxbin";
+            auto k = std::make_unique<agx_kernel>();
+            k->name          = name;
+            k->is_hot_kernel = opts.is_hot_kernel;
+            std::vector<uint8_t> code_bytes;
+            std::vector<uint8_t> const_bytes;
+            if (load_agxbin(glsl_cache_path, *k, code_bytes, const_bytes)) {
+                std::lock_guard<std::mutex> lock(c->mtx);
+                if (auto it = c->kernels.find(name); it != c->kernels.end()) {
+                    return it->second.get();
+                }
+                return finalize_loaded_kernel(c, name, std::move(k), code_bytes, const_bytes, opts, true);
+            }
+        }
+    }
+
     std::vector<uint32_t> spv;
     std::string err;
     if (!run_glsl_to_spirv(glsl_source, c->kernel_dir, opts, spv, err)) {
         AGX_LOG_ERROR("Kernel '%s': %s", name, err.c_str());
         return nullptr;
     }
-    return agx_compiler_compile_spirv(c, name, spv.data(), spv.size(), opts);
+    return compile_spirv_internal(c, name, spv.data(), spv.size(), opts, glsl_cache_path);
 }
 
 const agx_kernel * agx_compiler_compile_file(agx_compiler *           c,
