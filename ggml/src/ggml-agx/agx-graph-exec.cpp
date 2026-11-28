@@ -848,6 +848,8 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer BufF32 { float v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer BufVec4 { vec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer ConstBufVec4 { vec4 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer ConstBufI64 { int64_t v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ConstBufI32 { int v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 2) buffer BufF16 { float16_t v[]; };
@@ -862,11 +864,69 @@ layout(push_constant) uniform PushArgs {
     uint     i_nb0, i_nb1, i_nb2;
     uint     i_ne1, i_ne2;
     uint     d_nb1, d_nb2, d_nb3;
-    uint     dst_type;   // 0=F32, 1=F16, 2=Q8_0
+    uint     dst_type;   // 0=F32, 1=F16, 2=Q8_0, 4=F32 vec4, 5=Batched 1..4-col F32 vec4
     uint     ids_is_i64; // 1=I64, 0=I32
+    uint     n_batch_srcs;
+    uint64_t src1_va;
+    uint64_t src2_va;
+    uint64_t src3_va;
+    uint64_t dst1_va;
+    uint64_t dst2_va;
+    uint64_t dst3_va;
+    uint     s1_nb1;
+    uint     s2_nb1;
+    uint     s3_nb1;
+    uint     pad0;
 } pc;
 
 void main() {
+    if (pc.dst_type == 5u) {
+        uint col4  = gl_GlobalInvocationID.x;
+        uint r1    = gl_WorkGroupID.y;
+        uint ne0_4 = pc.ne0 >> 2u;
+        if (col4 >= ne0_4 || r1 >= pc.ne1) return;
+        uint64_t id_off = uint64_t(r1) * uint64_t(pc.i_nb0);
+        int64_t dst_row = (pc.ids_is_i64 != 0u)
+            ? ConstBufI64(pc.ids_va + id_off).v[0]
+            : int64_t(ConstBufI32(pc.ids_va + id_off).v[0]);
+        if (dst_row < 0l) return;
+        uint64_t d_off = uint64_t(dst_row) * uint64_t(pc.d_nb1);
+        BufVec4(pc.dst_va + d_off).v[col4] =
+            ConstBufVec4(pc.src_va + uint64_t(r1) * uint64_t(pc.s_nb1)).v[col4];
+        if (pc.n_batch_srcs > 1u) {
+            BufVec4(pc.dst1_va + d_off).v[col4] =
+                ConstBufVec4(pc.src1_va + uint64_t(r1) * uint64_t(pc.s1_nb1)).v[col4];
+        }
+        if (pc.n_batch_srcs > 2u) {
+            BufVec4(pc.dst2_va + d_off).v[col4] =
+                ConstBufVec4(pc.src2_va + uint64_t(r1) * uint64_t(pc.s2_nb1)).v[col4];
+        }
+        if (pc.n_batch_srcs > 3u) {
+            BufVec4(pc.dst3_va + d_off).v[col4] =
+                ConstBufVec4(pc.src3_va + uint64_t(r1) * uint64_t(pc.s3_nb1)).v[col4];
+        }
+        return;
+    }
+
+    if (pc.dst_type == 4u) {
+        uint col4  = gl_GlobalInvocationID.x;
+        uint r1    = gl_WorkGroupID.y;
+        uint r23   = gl_WorkGroupID.z;
+        uint ne0_4 = pc.ne0 >> 2u;
+        if (col4 >= ne0_4 || r1 >= pc.ne1 || r23 >= pc.ne2 * pc.ne3) return;
+        uint i2 = r23 % pc.ne2;
+        uint i3 = r23 / pc.ne2;
+        uint64_t id_off = uint64_t(r1) * pc.i_nb0 + uint64_t(i2 % pc.i_ne1) * pc.i_nb1 + uint64_t(i3 % pc.i_ne2) * pc.i_nb2;
+        int64_t dst_row = (pc.ids_is_i64 != 0u)
+            ? ConstBufI64(pc.ids_va + id_off).v[0]
+            : int64_t(ConstBufI32(pc.ids_va + id_off).v[0]);
+        if (dst_row < 0l) return;
+        uint64_t s_row = pc.src_va + uint64_t(r1) * pc.s_nb1 + uint64_t(i2) * pc.s_nb2 + uint64_t(i3) * pc.s_nb3;
+        uint64_t d_row = pc.dst_va + uint64_t(dst_row) * pc.d_nb1 + uint64_t(i2) * pc.d_nb2 + uint64_t(i3) * pc.d_nb3;
+        BufVec4(d_row).v[col4] = ConstBufVec4(s_row).v[col4];
+        return;
+    }
+
     uint col = gl_GlobalInvocationID.x;
     uint r1  = gl_WorkGroupID.y;
     uint r23 = gl_WorkGroupID.z;
@@ -915,8 +975,12 @@ struct set_rows_push {
     uint32_t i_nb0, i_nb1, i_nb2;
     uint32_t i_ne1, i_ne2;
     uint32_t d_nb1, d_nb2, d_nb3;
-    uint32_t dst_type, ids_is_i64;
+    uint32_t dst_type, ids_is_i64, n_batch_srcs;
+    uint64_t src1_va, src2_va, src3_va;
+    uint64_t dst1_va, dst2_va, dst3_va;
+    uint32_t s1_nb1, s2_nb1, s3_nb1, pad0;
 };
+static_assert(sizeof(set_rows_push) == 160u, "set_rows_push must match 160B GLSL layout");
 static_assert(sizeof(set_rows_push) <= AGX_MAX_PUSH_BYTES, "set_rows_push > 256B");
 
 static const char * k_glsl_concat_pad = R"GLSL(
@@ -3428,6 +3492,7 @@ enum agx_exec_kind : uint8_t {
     ITEM_FA_MASK_BOUNDS,
     ITEM_FLASH_ATTN,
     ITEM_GEMM_REDIRECT,
+    ITEM_SET_ROWS_BATCH,
 };
 
 struct agx_dspark_w4_item_args {
@@ -3545,7 +3610,7 @@ static agx_graph_exec_state * get_exec_state(agx_backend_context * ctx) {
         st->k_row_reduce           = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_row_reduce",           k_glsl_row_reduce,           opts);
         st->k_softmax              = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_softmax",              k_glsl_softmax,              opts);
         st->k_get_rows             = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_get_rows",             k_glsl_get_rows,             opts);
-        st->k_set_rows             = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_set_rows",             k_glsl_set_rows,             opts);
+        st->k_set_rows             = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_set_rows_w11",         k_glsl_set_rows,             opts);
         st->k_concat_pad           = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_concat_pad",           k_glsl_concat_pad,           opts);
         st->k_ssm_conv             = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_ssm_conv",             k_glsl_ssm_conv,             opts);
         st->k_rope                 = agx_compiler_compile_glsl(ctx->compiler, "agx_ge_rope",                 k_glsl_rope,                 opts);
@@ -3832,11 +3897,50 @@ void agx_graph_optimize(agx_backend_context *                       ctx,
                         struct ggml_cgraph *                        cgraph,
                         struct ggml_backend_graph_optimize_params * params) {
     (void) params;
-    if (!ctx || !ctx->drm || !ctx->compiler || !cgraph || cgraph->n_nodes < 256) {
+    if (!ctx || !ctx->drm || !ctx->compiler || !cgraph || cgraph->n_nodes < 16) {
         return;
     }
     const char * no_pre = std::getenv("GGML_AGX_NO_PRECOMPILE");
     if (no_pre && std::atoi(no_pre) != 0) {
+        return;
+    }
+
+    // Wave 11: Detect Inkling-2 target and DSpark draft/inject graphs even when n_nodes < 256
+    // (e.g. 3-layer DSpark draft context has ~90-150 nodes during graph_reserve()), so BOTH
+    // ctx_tgt and ctx_dft precompile Inkling-2 + W4/DSpark shaders at load time with ZERO
+    // cold-compile tax during the first timed prompt (eliminating Novel 1k cli -270 t/s tax!).
+    bool has_inkling2 = false;
+    bool has_dspark   = false;
+    auto check_arch_name = [&](const struct ggml_tensor * t) {
+        if (!t || !t->name[0]) return;
+        const char * nm = t->name;
+        if (std::strcmp(nm, "output_res_query.weight") == 0 ||
+            std::strcmp(nm, "blk.0.attn_res_query.weight") == 0 ||
+            std::strcmp(nm, "blk.0.attn_rel_bias.weight") == 0) {
+            has_inkling2 = true;
+        } else if (std::strcmp(nm, "markov_w1.weight") == 0 ||
+                   std::strcmp(nm, "markov_w2.weight") == 0 ||
+                   std::strcmp(nm, "markov_ctx_mix.weight") == 0 ||
+                   std::strcmp(nm, "blk.0.ctx_mix.weight") == 0 ||
+                   std::strcmp(nm, "blk.0.attn_k_ctx.weight") == 0 ||
+                   std::strcmp(nm, "mask_embd.weight") == 0 ||
+                   std::strcmp(nm, "dspark_mask_embd.weight") == 0) {
+            has_dspark = true;
+        }
+    };
+    for (int i = 0; i < cgraph->n_leafs && (!has_inkling2 || !has_dspark); ++i) {
+        check_arch_name(cgraph->leafs[i]);
+    }
+    for (int i = 0; i < cgraph->n_nodes && (!has_inkling2 || !has_dspark); ++i) {
+        const struct ggml_tensor * nd = cgraph->nodes[i];
+        if (!nd) continue;
+        check_arch_name(nd);
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (nd->src[s]) check_arch_name(nd->src[s]);
+        }
+    }
+
+    if (cgraph->n_nodes < 256 && !has_dspark && !has_inkling2) {
         return;
     }
 
@@ -3846,7 +3950,7 @@ void agx_graph_optimize(agx_backend_context *                       ctx,
     }
 
     // 1. Pre-compile ALL hot prefill/decode shaders ONCE during llama_context::graph_reserve()
-    //    so the first timed prompt (e.g. Code 1k after a 32-token warmup) pays ZERO cold compile tax!
+    //    so the first timed prompt (e.g. Code 1k / Novel 1k cli) pays ZERO cold compile tax!
     if (!st->precompiled_llm) {
         st->precompiled_llm = true;
         agx_gemm_precompile_all(ctx);
@@ -3918,6 +4022,19 @@ void agx_graph_optimize(agx_backend_context *                       ctx,
                 }
             }
         }
+
+        const char * no_pre_w4 = std::getenv("GGML_AGX_NO_PRECOMPILE_W4");
+        const bool   pre_w4    = !(no_pre_w4 && std::atoi(no_pre_w4) != 0);
+        if (pre_w4 && (has_inkling2 || has_dspark)) {
+            agx_inkling2_engine * eng = agx_graph_exec_get_inkling2(ctx);
+            if (eng) {
+                agx_inkling2_precompile_w4(eng);
+            }
+        }
+    }
+
+    if (cgraph->n_nodes < 256) {
+        return;
     }
 
     // 2. Pre-size scratch BOs (fa_bounds_bo, redirect_tmp_bo, ctrl_pipe_bo) to the reserved
@@ -4241,6 +4358,8 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                                      std::getenv("GGML_AGX_NO_CTRL_PIPE")[0] == '1');
     const bool no_weak_war        = (std::getenv("GGML_AGX_NO_WEAK_WAR") != nullptr &&
                                      std::getenv("GGML_AGX_NO_WEAK_WAR")[0] == '1');
+    const bool no_batch_set_rows  = (std::getenv("GGML_AGX_NO_BATCH_SET_ROWS") != nullptr &&
+                                     std::getenv("GGML_AGX_NO_BATCH_SET_ROWS")[0] == '1');
     const bool print_stats    = (std::getenv("GGML_AGX_STATS") != nullptr &&
                                  std::getenv("GGML_AGX_STATS")[0] == '1');
     uint32_t fusion_mask     = no_fusion ? 0u : 0xFFFFFFFFu;
@@ -4578,7 +4697,7 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
     uint64_t g_mix = 0, g_moe_wsum = 0, g_ssm_res = 0, g_moe_norm = 0;
     uint64_t g_prep_store = 0, g_full_sconv = 0, g_router = 0, g_rel_bias = 0, g_cont_abs = 0, g_fused_moe = 0;
     uint64_t g_sprep = 0, g_fa_epi = 0, g_mix_rms = 0, g_rel_bskip = 0;
-    uint64_t g_ctrl_ovlp = 0, g_redir = 0, g_ctrl_pipe = 0, g_wfi_bar = 0;
+    uint64_t g_ctrl_ovlp = 0, g_redir = 0, g_ctrl_pipe = 0, g_wfi_bar = 0, g_sr_batch = 0;
     std::vector<uint8_t> alias_scratch_locked(n_exec, 0u);
     std::vector<agx_exec_item> pre_items;
 
@@ -8391,6 +8510,132 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
             if (fa_committed) continue;
         }
 
+        // --------------------------------------------------------------------
+        // Fusion 15 (Wave 11 NEW): Multi-Column Batched vec4 F32 SET_ROWS
+        //   Collapses DSpark build_layer_inp_dev()'s 4 consecutive strided F32 SET_ROWS
+        //   (4 scalar dispatches + 3 STRONG_USC barriers) into 1 vectorized vec4 dispatch!
+        // --------------------------------------------------------------------
+        if (!no_batch_set_rows && (fusion_mask & (1u << 15)) &&
+            node->op == GGML_OP_SET_ROWS && node->type == GGML_TYPE_F32 &&
+            node->src[0] && node->src[1] && node->src[0]->type == GGML_TYPE_F32 &&
+            node->ne[2] == 1 && node->ne[3] == 1 &&
+            node->src[0]->ne[2] == 1 && node->src[0]->ne[3] == 1 &&
+            node->src[1]->ne[1] == 1 && node->src[1]->ne[2] == 1) {
+            const struct ggml_tensor * s0    = node->src[0];
+            const struct ggml_tensor * ids_t = node->src[1];
+            const int64_t  ne0    = s0->ne[0];
+            const int64_t  ne1    = s0->ne[1];
+            const uint64_t d_nb1  = (uint64_t) node->nb[1];
+            const uint64_t row_B  = (uint64_t) ne0 * sizeof(float);
+            const uint64_t ids_va = agx_tensor_gpu_va(ids_t);
+            const uint64_t s0_va  = agx_tensor_gpu_va(s0);
+            const uint64_t d0_va  = agx_tensor_gpu_va(node);
+            if (ne0 > 0 && ne1 > 0 && (ne0 & 3) == 0 && d_nb1 >= row_B && (d_nb1 & 15ull) == 0ull &&
+                ids_va != 0ull && s0_va != 0ull && d0_va != 0ull &&
+                ((s0_va | d0_va) & 15ull) == 0ull && (s0->nb[1] & 15u) == 0u &&
+                va_disjoint(s0, node) && va_disjoint(ids_t, node)) {
+                struct ggml_tensor * batch[4] = { node, nullptr, nullptr, nullptr };
+                uint64_t s_vas[4]  = { s0_va, 0ull, 0ull, 0ull };
+                uint64_t d_vas[4]  = { d0_va, 0ull, 0ull, 0ull };
+                uint32_t s_nb1s[4] = { (uint32_t) s0->nb[1], 0u, 0u, 0u };
+                int nb = 1;
+
+                auto dst_cols_disjoint = [&](const struct ggml_tensor * a, uint64_t a_va,
+                                             const struct ggml_tensor * b, uint64_t b_va) -> bool {
+                    if (!va_range_overlap(tensor_va_range(a), tensor_va_range(b))) return true;
+                    const uint64_t lo   = std::min(a_va, b_va);
+                    const uint64_t hi   = std::max(a_va, b_va);
+                    const uint64_t diff = hi - lo;
+                    return diff >= row_B && (diff + row_B) <= d_nb1;
+                };
+
+                for (size_t k = 1u; k < 4u && e + k < n_exec; ++k) {
+                    if (consumed[e + k]) break;
+                    struct ggml_tensor * cand = cgraph->nodes[st->exec_nodes[e + k]];
+                    if (!cand || cand->op != GGML_OP_SET_ROWS || cand->type != GGML_TYPE_F32 ||
+                        !cand->src[0] || !cand->src[1] || cand->src[0]->type != GGML_TYPE_F32 ||
+                        cand->ne[2] != 1 || cand->ne[3] != 1 ||
+                        cand->src[0]->ne[0] != ne0 || cand->src[0]->ne[1] != ne1 ||
+                        cand->src[0]->ne[2] != 1 || cand->src[0]->ne[3] != 1 ||
+                        (uint64_t) cand->nb[1] != d_nb1 ||
+                        cand->src[1]->type != ids_t->type || cand->src[1]->nb[0] != ids_t->nb[0] ||
+                        cand->src[1]->ne[1] != 1 || cand->src[1]->ne[2] != 1 ||
+                        agx_tensor_gpu_va(cand->src[1]) != ids_va) {
+                        break;
+                    }
+                    const uint64_t sk_va = agx_tensor_gpu_va(cand->src[0]);
+                    const uint64_t dk_va = agx_tensor_gpu_va(cand);
+                    if (!sk_va || !dk_va || ((sk_va | dk_va) & 15ull) != 0ull || (cand->src[0]->nb[1] & 15u) != 0u) {
+                        break;
+                    }
+                    if (!va_disjoint(cand->src[0], cand) || !va_disjoint(ids_t, cand)) {
+                        break;
+                    }
+                    bool pair_ok = true;
+                    for (int j = 0; j < nb; ++j) {
+                        if (!va_disjoint(cand->src[0], batch[j]) ||
+                            !va_disjoint(batch[j]->src[0], cand) ||
+                            !dst_cols_disjoint(batch[j], d_vas[j], cand, dk_va)) {
+                            pair_ok = false;
+                            break;
+                        }
+                    }
+                    if (!pair_ok) break;
+                    batch[nb]  = cand;
+                    s_vas[nb]  = sk_va;
+                    d_vas[nb]  = dk_va;
+                    s_nb1s[nb] = (uint32_t) cand->src[0]->nb[1];
+                    ++nb;
+                }
+
+                if (nb >= 2) {
+                    set_rows_push pc{};
+                    pc.src_va       = s_vas[0];
+                    pc.ids_va       = ids_va;
+                    pc.dst_va       = d_vas[0];
+                    pc.ne0          = (uint32_t) ne0;
+                    pc.ne1          = (uint32_t) ne1;
+                    pc.ne2          = 1u;
+                    pc.ne3          = 1u;
+                    pc.s_nb1        = s_nb1s[0];
+                    pc.i_nb0        = (uint32_t) ids_t->nb[0];
+                    pc.i_ne1        = 1u;
+                    pc.i_ne2        = 1u;
+                    pc.d_nb1        = (uint32_t) d_nb1;
+                    pc.dst_type     = 5u;
+                    pc.ids_is_i64   = (ids_t->type == GGML_TYPE_I64) ? 1u : 0u;
+                    pc.n_batch_srcs = (uint32_t) nb;
+                    pc.src1_va      = s_vas[1];
+                    pc.src2_va      = s_vas[2];
+                    pc.src3_va      = s_vas[3];
+                    pc.dst1_va      = d_vas[1];
+                    pc.dst2_va      = d_vas[2];
+                    pc.dst3_va      = d_vas[3];
+                    pc.s1_nb1       = s_nb1s[1];
+                    pc.s2_nb1       = s_nb1s[2];
+                    pc.s3_nb1       = s_nb1s[3];
+
+                    int32_t fset[4];
+                    agx_exec_item it{};
+                    it.kind          = ITEM_SET_ROWS_BATCH;
+                    it.gx            = ((pc.ne0 >> 2u) + 255u) / 256u;
+                    it.gy            = pc.ne1;
+                    it.gz            = 1u;
+                    it.nodes_covered = (uint32_t) nb;
+                    it.add_read(tensor_va_range(ids_t));
+                    for (int j = 0; j < nb; ++j) {
+                        fset[j] = (int32_t) (e + (size_t) j);
+                        it.add_read(tensor_va_range(batch[j]->src[0]));
+                        it.add_write(tensor_va_range(batch[j]));
+                    }
+                    it.set_push(pc);
+                    commit_single_item((int32_t) e, fset, nb, it);
+                    g_sr_batch++;
+                    continue;
+                }
+            }
+        }
+
         // Default: emit plain single-node generic item at anchor `e`
         {
             agx_exec_item it{};
@@ -8776,6 +9021,11 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                 ok = dispatch_gemm_to_va(ctx, stream, it.node, it.va0, it.va1, AGX_BARRIER_NONE);
             } break;
 
+            case ITEM_SET_ROWS_BATCH:
+                ok = agx_cdm_dispatch(stream, st->k_set_rows, it.gx, it.gy, it.gz,
+                                      it.push, it.push_bytes, AGX_BARRIER_NONE);
+                break;
+
             case ITEM_ROUTER_TOPK:
                 ok = agx_cdm_dispatch(stream, st->k_router_topk_norm, it.gx, it.gy, it.gz,
                                       it.push, it.push_bytes, AGX_BARRIER_NONE);
@@ -9085,11 +9335,21 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                         pc.i_nb0      = (uint32_t) ids->nb[0]; pc.i_nb1 = (uint32_t) ids->nb[1]; pc.i_nb2 = (uint32_t) ids->nb[2];
                         pc.i_ne1      = (uint32_t) ids->ne[1]; pc.i_ne2 = (uint32_t) ids->ne[2];
                         pc.d_nb1      = (uint32_t) node->nb[1]; pc.d_nb2 = (uint32_t) node->nb[2]; pc.d_nb3 = (uint32_t) node->nb[3];
-                        pc.dst_type   = (node->type == GGML_TYPE_Q8_0) ? 2u :
-                                        (node->type == GGML_TYPE_F16)  ? 1u : 0u;
                         pc.ids_is_i64 = (ids->type == GGML_TYPE_I64) ? 1u : 0u;
-                        ok = agx_cdm_dispatch(stream, st->k_set_rows, (pc.ne0 + 255u) / 256u, pc.ne1, pc.ne2 * pc.ne3,
-                                              &pc, sizeof(pc), AGX_BARRIER_NONE);
+                        const bool sr_vec4_ok = (!no_batch_set_rows && node->type == GGML_TYPE_F32 &&
+                                                 (pc.ne0 & 3u) == 0u &&
+                                                 ((pc.src_va | pc.dst_va) & 15ull) == 0ull &&
+                                                 ((pc.s_nb1 | pc.s_nb2 | pc.s_nb3 | pc.d_nb1 | pc.d_nb2 | pc.d_nb3) & 15u) == 0u);
+                        if (sr_vec4_ok) {
+                            pc.dst_type = 4u;
+                            ok = agx_cdm_dispatch(stream, st->k_set_rows, ((pc.ne0 >> 2u) + 255u) / 256u, pc.ne1, pc.ne2 * pc.ne3,
+                                                  &pc, sizeof(pc), AGX_BARRIER_NONE);
+                        } else {
+                            pc.dst_type = (node->type == GGML_TYPE_Q8_0) ? 2u :
+                                          (node->type == GGML_TYPE_F16)  ? 1u : 0u;
+                            ok = agx_cdm_dispatch(stream, st->k_set_rows, (pc.ne0 + 255u) / 256u, pc.ne1, pc.ne2 * pc.ne3,
+                                                  &pc, sizeof(pc), AGX_BARRIER_NONE);
+                        }
                     } break;
 
                     case GGML_OP_ADD_ID: {
@@ -9369,7 +9629,7 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
         const uint64_t d_sub   = cdm_after.submits             - cdm_before.submits;
         std::fprintf(stderr,
                      "[ggml-agx STATS] nodes=%d exec=%zu items=%zu waves=%u wave_sched=%d dispatches=%llu submits=%llu usc_bar=%llu wfi_bar=%llu elided=%llu "
-                     "cpu_enc=%.2fms gpu=%.2fms fusions(prep=%llu sconv=%llu rel=%llu rtr=%llu cont=%llu rms=%llu situ=%llu ctrl=%llu mix=%llu moe=%llu wsum=%llu ssm=%llu mnorm=%llu clip=%llu sc=%llu addsc=%llu sigm=%llu sprep=%llu faepi=%llu mrms=%llu relb=%llu covlp=%llu redir=%llu cpipe=%llu)\n",
+                     "cpu_enc=%.2fms gpu=%.2fms fusions(prep=%llu sconv=%llu rel=%llu rtr=%llu cont=%llu rms=%llu situ=%llu ctrl=%llu mix=%llu moe=%llu wsum=%llu ssm=%llu mnorm=%llu clip=%llu sc=%llu addsc=%llu sigm=%llu sprep=%llu faepi=%llu mrms=%llu relb=%llu covlp=%llu redir=%llu cpipe=%llu srb=%llu)\n",
                      cgraph->n_nodes, n_exec, n_items, num_waves, no_wave_sched ? 0 : 1,
                      (unsigned long long) d_disp, (unsigned long long) d_sub,
                      (unsigned long long) d_usc, (unsigned long long) g_wfi_bar, (unsigned long long) d_elide,
@@ -9387,7 +9647,7 @@ enum ggml_status agx_graph_compute(agx_backend_context * ctx, struct ggml_cgraph
                      (unsigned long long) g_sprep, (unsigned long long) g_fa_epi,
                      (unsigned long long) g_mix_rms, (unsigned long long) g_rel_bskip,
                      (unsigned long long) g_ctrl_ovlp, (unsigned long long) g_redir,
-                     (unsigned long long) g_ctrl_pipe);
+                     (unsigned long long) g_ctrl_pipe, (unsigned long long) g_sr_batch);
     }
 
     st->stats.graphs_executed++;

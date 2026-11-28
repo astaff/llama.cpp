@@ -4,7 +4,7 @@
 // Wave 7 Pillar 3: agx_inkling2_dspark_mtp.comp
 // Fused DSpark Draft Body + High-BW 40-Core Markov Head (< 2.4 ms!)
 // ============================================================================
-// Compiled with -DDSPARK_FUSED_MODE=0..7:
+// Compiled with -DDSPARK_FUSED_MODE=0..14:
 //   0: JOINT_PACK          (w1[prev] + concat4 -> joint_in_va)
 //   1: W2_SOFTCAP_TOPK     (160-WG 16B uvec4 2-row/SG w2 @ markov * scale + bias
 //                           + base_i[base_stride] + softcap + adaptive Top-64!)
@@ -15,6 +15,10 @@
 //   5: DSPARK_INP_BLOCK    (anchor embd + tok_norm + mask_embd + blk.0.attn_norm!)
 //   6: DSPARK_QKV_ROPE_STORE (1-SG/head Q/K RMSNorm + RoPE + [FWHT128] + F16/Q8_0 KV-store!)
 //   7: DSPARK_POST_OP      (op=0 RES_NORM | op=1 GLU | op=2 MARKOV_INIT + step-1 pack!)
+//   8..13: Wave 7-9 Gate/Up+GLU, Prep/Coalesce, Inject Mix (Mode 10), Inject KV (Mode 11),
+//          Direct-L1 Q8 GEMV (Mode 12), Q4_32 W2 Softcap+TopK (Mode 13)
+//  14: DSPARK_INJECT_MIX_FUSED (Wave 11: single-read all-slots gather + ctx_mix + RMSNorm*w
+//                               for large-M prefill inject; 512T/WG, <=40 GPR32, 0:0 spills)
 // Target: <= 60 GPR32, 0:0 spills, 100% native FP32 math.
 
 #extension GL_GOOGLE_include_directive : enable
@@ -67,7 +71,7 @@ bool comes_before_desc(float va, int ia, float vb, int ib) {
     return (va > vb) || (va == vb && ia < ib);
 }
 
-#if DSPARK_FUSED_MODE == 0 || DSPARK_FUSED_MODE == 2 || DSPARK_FUSED_MODE == 5 || DSPARK_FUSED_MODE == 7 || DSPARK_FUSED_MODE == 9 || DSPARK_FUSED_MODE == 10
+#if DSPARK_FUSED_MODE == 0 || DSPARK_FUSED_MODE == 2 || DSPARK_FUSED_MODE == 5 || DSPARK_FUSED_MODE == 7 || DSPARK_FUSED_MODE == 9 || DSPARK_FUSED_MODE == 10 || DSPARK_FUSED_MODE == 14
 float load_w_scalar(uint64_t row_va, uint wtype, uint k) {
     if (wtype == WTYPE_F32)  return ConstBufF32(row_va).v[k];
     if (wtype == WTYPE_BF16) return uintBitsToFloat(uint(ConstBufU16(row_va).v[k]) << 16u);
@@ -1886,7 +1890,7 @@ void main() {
     const float ir = s_red[0];
 
     ConstBufVec4 nw = ConstBufVec4(pc.norm_w_va[slot]);
-    BufVec4      ob = BufVec4(pc.out_va[slot] + uint64_t(tok * D) * 4ul);
+    BufVec4      ob = BufVec4(pc.out_va[slot] + uint64_t(tok) * uint64_t(D) * 4ul);
     for (uint i4 = tid; i4 < D4; i4 += 256u) {
         const uint b = i4 << 2u;
         vec4 v = vec4(s_buf[b], s_buf[b + 1u], s_buf[b + 2u], s_buf[b + 3u]) * ir;
@@ -1991,8 +1995,8 @@ void main() {
 
     const uint64_t l_off_B = uint64_t(il) * uint64_t(pc.layer_raw_stride_f32) * 4ul;
     const uint64_t src_va  = is_k
-        ? (pc.k_raw_base_va + l_off_B + uint64_t(tok * pc.k_raw_stride_f32 + head * hd) * 4ul)
-        : (pc.v_raw_base_va + l_off_B + uint64_t(tok * pc.v_raw_stride_f32 + head * hd) * 4ul);
+        ? (pc.k_raw_base_va + l_off_B + (uint64_t(tok) * uint64_t(pc.k_raw_stride_f32) + uint64_t(head) * uint64_t(hd)) * 4ul)
+        : (pc.v_raw_base_va + l_off_B + (uint64_t(tok) * uint64_t(pc.v_raw_stride_f32) + uint64_t(head) * uint64_t(hd)) * 4ul);
 
     float ss = 0.0;
     for (uint i = ln; i < hd; i += 32u) {
@@ -2464,6 +2468,154 @@ void main() {
             BufF32(pc.cand_val_va).v[cand_base + tid] = s_val[128u + tid];
             BufI32(pc.cand_idx_va).v[cand_base + tid] = s_idx[128u + tid];
         }
+    }
+}
+
+#elif DSPARK_FUSED_MODE == 14
+// ============================================================================
+// Mode 14 (Wave 11): Single-Read All-Slots Fused Target-Feature Gather + ctx_mix + RMSNorm*w
+//   - Grid: (n_tokens, 1, 1), Local: (512, 1, 1) [16 SGs/WG]
+//   - Reads feat_src_va ONCE across all n_slots <= 4 (4x less DRAM read BW than Mode 10!)
+//   - Supports D <= 3072 (D4 <= 768), n_target <= 16, n_slots <= 4; <= 40 GPR32, 0:0 spills
+// ============================================================================
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushArgs {
+    uint64_t feat_src_va;
+    uint64_t embd_rows_va;
+    uint64_t mix_w_va[4];
+    uint64_t norm_w_va[4];
+    uint64_t out_va[4];
+    uint     n_embd;
+    uint     n_target;
+    uint     n_tokens;
+    uint     n_slots;
+    uint     feat_row_f32;
+    uint     mix_wtypes;
+    float    rms_eps;
+    uint     pad0;
+} pc;
+
+shared vec4  s_tail[4][256];
+shared float s_mw[4][16];
+shared float s_red[4][16];
+
+void main() {
+    const uint tok = gl_WorkGroupID.x;
+    if (tok >= pc.n_tokens) return;
+
+    const uint tid     = gl_LocalInvocationID.x;
+    const uint sg      = tid >> 5u;
+    const uint ln      = tid & 31u;
+    const uint D       = pc.n_embd;
+    const uint D4      = D >> 2u;
+    const uint T       = pc.n_target;
+    const uint n_slots = min(pc.n_slots, 4u);
+
+    if (tid < n_slots * 16u) {
+        const uint s   = tid >> 4u;
+        const uint tap = tid & 15u;
+        float mw = 0.0;
+        if (tap < T && pc.mix_w_va[s] != 0ul) {
+            const uint wt = (pc.mix_wtypes >> (s * 2u)) & 3u;
+            mw = load_w_scalar(pc.mix_w_va[s], wt, tap);
+        }
+        s_mw[s][tap] = mw;
+    }
+    barrier();
+
+    const int src_row = (pc.embd_rows_va != 0ul) ? max(ConstBufI32(pc.embd_rows_va).v[tok], 0) : int(tok);
+    const uint64_t row_va = pc.feat_src_va + uint64_t(src_row) * uint64_t(pc.feat_row_f32) * 4ul;
+    ConstBufVec4 fb = ConstBufVec4(row_va);
+
+    vec4 a0 = vec4(0.0), a1 = vec4(0.0), a2 = vec4(0.0), a3 = vec4(0.0);
+    float ss0 = 0.0, ss1 = 0.0, ss2 = 0.0, ss3 = 0.0;
+    if (tid < D4) {
+        for (uint tap = 0u; tap < T; ++tap) {
+            vec4 fv = fb.v[tap * D4 + tid];
+            if (n_slots > 0u) a0 = fma(fv, vec4(s_mw[0][tap]), a0);
+            if (n_slots > 1u) a1 = fma(fv, vec4(s_mw[1][tap]), a1);
+            if (n_slots > 2u) a2 = fma(fv, vec4(s_mw[2][tap]), a2);
+            if (n_slots > 3u) a3 = fma(fv, vec4(s_mw[3][tap]), a3);
+        }
+        if (n_slots > 0u) ss0 = dot(a0, a0);
+        if (n_slots > 1u) ss1 = dot(a1, a1);
+        if (n_slots > 2u) ss2 = dot(a2, a2);
+        if (n_slots > 3u) ss3 = dot(a3, a3);
+    }
+
+    const uint i4_1 = tid + 512u;
+    if (i4_1 < D4 && tid < 256u) {
+        s_tail[0][tid] = vec4(0.0);
+        s_tail[1][tid] = vec4(0.0);
+        s_tail[2][tid] = vec4(0.0);
+        s_tail[3][tid] = vec4(0.0);
+        for (uint tap = 0u; tap < T; ++tap) {
+            vec4 fv = fb.v[tap * D4 + i4_1];
+            if (n_slots > 0u) s_tail[0][tid] = fma(fv, vec4(s_mw[0][tap]), s_tail[0][tid]);
+            if (n_slots > 1u) s_tail[1][tid] = fma(fv, vec4(s_mw[1][tap]), s_tail[1][tid]);
+            if (n_slots > 2u) s_tail[2][tid] = fma(fv, vec4(s_mw[2][tap]), s_tail[2][tid]);
+            if (n_slots > 3u) s_tail[3][tid] = fma(fv, vec4(s_mw[3][tap]), s_tail[3][tid]);
+        }
+        if (n_slots > 0u) { vec4 t = s_tail[0][tid]; ss0 += dot(t, t); }
+        if (n_slots > 1u) { vec4 t = s_tail[1][tid]; ss1 += dot(t, t); }
+        if (n_slots > 2u) { vec4 t = s_tail[2][tid]; ss2 += dot(t, t); }
+        if (n_slots > 3u) { vec4 t = s_tail[3][tid]; ss3 += dot(t, t); }
+    }
+
+    float r0 = subgroupAdd(ss0);
+    float r1 = subgroupAdd(ss1);
+    float r2 = subgroupAdd(ss2);
+    float r3 = subgroupAdd(ss3);
+    if (ln == 0u) {
+        s_red[0][sg] = r0;
+        s_red[1][sg] = r1;
+        s_red[2][sg] = r2;
+        s_red[3][sg] = r3;
+    }
+    barrier();
+    if (sg == 0u) {
+        float t0 = subgroupAdd((ln < 16u) ? s_red[0][ln] : 0.0);
+        float t1 = subgroupAdd((ln < 16u) ? s_red[1][ln] : 0.0);
+        float t2 = subgroupAdd((ln < 16u) ? s_red[2][ln] : 0.0);
+        float t3 = subgroupAdd((ln < 16u) ? s_red[3][ln] : 0.0);
+        if (ln == 0u) {
+            s_red[0][0] = inversesqrt(t0 / float(D) + pc.rms_eps);
+            s_red[1][0] = inversesqrt(t1 / float(D) + pc.rms_eps);
+            s_red[2][0] = inversesqrt(t2 / float(D) + pc.rms_eps);
+            s_red[3][0] = inversesqrt(t3 / float(D) + pc.rms_eps);
+        }
+    }
+    barrier();
+
+    const uint64_t tok_off_B = uint64_t(tok) * uint64_t(D) * 4ul;
+    if (n_slots > 0u && pc.out_va[0] != 0ul) {
+        const float ir = s_red[0][0];
+        ConstBufVec4 nw = ConstBufVec4(pc.norm_w_va[0]);
+        BufVec4      ob = BufVec4(pc.out_va[0] + tok_off_B);
+        if (tid < D4)                 ob.v[tid]  = (a0 * ir) * nw.v[tid];
+        if (i4_1 < D4 && tid < 256u)  ob.v[i4_1] = (s_tail[0][tid] * ir) * nw.v[i4_1];
+    }
+    if (n_slots > 1u && pc.out_va[1] != 0ul) {
+        const float ir = s_red[1][0];
+        ConstBufVec4 nw = ConstBufVec4(pc.norm_w_va[1]);
+        BufVec4      ob = BufVec4(pc.out_va[1] + tok_off_B);
+        if (tid < D4)                 ob.v[tid]  = (a1 * ir) * nw.v[tid];
+        if (i4_1 < D4 && tid < 256u)  ob.v[i4_1] = (s_tail[1][tid] * ir) * nw.v[i4_1];
+    }
+    if (n_slots > 2u && pc.out_va[2] != 0ul) {
+        const float ir = s_red[2][0];
+        ConstBufVec4 nw = ConstBufVec4(pc.norm_w_va[2]);
+        BufVec4      ob = BufVec4(pc.out_va[2] + tok_off_B);
+        if (tid < D4)                 ob.v[tid]  = (a2 * ir) * nw.v[tid];
+        if (i4_1 < D4 && tid < 256u)  ob.v[i4_1] = (s_tail[2][tid] * ir) * nw.v[i4_1];
+    }
+    if (n_slots > 3u && pc.out_va[3] != 0ul) {
+        const float ir = s_red[3][0];
+        ConstBufVec4 nw = ConstBufVec4(pc.norm_w_va[3]);
+        BufVec4      ob = BufVec4(pc.out_va[3] + tok_off_B);
+        if (tid < D4)                 ob.v[tid]  = (a3 * ir) * nw.v[tid];
+        if (i4_1 < D4 && tid < 256u)  ob.v[i4_1] = (s_tail[3][tid] * ir) * nw.v[i4_1];
     }
 }
 #endif
