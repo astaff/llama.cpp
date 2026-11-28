@@ -829,14 +829,15 @@ bool agx_kv_hybrid_dispatch_full_attn(agx_kv_hybrid_pool *        pool,
         pc.ext_mask_ne2  = args.ext_mask_ne2 ? args.ext_mask_ne2 : 1u;
     }
 
-    // Tiled Multi-Q 8x8 FP16 Coopmat Prefill fastpath (32 Q/WG, 16 KV/tile, FP32 online softmax + causal skip!)
+    // Tiled Multi-Q 8x8 FP16 Coopmat Prefill fastpath (32 Q/WG, 16 KV/tile, FP32 online softmax + causal/SWA skip!)
     // Triggers for non-paged D=128 prefill with F16/F8_E4M3/Q8_0 KV (preserves full F32 accuracy for F32 KV).
     if (!is_paged && args.head_dim == 128u && args.n_tokens >= 16u && args.n_kv >= 32u &&
         k_dt != AGX_KV_F32 && v_dt != AGX_KV_F32 &&
         (args.flags & (AGX_ATTN_FLAG_CAUSAL | AGX_ATTN_FLAG_HAS_REL_TABLE)) == 0u) {
         const agx_kernel * k_pf = get_full_prefill_kernel(pool, k_dt, v_dt);
         if (k_pf) {
-            pc.n_splits = 1u;
+            pc.n_splits   = 1u;
+            pc.partial_va = ((args.flags & AGX_ATTN_FLAG_KV_BOUNDS) != 0u) ? args.kv_bounds_va : 0ull;
             const uint32_t grid_y = (args.n_tokens + 31u) / 32u;
             return agx_cdm_dispatch(stream, k_pf, args.n_head_q, grid_y, 1u,
                                     &pc, sizeof(pc), post_barrier);
@@ -853,7 +854,7 @@ bool agx_kv_hybrid_dispatch_full_attn(agx_kv_hybrid_pool *        pool,
             const uint32_t grid_y   = (args.n_tokens + 7u) / 8u;
             const uint32_t base_wgs = std::max<uint32_t>(1u, args.n_head_q * grid_y);
             uint32_t pf4_splits = 1u;
-            if (args.n_kv > 256u) {
+            if (args.n_kv > 512u) {
                 const uint32_t max_by_kv = std::max<uint32_t>(1u, (args.n_kv + 63u) / 64u);
                 const uint32_t want      = (base_wgs >= 160u) ? 1u : ((160u + base_wgs - 1u) / base_wgs);
                 pf4_splits = std::max<uint32_t>(want, (args.n_kv + 255u) / 256u);
@@ -1010,10 +1011,36 @@ bool agx_kv_hybrid_supports_ggml_flash_attn(const struct ggml_tensor * dst) {
     return true;
 }
 
-bool agx_kv_hybrid_dispatch_ggml_flash_attn(agx_kv_hybrid_pool *       pool,
-                                            agx_cdm_stream *           stream,
-                                            const struct ggml_tensor * dst,
-                                            agx_barrier_mode           post_barrier) {
+bool agx_kv_hybrid_ggml_flash_attn_uses_scratch(const struct ggml_tensor * dst) {
+    if (!agx_kv_hybrid_supports_ggml_flash_attn(dst)) {
+        return true;
+    }
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    agx_kv_dtype k_dt = AGX_KV_F32;
+    agx_kv_dtype v_dt = AGX_KV_F32;
+    ggml_type_to_ext_kv(k->type, &k_dt);
+    ggml_type_to_ext_kv(v->type, &v_dt);
+    const uint32_t head_dim = static_cast<uint32_t>(q->ne[0]);
+    const uint32_t n_tokens = static_cast<uint32_t>(q->ne[1]);
+    const uint32_t n_kv     = static_cast<uint32_t>(k->ne[1]);
+    const uint32_t n_head_q = static_cast<uint32_t>(q->ne[2]);
+    if (head_dim == 128u && n_tokens >= 16u && n_kv >= 32u && k_dt != AGX_KV_F32 && v_dt != AGX_KV_F32) {
+        return false; // PASS_MODE=3 single-pass coopmat prefill never uses split_partial_bo
+    }
+    if (head_dim == 128u && n_tokens >= 2u && n_tokens < 16u && n_kv >= 32u && n_kv <= 512u &&
+        k_dt != AGX_KV_F32 && v_dt != AGX_KV_F32) {
+        return false; // PASS_MODE=4 pf4_splits == 1
+    }
+    return choose_flash_decode_splits(n_kv, n_head_q, n_tokens) > 1u;
+}
+
+bool agx_kv_hybrid_dispatch_ggml_flash_attn_ext(agx_kv_hybrid_pool *            pool,
+                                                agx_cdm_stream *                stream,
+                                                const struct ggml_tensor *      dst,
+                                                const agx_ggml_flash_attn_epi * epi,
+                                                agx_barrier_mode                post_barrier) {
     if (!pool || !stream || !agx_kv_hybrid_supports_ggml_flash_attn(dst)) {
         return false;
     }
@@ -1036,7 +1063,8 @@ bool agx_kv_hybrid_dispatch_ggml_flash_attn(agx_kv_hybrid_pool *       pool,
     const uint64_t base_q_va    = agx_tensor_gpu_va(q);
     const uint64_t base_k_va    = agx_tensor_gpu_va(k);
     const uint64_t base_v_va    = agx_tensor_gpu_va(v);
-    const uint64_t base_out_va  = agx_tensor_gpu_va(dst);
+    const uint64_t base_out_va  = (epi && epi->out_va) ? epi->out_va : agx_tensor_gpu_va(dst);
+    const uint64_t out_nb3      = (epi && epi->out_va && epi->out_nb3) ? epi->out_nb3 : static_cast<uint64_t>(dst->nb[3]);
     const uint64_t base_mask_va = mask  ? agx_tensor_gpu_va(mask)  : 0;
     const uint64_t sinks_va     = sinks ? agx_tensor_gpu_va(sinks) : 0;
 
@@ -1060,12 +1088,20 @@ bool agx_kv_hybrid_dispatch_ggml_flash_attn(agx_kv_hybrid_pool *       pool,
         args.logit_softcap = logit_softcap;
         args.flags         = (logit_softcap != 0.0f ? AGX_ATTN_FLAG_SOFTCAP : 0u)
                            | (q->type == GGML_TYPE_F16 ? AGX_ATTN_FLAG_Q_F16 : 0u)
-                           | (dst->type == GGML_TYPE_F16 ? AGX_ATTN_FLAG_OUT_F16 : 0u);
+                           | (dst->type == GGML_TYPE_F16 ? AGX_ATTN_FLAG_OUT_F16 : 0u)
+                           | (epi ? (epi->extra_flags & ~AGX_ATTN_FLAG_KV_BOUNDS) : 0u);
 
         args.q_va          = base_q_va   + static_cast<uint64_t>(b) * q->nb[3];
         args.q_nb1         = static_cast<uint32_t>(q->nb[1]);
         args.q_nb2         = static_cast<uint32_t>(q->nb[2]);
-        args.out_va        = base_out_va + static_cast<uint64_t>(b) * dst->nb[3];
+        args.out_va        = base_out_va + static_cast<uint64_t>(b) * out_nb3;
+        if (epi && epi->q_gate_va) {
+            args.q_gate_va = epi->q_gate_va + static_cast<uint64_t>(b) * epi->q_gate_nb3;
+        }
+        if (epi && (epi->extra_flags & AGX_ATTN_FLAG_KV_BOUNDS) != 0u && epi->kv_bounds_va && B == 1) {
+            args.flags       |= AGX_ATTN_FLAG_KV_BOUNDS;
+            args.kv_bounds_va = epi->kv_bounds_va;
+        }
         args.ext_k_dtype   = k_dt;
         args.ext_v_dtype   = v_dt;
         args.ext_k_va      = base_k_va + static_cast<uint64_t>(b / rk3) * k->nb[3];
@@ -1093,4 +1129,11 @@ bool agx_kv_hybrid_dispatch_ggml_flash_attn(agx_kv_hybrid_pool *       pool,
         }
     }
     return true;
+}
+
+bool agx_kv_hybrid_dispatch_ggml_flash_attn(agx_kv_hybrid_pool *       pool,
+                                            agx_cdm_stream *           stream,
+                                            const struct ggml_tensor * dst,
+                                            agx_barrier_mode           post_barrier) {
+    return agx_kv_hybrid_dispatch_ggml_flash_attn_ext(pool, stream, dst, nullptr, post_barrier);
 }
